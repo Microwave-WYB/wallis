@@ -1,0 +1,11 @@
+[tools]
+gleam = "1.19.2"
+node = "26.13.0"
+
+[tasks.build]
+dir = "core"
+run = "gleam build"
+
+[tasks.test]
+dir = "core"
+run = "gleam test"
