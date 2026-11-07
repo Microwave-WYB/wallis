@@ -6,8 +6,8 @@
 import { spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
 import Type from "typebox";
+import { type Tool, tool } from "./tool.ts";
 
 export interface Box {
 	/** host path -> path inside, read-only (code, data, the Python env). */
@@ -51,18 +51,16 @@ export async function python<T>(harness: string, script: string, work: string, i
 }
 
 /** An implementor's "try running my code" tool: its file runs in a fresh sandbox; only capped output returns. */
-export function tryRunTool(scratch: string): AgentTool {
-	return {
+export function tryRunTool(scratch: string): Tool {
+	return tool({
 		name: "try_run",
-		label: "try_run",
 		description: "Run a Python file you write in a sandbox (no network, no host files); returns its exit code and output.",
 		parameters: Type.Object({ file: Type.String({ pattern: "^[\\w.-]+\\.py$" }), code: Type.String() }),
-		execute: async (_id, params) => {
-			const { file, code } = params as { file: string; code: string };
+		execute: async ({ file, code }) => {
 			mkdirSync(scratch, { recursive: true });
 			writeFileSync(join(scratch, file), code);
 			const r = await sandboxed(["python3", file], { ro: {}, work: scratch, timeoutMs: 60_000 });
-			return { content: [{ type: "text", text: `exit ${r.code}\n${r.stdout}${r.stderr}`.slice(0, 8_000) }], details: undefined, isError: r.code !== 0 };
+			return { text: `exit ${r.code}\n${r.stdout}${r.stderr}`.slice(0, 8_000), isError: r.code !== 0 };
 		},
-	};
+	});
 }

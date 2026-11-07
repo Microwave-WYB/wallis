@@ -1,6 +1,6 @@
 // Recovery without a framework: everything lands in work/, every expensive
 // step writes one file and is skipped when that file exists, and agents
-// checkpoint their conversation (lib/agent.ts `checkpoint`). Re-running the
+// save their session (lib/agent.ts `session`). Re-running the
 // program is the resume.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";

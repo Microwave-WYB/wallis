@@ -2,14 +2,15 @@
 // harness evaluates it in a sandbox, a critic reads the history and says
 // what to try next. Memory is local variables, pushed into each agent's
 // input. Every step writes a file in work/ and is skipped when it exists,
-// and agents checkpoint their conversation: re-running is the resume.
+// and agents save their session: re-running is the resume. No agent SDK is
+// imported here: lib/agent.ts is the only seam.
 //
 //   node run.ts            (provider credentials from the usual env vars)
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import Type, { type Static } from "typebox";
-import { type Models, runAgent } from "./lib/agent.ts";
+import { runAgent, submitted } from "./lib/agent.ts";
 import { python } from "./lib/sandbox.ts";
 import { step } from "./lib/steps.ts";
 
@@ -28,18 +29,18 @@ export interface Options {
 	readonly critic: string;
 }
 
-export async function main(models: Models, o: Options) {
+export async function main(o: Options) {
 	const history: Trial[] = [];
 	let advice = "";
 	for (let i = 0; i < o.iterations; i++) {
 		const dir = `work/iter-${i}`;
-		const config = await step(`${dir}/config.json`, () =>
-			runAgent(models, { model: o.proposer, system: prompt("propose"), output: Config, checkpoint: `${dir}/propose.session.json`, maxTurns: 6 }, { task: o.task, history, advice }),
+		const config = await step(`${dir}/config.json`, async () =>
+			submitted(await runAgent({ model: o.proposer, system: prompt("propose"), output: Config, session: `${dir}/propose.session.json`, maxTurns: 6 }, { task: o.task, history, advice })),
 		);
 		const result = await step(`${dir}/result.json`, () => python<Static<typeof Result>>(harness, "evaluate.py", `${dir}/eval`, config));
 		history.push({ ...config, ...result });
-		const review = await step(`${dir}/review.json`, () =>
-			runAgent(models, { model: o.critic, system: prompt("critique"), output: Review, checkpoint: `${dir}/critique.session.json`, maxTurns: 4 }, { task: o.task, history }),
+		const review = await step(`${dir}/review.json`, async () =>
+			submitted(await runAgent({ model: o.critic, system: prompt("critique"), output: Review, session: `${dir}/critique.session.json`, maxTurns: 4 }, { task: o.task, history })),
 		);
 		advice = review.advice;
 		if (review.stop) break;
@@ -49,8 +50,7 @@ export async function main(models: Models, o: Options) {
 }
 
 if (import.meta.main) {
-	const { builtinModels } = await import("@earendil-works/pi-ai/providers/all");
-	const out = await main(builtinModels() as unknown as Models, {
+	const out = await main({
 		task: "Tune the learning rate and epochs of the toy model in harness/evaluate.py.",
 		iterations: 5,
 		proposer: "anthropic/claude-sonnet-5-5",
