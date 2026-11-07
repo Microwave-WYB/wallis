@@ -72,21 +72,37 @@ As built (`core/src/wallis_core/types.gleam`):
 ```gleam
 // Event:  Started(workflow, pin, input) | Resumed(pin)
 //       | Requested(id, branch, Call | Script | Read | Commit)
-//       | AgentReturned(id, output, emits, usage) | AgentFailed(id, error, usage)
+//       | AgentReturned(id, output, emits, usage, model)
+//       | AgentIdle(id, message, usage, model) | AgentFailed(id, error, usage, model)
+//       | ExecutorFailed(id, error) | RetryUnavailable
 //       | ScriptReturned(id, output, minutes) | ScriptFailed(id, error, minutes)
-//       | BodyFinished(output) | BodyFailed(error)
-// Effect: Checkpoint | CallAgent(..) | RunScript(..) | Deliver(id, value)
-//       | Fail(id, error) | Refuse(Option(id), reason) | Finish(outcome)
+//       | Sent(node, text, message_id) | AliasRebound(alias, from, to)
+//       | BudgetRaised(kind, limit) | ExecutorChanged(name) | CancelRequested
+//       | BodyFinished(output) | BodyFailed(FailReason)
+// Effect: Checkpoint | CallAgent(.., transcript) | RunScript(..) | Deliver(id, value)
+//       | Fail(id, FailReason) | Refuse(Option(id), Refusal) | Finish(Outcome)
 ```
 
 - Prototype choice: the body talks to the core only through `Requested`
   events: `Call` (agent), `Script`, `Read` (a view of the state) and
-  `Commit` (body writes, `ctx.emit`). Each is answered by `Deliver`, `Fail`
-  or `Refuse(Some(id))`, which reject the body's promise with `AgentFailed`
-  or `Refused`. `Refuse(None)` stops the run.
+  `Commit` (body writes, `ctx.emit`). Each is answered in one of three ways:
+  - `Deliver`;
+  - `Fail(id, FailReason)`, which the SDK throws as `AgentFailed` or
+    `ScriptFailed`;
+  - `Refuse(Some(id), Refusal)`, which it throws as `Refused` with the
+    typed refusal.
+
+  `Refuse(None, Refusal)` means the event itself was refused and not
+  applied. The host decides what that means for the source of the event:
+  - a refused `Resumed`, or a path divergence during replay, ends the
+    session;
+  - a refused send is reported to the sender.
+- Prototype choice: strings appear only at the leaves of `Refusal`,
+  `FailReason`, `IdleReason` and the statuses; nothing matches on message
+  text.
 - Prototype choice: `Checkpoint` means "append the event just stepped to the
   log". The core emits it for every event that changes the run, and not for
-  replayed requests or `Resumed`.
+  replayed requests, `Resumed` or refused events.
 - Prototype choice: the host holds `RunState` as an opaque handle;
   `step_json` and `snapshot_json` carry events, effects and state snapshots
   as JSON text.
@@ -98,6 +114,161 @@ As built (`core/src/wallis_core/types.gleam`):
   Gleam language server code actions, driven headless by
   `tools/gleam-codegen.mjs`. The recursive JSON `Value` decoder is
   hand-written, because the action cannot generate it.
+
+## Run and node status (decided)
+
+- Run: `Running | Idle(Option(IdleReason)) | Finished(Outcome)`.
+  - `Outcome = Done(value) | Failed(FailReason) | Cancelled`.
+  - `IdleReason = BudgetExhausted(kind, spent, limit) | ExecutorUnavailable(alias, error)`.
+  - `FailReason = BodyError(message) | AgentGaveUp(agent, error) | ScriptCrashed(script, error)`.
+- Node (one agent call and its conversation): `Running | Idle(last_message) | Done(Submitted | GaveUp(error))`.
+  An idle node is always waiting for a message.
+- A refused resume or request does not change the persisted status.
+- `stopped` is derived at query time: the run is not finished and no live
+  process holds its lock. It is never logged.
+
+Prototype choices:
+
+- The status is derived from the requests, not stored:
+  - `Running` while any call, script or merge is in flight;
+  - otherwise `Idle(Some(reason))` for the first request, by id, that is
+    blocked on budget or an executor fault;
+  - otherwise `Idle(None)` if a node waits for a message;
+  - otherwise `Running` (the body is computing).
+- Nodes are agent calls that started a conversation. Calls blocked on budget
+  or an executor fault are not nodes yet; the run's idle reason names them.
+  llmMerge calls are not listed as nodes.
+- The lock is `<run>/lock` with the driver's pid. A lock whose pid is dead is
+  stale.
+
+## Asking the human (decided)
+
+An agent that ends its turn without submitting a result makes its node
+`Idle(last_message)`; the message is the question. `send(run, node, text)`
+is allowed only to an idle node: it appends a user message to the same
+conversation and the agent continues. The send is a logged event. There is
+no `defineHuman`: a workflow-level question is an agent node that asks.
+
+Prototype choices:
+
+- `CallAgent` carries the transcript after the first prompt: the agent's
+  messages and the replies. Executors can therefore be stateless, and a
+  continued call after a crash is reissued with the whole transcript.
+  Replaying an idle node does nothing; the idle turn is not run again.
+- `Sent` carries a `message_id` chosen by the sender. The host uses it to
+  apply each inbox entry once; the core ignores it.
+
+## Notification and the MCP server (decided)
+
+- `wallis wait <run>` blocks until something new needs attention, prints an
+  agent-readable summary and exits; harnesses run it in the background.
+- `wallis pending` lists idle nodes and idle runs under the current
+  directory, and prints nothing when there are none (for a
+  UserPromptSubmit-style hook).
+- `wallis serve` is a stdio MCP server with the tools `run`, `send`,
+  `get_run`, `cancel` and `wait`. `wait` is a long poll with a server-side
+  cap. Every result appends what is pending. The `run` result and the
+  server instructions tell the caller to run `npx wallis wait <run_id>` in
+  the background.
+
+Prototype choices:
+
+- Runs live in `.wallis/runs/<run_id>/`: `log.jsonl`, `meta.json`, `lock`,
+  `inbox.jsonl` and `inbox.jsonl.done`. A run id is
+  `<workflow>-<UTC stamp>-<4 hex>`.
+- A session drives a run until it is finished or idle, then releases the
+  lock and exits. The next session resumes it.
+- `send` and `cancel` append an inbox entry. A live driver polls the inbox
+  every 100 ms. If no process holds the lock, the CLI starts a detached
+  driver. The command returns once the entry is taken: its send is logged,
+  or it is marked done.
+- What `wait` returns:
+  - it returns at once if the whole run is finished, idle or stopped;
+  - otherwise it waits for a node to become idle that was not idle when the
+    wait began.
+- The `wait` cap is 30 s. A timeout returns "still running" (exit code 2 in
+  the CLI).
+- The executor is a module whose default export returns
+  `{ executor, scripts? }`. It is passed with `--executor`, recorded in
+  `meta.json`, and reused on resume. There is no default executor until pi
+  is built.
+
+## Recovery (decided)
+
+- Result-defining changes are refused on resume: workflow digest, pinned
+  files, seed, and the core's semantics version.
+- Operational changes are allowed, and each is a logged event:
+  - alias remaps (`AliasRebound`);
+  - budget raises (`BudgetRaised`);
+  - executor changes (`ExecutorChanged`).
+- The journal key does not include the model. Every completed agent call
+  records its resolved model. Completed calls are never re-executed; later
+  calls, and idle nodes when they continue, use the new binding.
+- Executor errors are not agent failures. A provider, auth or billing error
+  leaves the call incomplete and the run `Idle(ExecutorUnavailable)`. After
+  a fix or rebind, resume reissues the call. Agent failures (bad output,
+  maxTurns) reach the body as typed errors.
+- A spent budget pauses the run (`Idle(BudgetExhausted)`); a raise continues
+  it.
+- `wallis fork <run> --at <events|node> [--model ...]` copies a log prefix
+  into a new run and leaves the original untouched.
+- Out of scope: resuming with changed workflow code.
+
+Prototype choices:
+
+- The semantics version is a constant in the core (`wallis-core/2`).
+- Resume order:
+  1. refold the log;
+  2. `Resumed` (only result-defining fields are compared);
+  3. `ExecutorChanged` and `AliasRebound`;
+  4. replay the body;
+  5. `BudgetRaised`, `RetryUnavailable`, sends, inbox.
+
+  Replaying a blocked or unavailable request does not reissue it. Only the
+  logged `BudgetRaised` or `RetryUnavailable` does, so a refold reaches the
+  same state. `RetryUnavailable` is logged only when it reissues something.
+- Any executor exception other than `AgentFailure` is treated as an
+  executor fault (the run pauses, nothing is recorded as a failure).
+- Forking `--at <node>` keeps the events up to and including that node's
+  request, so the fork issues it again; `--at <n>` keeps the first n events.
+- A merge call refused for budget, or failing at the executor, uses the
+  deterministic llmMerge fallback rather than pausing.
+
+## Schemas at the boundary (decided)
+
+- Scripts declare TypeBox args and outputs (`defineScript`), and
+  `ctx.script(script, args)` is typed by them.
+- Every state field has a write schema, enforced for every write: `ctx.emit`,
+  executor `emits` and declared `writes` mappings.
+- The executor gets the agent's output JSON Schema (for provider-side
+  structured output). Its `submit_result` validates against it and returns
+  the errors to the model, which retries within its turn. Only giving up or
+  exceeding maxTurns is an agent failure.
+
+Prototype choices:
+
+- Each value is checked twice, with the same TypeBox check (`schemaErrors`):
+  in the sandbox before it is sent or delivered, and in the host before it
+  is logged. What a mismatch becomes depends on where it comes from:
+
+  | Source | Mismatch becomes |
+  | --- | --- |
+  | Body: agent input, script args, `emit` | `SchemaError`; nothing is logged |
+  | Script output | `ScriptFailed` |
+  | Agent output, emits, mapped writes, merge items | Agent failure; nothing is committed |
+- The write schema follows the reducer:
+
+  | Reducer | Write schema |
+  | --- | --- |
+  | `append`, `topK`, `appendByKey` | the item schema |
+  | `freeze`, `replace` | the value schema |
+  | `union`, `llmMerge` | an array of the item schema |
+  | `sum` | number |
+  | `countByKey` | string or array of strings |
+
+  Item and value schemas are required arguments.
+- The log keeps only a call's final valid output, with the usage of the whole
+  call.
 
 ## State, views and reducers (proposed)
 
@@ -174,9 +345,12 @@ Prototype choices:
   `Resumed(pin)`, then reruns the body from the start. The input comes from
   the logged `started` event. Replay rules for a request whose id is already
   recorded:
-  - a different digest halts the run (path divergence);
+  - a different digest is refused as `PathDiverged`, and the session ends;
   - a completed request is answered from the journal;
-  - a request that was in flight is issued again with its original view.
+  - a request that was in flight is issued again with its original view and
+    transcript, and with the model its alias resolves to now;
+  - an idle node, a call blocked on budget and a call the executor could not
+    serve are left alone (see Recovery).
 
   The resumed run's log therefore equals an uninterrupted run's.
 - The sandbox is `quickjs-wasi` 3.6.2 (the version pi-codemode 1.5.0 uses),
@@ -205,17 +379,21 @@ Prototype choices:
 
 - Pin fields:
   - `workflow_digest`;
-  - `models`: the resolved alias table;
+  - `models`: the resolved alias table. It is recorded but is operational,
+    so it is not compared; see Recovery.
   - `seed`;
   - `inputs`: the sha256 of each file in the workflow's `pin.files`, which
-    are relative to the project root.
+    are relative to the project root;
+  - `semantics`: the core's semantics version.
 
-  On resume they are compared in that order, and the first mismatch is
-  refused as `pin mismatch: <field>`.
+  On resume, `workflow_digest`, `seed`, `semantics` and `inputs` are
+  compared in that order. The first mismatch is refused as
+  `PinMismatch(field, recorded, current)`.
 - Budget fields:
   - `usd`, `tokens`, `turns` (run totals) and `computeMinutes`.
-  - A call is refused once spend reaches a limit. In-flight calls are not
-    reserved, so parallel calls can overshoot by what is in flight.
+  - Once spend reaches a limit, the next call or script is logged but
+    paused, not refused. In-flight calls are not reserved, so parallel calls
+    can overshoot by what is in flight.
   - Each call gets `maxTurns = min(agent.maxTurns, turns left)`.
   - `RunScript` carries the compute minutes left.
   - Merge calls are checked like any other call. A merge refused for budget
@@ -236,16 +414,25 @@ Prototype choices:
 
 The `wallis` package in `host/` exports `defineModels`, `defineMcp`,
 `defineState`, `defineAgent(env, spec)`, `defineTool`, `subWorkflow`,
-`workflow`, `view`, the reducers, TypeBox's `Type`, and the errors `Refused`
-and `AgentFailed`. `env = { models, state?, mcp? }` exists for typing:
+`workflow`, `view`, `defineScript`, the reducers, TypeBox's `Type`, and the
+typed errors `Refused` (with `refusal`), `AgentFailed` (`agent`, `error`),
+`ScriptFailed` (`script`, `error`) and `SchemaError` (`subject`, `errors`). `env = { models, state?, mcp? }` exists for typing:
 - an agent's `model` is `keyof` the alias table;
 - `view.fields` and `writes` keys are state fields;
 - `writes` values are output keys;
 - `mcp` keys are servers in the imported `mcp.json`.
 
-The body gets `ctx.call` (typed by the agent's TypeBox schemas and checked at
-run time), `script`, `read`, `emit` (typed by the field's reducer),
-`parallel`, `sub` and `seed`. This is a draft answer to open item 4.
+The body gets these context methods:
+- `ctx.call`, typed by the agent's TypeBox schemas and checked at run time;
+- `script`, typed by the script's schemas;
+- `read`;
+- `emit`, typed and checked by the field's write schema;
+- `parallel`, `sub` and `seed`.
+
+An uncaught `AgentFailed` or `ScriptFailed` ends the run as
+`AgentGaveUp`/`ScriptCrashed`; anything else ends it as `BodyError`. This is
+a draft answer to open item 4. There are no workflow version declarations
+(owner decision).
 
 ## Executors (proposed)
 
@@ -258,19 +445,24 @@ subscription auth needs a leak test.
 
 ## Prototype status
 
-Built: the core (`core/`), the SDK and host (`host/`), a fake executor and
-script runner, the two-node example with a kill-and-resume test, and the
-SIDERIUS example (`.agents/workflows/siderius/`, see its `MAPPING.md`).
+Built:
+- the core (`core/`) and the SDK and host (`host/`);
+- sessions with a lock, the CLI (`run`, `resume`, `send`, `cancel`,
+  `status`, `wait`, `pending`, `fork`, `serve`) and the stdio MCP server;
+- the fake executor (multi-turn conversations, `submit_result` retries,
+  executor errors) and the fake script runner;
+- examples: `two-node` and `ask`;
+- the SIDERIUS example (`.agents/workflows/siderius/`, see its `MAPPING.md`).
 
 Not built yet:
-- the pi executor and preflight;
+- the pi executor and its preflight capabilities (preflight runs against
+  whatever capabilities an executor declares);
 - the MCP proxy, `defineTool` serving, `sandbox_exec`, secret injection and
   script sandboxing;
-- the `state_read` pull tool and persistent sessions;
+- the `state_read` pull tool and persistent sessions beyond the transcript;
 - pure script reducers and merging non-commutative writes at a join;
 - the local profile file (resolution accepts a profile object);
-- declaration approval on first run or digest change;
-- the MCP server exposing workflows to harnesses.
+- declaration approval on first run or digest change.
 
 ## Open
 

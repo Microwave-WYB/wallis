@@ -33,4 +33,9 @@
 
 - `host/src/sdk/` runs inside the QuickJS sandbox: no Node imports.
 - Host tests use the fake executor and fake scripts; never real model calls
-  or API keys.
+  or API keys. CLI and MCP tests load `host/test/fixtures/fake-executor.ts`
+  as the executor module and work in throwaway projects (`test/util.ts`).
+- Every value crossing the sandbox or executor boundary is schema-checked on
+  both sides (`src/sdk/validate.ts`); keep new boundaries that way.
+- The body sees typed errors only (`Refused`, `AgentFailed`, `ScriptFailed`,
+  `SchemaError`); never make it match on message text.
