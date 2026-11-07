@@ -17,7 +17,7 @@ pub fn step_json_roundtrip_test() {
     "{\"workflow_digest\":\"d\",\"models\":{\"default\":\"fake/m\"},\"seed\":1,\"inputs\":{}}"
   let #(s, effects) =
     wallis_core.step_json(
-      wallis_core.new(),
+      wallis_core.init(),
       "{\"type\":\"started\",\"workflow\":"
         <> wf
         <> ",\"pin\":"
@@ -44,7 +44,7 @@ pub fn step_json_roundtrip_test() {
 
 pub fn step_json_rejects_bad_event_test() {
   let #(_, effects) =
-    wallis_core.step_json(wallis_core.new(), "{\"type\":\"nope\"}")
+    wallis_core.step_json(wallis_core.init(), "{\"type\":\"nope\"}")
   assert string.starts_with(
     effects,
     "[{\"type\":\"refuse\",\"id\":null,\"reason\":\"invalid event",

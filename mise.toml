@@ -2,10 +2,33 @@
 gleam = "1.19.2"
 node = "26.13.0"
 
+[tasks.install]
+description = "Install host npm dependencies (exact pins, from the lockfile)"
+dir = "host"
+run = "npm ci --no-fund --no-audit"
+
 [tasks.build]
+description = "Build the Gleam core to JavaScript"
 dir = "core"
 run = "gleam build"
 
-[tasks.test]
+[tasks."test:core"]
+description = "Core event-replay tests (gleeunit)"
 dir = "core"
 run = "gleam test"
+
+[tasks.typecheck]
+description = "Type-check the host, SDK, examples and committed workflows"
+dir = "host"
+depends = ["build"]
+run = "npx tsc --noEmit -p . && npx tsc --noEmit -p ../.agents/workflows"
+
+[tasks."test:host"]
+description = "Host tests: sandbox, log, resume (fake executor)"
+dir = "host"
+depends = ["build"]
+run = "node --test 'test/*.test.ts'"
+
+[tasks.test]
+description = "All tests"
+depends = ["test:core", "test:host"]

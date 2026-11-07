@@ -15,7 +15,7 @@ import wallis_core/run.{type RunState}
 import wallis_core/types.{type Effect, type Event, Refuse}
 import wallis_core/value
 
-pub fn new() -> RunState {
+pub fn init() -> RunState {
   run.new()
 }
 
