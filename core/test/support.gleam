@@ -1,6 +1,7 @@
 //// Helpers for event-replay tests.
 
 import gleam/dict
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import wallis_core/reducer
@@ -10,7 +11,7 @@ import wallis_core/types.{
   type Workflow, Agent, Budget, Call, Checkpoint, Commit, Field, Pin, Requested,
   Started, Usage, ViewSpec, Workflow, Write, WriteMap,
 }
-import wallis_core/value.{type Value, JNull}
+import wallis_core/value.{type Value, JArray, JNull}
 
 pub fn field(name: String, r: Reducer) -> Field {
   Field(name, r, reducer.default_initial(r))
@@ -50,6 +51,7 @@ pub fn pin() -> types.Pin {
     models: dict.from_list([#("default", "fake/model")]),
     seed: 7,
     inputs: dict.from_list([#("advice.md", "a1")]),
+    semantics: run.semantics,
   )
 }
 
@@ -79,7 +81,13 @@ pub fn commit(id: String, writes: List(#(String, Value))) -> Event {
 }
 
 pub fn returned(id: String, output: Value) -> Event {
-  types.AgentReturned(id:, output:, emits: [], usage: usage())
+  types.AgentReturned(
+    id:,
+    output:,
+    emits: [],
+    usage: usage(),
+    model: "fake/model",
+  )
 }
 
 pub fn usage() -> types.Usage {
@@ -115,8 +123,31 @@ pub fn last(events: List(Event)) -> List(Effect) {
 
 pub fn state_of(events: List(Event), name: String) -> Value {
   let #(state, _, _) = replay(events)
-  case run.snapshot(state) |> value.get("state." <> name) {
+  snapshot_get(state, "state." <> name)
+}
+
+/// A dotted path into the run's JSON snapshot.
+pub fn snapshot_get(state: RunState, path: String) -> Value {
+  let assert Ok(snap) = value.parse(json.to_string(run.snapshot(state)))
+  case value.get(snap, path) {
     Some(v) -> v
     None -> JNull
+  }
+}
+
+pub fn status_after(events: List(Event)) -> Option(types.RunStatus) {
+  let #(state, _, _) = replay(events)
+  run.status(state)
+}
+
+/// The i-th node of the run's snapshot.
+pub fn node(state: RunState, i: Int) -> Value {
+  case snapshot_get(state, "nodes") {
+    JArray(nodes) ->
+      case list.drop(nodes, i) {
+        [n, ..] -> n
+        [] -> JNull
+      }
+    _ -> JNull
   }
 }

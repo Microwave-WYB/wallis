@@ -109,6 +109,7 @@ const snake = (t) => t.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
 text = text
   .replace(/#\("(\w+)", todo as "Encoder for Value"\)/g, '#("$1", json_value.to_json($1))')
   .replace(/#\("(\w+)", todo as "Encoder for (\w+)"\)/g, (_, f, t) => `#("${f}", ${snake(t)}_to_json(${f}))`)
+  .replace(/option\.Some\(value\) -> todo as "Encoder for (\w+)"/g, (_, t) => `option.Some(value) -> ${t === "Value" ? "json_value.to_json" : `${snake(t)}_to_json`}(value)`)
   .replace(/todo as "Decoder for Value"/g, "json_value.decoder()")
   .replace(/todo as "Encoder for Value"/g, "json_value.to_json")
   .replace(/todo as "Decoder for (\w+)"/g, (_, t) => `${snake(t)}_decoder()`)

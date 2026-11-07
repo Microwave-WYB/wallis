@@ -14,7 +14,9 @@ pub fn step_json_roundtrip_test() {
     <> "\"writes\":[{\"field\":\"runs\",\"from\":\"summary\"}],\"max_turns\":4}],\"scripts\":[],"
     <> "\"budget\":{\"usd\":null,\"tokens\":null,\"turns\":null,\"compute_minutes\":null}}"
   let pin =
-    "{\"workflow_digest\":\"d\",\"models\":{\"default\":\"fake/m\"},\"seed\":1,\"inputs\":{}}"
+    "{\"workflow_digest\":\"d\",\"models\":{\"default\":\"fake/m\"},\"seed\":1,\"inputs\":{},\"semantics\":\""
+    <> wallis_core.semantics()
+    <> "\"}"
   let #(s, effects) =
     wallis_core.step_json(
       wallis_core.init(),
@@ -32,14 +34,20 @@ pub fn step_json_roundtrip_test() {
     )
   assert string.contains(effects, "\"type\":\"call_agent\"")
   assert string.contains(effects, "\"model\":\"fake/m\"")
+  assert string.contains(effects, "\"transcript\":[]")
   let #(s, effects) =
     wallis_core.step_json(
       s,
-      "{\"type\":\"agent_returned\",\"id\":\"#0\",\"output\":{\"summary\":\"s1\"},\"emits\":[],\"usage\":{\"usd\":0.1,\"tokens\":5,\"turns\":1}}",
+      "{\"type\":\"agent_returned\",\"id\":\"#0\",\"output\":{\"summary\":\"s1\"},\"emits\":[],\"usage\":{\"usd\":0.1,\"tokens\":5,\"turns\":1},\"model\":\"fake/m\"}",
     )
   assert effects
     == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"#0\",\"value\":{\"summary\":\"s1\"}}]"
-  assert string.contains(wallis_core.snapshot_json(s), "\"runs\":[\"s1\"]")
+  let snapshot = wallis_core.snapshot_json(s)
+  assert string.contains(snapshot, "\"runs\":[\"s1\"]")
+  assert string.contains(
+    snapshot,
+    "{\"id\":\"#0\",\"agent\":\"a\",\"model\":\"fake/m\",\"status\":{\"type\":\"node_done\",\"outcome\":{\"type\":\"submitted\"}}}",
+  )
 }
 
 pub fn step_json_rejects_bad_event_test() {
@@ -47,6 +55,6 @@ pub fn step_json_rejects_bad_event_test() {
     wallis_core.step_json(wallis_core.init(), "{\"type\":\"nope\"}")
   assert string.starts_with(
     effects,
-    "[{\"type\":\"refuse\",\"id\":null,\"reason\":\"invalid event",
+    "[{\"type\":\"refuse\",\"id\":null,\"refusal\":{\"type\":\"invalid_event\"",
   )
 }

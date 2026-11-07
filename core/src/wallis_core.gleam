@@ -12,8 +12,7 @@ import gleam/list
 import gleam/option.{None}
 import gleam/string
 import wallis_core/run.{type RunState}
-import wallis_core/types.{type Effect, type Event, Refuse}
-import wallis_core/value
+import wallis_core/types.{type Effect, type Event, InvalidEvent, Refuse}
 
 pub fn init() -> RunState {
   run.new()
@@ -29,7 +28,7 @@ pub fn step_json(state: RunState, event: String) -> #(RunState, String) {
   let #(state, effects) = case json.parse(event, types.event_decoder()) {
     Ok(event) -> run.step(state, event)
     Error(error) -> #(state, [
-      Refuse(None, "invalid event: " <> string.inspect(error)),
+      Refuse(None, InvalidEvent(string.inspect(error))),
     ])
   }
   #(
@@ -41,7 +40,12 @@ pub fn step_json(state: RunState, event: String) -> #(RunState, String) {
   )
 }
 
-/// Canonical JSON of the run: status, state, spend, in-flight requests.
+/// JSON of the run: status, nodes, state, spend, budget and models.
 pub fn snapshot_json(state: RunState) -> String {
-  value.canonical(run.snapshot(state))
+  json.to_string(run.snapshot(state))
+}
+
+/// The core's semantics version, pinned with every run.
+pub fn semantics() -> String {
+  run.semantics
 }

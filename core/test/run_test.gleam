@@ -4,13 +4,18 @@ import gleam/option.{None, Some}
 import gleam/string
 import support.{
   agent, branch_call, call, commit, field, last, pin, replay, replay_from,
-  returned, started, state_of, view, workflow,
+  returned, snapshot_get, started, state_of, status_after, view, workflow,
 }
 import wallis_core/run
 import wallis_core/types.{
-  type Workflow, Append, Budget, CallAgent, Checkpoint, Deliver, Descending,
-  Fail, Finish, LlmMerge, Pin, Refuse, Requested, Resumed, RunScript, Script,
-  Sum, TopK, TopOnly, Union, Usage, ViewSpec, Workflow,
+  type Workflow, AgentGaveUp, AgentIdle, AliasRebound, Append, Assistant, Budget,
+  BudgetExhausted, BudgetRaised, CallAgent, CancelRequested, Cancelled,
+  Checkpoint, ComputeMinutes, Deliver, Descending, Done, ExecutorFailed,
+  ExecutorUnavailable, Fail, Finish, Finished, Idle, InvalidDeclaration,
+  LlmMerge, Message, NonCommutativeWriteInBranch, NotIdle, NotRunning,
+  PathDiverged, Pin, PinMismatch, Refuse, Requested, Resumed, RetryUnavailable,
+  RunScript, Running, Script, Sent, Sum, Tokens, TopK, TopOnly, Union,
+  UnknownAlias, Usage, Usd, User, ViewSpec, Workflow, WriteNotAllowed,
 }
 import wallis_core/value.{JArray, JInt, JNull, JString}
 
@@ -31,6 +36,14 @@ fn summary(s) {
   value.object([#("summary", JString(s))])
 }
 
+fn failed(id, error) {
+  types.AgentFailed(id, error, support.usage(), "fake/model")
+}
+
+fn idle(id, message) {
+  AgentIdle(id, message, support.usage(), "fake/model")
+}
+
 // --- Start ---
 
 pub fn start_checkpoints_and_rejects_unresolved_alias_test() {
@@ -43,13 +56,13 @@ pub fn start_checkpoints_and_rejects_unresolved_alias_test() {
       types.Agent(..support.agent("x", view([]), []), model: "judge"),
     ])
   let no_default = types.Started(bad, Pin(..pin(), models: dict.new()), JNull)
-  let assert [Refuse(None, reason)] = last([no_default])
+  let assert [Refuse(None, InvalidDeclaration(reason))] = last([no_default])
   assert string.contains(reason, "judge")
 }
 
 pub fn start_rejects_view_of_unknown_field_test() {
   let wf = workflow([], [agent("a", view(["ghost"]), [])])
-  let assert [Refuse(None, reason)] = last([started(wf)])
+  let assert [Refuse(None, InvalidDeclaration(reason))] = last([started(wf)])
   assert string.contains(reason, "ghost")
 }
 
@@ -57,9 +70,18 @@ pub fn start_rejects_view_of_unknown_field_test() {
 
 pub fn call_emits_call_agent_with_view_test() {
   let assert [
-    CallAgent(id: "#0", agent: "worker", model: "fake/model", view:, ..),
+    CallAgent(
+      id: "#0",
+      agent: "worker",
+      model: "fake/model",
+      view:,
+      transcript: [],
+      ..,
+    ),
   ] = last([started(basic()), call("#0", "worker", JInt(1))])
   assert view == "<field name=\"runs\">\n</field>"
+  assert status_after([started(basic()), call("#0", "worker", JInt(1))])
+    == Some(Running)
 }
 
 pub fn writes_apply_at_call_end_test() {
@@ -74,16 +96,7 @@ pub fn writes_apply_at_call_end_test() {
       ]),
     ),
   ]
-  assert last(events)
-    == [
-      Deliver(
-        "#0",
-        value.object([
-          #("errors", JArray([JString("E1")])),
-          #("summary", JString("s0")),
-        ]),
-      ),
-    ]
+  let assert [Deliver("#0", _)] = last(events)
   assert state_of(events, "runs") == JArray([JString("s0")])
   assert state_of(events, "errors") == JArray([JString("E1")])
 }
@@ -101,10 +114,11 @@ pub fn emit_to_undeclared_field_is_refused_atomically_test() {
       summary("s"),
       [types.Write("other", JInt(1))],
       support.usage(),
+      "fake/model",
     ),
   ]
-  let assert [Refuse(Some("#0"), reason)] = last(events)
-  assert string.contains(reason, "other")
+  assert last(events)
+    == [Refuse(Some("#0"), WriteNotAllowed("worker", "other"))]
   assert state_of(events, "runs") == JArray([])
 }
 
@@ -117,6 +131,7 @@ pub fn emit_tool_writes_declared_field_test() {
       JNull,
       [types.Write("score", JInt(4))],
       support.usage(),
+      "fake/model",
     ),
   ]
   assert state_of(events, "score") == JInt(4)
@@ -136,11 +151,9 @@ pub fn calls_are_snapshot_isolated_test() {
     branch_call("#0.b#0", "b", "w", JNull),
     returned("#0.a#0", errs("A")),
   ]
-  // The state has A, but b's call was rendered at request time.
   assert state_of(events, "errors") == JArray([JString("A")])
   let assert [CallAgent(view:, ..)] = last(list.take(events, 3))
   assert !string.contains(view, "\"A\"")
-  // A call requested after a's return sees it.
   let assert [CallAgent(view:, ..)] =
     last(list.append(events, [call("#1", "w", JNull)]))
   assert string.contains(view, "\"A\"")
@@ -152,8 +165,8 @@ pub fn parallel_branch_refuses_non_commutative_write_test() {
     branch_call("#0.a#0", "a", "worker", JNull),
     returned("#0.a#0", summary("s")),
   ]
-  let assert [Refuse(Some("#0.a#0"), reason)] = last(events)
-  assert string.contains(reason, "not commutative")
+  assert last(events)
+    == [Refuse(Some("#0.a#0"), NonCommutativeWriteInBranch("runs", "a"))]
   assert state_of(events, "runs") == JArray([])
 }
 
@@ -167,13 +180,35 @@ pub fn parallel_branch_accepts_commutative_write_test() {
   assert state_of(events, "errors") == JArray([JString("E")])
 }
 
-pub fn agent_failure_is_journaled_test() {
+pub fn agent_failure_is_journaled_and_typed_test() {
   let events = [
     started(basic()),
     call("#0", "worker", JNull),
-    types.AgentFailed("#0", "boom", support.usage()),
+    failed("#0", "maxTurns exceeded"),
   ]
-  assert last(events) == [Fail("#0", "boom")]
+  assert last(events)
+    == [Fail("#0", AgentGaveUp("worker", "maxTurns exceeded"))]
+  assert snapshot_get(replay(events).0, "nodes")
+    == JArray([
+      value.object([
+        #("id", JString("#0")),
+        #("agent", JString("worker")),
+        #("model", JString("fake/model")),
+        #(
+          "status",
+          value.object([
+            #("type", JString("node_done")),
+            #(
+              "outcome",
+              value.object([
+                #("type", JString("gave_up")),
+                #("error", JString("maxTurns exceeded")),
+              ]),
+            ),
+          ]),
+        ),
+      ]),
+    ])
 }
 
 pub fn body_commit_and_read_test() {
@@ -192,17 +227,101 @@ pub fn body_commit_and_read_test() {
 }
 
 pub fn body_finish_test() {
-  let assert [Finish(types.Done(JInt(1)))] =
+  let assert [Finish(Done(JInt(1)))] =
     last([started(basic()), types.BodyFinished(JInt(1))])
 }
 
-// --- Budget ---
+pub fn body_failure_is_typed_test() {
+  let reason = types.BodyError("TypeError: x is undefined")
+  assert last([started(basic()), types.BodyFailed(reason)])
+    == [Finish(types.Failed(reason))]
+}
+
+// --- Cancel ---
+
+pub fn cancel_finishes_and_later_events_are_refused_test() {
+  let events = [started(basic()), call("#0", "worker", JNull), CancelRequested]
+  assert last(events) == [Finish(Cancelled)]
+  assert status_after(events) == Some(Finished(Cancelled))
+  assert last(list.append(events, [returned("#0", summary("late"))]))
+    == [Refuse(None, NotRunning)]
+}
+
+// --- Questions: ending a turn without a result ---
+
+fn asked() {
+  [started(basic()), call("#0", "worker", JNull), idle("#0", "Which dataset?")]
+}
+
+pub fn agent_ending_turn_without_result_idles_its_node_test() {
+  assert last(asked()) == []
+  assert status_after(asked()) == Some(Idle(None))
+  assert support.node(replay(asked()).0, 0) |> value.get("status")
+    == Some(
+      value.object([
+        #("type", JString("node_idle")),
+        #("last_message", JString("Which dataset?")),
+      ]),
+    )
+}
+
+pub fn send_continues_the_same_conversation_test() {
+  let events = list.append(asked(), [Sent("#0", "the 2024 one", "m1")])
+  let assert [CallAgent(id: "#0", transcript:, ..)] = last(events)
+  assert transcript
+    == [Message(Assistant, "Which dataset?"), Message(User, "the 2024 one")]
+  assert status_after(events) == Some(Running)
+  let done = list.append(events, [returned("#0", summary("s"))])
+  let assert [Deliver("#0", _)] = last(done)
+}
+
+pub fn send_to_a_node_that_is_not_idle_is_refused_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    Sent("#0", "hi", "m1"),
+  ]
+  assert last(events) == [Refuse(None, NotIdle("#0"))]
+  let #(_, _, log) = replay(events)
+  assert list.length(log) == 2
+}
+
+/// Killed after the send was logged: the replay reissues the continued
+/// call with the whole transcript, and the log ends equal.
+pub fn question_send_survives_a_kill_test() {
+  let whole =
+    list.append(asked(), [
+      Sent("#0", "the 2024 one", "m1"),
+      returned("#0", summary("s")),
+      types.BodyFinished(JNull),
+    ])
+  let #(expected, _, expected_log) = replay(whole)
+  let #(s, _, log) =
+    replay(list.append(asked(), [Sent("#0", "the 2024 one", "m1")]))
+  let #(s, effects) = run.step(s, Resumed(pin()))
+  assert effects == []
+  let #(s, effects) = run.step(s, call("#0", "worker", JNull))
+  let assert [CallAgent(transcript: [_, Message(User, "the 2024 one")], ..)] =
+    effects
+  let #(s, _, log2) =
+    replay_from(s, [returned("#0", summary("s")), types.BodyFinished(JNull)])
+  assert list.append(log, log2) == expected_log
+  assert run.snapshot(s) == run.snapshot(expected)
+}
+
+pub fn replaying_an_idle_node_does_nothing_test() {
+  let #(s, _, _) = replay(asked())
+  let #(_, effects) = run.step(s, call("#0", "worker", JNull))
+  assert effects == []
+}
+
+// --- Budget: exhaustion pauses ---
 
 fn budgeted(budget) {
   Workflow(..basic(), budget:)
 }
 
-pub fn budget_refuses_call_when_usd_spent_test() {
+pub fn exhausted_budget_pauses_then_raise_continues_test() {
   let wf =
     budgeted(Budget(
       usd: Some(0.5),
@@ -216,8 +335,19 @@ pub fn budget_refuses_call_when_usd_spent_test() {
     returned("#0", summary("s")),
     call("#1", "worker", JNull),
   ]
-  let assert [Refuse(Some("#1"), reason)] = last(events)
-  assert string.contains(reason, "usd")
+  assert last(events) == []
+  assert status_after(events)
+    == Some(Idle(Some(BudgetExhausted(Usd, 0.5, 0.5))))
+  // The paused call is logged; replay leaves it paused.
+  let #(s, _, log) = replay(events)
+  assert list.length(log) == 4
+  let #(_, effects) = run.step(s, call("#1", "worker", JNull))
+  assert effects == []
+  let raised = list.append(events, [BudgetRaised(Usd, 1.0)])
+  let assert [CallAgent(id: "#1", ..)] = last(raised)
+  assert status_after(raised) == Some(Running)
+  // A raise that is not enough leaves it paused.
+  let assert [] = last(list.append(events, [BudgetRaised(Usd, 0.4)]))
 }
 
 pub fn budget_caps_turns_of_call_test() {
@@ -231,13 +361,13 @@ pub fn budget_caps_turns_of_call_test() {
   let events = [
     started(wf),
     call("#0", "worker", JNull),
-    types.AgentReturned("#0", summary("s"), [], Usage(0.0, 0, 2)),
+    types.AgentReturned("#0", summary("s"), [], Usage(0.0, 0, 2), "fake/model"),
     call("#1", "worker", JNull),
   ]
   let assert [CallAgent(max_turns: 1, ..)] = last(events)
 }
 
-pub fn budget_checks_tokens_test() {
+pub fn token_budget_pauses_test() {
   let wf =
     budgeted(Budget(
       usd: None,
@@ -245,16 +375,17 @@ pub fn budget_checks_tokens_test() {
       turns: None,
       compute_minutes: None,
     ))
-  let assert [Refuse(Some("#1"), _)] =
-    last([
-      started(wf),
-      call("#0", "worker", JNull),
-      returned("#0", summary("s")),
-      call("#1", "worker", JNull),
-    ])
+  let events = [
+    started(wf),
+    call("#0", "worker", JNull),
+    returned("#0", summary("s")),
+    call("#1", "worker", JNull),
+  ]
+  assert status_after(events)
+    == Some(Idle(Some(BudgetExhausted(Tokens, 100.0, 100.0))))
 }
 
-pub fn compute_minutes_pass_to_scripts_test() {
+pub fn compute_minutes_pass_to_scripts_and_pause_test() {
   let wf =
     budgeted(Budget(
       usd: None,
@@ -271,8 +402,101 @@ pub fn compute_minutes_pass_to_scripts_test() {
     types.ScriptReturned("#0", JInt(1), 10.0),
     script("#1"),
   ]
-  let assert [Refuse(Some("#1"), reason)] = last(events)
-  assert string.contains(reason, "compute")
+  assert status_after(events)
+    == Some(Idle(Some(BudgetExhausted(ComputeMinutes, 10.0, 10.0))))
+  let assert [RunScript(id: "#1", compute_minutes: Some(5.0), ..)] =
+    last(list.append(events, [BudgetRaised(ComputeMinutes, 15.0)]))
+}
+
+// --- Models: rebinding mid-run ---
+
+pub fn alias_rebind_reaches_later_calls_only_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    returned("#0", summary("s0")),
+    AliasRebound("default", "fake/model", "other/model"),
+    call("#1", "worker", JNull),
+  ]
+  let assert [CallAgent(id: "#1", model: "other/model", ..)] = last(events)
+  let #(s, _, log) = replay(events)
+  assert list.length(log) == 5
+  // Each node records the model it ran on.
+  assert support.node(s, 0) |> value.get("model") == Some(JString("fake/model"))
+  assert support.node(s, 1) |> value.get("model")
+    == Some(JString("other/model"))
+  // The completed call is answered from the journal, not re-executed.
+  let #(s, _) = run.step(s, Resumed(pin()))
+  let #(_, effects) = run.step(s, call("#0", "worker", JNull))
+  assert effects == [Deliver("#0", summary("s0"))]
+}
+
+pub fn rebinding_an_unknown_alias_is_refused_test() {
+  assert last([started(basic()), AliasRebound("nope", "", "x/y")])
+    == [Refuse(None, UnknownAlias("nope"))]
+}
+
+pub fn idle_node_continues_with_the_new_model_test() {
+  let events =
+    list.append(asked(), [
+      AliasRebound("default", "fake/model", "other/model"),
+      Sent("#0", "yes", "m1"),
+    ])
+  let assert [CallAgent(id: "#0", model: "other/model", ..)] = last(events)
+}
+
+pub fn resume_accepts_a_changed_alias_table_test() {
+  let #(s, _, _) = replay(asked())
+  let other =
+    Pin(..pin(), models: dict.from_list([#("default", "other/model")]))
+  let #(s, effects) = run.step(s, Resumed(other))
+  assert effects == []
+  // Bindings change only through AliasRebound.
+  assert snapshot_get(s, "models.default") == JString("fake/model")
+}
+
+// --- Executor errors are not agent failures ---
+
+pub fn executor_error_pauses_and_retry_reissues_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    ExecutorFailed("#0", "HTTP 412 account suspended"),
+  ]
+  assert last(events) == []
+  assert status_after(events)
+    == Some(
+      Idle(Some(ExecutorUnavailable("default", "HTTP 412 account suspended"))),
+    )
+  // A replay alone does not reissue it.
+  let #(s, _, _) = replay(events)
+  let #(s, _) = run.step(s, Resumed(pin()))
+  let #(s, effects) = run.step(s, call("#0", "worker", JNull))
+  assert effects == []
+  // After a rebind, the retry reissues it with the new model.
+  let #(s, _) =
+    run.step(s, AliasRebound("default", "fake/model", "other/model"))
+  let #(s, effects) = run.step(s, RetryUnavailable)
+  let assert [Checkpoint, CallAgent(id: "#0", model: "other/model", ..)] =
+    effects
+  let #(_, effects) =
+    run.step(
+      s,
+      types.AgentReturned(
+        "#0",
+        summary("s"),
+        [],
+        support.usage(),
+        "other/model",
+      ),
+    )
+  let assert [Checkpoint, Deliver("#0", _)] = effects
+}
+
+pub fn retry_without_unavailable_calls_logs_nothing_test() {
+  let #(s, _, _) = replay([started(basic())])
+  let #(_, effects) = run.step(s, RetryUnavailable)
+  assert effects == []
 }
 
 // --- llmMerge ---
@@ -307,7 +531,6 @@ pub fn llm_merge_calls_merge_agent_and_applies_result_test() {
     last(prefix)
   assert value.get(input, "incoming")
     == Some(JArray([JString("a"), JString("b"), JString("c")]))
-  // Writes wait for the merge.
   assert state_of(prefix, "findings") == JArray([])
   let merged =
     value.object([
@@ -316,7 +539,6 @@ pub fn llm_merge_calls_merge_agent_and_applies_result_test() {
     ])
   let events = list.append(prefix, [returned("#0/merge/findings", merged)])
   let assert [Deliver("#0", _)] = last(events)
-  // At most `max` items survive; the rest are archived.
   assert state_of(events, "findings") == JArray([JString("ab"), JString("c")])
   assert state_of(events, "archive") == JArray([JString("a"), JString("x")])
 }
@@ -333,12 +555,10 @@ pub fn llm_merge_call_cap_falls_back_test() {
     call("#1", "worker", JNull),
     returned("#1", findings(["b", "c"])),
   ]
-  // Cap reached: no merge call, deterministic fallback keeps the newest two.
   let assert [Deliver("#1", _)] = last(events)
   assert state_of(events, "findings") == JArray([JString("b"), JString("c")])
   assert state_of(events, "archive") == JArray([JString("a")])
-  let #(s, _, _) = replay(events)
-  assert value.get(run.snapshot(s), "merge_calls.findings") == Some(JInt(1))
+  assert snapshot_get(replay(events).0, "merge_calls.findings") == JInt(1)
 }
 
 pub fn llm_merge_failure_falls_back_test() {
@@ -346,7 +566,7 @@ pub fn llm_merge_failure_falls_back_test() {
     started(merging(5)),
     call("#0", "worker", JNull),
     returned("#0", findings(["a", "b", "c"])),
-    types.AgentFailed("#0/merge/findings", "bad", support.usage()),
+    failed("#0/merge/findings", "bad"),
   ]
   let assert [Deliver("#0", _)] = last(events)
   assert state_of(events, "findings") == JArray([JString("b"), JString("c")])
@@ -358,7 +578,9 @@ pub fn llm_merge_refused_in_parallel_branch_test() {
     branch_call("#0.x#0", "x", "worker", JNull),
     returned("#0.x#0", findings(["a"])),
   ]
-  let assert [Refuse(Some("#0.x#0"), _)] = last(events)
+  let assert [
+    Refuse(Some("#0.x#0"), NonCommutativeWriteInBranch("findings", "x")),
+  ] = last(events)
 }
 
 pub fn top_k_in_parallel_branch_test() {
@@ -426,58 +648,55 @@ pub fn resume_with_same_pin_is_accepted_test() {
   assert effects == []
 }
 
-pub fn resume_with_changed_input_file_is_refused_test() {
+pub fn resume_with_changed_input_file_is_refused_typed_test() {
   let #(s, _, _) = replay(first_run())
   let changed = Pin(..pin(), inputs: dict.from_list([#("advice.md", "a2")]))
-  let #(s, effects) = run.step(s, Resumed(changed))
-  let assert [Refuse(None, reason)] = effects
-  assert string.contains(reason, "pin mismatch: inputs.advice.md")
-  // The halted run takes no further requests.
-  let #(_, effects) = run.step(s, call("#2", "worker", JNull))
-  let assert [Refuse(None, "run is not running")] = effects
+  let #(s2, effects) = run.step(s, Resumed(changed))
+  assert effects
+    == [
+      Refuse(
+        None,
+        PinMismatch(field: "inputs.advice.md", recorded: "a1", current: "a2"),
+      ),
+    ]
+  // A refusal does not change the run.
+  assert run.snapshot(s2) == run.snapshot(s)
 }
 
-pub fn resume_names_each_pin_field_test() {
+pub fn resume_names_each_result_defining_field_test() {
   let #(s, _, _) = replay(first_run())
-  let reason = fn(p) {
+  let refusal = fn(p) {
     let assert #(_, [Refuse(None, r)]) = run.step(s, Resumed(p))
     r
   }
-  assert string.contains(reason(Pin(..pin(), seed: 8)), "seed")
-  assert string.contains(
-    reason(Pin(..pin(), workflow_digest: "wf2")),
-    "workflow_digest",
-  )
-  assert string.contains(
-    reason(Pin(..pin(), models: dict.from_list([#("default", "other/model")]))),
-    "models.default",
-  )
+  assert refusal(Pin(..pin(), seed: 8)) == PinMismatch("seed", "7", "8")
+  assert refusal(Pin(..pin(), workflow_digest: "wf2"))
+    == PinMismatch("workflow_digest", "wf1", "wf2")
+  assert refusal(Pin(..pin(), semantics: "wallis-core/1"))
+    == PinMismatch("semantics", run.semantics, "wallis-core/1")
 }
 
 pub fn replayed_request_is_answered_from_journal_test() {
   let #(s, _, _) = replay(first_run())
   let #(s, _, _) = replay_from(s, [Resumed(pin())])
-  // The completed call is a journal hit: delivered, not checkpointed, no CallAgent.
   let #(s, effects) = run.step(s, call("#0", "worker", JInt(0)))
   assert effects == [Deliver("#0", summary("s0"))]
-  // The call that was in flight at the stop is issued again, same view.
   let #(_, effects) = run.step(s, call("#1", "worker", JInt(1)))
   let assert [CallAgent(id: "#1", view:, ..)] = effects
   assert string.contains(view, "s0")
 }
 
-pub fn replay_divergence_halts_test() {
+pub fn replay_divergence_is_refused_without_changing_the_run_test() {
   let #(s, _, _) = replay(first_run())
-  let #(s, effects) = run.step(s, call("#0", "worker", JInt(99)))
-  let assert [Refuse(None, reason)] = effects
-  assert string.contains(reason, "path divergence at request #0")
-  let assert Some(run.Halted(_)) = run.status(s)
+  let #(s2, effects) = run.step(s, call("#0", "worker", JInt(99)))
+  assert effects == [Refuse(None, PathDiverged("#0"))]
+  assert run.snapshot(s2) == run.snapshot(s)
 }
 
 pub fn resumed_finished_run_reports_outcome_test() {
   let #(s, _, _) = replay([started(basic()), types.BodyFinished(JInt(5))])
   let #(_, effects) = run.step(s, Resumed(pin()))
-  assert effects == [Finish(types.Done(JInt(5)))]
+  assert effects == [Finish(Done(JInt(5)))]
 }
 
 pub fn interrupted_run_log_equals_uninterrupted_test() {
@@ -487,7 +706,6 @@ pub fn interrupted_run_log_equals_uninterrupted_test() {
       types.BodyFinished(JNull),
     ])
   let #(expected, _, expected_log) = replay(whole)
-  // Stop after #1 was requested; resume; the body replays #0 and #1.
   let #(s, _, log) = replay(first_run())
   let #(s, _, log2) =
     replay_from(s, [
