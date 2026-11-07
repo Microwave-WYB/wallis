@@ -19,13 +19,13 @@ Status: first prototype. See [docs/design.md](docs/design.md).
 
 | Path | Contents |
 | --- | --- |
-| `core/` | Pure Gleam core compiled to JavaScript: journal, replay matching, budget, pin, status, ownership, interventions and their capabilities |
+| `core/` | Pure Gleam core compiled to JavaScript: the journal (a content-addressed cache), budget, pin, status, ownership, interventions and their capabilities, held failures |
 | `host/` | The `wallis` npm package (not published): the SDK (`src/sdk/`), the thin host (`src/host/`: QuickJS sandbox, JSONL log, sessions, resume, fork, fake executor, MCP server) and the CLI (`src/cli/main.ts`) |
 | `host/examples/two-node/` | A two-node workflow and a runner that can kill itself mid-call |
 | `host/examples/ask/` | Two nodes, the first of which asks the human a question |
-| `host/src/host/pi.ts`, `tools.ts` | The pi executor (pi-agent-core, in process, compaction) and the wallis tool layer (allowlist, logging, codemode for every agent, result caps with spills, MCP via pi-mcp) |
+| `host/src/host/pi.ts`, `tools.ts` | The pi executor (pi-agent-core: retries, per-turn checkpoints, turn quota, compaction) and the wallis tool layer (codemode, bash and file tools in the agent's sandbox, caps with spills, sandboxed MCP servers, the containment check) |
 | `host/src/host/capability.ts`, `render.ts`, `mounts.ts` | Capabilities (`OwnedRun`, `IdleNode`, `SteerableNode`, `LiveNode`, `ResumableRun`), Foldable input rendering and the window check, read-only mounts |
-| `host/src/host/scripts.ts`, `slots.ts` | Domain scripts under bubblewrap; machine-wide resource and provider slots |
+| `host/src/host/confine.ts`, `commands.ts`, `slots.ts` | Declared bwrap sandboxes (binaries, setup, mounts); command calls; machine-wide resource and provider slots |
 | `.agents/workflows/siderius/` | SIDERIUS expressed as a wallis workflow; `MAPPING.md` lists what maps and what does not |
 | `tools/gleam-codegen.mjs` | Drives `gleam lsp` code actions to generate decoders and JSON encoders |
 | `docs/design.md` | Current design: decided, proposed and open items, plus prototype choices |
@@ -43,16 +43,16 @@ Runs live under `.wallis/runs/` of the project. The CLI (run it with
 `node host/src/cli/main.ts`; `npx wallis` once installed):
 
 ```sh
-wallis run <workflow> --input '{...}' [--mount name=dir] --executor <module>   # until it needs attention
+wallis run <workflow> --input '{...}' [--mount name=dir] [--bin name=path] --executor <module>   # until it needs attention
 wallis wait <run>        # in the background: returns when a node asks, the run pauses or ends
 wallis wait              # in the background: returns when any of your own runs needs attention
 wallis pending           # your idle nodes and runs here; prints nothing when there are none
 wallis claim <run>       # take over a run (a logged event); others' runs are read-only
-wallis send <run> <node> <text>        # answer an idle node
+wallis send <run> <node> [text] [--turns N]   # answer an idle node, or grant more turns
 wallis steer <run> <node> <text>       # a running node of a steerable agent, at its next step
-wallis restart <run> <node> [note]     # discard the node's progress, reissue with the note
-wallis resume <run> [--model alias=provider/model:thinking] [--budget usd=60]
-wallis fork <run> --at <events|node> [--model ...]
+wallis restart <run> <node> [note] [--turns N] [--model a=m]   # rerun a node (also a held failed one)
+wallis resume <run> [--model alias=provider/model:thinking] [--budget turns=500]   # code changes are fine
+wallis fork <run> [--model ...]        # copies the journal (a cache); unchanged calls hit
 wallis cancel <run> | wallis status <run> [--json]
 wallis export <run> <artifact> <dir>   # copy an artifact out of a run
 wallis ls | tree <run> | log <run> [--follow] | show <run> [<node>]   # monitoring, observations
@@ -62,7 +62,7 @@ wallis serve --executor <module>   # stdio MCP server: run, send, steer, interru
 
 The default executor is pi (`host/src/executors/pi.ts`, pi-ai's built-in
 providers, auth from their usual environment variables). `--executor` takes
-any module whose default export returns `{ executor, scripts? }`, such as the
+any module whose default export returns `{ executor, commands? }`, such as the
 scripted fake in `host/test/fixtures/fake-executor.ts`. Machine settings
-(mount dirs, provider limits, slots, model remaps) live in the local profile:
+(mount dirs, binaries, retry delays, provider limits, slots, model remaps) live in the local profile:
 `~/.config/wallis/profile.json` and `.wallis/profile.json`.

@@ -4,7 +4,14 @@
 (github.com/yuema137/SIDERIUS, commit 5ccb436) as a wallis workflow. The
 mapping is approximate. The workflow type-checks, and it runs end to end
 only with scripted agents and scripts (`host/test/siderius.test.ts`); the
-prompts and `scripts/` are placeholders.
+prompts, `trainer/` and `checks/` are placeholders.
+
+Since round 5 the directory is laid out by who may see what: `trainer/`
+(pyproject, lock, train, evaluate) and `checks/` (Health, fingerprints, the
+deterministic validator, the metric order) are mounted only into the
+sandboxes that run them, and `prompts/` is never mounted anywhere, so no
+agent or command can read the judge's prompt or the Health code it is
+graded by.
 
 Since round 4 the body is a pure program over journaled calls. SIDERIUS's
 carried history (`ChainState`: knowledge cache, findings archive, collapse
@@ -20,11 +27,11 @@ the SIDERIUS code, the code's behavior is noted here.
 
 | Brief | SIDERIUS code | In `workflow.ts` |
 | --- | --- | --- |
-| Evidence stage as a fan-out, then a judge | `scientific_evidence_stage.py` runs data analysis and literature in sequence (default `analysis_then_literature`). The second node gets the first node's output. The fixed loop has no judge; judges exist only in authored loops (`judge_strategies/`). | `input.evidence.order` selects `parallel` (the fan-out) or either sequential order. The judge is the authored-loop judge with its projection caps. |
+| Evidence stage as a fan-out, then a judge | `scientific_evidence_stage.py` runs data analysis and literature in sequence (default `analysis_then_literature`). The second node gets the first node's output. The fixed loop has no judge; judges exist only in authored loops (`judge_strategies/`). | Parallel by default (the two are independent); `input.evidence.order` selects either sequential order. The judge is the authored-loop judge with its projection caps. |
 | Interpretation after Health | Interpretation runs at the start of each iteration and covers the previous iteration's results. | Same as SIDERIUS: it runs first in each iteration. The last iteration's results are not interpreted. |
 | Knowledge cache: top 5 by metric plus the current model | 5 entries in total: the current model plus the top 4 others. | `capCache` in body code: the current model plus the top 4 others, 5 in total. |
 | Collapse history never pruned | Pruned: 3-iteration window, at most 8 entries per model, empty models dropped. | Pruned as SIDERIUS does, in body code (`pruneCollapse`). (Round 3 owner decision; the first brief said never pruned.) |
-| LLM USD budget | Not tracked or enforced; token use is only logged. | Added: `budget.usd` and `budget.turns`. A spent budget pauses the run (`Idle(BudgetExhausted)`); `wallis resume <run> --budget usd=…` continues it. |
+| LLM USD budget | Not tracked or enforced; token use is only logged. | wallis budgets agent `turns` and command `computeMinutes` as attention points: when one is reached no new call starts, calls in flight finish, and the run waits (`Idle(BudgetReached)`) for `wallis resume <run> --budget turns=…` or a cancel. USD and tokens are recorded, never budgeted. |
 
 ## Concept to construct
 
@@ -34,28 +41,28 @@ the SIDERIUS code, the code's behavior is noted here.
 | `ChainState` and `research_history.py` | Local variables of the body: `runs`, `knowledgeCache`, `findingsArchive`, `collapseHistory`, `predictionV1`/`predictionV2`/`infoGainV2`, `evidence`, `incumbent`, `lastRejections`. The run returns them as `carried`. |
 | Target check before each iteration (2159) | `atLeast(direction, incumbent.score, target)` on the local `incumbent` |
 | `ResultInterpretationAgent` (route `interpret`) | Agent `interpret`. Its input carries `history` (runs, knowledge cache, collapse history; each `Foldable`) and `prediction_memory`. It reads `advice.md` from the `config` mount (`sandbox: "read-only"`). |
-| `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with `defineTool(run_skill)` (served by `scripts/run_skill.py`), `sandbox: "read-only"` and the `data` mount. Its input carries the last 4 run summaries. |
-| `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review` with `mcp: { arxiv: [...], semantic_scholar: "*" }` over `mcp.json`; the knowledge cache arrives `Foldable`. `S2_API_KEY` is a `${VAR}` secret reference. |
+| `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with the `analysis` sandbox: the data mount read-only and a shell (`bash`), which replaces SIDERIUS's `run_skill` tool. Its input carries the last 4 run summaries. |
+| `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review`: MCP only, no sandbox (no filesystem). `mcp: { arxiv: [...], semantic_scholar: "*" }` over `mcp.json`; each server runs in its own sandbox from the overlay (`arxiv-mcp`, `scholar-mcp`) with its network allowlist. `S2_API_KEY` reaches only the Semantic Scholar server's process. The knowledge cache arrives `Foldable`. |
 | Judge strategies, projection caps (`judge-strategies-contract.md`) | Agent `evidence_judge`, `steerable: false`. `judgeProjection` in body code: the newest 24 entries without self-reported confidence, oldest dropped until the JSON fits 4000 chars, with an `omitted` count. |
 | `JudgeStop` (authored loops), `on_met: "stop"` | `stops.judgeCriterion` plus `verdict.stop.recommend`, with `stops.judgeOnMet: "stop"` |
 | `JudgeStop` `on_met: "request_input"` (pause and ask the operator) | `stops.judgeOnMet: "request_input"`: agent `stop_check` presents the recommendation and ends its turn with the question. Its node goes `Idle(question)`, and the operator's answer continues the same dialogue; it then submits `stop` or `continue`. |
 | `NoImprovementStop` | `stops.noImprovementBodies` |
 | `MLModelProposalAgent` (route `propose`), `max_proposal_attempts = 3` | Agent `propose` in a loop of `input.maxProposalAttempts`, with `history` in its input and the `config` mount. `previous_failures` collects validation errors and physical rejections. |
-| `MLModelImplementor` and `MLCodeValidatorAgent`, `max_impl_attempts = 3` | `subWorkflow(implement_validate)`: agent `implement` (`sandbox: "workspace"`), then script `validate` (checks 1–7 and 9), then agent `validate` (check 8, the LLM review). The loop is bounded and feeds failures back. |
+| `MLModelImplementor` and `MLCodeValidatorAgent`, `max_impl_attempts = 3` | `subWorkflow(implement_validate)`: agent `implement` in the `coding` sandbox (the data only, never `trainer/` or `checks/`), then command `check_plugin` (checks 1–7 and 9), then agent `validate` (check 8, the LLM review) in the `review` sandbox (its input artifact only). The loop is bounded and feeds failures back. |
 | A failed iteration still uses a slot | Pushes a `no_candidate` run summary, then `continue` |
 | `HyperparamTuningAgent`, planner and reflector routes | `subWorkflow(tune)` with agents `tune_planner` (the knowledge cache in its input, `Foldable`) and `tune_reflector` |
 | Trial rounds, `force_formal_round`, `formal_round_strategy = full_clone` | `isTrial = round < maxRounds`. The Formal round inherits the best Trial config. |
-| `attempts_per_round = 3`, `attempts_per_formal_round = 5`, `max_fail_rounds = 3` | `input.tuning.*`. OOM and gate refusals count as attempts. |
-| Training, inference and `evaluate_metric` skills | Scripts `train` and `evaluate`. Trial and formal time and epoch caps are script arguments. |
+| `attempts_per_round = 3`, `attempts_per_formal_round = 5`, `max_fail_rounds = 3` | `input.tuning.*`. OOM and gate refusals count as attempts. The Trial attempts of one round run in parallel (`ctx.map`; resource slots throttle the GPUs) and the round keeps its best scored attempt; Formal attempts stay sequential. |
+| Training, inference and `evaluate_metric` skills | Commands `train` and `evaluate` in the `trainer` sandbox: `uv` and `sh` required, `trainer/` and the data mounted, the env built once by `uv sync --frozen` (setup, cached by digest) and used offline. Trial and formal time and epoch caps are inputs. |
 | Model plugin and checkpoints on disk (`iteration_NNN/attempt_NNN/impl_NNN/`, plugin dirs) | Artifacts: the implementor exports the plugin (`ModelPlugin`), `train` mounts it with the dataset and returns a `Checkpoint` artifact, which `evaluate` and Health mount. Nodes share no directories. |
 | `resolved_data_scope` data files | Mount `data` (read-only, supplied by the caller or the local profile); its content digest is pinned |
-| Health (`round_health.py`), effective Health config | Script `health` on every scored round, reading `health_config.yaml` from the `config` mount |
+| Health (`round_health.py`), effective Health config | Command `health` in the `checks` sandbox, run in parallel with `evaluate` on every trained checkpoint, reading `config/health_config.yaml`. |
 | `best_denoising_score` vs `best_valid_formal_denoising_score` | `best_score` (unfiltered) vs `best_valid_formal_score` (Formal and Health-valid); only the latter drives the incumbent and the cache rank. |
-| Collapse fingerprints, `collapse_fingerprint_history` | Script `fingerprint`, then `pruneCollapse` (window 3, at most 8 per model) on the local `collapseHistory` |
+| Collapse fingerprints, `collapse_fingerprint_history` | Command `fingerprint` (checks sandbox), then `pruneCollapse` (window 3, at most 8 per model) on the local `collapseHistory` |
 | `advance_completed_history` (`research_history.py`) | Step 7 of the body: updates `runs`, `knowledgeCache` and `incumbent` |
 | `cap_knowledge_cache` (keyed by `model_type`) | `capCache`: the current model plus the top 4 others by `rank_score`; ties keep insertion order, unscored last, as `MetricOrder.rank` does |
-| `MetricOrder` / `reconcile_metric_spec` | Script `metric_order` gives the direction. `rank_score = sign × score`, so one descending order follows it. |
-| `cache_consolidator` `list_merge` (4 rules, at most 2 calls per model, at most 8 survivors, archive) | On a cache hit, one `ctx.call(consolidate_findings)` per model and list (`key_findings`, `bottlenecks`); `rankPrune` (strength, evidence count, latest iteration) keeps 8; overflow goes to `findingsArchive`. A cache miss is not consolidated. |
+| `MetricOrder` / `reconcile_metric_spec` | Command `metric_order` (checks sandbox) gives the direction. `rank_score = sign × score`, so one descending order follows it. |
+| `cache_consolidator` `list_merge` (4 rules, at most 2 calls per model, at most 8 survivors, archive) | Per model concurrently (`ctx.map`); on a cache hit, one `ctx.call(consolidate_findings)` per list (`key_findings`, `bottlenecks`); `rankPrune` (strength, evidence count, latest iteration) keeps 8; overflow goes to `findingsArchive`. A cache miss is not consolidated. |
 | `_dedupe_error_signatures` (no cap, inside each cache entry) | `mergeSignatures`: deduped on `(failure_class, top_user_frame, error_type)`, `evidence_iters` unioned, the longer `last_frames` kept, the first message wins; stored in the model's cache entry |
 | `PredictionMemory`: v1 pool, v2 by semantics, v2 information gain, `prediction_evaluation_semantics` | Locals `predictionV1` (the first pool the interpreter reports), `predictionV2` (outcome counts), `infoGainV2`; version 2. The v2 outcome comes from `evaluatePrediction`, the `prediction.py` rule. |
 | `chain_formal_incumbent_reference` | The local `incumbent`, replaced on strict improvement; each replacement is `ctx.observe("incumbent", …)` for monitoring |
@@ -64,10 +71,10 @@ the SIDERIUS code, the code's behavior is noted here.
 | `run_seed`, `probe_seed_context(run_seed, iteration, attempt)`, `SeedCoordinates` | `ctx.seed` and `probeSeed()`. `Math.random` in the body is seeded from the pin. |
 | `llm.json` routes (`interpret`, `data_analysis`, `lit_review.*`, `propose`, `implement`, `validate`, `tune.*`, `judge`, `cache_consolidator`) | `defineModels` alias table. Empty aliases resolve to `default`; callers remap aliases (as `openai-moderate-v1` does). |
 | `token_usage.jsonl` | Per-call `usage` in `agent_returned` events of the wallis log |
-| Trial/formal time budgets, compute | `budget.computeMinutes`. Every `RunScript` carries the remaining minutes. |
-| Chain-mode resume (`restore_prior_state`, per-iteration subprocess) | wallis resume: refold the log, check the pin, replay the body. Completed calls and scripts are answered from the journal, and the body's local variables come back with them. |
+| Trial/formal time budgets, compute | `budget.computeMinutes` (an attention point). Every `RunCommand` carries the remaining minutes and the process is killed when they are spent. |
+| Chain-mode resume (`restore_prior_state`, per-iteration subprocess) | wallis resume re-executes the body against the journal, a cache keyed by node, input and occurrence: unchanged calls hit and the local variables come back with them; a node continues from its last completed turn; an uncaught node failure holds the run until it is restarted or cancelled. |
 | `workflow_stop_reason`: `infrastructure_abort` > `target_reached` > `iterations_exhausted` | `StopReason`, plus `no_improvement`, `judge_stop` and `operator_stop`. A spent budget is a pause, not a stop. |
-| Script outputs (`train`, `evaluate`, Health, fingerprints, metric order, validator, skills) | `defineScript` with TypeBox input and output schemas. Args and outputs are checked in the sandbox and in the host; a mismatch is a typed `ScriptFailed`. |
+| Script outputs (`train`, `evaluate`, Health, fingerprints, metric order, validator) | `command` adapters with TypeBox inputs and outputs (the default protocol: JSON on stdin and stdout). A mismatch is a typed `CommandFailed(output_mismatch)`. |
 
 ## Not expressed, or approximated
 
@@ -82,7 +89,8 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
    SIDERIUS also removes `candidate_id`; the projection here has no ids to
    remove. The judge's `maxTurns` is 2, not SIDERIUS's single call: wallis
    always offers codemode, and a codemode call is a turn. The consolidator
-   is raised from 1 to 2 for the same reason.
+   is raised from 1 to 2 for the same reason. At its limit a node waits
+   for more turns instead of failing.
 2. **JudgeStop timing.** SIDERIUS consults the judge only after every
    deterministic stop condition said continue, and never at the final
    boundary. Here it is checked mid-iteration, after the evidence stage.
@@ -95,7 +103,7 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 4. **Proposer.** The three stages (comparison, reasoning, proposing) are one
    call. The legacy two-call mode and the `validation_fixed_candidate_plan`
    bypass are not expressed.
-5. **Validator.** The deterministic checks are one placeholder script. The
+5. **Validator.** The deterministic checks are one placeholder command. The
    bounded child process (at most 96 GiB of address space) and
    `validation_{run}.json` are not expressed.
 6. **Tuner internals.** Not expressed:
@@ -188,9 +196,16 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 
 ### wallis prototype limits that affect this example
 
-25. `defineTool` tools are served by scripts through the tool layer, and MCP
-    servers are reached through pi-mcp with secrets injected per process,
-    but neither has met a real server or model in tests: only the fake
-    executor and pi's faux provider run here.
-26. Sub-workflows return their outputs; the main body folds them into its
-    local variables.
+25. The `trainer`, `checks`, `coding`, `analysis` and MCP sandboxes have
+    only met scripted commands and agents in tests; `trainer/` and
+    `checks/` hold placeholders, and the lock is a stub. The MCP sandboxes'
+    domain allowlists are recorded but not enforced per domain (bwrap
+    shares the network when the list is non-empty).
+26. Health now runs on every trained checkpoint, in parallel with
+    `evaluate`, not only on scored ones; a round's parallel Trial attempts
+    all run (more compute than SIDERIUS's stop-at-first-success).
+27. The `config` mount holds the advice and the Health config together, so
+    `interpret` and `propose` (which read the advice) can also read the
+    Health config file, though not the Health code.
+28. Nested workflows return their outputs; the main body folds them into
+    its local variables.

@@ -9,7 +9,7 @@ typed refusal. Nothing is ever silently dropped.
 1. Every lifecycle is a discriminated union; each variant carries only the
    data meaningful in that state.
 2. A capability is obtainable only through its check (`OwnedRun`,
-   `IdleNode`, `SteerableNode`, `LiveNode`, `ResumableRun`): opaque types in
+   `IdleNode`, `SteerableNode` (agents only), `LiveNode`, `ResumableRun`): opaque types in
    Gleam, classes with private constructors in TS. Prefer compiler narrowing
    over hand-written `x is T` predicates. Brand only raw ids that cross a
    boundary (`RunId`, `NodeId`).
@@ -53,7 +53,8 @@ generics or wrappers that add no proof.
 ## Host and SDK rules
 
 - `host/src/sdk/` runs inside the QuickJS sandbox: no Node imports.
-- Host tests use the fake executor and fake scripts; never real model calls
+- Host tests use the fake executor and fake commands (`confine: "off"`);
+  tests that run real commands need bwrap and skip without it; never real model calls
   or API keys. CLI and MCP tests load `host/test/fixtures/fake-executor.ts`
   as the executor module and work in throwaway projects (`test/util.ts`).
 - pi executor tests use pi-ai's faux provider (`fauxProvider().setResponses`);
@@ -66,13 +67,24 @@ generics or wrappers that add no proof.
   reducers or `emit` (owner decision, round 4). Agents get everything they
   need in their typed input.
 - Codemode is on for every agent; a codemode call costs a turn, so agents
-  need `maxTurns >= 2`.
+  need `maxTurns >= 2`. `maxTurns` is an orchestration point
+  (`Idle(turn_limit)`), not a failure.
+- One node union (agent | command | workflow) and one `ctx.call`; agents'
+  tools are MCP tools and built-ins only; commands are called by workflow
+  code only. Multi-step concurrent branches use `ctx.parallel`/`ctx.map`.
+- Sandboxes are declared (`defineSandbox`), bwrap only, nothing implicit:
+  never mount the workflow dir implicitly, never add a writable mount.
+- Recovery is the most important property: keep transient-error retries
+  in the executor, per-turn checkpoints, held node failures, and the
+  journal as a cache (node digest, input, occurrence) working, with tests.
+- The budget (turns, compute minutes) is an attention point; USD and
+  tokens are information only.
 - Interventions carry `by` and go through the capability checks on both
   sides (host, then core).
 - Every value crossing the sandbox or executor boundary is schema-checked on
   both sides (`src/sdk/validate.ts`); keep new boundaries that way.
-- The body sees typed errors only (`Refused`, `AgentFailed` with a typed
-  `failure`, `ScriptFailed`, `SchemaError`); never make it match on message
-  text.
+- The body sees typed errors only (`Refused`, `AgentFailed`,
+  `CommandFailed`, `WorkflowFailed`, `SchemaError`, each with a typed
+  failure); never make it match on message text.
 - Compile-time guarantees get `@ts-expect-error` tests in
   `host/test/sdk-types.ts`.
