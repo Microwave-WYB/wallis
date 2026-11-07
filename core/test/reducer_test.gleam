@@ -2,7 +2,7 @@ import gleam/option.{None, Some}
 import wallis_core/reducer.{Commutative, NonCommutative}
 import wallis_core/types.{
   Append, AppendByKey, Ascending, CountByKey, Descending, Freeze, KeepLatest,
-  LlmMerge, Replace, Sum, TopK, TopOnly, Union,
+  Replace, Sum, TopK, TopOnly, Union,
 }
 import wallis_core/value.{JArray, JFloat, JInt, JNull, JObject, JString}
 
@@ -123,13 +123,6 @@ pub fn freeze_first_write_wins_test() {
   assert reducer.default_initial(Freeze) == JNull
 }
 
-pub fn llm_merge_fallback_keeps_newest_and_archives_test() {
-  let assert Ok(#(kept, archived)) =
-    reducer.merge_fallback(2, JArray([JInt(1), JInt(2)]), JArray([JInt(3)]))
-  assert kept == JArray([JInt(2), JInt(3)])
-  assert archived == [JInt(1)]
-}
-
 pub fn classification_test() {
   assert reducer.commutativity(Union) == Commutative
   assert reducer.commutativity(Sum) == Commutative
@@ -142,7 +135,6 @@ pub fn classification_test() {
   assert reducer.commutativity(Append) == NonCommutative
   assert reducer.commutativity(AppendByKey("k")) == NonCommutative
   assert reducer.commutativity(Freeze) == NonCommutative
-  assert reducer.commutativity(LlmMerge("m", 8, 2, None)) == NonCommutative
 }
 
 /// Commutative reducers give the same result in any write order.

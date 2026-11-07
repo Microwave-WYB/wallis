@@ -395,14 +395,6 @@ export class Session {
 		const declaration = this.#decl.agents[effect.agent]!;
 		const errors = schemaErrors(declaration.output, output);
 		if (errors.length > 0) return `output does not match its schema: ${errors.join("; ")}`;
-		const merge = effect.id.indexOf("/merge/");
-		if (merge >= 0) {
-			const field = effect.id.slice(merge + "/merge/".length);
-			const schema = this.#decl.fields[field];
-			const items = getPath(output, "items");
-			const bad = schema && items !== undefined ? schemaErrors(schema, items) : [];
-			if (bad.length > 0) return `merged items do not match state field ${field}: ${bad.join("; ")}`;
-		}
 		for (const e of emits) {
 			const schema = this.#decl.fields[e.field];
 			const bad = schema ? schemaErrors(schema, e.value) : [];

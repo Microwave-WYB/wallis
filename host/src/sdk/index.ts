@@ -91,8 +91,7 @@ export type ReducerSpec =
 	| { type: "count_by_key" }
 	| { type: "top_k"; k: number; by: string; order: "ascending" | "descending"; key: string | null; latest: "keep_latest" | "top_only" }
 	| { type: "append_by_key"; key: string }
-	| { type: "freeze" }
-	| { type: "llm_merge"; agent: string; max: number; max_calls: number; archive: string | null };
+	| { type: "freeze" };
 
 /** `W` is what one write carries, `V` the field value. `schema` validates every write. */
 export interface Reducer<W = unknown, V = unknown> {
@@ -170,22 +169,51 @@ export function freeze<S extends TSchema>(value: S, initial: Static<S> | null = 
 	return reducer({ type: "freeze" }, initial, value);
 }
 
-export interface LlmMergeOptions {
-	/** The merge agent. It receives `{ current, incoming, max }` and returns `{ items, archived }`. */
-	readonly agent: AgentDef;
-	readonly max: number;
-	/** Merge calls per run; past the cap the newest `max` items are kept deterministically. */
-	readonly maxCalls: number;
-	/** State field (usually `append`) that receives archived items. */
-	readonly archive?: string;
+
+// --- Pruning helpers -------------------------------------------------------------
+//
+// Plain functions for body code, not reducers: a body that prunes or merges
+// writes the result back with `replace`.
+
+/** The last `n` items, in order. */
+export function lastN<T>(items: readonly T[], n: number): T[] {
+	return n <= 0 ? [] : items.slice(-n);
 }
 
-export function llmMerge<S extends TSchema>(options: LlmMergeOptions, item: S): Reducer<Static<S>[], Static<S>[]> {
-	return reducer(
-		{ type: "llm_merge", agent: options.agent.name, max: options.max, max_calls: options.maxCalls, archive: options.archive ?? null },
-		[],
-		Type.Array(item),
-	);
+/** Groups items by key, in first-seen key order, applying `each` to every group. */
+export function perKey<T, U = T[]>(items: readonly T[], key: (item: T) => string, each: (group: T[], key: string) => U = (g) => g as U): Record<string, U> {
+	const groups = new Map<string, T[]>();
+	for (const item of items) {
+		const k = key(item);
+		const group = groups.get(k);
+		if (group) group.push(item);
+		else groups.set(k, [item]);
+	}
+	return Object.fromEntries([...groups].map(([k, group]) => [k, each(group, k)]));
+}
+
+/**
+ * The top `k` items by score. Ties keep their input order; items without a
+ * score (null) come last.
+ */
+export function topKBy<T>(items: readonly T[], k: number, score: (item: T) => number | null, order: "ascending" | "descending"): T[] {
+	const sign = order === "descending" ? -1 : 1;
+	return items
+		.map((item, i) => ({ item, i, s: score(item) }))
+		.sort((a, b) => (a.s === null ? (b.s === null ? a.i - b.i : 1) : b.s === null ? -1 : sign * (a.s - b.s) || a.i - b.i))
+		.slice(0, Math.max(0, k))
+		.map((e) => e.item);
+}
+
+/** One item per key, in first-seen order; a later duplicate is folded in with `merge` (default: the first wins). */
+export function dedupeBy<T>(items: readonly T[], key: (item: T) => string, merge: (kept: T, next: T) => T = (kept) => kept): T[] {
+	const kept = new Map<string, T>();
+	for (const item of items) {
+		const k = key(item);
+		const prior = kept.get(k);
+		kept.set(k, prior === undefined ? item : merge(prior, item));
+	}
+	return [...kept.values()];
 }
 
 // --- State and views -----------------------------------------------------------
@@ -426,7 +454,7 @@ export interface WorkflowSpec<M extends ModelTable, F extends Fields, J extends 
 	readonly models: Models<M>;
 	readonly state: State<F>;
 	readonly mcp?: Mcp<J>;
-	/** Every agent the body may call, including merge agents. */
+	/** Every agent the body may call. */
 	readonly agents: readonly AgentDef[];
 	/** Every script the body may run. */
 	readonly scripts?: readonly ScriptDef[];

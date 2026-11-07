@@ -77,7 +77,6 @@ pub type Reducer {
   )
   AppendByKey(key: String)
   Freeze
-  LlmMerge(agent: String, max: Int, max_calls: Int, archive: Option(String))
 }
 
 pub fn reducer_to_json(reducer: Reducer) -> json.Json {
@@ -123,17 +122,6 @@ pub fn reducer_to_json(reducer: Reducer) -> json.Json {
       json.object([
         #("type", json.string("freeze")),
       ])
-    LlmMerge(agent:, max:, max_calls:, archive:) ->
-      json.object([
-        #("type", json.string("llm_merge")),
-        #("agent", json.string(agent)),
-        #("max", json.int(max)),
-        #("max_calls", json.int(max_calls)),
-        #("archive", case archive {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-      ])
   }
 }
 
@@ -158,13 +146,6 @@ pub fn reducer_decoder() -> decode.Decoder(Reducer) {
       decode.success(AppendByKey(key:))
     }
     "freeze" -> decode.success(Freeze)
-    "llm_merge" -> {
-      use agent <- decode.field("agent", decode.string)
-      use max <- decode.field("max", decode.int)
-      use max_calls <- decode.field("max_calls", decode.int)
-      use archive <- decode.field("archive", decode.optional(decode.string))
-      decode.success(LlmMerge(agent:, max:, max_calls:, archive:))
-    }
     _ -> decode.failure(Replace, "Reducer")
   }
 }

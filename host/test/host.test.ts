@@ -81,7 +81,7 @@ test("resume refuses a changed pinned input file", async () => {
 	await assert.rejects(runWorkflow(opts), (e: unknown) => e instanceof RunRefused && e.refusal.type === "pin_mismatch" && e.refusal.field === "inputs.advice.md");
 });
 
-test("parallel branches, a sub-workflow, llmMerge, typed scripts; a spent compute budget pauses until raised", async () => {
+test("parallel branches, a sub-workflow, an explicit merge call, typed scripts; a spent compute budget pauses until raised", async () => {
 	const dir = join(tmp(), "run");
 	const executor = fanoutExecutor();
 	const scripts = new FakeScripts({ train: (call) => ({ output: { budget: call.computeMinutes }, minutes: 5 }) });
@@ -90,7 +90,7 @@ test("parallel branches, a sub-workflow, llmMerge, typed scripts; a spent comput
 	assert.equal(scripts.calls.length, 1);
 
 	const ids = executor.calls.map((c) => c.id);
-	assert.deepEqual(ids, ["#0.a#0", "#0.b#0", "#1", "#1/merge/findings", "#2>retry#0", "#2>retry#1"]);
+	assert.deepEqual(ids, ["#0.a#0", "#0.b#0", "#1", "#3", "#6>retry#0", "#6>retry#1"]);
 	const judge = executor.calls.find((c) => c.agent === "judge")!;
 	assert.match(judge.view, /E-a/);
 	assert.match(judge.view, /E-b/);

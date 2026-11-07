@@ -1,16 +1,15 @@
-//// Reducers fold a write into a state field. Each one is classified as
-//// commutative (safe in parallel branches) or not. `llmMerge` is the one
-//// reducer that needs an effect; the run module drives it and uses
-//// `merge_fallback` once its call cap is reached.
+//// Reducers fold a write into a state field. They are built-in,
+//// deterministic merges only; anything custom or LLM-based is ordinary
+//// workflow code. Each one is classified as commutative (safe in parallel
+//// branches) or not.
 
-import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/order
 import gleam/result
 import wallis_core/types.{
   type Reducer, Append, AppendByKey, Ascending, CountByKey, Descending, Freeze,
-  KeepLatest, LlmMerge, Replace, Sum, TopK, TopOnly, Union,
+  KeepLatest, Replace, Sum, TopK, TopOnly, Union,
 }
 import wallis_core/value.{type Value, JArray, JInt, JNull, JObject, JString}
 
@@ -26,7 +25,7 @@ pub fn commutativity(reducer: Reducer) -> Commutativity {
     // keeps the latest write.
     TopK(latest: TopOnly, ..) -> Commutative
     TopK(latest: KeepLatest, ..) -> NonCommutative
-    Replace | Append | AppendByKey(..) | Freeze | LlmMerge(..) -> NonCommutative
+    Replace | Append | AppendByKey(..) | Freeze -> NonCommutative
   }
 }
 
@@ -41,7 +40,7 @@ pub fn stability(reducer: Reducer) -> Stability {
   case reducer {
     Freeze -> Frozen
     Append | Union | AppendByKey(..) -> AppendOnly
-    Replace | Sum | CountByKey | TopK(..) | LlmMerge(..) -> Volatile
+    Replace | Sum | CountByKey | TopK(..) -> Volatile
   }
 }
 
@@ -56,13 +55,13 @@ pub fn stability_rank(stability: Stability) -> Int {
 pub fn default_initial(reducer: Reducer) -> Value {
   case reducer {
     Replace | Freeze -> JNull
-    Append | Union | TopK(..) | LlmMerge(..) -> JArray([])
+    Append | Union | TopK(..) -> JArray([])
     Sum -> JInt(0)
     CountByKey | AppendByKey(..) -> JObject([])
   }
 }
 
-/// Applies one write. `LlmMerge` here is the deterministic fallback.
+/// Applies one write.
 pub fn apply(
   reducer: Reducer,
   current: Value,
@@ -152,26 +151,6 @@ pub fn apply(
         JNull -> Ok(write)
         _ -> Ok(current)
       }
-    LlmMerge(max:, ..) ->
-      merge_fallback(max, current, write) |> result.map(fn(r) { r.0 })
-  }
-}
-
-/// Deterministic llmMerge: keep the newest `max` items, return the rest as
-/// archived.
-pub fn merge_fallback(
-  max: Int,
-  current: Value,
-  incoming: Value,
-) -> Result(#(Value, List(Value)), String) {
-  case current, incoming {
-    JArray(items), JArray(new) -> {
-      let all = list.unique(list.append(items, new))
-      let drop = int.max(0, list.length(all) - max)
-      Ok(#(JArray(list.drop(all, drop)), list.take(all, drop)))
-    }
-    JArray(_), _ -> Error("llmMerge: write must be a list")
-    _, _ -> Error("llmMerge: field is not a list")
   }
 }
 

@@ -56,7 +56,6 @@ export type Snapshot = {
 	spent: { usd: number; tokens: number; turns: number; compute_minutes: number };
 	budget: { usd: number | null; tokens: number | null; turns: number | null; compute_minutes: number | null };
 	models: Record<string, string>;
-	merge_calls: Record<string, number>;
 	executor: string | null;
 };
 

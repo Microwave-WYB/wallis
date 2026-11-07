@@ -34,7 +34,7 @@ const input = {
 	},
 };
 
-const finding = (i: number, statement: string) => ({ kind: "finding", statement, strength: 3, evidence_iters: [i], model_type: `m${i}` });
+const finding = (i: number, statement: string) => ({ kind: "finding", statement, strength: 3, evidence_iters: [i], model_type: `m${i - 1}` });
 
 function agents(overrides: Record<string, unknown> = {}) {
 	let proposals = 0;
@@ -45,8 +45,6 @@ function agents(overrides: Record<string, unknown> = {}) {
 				output: {
 					take_home: `iteration ${i}`,
 					key_findings: [finding(i, `f${i}a`), finding(i, `f${i}b`)],
-					prediction_outcomes: i === 0 ? [] : ["confirmed"],
-					information_gain: i === 0 ? 0 : 0.5,
 					legacy_prediction_pool: { confirmed: 1 },
 					analysis_brief: "look at sparsity",
 				},
@@ -85,9 +83,9 @@ function agents(overrides: Record<string, unknown> = {}) {
 		implement: { output: { model_file_path: "plugins/model.py", config_path: "plugins/config.yaml", capability_metadata: {} } },
 		// The first review of each candidate fails, the retry passes.
 		validate: [
-			{ output: { passed: false, error: "gradient does not flow", error_signatures: [{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad" }] } },
+			{ output: { passed: false, error: "gradient does not flow", error_signatures: [{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad", last_frames: ["forward"] }] } },
 			{ output: { passed: true, error: null, error_signatures: [] } },
-			{ output: { passed: false, error: "gradient does not flow", error_signatures: [{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad" }] } },
+			{ output: { passed: false, error: "gradient does not flow", error_signatures: [{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad", last_frames: ["forward", "loss"] }] } },
 			{ output: { passed: true, error: null, error_signatures: [] } },
 		],
 		tune_planner: { output: { config: { lr: 0.01 }, rationale: "try a larger step" } },
@@ -145,15 +143,24 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 		["m1", "m2", "m4", "m5", "m6"],
 	);
 	assert.equal(out.incumbent.score, 0.9);
-	assert.ok(state.findings.length <= 8);
+	// Each model holds its own consolidated findings (at most 8); misses and overflow are archived.
+	for (const entry of state.knowledge_cache) assert.ok(entry.key_findings.length <= 8);
+	assert.equal(state.knowledge_cache.find((e: { model_type: string }) => e.model_type === "m5").key_findings.length, 2);
 	assert.ok(state.findings_archive.length > 0);
+	const consolidations = executor.calls.filter((c) => c.agent === "consolidate_findings");
+	assert.equal(consolidations.length, 6, "one call per model with a cache hit");
 	assert.equal(state.runs.length, 7);
 	assert.equal(state.prediction_version, 2);
 	assert.deepEqual(state.prediction_v1, { confirmed: 1 });
-	assert.deepEqual(state.prediction_v2, { confirmed: 6 });
-	assert.equal(state.info_gain_v2, 3);
-	assert.equal(state.error_signatures.length, 1);
-	assert.deepEqual(Object.keys(state.collapse_history).sort(), ["m0", "m1", "m2", "m3", "m4", "m5", "m6"]);
+	// The prediction rule, in body code: only m1 beat the incumbent.
+	assert.deepEqual(state.prediction_v2, { confirmed: 1, refuted: 5 });
+	assert.ok(Math.abs(state.info_gain_v2 - 0.7) < 1e-9);
+	// Error signatures live in their model's entry, deduped by the 3-field key.
+	assert.deepEqual(state.knowledge_cache.find((e: { model_type: string }) => e.model_type === "m1").error_signatures, [
+		{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad", last_frames: ["forward", "loss"], evidence_iters: [1] },
+	]);
+	// Collapse history is pruned to the last 3 iterations.
+	assert.deepEqual(Object.keys(state.collapse_history).sort(), ["m4", "m5", "m6"]);
 
 	// The judge saw the capped projection, never the confidence.
 	for (const call of executor.calls.filter((c) => c.agent === "evidence_judge")) {
@@ -170,8 +177,6 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 	const budgets = runner.calls.map((c) => c.computeMinutes!);
 	assert.equal(budgets[0], 24 * 60);
 	assert.ok(budgets.at(-1)! < budgets[0]!);
-	// Every merge stayed under the cap and spend was tracked.
-	assert.ok(JSON.parse(result.snapshot).merge_calls.findings <= 60);
 	assert.ok(JSON.parse(result.snapshot).spent.usd > 0);
 });
 

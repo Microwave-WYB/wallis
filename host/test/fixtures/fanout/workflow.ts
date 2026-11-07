@@ -1,7 +1,7 @@
-// Test fixture: parallel branches, a sub-workflow with retries, llmMerge,
+// Test fixture: parallel branches, a sub-workflow with retries, an explicit merge call,
 // a script, a capped read, and a budget-limited loop.
 
-import { append, defineAgent, defineModels, defineScript, defineState, llmMerge, subWorkflow, Type, union, view, workflow } from "wallis";
+import { append, defineAgent, defineModels, defineScript, defineState, lastN, replace, subWorkflow, Type, union, view, workflow } from "wallis";
 
 const models = defineModels({ default: "fake/default" });
 
@@ -26,7 +26,7 @@ const merger = defineAgent(
 
 const state = defineState({
 	errors: union(Type.String()),
-	findings: llmMerge({ agent: merger, max: 2, maxCalls: 1, archive: "archive" }, Finding),
+	findings: replace(Type.Array(Finding), []),
 	archive: append(Finding),
 	log: append(Type.String()),
 });
@@ -53,7 +53,6 @@ const judge = defineAgent(
 		input: Type.Object({ seen: Type.Number() }),
 		output: Type.Object({ findings: Type.Array(Finding) }),
 		view: { fields: ["errors", "findings"], maxChars: 400, maxItems: 4, omit: ["confidence"] },
-		writes: { findings: "findings" },
 	},
 );
 
@@ -89,6 +88,11 @@ export default workflow({
 			b: (c) => c.call(scout, { area: "b" }),
 		});
 		const verdict = await ctx.call(judge, { seen: found.a.errors.length + found.b.errors.length });
+		// Merging is ordinary workflow code: an agent call, then `replace`.
+		const current = (await ctx.read(view(state, { fields: ["findings"], maxChars: 4000, maxItems: 50 }))).data.findings ?? [];
+		const merged = await ctx.call(merger, { current, incoming: verdict.findings, max: 2 });
+		await ctx.emit("findings", lastN(merged.items, 2));
+		for (const item of merged.archived) await ctx.emit("archive", item);
 		const tries = await ctx.sub(retry, { max: 3 });
 		const trained = await ctx.script(train, { minutes: 5 });
 		// The compute budget is spent: this pauses the run until it is raised.

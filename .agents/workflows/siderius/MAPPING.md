@@ -15,8 +15,8 @@ the SIDERIUS code, the code's behavior is noted here.
 | --- | --- | --- |
 | Evidence stage as a fan-out, then a judge | `scientific_evidence_stage.py` runs data analysis and literature in sequence (default `analysis_then_literature`). The second node gets the first node's output. The fixed loop has no judge; judges exist only in authored loops (`judge_strategies/`). | `input.evidence.order` selects `parallel` (the fan-out) or either sequential order. The judge is the authored-loop judge with its projection caps. |
 | Interpretation after Health | Interpretation runs at the start of each iteration and covers the previous iteration's results. | Same as SIDERIUS: it runs first in each iteration. The last iteration's results are not interpreted. |
-| Knowledge cache: top 5 by metric plus the current model | 5 entries in total: the current model plus the top 4 others. | `topK({ k: 4, keepLatest: true })`, 5 in total. |
-| Collapse history never pruned | Pruned: 3-iteration window, at most 8 entries per model, empty models dropped. | Never pruned, as the brief asks. Views window it per model. |
+| Knowledge cache: top 5 by metric plus the current model | 5 entries in total: the current model plus the top 4 others. | `capCache` in body code: the current model plus `topKBy(others, 4)`, 5 in total. |
+| Collapse history never pruned | Pruned: 3-iteration window, at most 8 entries per model, empty models dropped. | Pruned as SIDERIUS does, in body code (`pruneCollapse`), written back with `replace`. (Round 3 owner decision; the first brief said never pruned.) |
 | LLM USD budget | Not tracked or enforced; token use is only logged. | Added: `budget.usd` and `budget.turns`. A spent budget pauses the run (`Idle(BudgetExhausted)`); `wallis resume <run> --budget usd=…` continues it. |
 
 ## Concept to construct
@@ -41,13 +41,13 @@ the SIDERIUS code, the code's behavior is noted here.
 | Training, inference and `evaluate_metric` skills | Scripts `train` and `evaluate`. Trial and formal time and epoch caps are script arguments. |
 | Health (`round_health.py`), effective Health config | Script `health` on every scored round. `siderius/health_config.yaml` is pinned. |
 | `best_denoising_score` vs `best_valid_formal_denoising_score` | `best_score` (unfiltered) vs `best_valid_formal_score` (Formal and Health-valid); only the latter drives the incumbent and the cache rank. |
-| Collapse fingerprints, `collapse_fingerprint_history` | Script `fingerprint`, then `ctx.emit("collapse_history", …)` into `appendByKey({ key: "model_type" })` |
+| Collapse fingerprints, `collapse_fingerprint_history` | Script `fingerprint`, then `pruneCollapse` (window 3, at most 8 per model) and `replace` |
 | `advance_completed_history` (`research_history.py`) | Step 7 of the body: emits `runs`, `knowledge_cache` and `incumbent` |
-| `cap_knowledge_cache` (keyed by `model_type`) | `topK({ k: 4, by: "rank_score", order: "descending", key: "model_type", keepLatest: true })` |
+| `cap_knowledge_cache` (keyed by `model_type`) | Per-model records in `knowledge_cache: replace(...)`; `capCache` keeps the current model plus `topKBy(others, 4, rank_score)`; ties keep insertion order, unscored last, as `MetricOrder.rank` does |
 | `MetricOrder` / `reconcile_metric_spec` | Script `metric_order` gives the direction. `rank_score = sign × score`, so a static descending top-k follows it. |
-| `cache_consolidator` `list_merge` (4 rules, at most 8 survivors, archive) | `llmMerge({ agent: consolidate_findings, max: 8, maxCalls: 60, archive: "findings_archive" })` |
-| `_dedupe_error_signatures` (no cap, never pruned) | `union(ErrorSignature)` |
-| `PredictionMemory`: v1 pool, v2 by semantics, v2 information gain, `prediction_evaluation_semantics` | `prediction_v1: freeze`, `prediction_v2: countByKey`, `info_gain_v2: sum`, `prediction_version: freeze(…, 2)` |
+| `cache_consolidator` `list_merge` (4 rules, at most 2 calls per model, at most 8 survivors, archive) | On a cache hit, one `ctx.call(consolidate_findings)` per model and list (`key_findings`, `bottlenecks`); `rankPrune` (strength, evidence count, latest iteration) keeps 8; overflow goes to `findings_archive`. A cache miss is not consolidated. |
+| `_dedupe_error_signatures` (no cap, inside each cache entry) | `mergeSignatures` in body code: deduped on `(failure_class, top_user_frame, error_type)`, `evidence_iters` unioned, the longer `last_frames` kept, the first message wins; stored in the model's cache entry |
+| `PredictionMemory`: v1 pool, v2 by semantics, v2 information gain, `prediction_evaluation_semantics` | `prediction_v1: freeze`, `prediction_v2: countByKey`, `info_gain_v2: sum`, `prediction_version: freeze(…, 2)`; the v2 outcome comes from `evaluatePrediction`, the `prediction.py` rule as body code |
 | `chain_formal_incumbent_reference` | `incumbent: topK({ k: 1 })` |
 | `run_invariants_lock.json`: `resolved_data_scope`, `health_config_sha256`, `advice_sha256`, `run_seed` | `pin.files`: `siderius/data_scope.json`, `siderius/health_config.yaml`, `siderius/advice.md`. The seed, workflow digest and alias table are pinned automatically. A mismatch on resume is refused and names the field. |
 | Locked knobs (windows, policies, portions, evidence order …) | Constants in `workflow.ts` are covered by the workflow digest. Values in the run input are recorded in the log's `started` event and replayed on resume, so they cannot drift. |
@@ -104,33 +104,26 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 
 ### Carried state
 
-9. **Knowledge-cache entries are flat.** SIDERIUS consolidates per model: each
-   cache entry has its own `key_findings` and `bottlenecks` (LLM-merged, at
-   most 8) and six narrative fields kept as replace-with-history (`latest` up
-   to 800 chars, 3 history entries). Here findings are merged once, globally,
-   and the narrative fields are not expressed. Per-entry merging would need a
-   keyed llmMerge (`llmMergeByKey`).
-10. **Error-signature identity.** SIDERIUS dedupes on `(failure_class,
-    top_user_frame, error_type)`, unions `evidence_iters` and keeps the
-    longer `last_frames`. `union` dedupes whole values, so two messages for
-    one key are kept as two items. In SIDERIUS the signatures live inside
-    cache entries and disappear on eviction; here they are global.
-11. **Collapse-history pruning.** See the table above: never pruned here.
-    A pruning fold (window, top 8 per model) would need a pure script
-    reducer. The design lists those, but the prototype does not implement
-    them.
+9. **Narrative cache fields.** Each cache entry now holds its own findings,
+   bottlenecks and error signatures, as in SIDERIUS. The six narrative
+   fields (`best_config_analysis`, `score_trend`, …, kept as
+   replace-with-history) are not expressed.
+10. **Error signatures.** Deduped like `_dedupe_error_signatures` and kept
+    per model, so like SIDERIUS they disappear when their model is evicted.
+    Remaining difference: the validator emits them once per candidate, not
+    once per frame.
+11. **Collapse history.** Pruned like SIDERIUS (window and per-model cap), but
+    each fingerprint is kept as its own entry. SIDERIUS merges occurrences of
+    one signature (`occurrences[{iteration, count, source_exp_ids}]`).
 12. **Metric order.** The direction is dynamic in SIDERIUS. Here a script
-    reports it, and a sign-normalized `rank_score` keeps `topK` static.
-    Remaining differences:
-    - Ties: `MetricOrder.rank` keeps insertion order; wallis breaks ties by
-      canonical value.
-    - SIDERIUS refuses to cap an unrankable cache (no MetricSpec). Not
-      expressed.
-13. **Prediction evaluation.** SIDERIUS computes `confirmed`/`partial`/
-    `refuted` in code (5% band around SOTA, gain = distance). Here the
-    interpreter agent reports the outcome and the gain. The rule could move
-    into the body as deterministic TypeScript. SIDERIUS also replaces all four
-    fields on every body; here each has its own reducer.
+    reports it, and a sign-normalized `rank_score` lets `topKBy` rank in one
+    direction. Not expressed: SIDERIUS refuses to cap an unrankable cache
+    (no MetricSpec).
+13. **Prediction memory.** The v2 rule is body code, comparing the
+    iteration's best valid formal score with the incumbent before it.
+    Remaining difference: SIDERIUS replaces all four fields on every body;
+    here each has its own reducer, and the v1 pool comes from the
+    interpreter.
 14. **Other carried fields.** Not expressed: `vocab_link_confirmations`
     (promotion after 3 runs), `runtime_vocab`, `previous_proposal_data`,
     `recent_formal_feedback` (last 3), and accumulated gate exhaustions. The

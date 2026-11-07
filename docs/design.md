@@ -109,7 +109,7 @@ As built (`core/src/wallis_core/types.gleam`):
 - Prototype choice: request ids come from the body's branch path and a
   per-branch counter: `#0`, `#1`, `#2.a#0` (branch `a` of the parallel at
   `#2`), `#3>retry#0` (sub-workflow `retry` at `#3`). The order results
-  arrive in does not change them. A merge call is `<id>/merge/<field>`.
+  arrive in does not change them.
 - Prototype choice: decoders and encoders in `types.gleam` come from the
   Gleam language server code actions, driven headless by
   `tools/gleam-codegen.mjs`. The recursive JSON `Value` decoder is
@@ -130,14 +130,13 @@ As built (`core/src/wallis_core/types.gleam`):
 Prototype choices:
 
 - The status is derived from the requests, not stored:
-  - `Running` while any call, script or merge is in flight;
+  - `Running` while any call or script is in flight;
   - otherwise `Idle(Some(reason))` for the first request, by id, that is
     blocked on budget or an executor fault;
   - otherwise `Idle(None)` if a node waits for a message;
   - otherwise `Running` (the body is computing).
 - Nodes are agent calls that started a conversation. Calls blocked on budget
   or an executor fault are not nodes yet; the run's idle reason names them.
-  llmMerge calls are not listed as nodes.
 - The lock is `<run>/lock` with the driver's pid. A lock whose pid is dead is
   stale.
 
@@ -231,8 +230,6 @@ Prototype choices:
   executor fault (the run pauses, nothing is recorded as a failure).
 - Forking `--at <node>` keeps the events up to and including that node's
   request, so the fork issues it again; `--at <n>` keeps the first n events.
-- A merge call refused for budget, or failing at the executor, uses the
-  deterministic llmMerge fallback rather than pausing.
 
 ## Schemas at the boundary (decided)
 
@@ -255,14 +252,14 @@ Prototype choices:
   | --- | --- |
   | Body: agent input, script args, `emit` | `SchemaError`; nothing is logged |
   | Script output | `ScriptFailed` |
-  | Agent output, emits, mapped writes, merge items | Agent failure; nothing is committed |
+  | Agent output, emits, mapped writes | Agent failure; nothing is committed |
 - The write schema follows the reducer:
 
   | Reducer | Write schema |
   | --- | --- |
   | `append`, `topK`, `appendByKey` | the item schema |
   | `freeze`, `replace` | the value schema |
-  | `union`, `llmMerge` | an array of the item schema |
+  | `union` | an array of the item schema |
   | `sum` | number |
   | `countByKey` | string or array of strings |
 
@@ -278,10 +275,14 @@ Prototype choices:
   counts and filters what an agent must not see. Views order output from
   stable to volatile and render canonically for prompt caching; windows grow
   in chunks so most calls only append.
-- Reducers: `replace`, `append`, `union`, `sum`, `countByKey`, `topK`,
-  `appendByKey`, `freeze`, `llmMerge` (bounded calls), plus pure script
-  reducers. Commutative-monoid reducers may run in parallel branches; others
-  merge once, in declaration order, at the join.
+- Reducers are built-in deterministic merges only (owner decision, round 3):
+  `replace`, `append`, `union`, `sum`, `countByKey`, `topK`, `appendByKey`
+  and `freeze`. Anything custom or LLM-based (consolidating findings,
+  pruning a history) is ordinary workflow code: agent calls and plain
+  functions, with the result written back through `replace`. The SDK has
+  plain pruning helpers for that: `lastN`, `perKey`, `topKBy` and
+  `dedupeBy`. Commutative-monoid reducers may run in parallel branches;
+  others merge once, in declaration order, at the join.
 - Each agent call is a transaction with snapshot isolation. Reads come from
   the initial view (push) or a capped `state_read` tool (pull). Writes
   (`submit_result`, `emit()`) are buffered and applied atomically at call end.
@@ -293,8 +294,8 @@ Prototype choices:
 Prototype choices:
 
 - Commutativity: `union`, `sum`, `countByKey` and `topK` without
-  `keepLatest` are commutative. `replace`, `append`, `appendByKey`, `freeze`,
-  `llmMerge` and `topK` with `keepLatest` are not. A non-commutative write
+  `keepLatest` are commutative. `replace`, `append`, `appendByKey`, `freeze`
+  and `topK` with `keepLatest` are not. A non-commutative write
   from a parallel branch is refused (the request gets `Refuse`, nothing is
   written). Merging such writes at the join is not built.
 - Reducer details: `union` stores items sorted by canonical value. `topK`
@@ -302,12 +303,6 @@ Prototype choices:
   `key`, a new entry replaces the old entry with that key. `keepLatest` keeps
   the latest write plus the top k of the others. `freeze`: the first write
   wins, later writes are ignored. `appendByKey` never prunes.
-- `llmMerge`: the merge agent gets `{ current, incoming, max }` and returns
-  `{ items, archived }`. Items past `max` are archived too. Each field has a
-  per-run call cap. Past the cap, or when the merge call fails, the reducer
-  keeps the newest `max` items deterministically. Archived items go through
-  the reducer of the declared `archive` field. The call's other writes wait
-  for its merges and are applied together.
 - Agent writes: an agent declares `writes: { field: outputKey | { emit: true } }`.
   Output keys map to writes when the call ends; `emit` writes must target a
   declared field.
@@ -396,8 +391,6 @@ Prototype choices:
     can overshoot by what is in flight.
   - Each call gets `maxTurns = min(agent.maxTurns, turns left)`.
   - `RunScript` carries the compute minutes left.
-  - Merge calls are checked like any other call. A merge refused for budget
-    uses the deterministic fallback.
 
 ## Tools and sandbox (proposed)
 
@@ -460,7 +453,7 @@ Not built yet:
 - the MCP proxy, `defineTool` serving, `sandbox_exec`, secret injection and
   script sandboxing;
 - the `state_read` pull tool and persistent sessions beyond the transcript;
-- pure script reducers and merging non-commutative writes at a join;
+- merging non-commutative writes at a join;
 - the local profile file (resolution accepts a profile object);
 - declaration approval on first run or digest change.
 

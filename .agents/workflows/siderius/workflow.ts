@@ -8,7 +8,6 @@
 import {
 	AgentFailed,
 	append,
-	appendByKey,
 	countByKey,
 	defineAgent,
 	defineMcp,
@@ -17,13 +16,17 @@ import {
 	defineState,
 	defineTool,
 	freeze,
-	llmMerge,
+	lastN,
+	perKey,
+	replace,
+	topK,
+	topKBy,
+	union,
+	dedupeBy,
 	type Static,
 	subWorkflow,
 	sum,
-	topK,
 	Type,
-	union,
 	view,
 	workflow,
 } from "wallis";
@@ -75,19 +78,6 @@ const RunSummary = Type.Object({
 	take_home: Type.String(),
 });
 
-/**
- * A knowledge-cache entry. `rank_score` is the best Health-valid formal score
- * with its sign normalized by the metric order (higher is better), so a
- * static descending top-k follows the run's MetricOrder.
- */
-const CacheEntry = Type.Object({
-	model_type: Type.String(),
-	description: Type.String(),
-	iteration: Type.Integer(),
-	rank_score: Score,
-	stats: Type.Object({ best_score: Score, best_formal_score: Score, best_valid_formal_score: Score }),
-});
-
 const Finding = Type.Object({
 	kind: Type.Union([Type.Literal("finding"), Type.Literal("bottleneck")]),
 	statement: Type.String({ maxLength: 500 }),
@@ -96,11 +86,39 @@ const Finding = Type.Object({
 	model_type: Type.String(),
 });
 
+/** What the validator reports; the body adds the iterations it was seen in. */
+const RawSignature = Type.Object({
+	failure_class: Type.String(),
+	top_user_frame: Type.String(),
+	error_type: Type.String(),
+	short_message: Type.String({ maxLength: 120 }),
+	last_frames: Type.Array(Type.String()),
+});
+
 const ErrorSignature = Type.Object({
 	failure_class: Type.String(),
 	top_user_frame: Type.String(),
 	error_type: Type.String(),
 	short_message: Type.String({ maxLength: 120 }),
+	last_frames: Type.Array(Type.String()),
+	evidence_iters: Type.Array(Type.Integer()),
+});
+
+/**
+ * A knowledge-cache entry: one per model, holding its own consolidated
+ * findings and bottlenecks (at most 8 each) and its error signatures, as in
+ * SIDERIUS. `rank_score` is the best Health-valid formal score with its sign
+ * normalized by the metric order (higher is better).
+ */
+const CacheEntry = Type.Object({
+	model_type: Type.String(),
+	description: Type.String(),
+	iteration: Type.Integer(),
+	rank_score: Score,
+	stats: Type.Object({ best_score: Score, best_formal_score: Score, best_valid_formal_score: Score }),
+	key_findings: Type.Array(Finding),
+	bottlenecks: Type.Array(Finding),
+	error_signatures: Type.Array(ErrorSignature),
 });
 
 const CollapseEntry = Type.Object({
@@ -210,7 +228,7 @@ const runSkillScript = defineScript({
 	output: SkillOutput,
 });
 
-// --- Merge agent (declared before state: llmMerge names it) --------------------
+// --- Findings consolidation (cache_consolidator.list_merge) ---------------------
 
 const consolidator = defineAgent(
 	{ models },
@@ -218,7 +236,13 @@ const consolidator = defineAgent(
 		name: "consolidate_findings",
 		model: "consolidate",
 		prompt: consolidatePrompt,
-		input: Type.Object({ current: Type.Array(Finding), incoming: Type.Array(Finding), max: Type.Integer() }),
+		input: Type.Object({
+			model_type: Type.String(),
+			kind: Type.Union([Type.Literal("finding"), Type.Literal("bottleneck")]),
+			current: Type.Array(Finding),
+			incoming: Type.Array(Finding),
+			max: Type.Integer(),
+		}),
 		output: Type.Object({ items: Type.Array(Finding), archived: Type.Array(Finding) }),
 		maxTurns: 1,
 		needs: { structuredOutput: true },
@@ -230,15 +254,14 @@ const consolidator = defineAgent(
 const state = defineState({
 	// recent_tune_outputs / latest_new_summary: one summary per iteration.
 	runs: append(RunSummary),
-	// cap_knowledge_cache: the current model plus the top 4 others, 5 total.
-	knowledge_cache: topK({ k: 4, by: "rank_score", order: "descending", key: "model_type", keepLatest: true }, CacheEntry),
-	// cache_consolidator: LLM merge, at most 8 survivors, overflow archived.
-	findings: llmMerge({ agent: consolidator, max: 8, maxCalls: 60, archive: "findings_archive" }, Finding),
+	// Per-model records; body code caps them (cap_knowledge_cache: the current
+	// model plus the top 4 others) and consolidates their findings.
+	knowledge_cache: replace(Type.Array(CacheEntry), []),
+	// Findings dropped by consolidation or rank-pruning (cache_archive_*.json).
 	findings_archive: append(Finding),
-	// _dedupe_error_signatures: set merge, no cap, never pruned.
-	error_signatures: union(ErrorSignature),
-	// collapse_fingerprint_history keyed by model_type, never pruned here.
-	collapse_history: appendByKey({ key: "model_type" }, CollapseEntry),
+	// collapse_fingerprint_history keyed by model_type; body code prunes it
+	// (3-iteration window, at most 8 entries per model).
+	collapse_history: replace(Type.Record(Type.String(), Type.Array(CollapseEntry)), {}),
 	// PredictionMemory: legacy v1 pool frozen, v2 outcome counts, v2 gain.
 	prediction_v1: freeze(Type.Record(Type.String(), Type.Integer())),
 	prediction_v2: countByKey(),
@@ -262,13 +285,13 @@ const judgeProjection = view(state, {
 });
 
 const interpreterView = view(state, {
-	fields: ["prediction_version", "prediction_v1", "runs", "collapse_history", "knowledge_cache", "findings", "prediction_v2", "info_gain_v2"],
+	fields: ["prediction_version", "prediction_v1", "runs", "collapse_history", "knowledge_cache", "prediction_v2", "info_gain_v2"],
 	maxChars: 24_000,
 	maxItems: 12,
 });
 
 const proposerView = view(state, {
-	fields: ["error_signatures", "runs", "collapse_history", "knowledge_cache", "findings"],
+	fields: ["runs", "collapse_history", "knowledge_cache"],
 	maxChars: 16_000,
 	maxItems: 8,
 });
@@ -295,18 +318,11 @@ const interpreter = defineAgent(env, {
 	output: Type.Object({
 		take_home: Type.String(),
 		key_findings: Type.Array(Finding),
-		prediction_outcomes: Type.Array(Type.Union([Type.Literal("confirmed"), Type.Literal("partial"), Type.Literal("refuted")])),
-		information_gain: Type.Number(),
 		legacy_prediction_pool: Type.Record(Type.String(), Type.Integer()),
 		analysis_brief: Type.String(),
 	}),
 	view: interpreterView,
-	writes: {
-		findings: "key_findings",
-		prediction_v1: "legacy_prediction_pool",
-		prediction_v2: "prediction_outcomes",
-		info_gain_v2: "information_gain",
-	},
+	writes: { prediction_v1: "legacy_prediction_pool" },
 	maxTurns: 4,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -331,7 +347,7 @@ const literature = defineAgent(env, {
 	prompt: literaturePrompt,
 	input: Type.Object({ at: Type.String(), bottlenecks: Type.Array(Type.String()), max_rounds: Type.Integer() }),
 	output: Type.Object({ evidence: Type.Array(Evidence), search_rounds_used: Type.Integer() }),
-	view: view(state, { fields: ["findings"], maxChars: 6000, maxItems: 8 }),
+	view: view(state, { fields: ["knowledge_cache"], maxChars: 6000, maxItems: 5 }),
 	writes: { evidence: "evidence" },
 	mcp: { arxiv: ["search_papers", "download_paper", "read_paper"], semantic_scholar: "*" },
 	sandbox: "none",
@@ -383,7 +399,7 @@ const validator = defineAgent(env, {
 	model: "validate",
 	prompt: validatePrompt,
 	input: Type.Object({ model_file_path: Type.String(), deterministic_report: validateScript.output }),
-	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), error_signatures: Type.Array(ErrorSignature) }),
+	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), error_signatures: Type.Array(RawSignature) }),
 	sandbox: "read-only",
 	maxTurns: 4,
 	needs: { structuredOutput: true },
@@ -494,6 +510,69 @@ function atLeast(direction: Direction, score: number, target: number): boolean {
 	return direction === "higher_is_better" ? score >= target : score <= target;
 }
 
+// --- Deterministic folds: SIDERIUS's code, as body code -------------------------
+
+type Finding = Static<typeof Finding>;
+type CacheEntry = Static<typeof CacheEntry>;
+type ErrorSignature = Static<typeof ErrorSignature>;
+type CollapseEntry = Static<typeof CollapseEntry>;
+
+/** LIST_FIELD_MAX_SURVIVORS */
+const MAX_SURVIVORS = 8;
+/** health_feedback_history_window_iterations and max_entries_per_model */
+const COLLAPSE_WINDOW = 3;
+const COLLAPSE_PER_MODEL = 8;
+
+/** Rank-prune: strength, then number of evidence iterations, then latest iteration; overflow is archived. */
+function rankPrune(items: readonly Finding[]): { kept: Finding[]; archived: Finding[] } {
+	const latest = (f: Finding) => Math.max(-1, ...f.evidence_iters);
+	const ranked = [...items].sort((a, b) => b.strength - a.strength || b.evidence_iters.length - a.evidence_iters.length || latest(b) - latest(a));
+	return { kept: ranked.slice(0, MAX_SURVIVORS), archived: ranked.slice(MAX_SURVIVORS) };
+}
+
+/** _dedupe_error_signatures: one per (failure_class, top_user_frame, error_type); union evidence, keep the longer frames, the first message wins. */
+function mergeSignatures(existing: readonly ErrorSignature[], incoming: readonly ErrorSignature[]): ErrorSignature[] {
+	return dedupeBy(
+		[...existing, ...incoming],
+		(e) => JSON.stringify([e.failure_class, e.top_user_frame, e.error_type]),
+		(kept, next) => ({
+			...kept,
+			evidence_iters: [...new Set([...kept.evidence_iters, ...next.evidence_iters])].sort((a, b) => a - b),
+			last_frames: next.last_frames.length > kept.last_frames.length ? next.last_frames : kept.last_frames,
+		}),
+	);
+}
+
+/** Collapse history: drop entries outside the window, then keep the 8 most recent per model; empty models disappear. */
+function pruneCollapse(history: Record<string, CollapseEntry[]>, fresh: readonly CollapseEntry[], iteration: number): Record<string, CollapseEntry[]> {
+	const all = [...Object.values(history).flat(), ...fresh].filter((e) => e.iteration > iteration - COLLAPSE_WINDOW);
+	return perKey(all, (e) => e.model_type, (entries) =>
+		lastN(
+			[...entries].sort((a, b) => a.iteration - b.iteration || a.count - b.count || a.signature.localeCompare(b.signature)),
+			COLLAPSE_PER_MODEL,
+		),
+	);
+}
+
+/** cap_knowledge_cache: the current model plus the top 4 others by rank score; scoreless entries rank last. */
+function capCache(cache: readonly CacheEntry[], current: CacheEntry): CacheEntry[] {
+	const others = cache.filter((e) => e.model_type !== current.model_type);
+	return [...topKBy(others, 4, (e) => e.rank_score, "descending"), current];
+}
+
+/**
+ * prediction.py (metric_order_signsafe_v2): with distance = |actual - sota|
+ * and band = 5% of |sota|, a missing score is unevaluated; better than SOTA
+ * is confirmed (gain = distance); within the band is partial; else refuted.
+ */
+function evaluatePrediction(direction: Direction, actual: number | null, sota: number | null): { outcome: "confirmed" | "partial" | "refuted" | "unevaluated"; gain: number } {
+	if (actual === null || sota === null) return { outcome: "unevaluated", gain: 0 };
+	const distance = Math.abs(actual - sota);
+	if (better(direction, actual, sota) && actual !== sota) return { outcome: "confirmed", gain: distance };
+	if (distance <= 0.05 * Math.abs(sota)) return { outcome: "partial", gain: 0 };
+	return { outcome: "refuted", gain: 0 };
+}
+
 // --- Sub-workflow: implement and validate, bounded retry --------------------------
 
 const ImplementInput = Type.Object({
@@ -509,7 +588,7 @@ const ImplementOutput = Type.Object({
 	model_file_path: Type.Union([Type.String(), Type.Null()]),
 	attempts: Type.Integer(),
 	last_error: Type.Union([Type.String(), Type.Null()]),
-	error_signatures: Type.Array(ErrorSignature),
+	error_signatures: Type.Array(RawSignature),
 });
 
 const implementAndValidate = subWorkflow({
@@ -518,7 +597,7 @@ const implementAndValidate = subWorkflow({
 	output: ImplementOutput,
 	run: async (ctx, input) => {
 		let feedback = input.previous_failure;
-		const signatures: Static<typeof ErrorSignature>[] = [];
+		const signatures: Static<typeof RawSignature>[] = [];
 		for (let attempt = 1; attempt <= input.max_attempts; attempt++) {
 			const impl = await ctx.call(implementor, {
 				proposal: input.proposal,
@@ -698,6 +777,9 @@ export default workflow({
 		let lastRejections: string[] = [];
 		let bodiesWithoutImprovement = 0;
 
+		// Unbounded reads for the body's own folds (not an agent view).
+		const whole = view(state, { fields: ["knowledge_cache", "collapse_history"], maxChars: 10_000_000, maxItems: 10_000 });
+		const readCache = async () => (await ctx.read(whole)).data.knowledge_cache ?? [];
 		const incumbent = async () => (await ctx.read(view(state, { fields: ["incumbent"], maxChars: 1000, maxItems: 1 }))).data.incumbent[0] ?? null;
 
 		for (let iteration = 0; iteration < input.maxIterations; iteration++) {
@@ -711,6 +793,30 @@ export default workflow({
 
 			// 2. Interpretation of the previous iteration (cold start on the first).
 			const interpretation = await ctx.call(interpreter, { iteration, cold_start: iteration === 0, metric_direction: direction });
+
+			// 2b. Consolidate the findings into each model's own cache entry
+			// (cache_consolidator: at most one call per list, on a cache hit).
+			let cache = await readCache();
+			for (const [modelType, found] of Object.entries(perKey(interpretation.key_findings, (f) => f.model_type))) {
+				const entry = cache.find((e) => e.model_type === modelType);
+				if (!entry) {
+					// A cache miss: nothing to consolidate into.
+					for (const f of found) await ctx.emit("findings_archive", f);
+					continue;
+				}
+				const updated: CacheEntry = { ...entry };
+				for (const kind of ["finding", "bottleneck"] as const) {
+					const incoming = found.filter((f) => f.kind === kind);
+					if (incoming.length === 0) continue;
+					const list = kind === "finding" ? "key_findings" : "bottlenecks";
+					const merged = await ctx.call(consolidator, { model_type: modelType, kind, current: entry[list], incoming, max: MAX_SURVIVORS });
+					const pruned = rankPrune(merged.items);
+					updated[list] = pruned.kept;
+					for (const f of [...merged.archived, ...pruned.archived]) await ctx.emit("findings_archive", f);
+				}
+				cache = cache.map((e) => (e.model_type === modelType ? updated : e));
+			}
+			await ctx.emit("knowledge_cache", cache);
 
 			// 3. Optional evidence stage, then the judge over a capped projection.
 			let evidenceBrief = "";
@@ -749,6 +855,7 @@ export default workflow({
 
 			// 4. Propose, then implement with a bounded validate/retry sub-workflow.
 			const failures = [...lastRejections];
+			const signatures: ErrorSignature[] = [];
 			let candidate: { proposal: Static<typeof Proposal>; modelFile: string } | null = null;
 			for (let attempt = 1; attempt <= input.maxProposalAttempts && candidate === null; attempt++) {
 				try {
@@ -766,7 +873,7 @@ export default workflow({
 						seed: ctx.seed,
 						iteration,
 					});
-					if (impl.error_signatures.length > 0) await ctx.emit("error_signatures", impl.error_signatures);
+					signatures.push(...impl.error_signatures.map((e) => ({ ...e, evidence_iters: [iteration] })));
 					if (impl.passed && impl.model_file_path !== null) candidate = { proposal, modelFile: impl.model_file_path };
 					else failures.push(impl.last_error ?? "validation failed");
 				} catch (error) {
@@ -817,7 +924,8 @@ export default workflow({
 
 			// 6. Health feedback: collapse fingerprints per model.
 			const fingerprints = await ctx.script(fingerprintScript, { failed_checks: tuned.failed_checks, model_type: candidate.proposal.model_type, iteration });
-			for (const entry of fingerprints.entries) await ctx.emit("collapse_history", entry);
+			const history = (await ctx.read(whole)).data.collapse_history ?? {};
+			await ctx.emit("collapse_history", pruneCollapse(history, fingerprints.entries, iteration));
 
 			// 7. Fold the iteration into the carried history (advance_completed_history).
 			const valid = tuned.best_valid_formal_score;
@@ -830,14 +938,28 @@ export default workflow({
 				termination_reason: tuned.termination_reason,
 				take_home: interpretation.take_home,
 			});
-			await ctx.emit("knowledge_cache", {
-				model_type: candidate.proposal.model_type,
+			const modelType = candidate.proposal.model_type;
+			const cached = await readCache();
+			const prior = cached.find((e) => e.model_type === modelType);
+			const entry: CacheEntry = {
+				model_type: modelType,
 				description: candidate.proposal.model_description,
 				iteration,
 				rank_score: valid === null ? null : sign * valid,
 				stats: { best_score: tuned.best_score, best_formal_score: tuned.best_formal_score, best_valid_formal_score: valid },
-			});
+				key_findings: prior?.key_findings ?? [],
+				bottlenecks: prior?.bottlenecks ?? [],
+				error_signatures: mergeSignatures(prior?.error_signatures ?? [], signatures),
+			};
+			await ctx.emit("knowledge_cache", capCache(cached, entry));
+
+			// PredictionMemory v2: the deterministic rule, against the incumbent before this iteration.
 			const before = best === null ? null : best.score;
+			const prediction = evaluatePrediction(direction, valid, before);
+			if (prediction.outcome !== "unevaluated") {
+				await ctx.emit("prediction_v2", prediction.outcome);
+				await ctx.emit("info_gain_v2", prediction.gain);
+			}
 			if (valid !== null && better(direction, valid, before)) {
 				await ctx.emit("incumbent", { rank_score: sign * valid, score: valid, model_type: candidate.proposal.model_type, iteration });
 				bodiesWithoutImprovement = 0;

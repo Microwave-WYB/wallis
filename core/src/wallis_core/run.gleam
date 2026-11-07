@@ -30,13 +30,12 @@ import wallis_core/types.{
   BudgetRaised, Call, CallAgent, CancelRequested, Cancelled, Checkpoint, Commit,
   ComputeMinutes, Deliver, Done, ExecutorChanged, ExecutorFailed,
   ExecutorUnavailable, Fail, Failed, Finish, Finished, GaveUp, Idle,
-  InvalidDeclaration, JournalMissing, LlmMerge, Message, Node, NodeDone,
-  NodeIdle, NodeRunning, NonCommutativeWriteInBranch, NotIdle, NotRunning,
-  NotStarted, PathDiverged, PinMismatch, Read, ReducerRejected, Refuse,
-  Requested, Resumed, RetryUnavailable, RunScript, Running, Script,
-  ScriptCrashed, ScriptFailed, ScriptReturned, Sent, Started, Submitted, Tokens,
-  Turns, UnknownAgent, UnknownAlias, UnknownField, UnknownScript, Usd, User,
-  Write, WriteNotAllowed,
+  InvalidDeclaration, JournalMissing, Message, Node, NodeDone, NodeIdle,
+  NodeRunning, NonCommutativeWriteInBranch, NotIdle, NotRunning, NotStarted,
+  PathDiverged, PinMismatch, Read, ReducerRejected, Refuse, Requested, Resumed,
+  RetryUnavailable, RunScript, Running, Script, ScriptCrashed, ScriptFailed,
+  ScriptReturned, Sent, Started, Submitted, Tokens, Turns, UnknownAgent,
+  UnknownAlias, UnknownField, UnknownScript, Usd, User, Write, WriteNotAllowed,
 }
 import wallis_core/value.{type Value, JArray, JInt, JNull, JString}
 import wallis_core/view
@@ -66,8 +65,6 @@ type Run {
     state: Dict(String, Value),
     requests: Dict(String, Record),
     journal: Dict(String, Entry),
-    merges: Dict(String, MergeRef),
-    merge_calls: Dict(String, Int),
     spent: Spent,
   )
 }
@@ -104,28 +101,7 @@ type Progress {
   /// The executor could not serve the call; reissued after a fix.
   Unavailable(conversation: Conversation, alias: String, error: String)
   AwaitingScript
-  /// The call returned; its writes wait for llmMerge calls. They are
-  /// applied together when the last merge settles.
-  AwaitingMerges(
-    output: Value,
-    writes: List(Write),
-    pending: List(PendingMerge),
-    settled: List(#(String, MergeOutcome)),
-  )
   Completed(model: Option(String))
-}
-
-type PendingMerge {
-  PendingMerge(field: String, call: Effect)
-}
-
-type MergeOutcome {
-  Merged(items: List(Value), archived: List(Value))
-  UseFallback
-}
-
-type MergeRef {
-  MergeRef(parent: String, field: String)
 }
 
 type Entry {
@@ -179,8 +155,6 @@ fn start(
           state:,
           requests: dict.new(),
           journal: dict.new(),
-          merges: dict.new(),
-          merge_calls: dict.new(),
           spent: Spent(0.0, 0, 0, 0.0),
         )
       #(Active(run), [Checkpoint])
@@ -215,22 +189,7 @@ fn validate(workflow: Workflow, pin: Pin) -> Result(Nil, String) {
       })
     }),
   )
-  list.try_each(workflow.fields, fn(f) {
-    case f.reducer {
-      LlmMerge(agent:, archive:, ..) -> {
-        use _ <- result.try(case find_agent(workflow, agent) {
-          Ok(_) -> Ok(Nil)
-          Error(Nil) ->
-            Error("llmMerge of " <> f.name <> " names unknown agent " <> agent)
-        })
-        case archive {
-          Some(a) -> known(a, "archive of " <> f.name)
-          None -> Ok(Nil)
-        }
-      }
-      _ -> Ok(Nil)
-    }
-  })
+  Ok(Nil)
 }
 
 /// Resolution: the current alias table, then `default`.
@@ -391,10 +350,6 @@ fn replay(
         AwaitingScript, ScriptKind(script:, args:) -> #(run, [
           script_effect(run, id, script, args, d),
         ])
-        AwaitingMerges(pending:, ..), _ -> #(
-          run,
-          list.map(pending, fn(p) { p.call }),
-        )
         // Waiting for a message, for budget, or for an executor fix: the
         // events that unblock them (`Sent`, `BudgetRaised`,
         // `RetryUnavailable`) are logged and reissue the call.
@@ -664,13 +619,8 @@ fn agent_returned(
   usage: Usage,
   model: String,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.merges, id), dict.get(run.requests, id) {
-    Ok(ref), _ -> {
-      let #(run, effects) =
-        merge_settled(spend(run, usage), id, ref, parse_merge(run, ref, output))
-      #(run, [Checkpoint, ..effects])
-    }
-    _, Ok(rec) ->
+  case dict.get(run.requests, id) {
+    Ok(rec) ->
       case in_flight(rec) {
         None -> #(run, [])
         Some(#(name, _, _)) -> {
@@ -690,7 +640,7 @@ fn agent_returned(
           #(run, [Checkpoint, ..effects])
         }
       }
-    _, _ -> #(run, [])
+    Error(Nil) -> #(run, [])
   }
 }
 
@@ -730,13 +680,8 @@ fn agent_failed(
   usage: Usage,
   model: String,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.merges, id), dict.get(run.requests, id) {
-    Ok(ref), _ -> {
-      let #(run, effects) =
-        merge_settled(spend(run, usage), id, ref, UseFallback)
-      #(run, [Checkpoint, ..effects])
-    }
-    _, Ok(rec) ->
+  case dict.get(run.requests, id) {
+    Ok(rec) ->
       case in_flight(rec) {
         Some(#(name, _, _)) -> {
           let #(run, effects) =
@@ -750,24 +695,19 @@ fn agent_failed(
         }
         None -> #(run, [])
       }
-    _, _ -> #(run, [])
+    Error(Nil) -> #(run, [])
   }
 }
 
 /// An executor error is not an agent failure: the call stays incomplete and
-/// the run goes idle until a fix and a `RetryUnavailable`. A failing merge
-/// call falls back instead.
+/// the run goes idle until a fix and a `RetryUnavailable`.
 fn executor_failed(
   run: Run,
   id: String,
   error: String,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.merges, id), dict.get(run.requests, id) {
-    Ok(ref), _ -> {
-      let #(run, effects) = merge_settled(run, id, ref, UseFallback)
-      #(run, [Checkpoint, ..effects])
-    }
-    _, Ok(rec) ->
+  case dict.get(run.requests, id) {
+    Ok(rec) ->
       case in_flight(rec) {
         Some(#(name, _, c)) -> {
           let alias = case find_agent(run.workflow, name) {
@@ -787,7 +727,7 @@ fn executor_failed(
         }
         None -> #(run, [])
       }
-    _, _ -> #(run, [])
+    Error(Nil) -> #(run, [])
   }
 }
 
@@ -982,8 +922,8 @@ fn agent_writes(
 
 // --- Writes and reducers -------------------------------------------------------
 
-/// Applies a finished call's buffered writes atomically, or starts the
-/// llmMerge calls they need first.
+/// Applies a finished call's buffered writes atomically: one bad write
+/// refuses them all.
 fn complete(
   run: Run,
   id: String,
@@ -995,27 +935,14 @@ fn complete(
     Ok(rec) -> #(rec.branch, None)
     Error(Nil) -> #(None, None)
   }
-  case check_writes(run, branch, writes) {
+  let applied = {
+    use Nil <- result.try(check_writes(run, branch, writes))
+    apply_writes(run.workflow, run.state, writes)
+  }
+  case applied {
     Error(refusal) -> settle_recorded(run, id, model, Refused(refusal))
-    Ok(Nil) -> {
-      let #(run, pending) = start_merges(run, id, writes)
-      case pending, dict.get(run.requests, id) {
-        [], _ -> apply_and_answer(run, id, model, output, writes, [])
-        _, Ok(rec) -> {
-          let run =
-            record(
-              run,
-              id,
-              Record(
-                ..rec,
-                progress: AwaitingMerges(output, writes, pending, []),
-              ),
-            )
-          #(run, list.map(pending, fn(p) { p.call }))
-        }
-        _, Error(Nil) -> #(run, [])
-      }
-    }
+    Ok(state) ->
+      settle_recorded(Run(..run, state:), id, model, Answered(output))
   }
 }
 
@@ -1037,231 +964,21 @@ fn check_writes(
   })
 }
 
-/// One merge call per llmMerge field written, while under its call cap and
-/// the budget; otherwise that field uses the deterministic fallback.
-fn start_merges(
-  run: Run,
-  id: String,
-  writes: List(Write),
-) -> #(Run, List(PendingMerge)) {
-  writes
-  |> list.map(fn(w) { w.field })
-  |> list.unique
-  |> list.fold(#(run, []), fn(acc, field) {
-    let #(run, pending) = acc
-    case find_field(run.workflow, field) {
-      Ok(types.Field(reducer: LlmMerge(agent:, max:, max_calls:, ..), ..)) -> {
-        let used = dict.get(run.merge_calls, field) |> result.unwrap(0)
-        let incoming =
-          writes
-          |> list.filter(fn(w) { w.field == field })
-          |> list.flat_map(fn(w) { as_items(w.value) })
-        let current = dict.get(run.state, field) |> result.unwrap(JArray([]))
-        let call_id = id <> "/merge/" <> field
-        let input =
-          value.object([
-            #("current", current),
-            #("incoming", JArray(incoming)),
-            #("max", JInt(max)),
-          ])
-        let effect = case
-          used < max_calls,
-          budget_check(run),
-          find_agent(run.workflow, agent)
-        {
-          True, Ok(Nil), Ok(a) ->
-            call_effect(
-              run,
-              call_id,
-              a.name,
-              input,
-              digest.hex(call_id <> "\n" <> value.canonical(input)),
-              snapshot_view(run, a),
-            )
-            |> option.from_result
-          _, _, _ -> None
-        }
-        case effect {
-          None -> #(run, pending)
-          Some(call) -> #(
-            Run(
-              ..run,
-              merges: dict.insert(run.merges, call_id, MergeRef(id, field)),
-              merge_calls: dict.insert(run.merge_calls, field, used + 1),
-            ),
-            list.append(pending, [PendingMerge(field, call)]),
-          )
-        }
-      }
-      _ -> #(run, pending)
-    }
-  })
-}
-
-fn as_items(v: Value) -> List(Value) {
-  case v {
-    JArray(items) -> items
-    _ -> [v]
-  }
-}
-
-/// A merge agent returns `{ items: [...], archived: [...] }`. Items past the
-/// field's `max` are archived too. Anything else falls back.
-fn parse_merge(run: Run, ref: MergeRef, output: Value) -> MergeOutcome {
-  let max = case find_field(run.workflow, ref.field) {
-    Ok(types.Field(reducer: LlmMerge(max:, ..), ..)) -> max
-    _ -> 0
-  }
-  case value.get(output, "items"), value.get(output, "archived") {
-    Some(JArray(items)), archived -> {
-      let archived = case archived {
-        Some(JArray(a)) -> a
-        _ -> []
-      }
-      Merged(
-        list.take(items, max),
-        list.append(archived, list.drop(items, max)),
-      )
-    }
-    _, _ -> UseFallback
-  }
-}
-
-fn merge_settled(
-  run: Run,
-  call_id: String,
-  ref: MergeRef,
-  outcome: MergeOutcome,
-) -> #(Run, List(Effect)) {
-  let run = Run(..run, merges: dict.delete(run.merges, call_id))
-  case dict.get(run.requests, ref.parent) {
-    Ok(
-      Record(progress: AwaitingMerges(output:, writes:, pending:, settled:), ..) as rec,
-    ) -> {
-      let pending = list.filter(pending, fn(p) { p.field != ref.field })
-      let settled = list.append(settled, [#(ref.field, outcome)])
-      case pending {
-        [] ->
-          apply_and_answer(
-            run,
-            ref.parent,
-            model_of(rec),
-            output,
-            writes,
-            settled,
-          )
-        _ -> #(
-          record(
-            run,
-            ref.parent,
-            Record(
-              ..rec,
-              progress: AwaitingMerges(output, writes, pending, settled),
-            ),
-          ),
-          [],
-        )
-      }
-    }
-    _ -> #(run, [])
-  }
-}
-
-fn model_of(rec: Record) -> Option(String) {
-  case rec.progress {
-    Completed(model:) -> model
-    _ -> None
-  }
-}
-
-fn apply_and_answer(
-  run: Run,
-  id: String,
-  model: Option(String),
-  output: Value,
-  writes: List(Write),
-  merged: List(#(String, MergeOutcome)),
-) -> #(Run, List(Effect)) {
-  case apply_writes(run.workflow, run.state, writes, merged) {
-    Error(refusal) -> settle_recorded(run, id, model, Refused(refusal))
-    Ok(state) ->
-      settle_recorded(Run(..run, state:), id, model, Answered(output))
-  }
-}
-
 fn apply_writes(
   workflow: Workflow,
   state: Dict(String, Value),
   writes: List(Write),
-  merged: List(#(String, MergeOutcome)),
 ) -> Result(Dict(String, Value), Refusal) {
-  writes
-  |> list.try_fold(#(state, []), fn(acc, w) {
-    let #(state, done) = acc
+  list.try_fold(writes, state, fn(state, w) {
     use f <- result.try(
       find_field(workflow, w.field)
       |> result.replace_error(UnknownField(w.field)),
     )
     let current = dict.get(state, w.field) |> result.unwrap(f.initial)
-    case f.reducer {
-      LlmMerge(max:, archive:, ..) ->
-        case list.contains(done, w.field) {
-          True -> Ok(acc)
-          False -> {
-            let incoming =
-              writes
-              |> list.filter(fn(x) { x.field == w.field })
-              |> list.flat_map(fn(x) { as_items(x.value) })
-            use #(kept, archived) <- result.try(
-              case list.key_find(merged, w.field) {
-                Ok(Merged(items:, archived:)) -> Ok(#(JArray(items), archived))
-                _ ->
-                  reducer.merge_fallback(max, current, JArray(incoming))
-                  |> result.map_error(ReducerRejected(w.field, _))
-              },
-            )
-            let state = dict.insert(state, w.field, kept)
-            use state <- result.try(archive_items(
-              workflow,
-              state,
-              archive,
-              archived,
-            ))
-            Ok(#(state, [w.field, ..done]))
-          }
-        }
-      r -> {
-        use next <- result.try(
-          reducer.apply(r, current, w.value)
-          |> result.map_error(ReducerRejected(w.field, _)),
-        )
-        Ok(#(dict.insert(state, w.field, next), done))
-      }
-    }
+    reducer.apply(f.reducer, current, w.value)
+    |> result.map(dict.insert(state, w.field, _))
+    |> result.map_error(ReducerRejected(w.field, _))
   })
-  |> result.map(fn(acc) { acc.0 })
-}
-
-fn archive_items(
-  workflow: Workflow,
-  state: Dict(String, Value),
-  archive: Option(String),
-  items: List(Value),
-) -> Result(Dict(String, Value), Refusal) {
-  case archive {
-    None -> Ok(state)
-    Some(name) -> {
-      use f <- result.try(
-        find_field(workflow, name) |> result.replace_error(UnknownField(name)),
-      )
-      list.try_fold(items, state, fn(state, item) {
-        let current = dict.get(state, name) |> result.unwrap(f.initial)
-        reducer.apply(f.reducer, current, item)
-        |> result.map(dict.insert(state, name, _))
-        |> result.map_error(ReducerRejected(name, _))
-      })
-    }
-  }
 }
 
 fn find_agent(workflow: Workflow, name: String) -> Result(Agent, Nil) {
@@ -1274,7 +991,7 @@ fn find_field(workflow: Workflow, name: String) -> Result(Field, Nil) {
 
 // --- Status --------------------------------------------------------------------
 
-/// Running while any call, script or merge is in flight. Otherwise idle: for
+/// Running while any call or script is in flight. Otherwise idle: for
 /// budget or an executor fault (the first blocked request by id), or because
 /// a node waits for a message. A run with nothing in flight and nothing
 /// waiting is running: its body is computing.
@@ -1291,7 +1008,7 @@ pub fn status(run: RunState) -> Option(RunStatus) {
       let running =
         list.any(records, fn(p) {
           case p {
-            AwaitingAgent(..) | AwaitingScript | AwaitingMerges(..) -> True
+            AwaitingAgent(..) | AwaitingScript -> True
             _ -> False
           }
         })
@@ -1390,7 +1107,6 @@ pub fn snapshot(run: RunState) -> json.Json {
         ),
         #("budget", types.budget_to_json(r.budget)),
         #("models", sorted_object(r.models, json.string)),
-        #("merge_calls", sorted_object(r.merge_calls, json.int)),
         #("executor", json.nullable(r.executor, json.string)),
       ])
   }

@@ -11,11 +11,11 @@ import wallis_core/types.{
   type Workflow, AgentGaveUp, AgentIdle, AliasRebound, Append, Assistant, Budget,
   BudgetExhausted, BudgetRaised, CallAgent, CancelRequested, Cancelled,
   Checkpoint, ComputeMinutes, Deliver, Descending, Done, ExecutorFailed,
-  ExecutorUnavailable, Fail, Finish, Finished, Idle, InvalidDeclaration,
-  LlmMerge, Message, NonCommutativeWriteInBranch, NotIdle, NotRunning,
-  PathDiverged, Pin, PinMismatch, Refuse, Requested, Resumed, RetryUnavailable,
-  RunScript, Running, Script, Sent, Sum, Tokens, TopK, TopOnly, Union,
-  UnknownAlias, Usage, Usd, User, ViewSpec, Workflow, WriteNotAllowed,
+  ExecutorUnavailable, Fail, Finish, Finished, Idle, InvalidDeclaration, Message,
+  NonCommutativeWriteInBranch, NotIdle, NotRunning, PathDiverged, Pin,
+  PinMismatch, Refuse, Requested, Resumed, RetryUnavailable, RunScript, Running,
+  Script, Sent, Sum, Tokens, TopK, TopOnly, Union, UnknownAlias, Usage, Usd,
+  User, ViewSpec, Workflow, WriteNotAllowed,
 }
 import wallis_core/value.{JArray, JInt, JNull, JString}
 
@@ -497,90 +497,6 @@ pub fn retry_without_unavailable_calls_logs_nothing_test() {
   let #(s, _, _) = replay([started(basic())])
   let #(_, effects) = run.step(s, RetryUnavailable)
   assert effects == []
-}
-
-// --- llmMerge ---
-
-fn merging(max_calls) {
-  workflow(
-    [
-      field(
-        "findings",
-        LlmMerge(agent: "merger", max: 2, max_calls:, archive: Some("archive")),
-      ),
-      field("archive", Append),
-    ],
-    [
-      agent("worker", view(["findings"]), [#("findings", Some("findings"))]),
-      agent("merger", view([]), []),
-    ],
-  )
-}
-
-fn findings(xs) {
-  value.object([#("findings", JArray(list.map(xs, JString)))])
-}
-
-pub fn llm_merge_calls_merge_agent_and_applies_result_test() {
-  let prefix = [
-    started(merging(5)),
-    call("#0", "worker", JNull),
-    returned("#0", findings(["a", "b", "c"])),
-  ]
-  let assert [CallAgent(id: "#0/merge/findings", agent: "merger", input:, ..)] =
-    last(prefix)
-  assert value.get(input, "incoming")
-    == Some(JArray([JString("a"), JString("b"), JString("c")]))
-  assert state_of(prefix, "findings") == JArray([])
-  let merged =
-    value.object([
-      #("items", JArray([JString("ab"), JString("c"), JString("x")])),
-      #("archived", JArray([JString("a")])),
-    ])
-  let events = list.append(prefix, [returned("#0/merge/findings", merged)])
-  let assert [Deliver("#0", _)] = last(events)
-  assert state_of(events, "findings") == JArray([JString("ab"), JString("c")])
-  assert state_of(events, "archive") == JArray([JString("a"), JString("x")])
-}
-
-pub fn llm_merge_call_cap_falls_back_test() {
-  let events = [
-    started(merging(1)),
-    call("#0", "worker", JNull),
-    returned("#0", findings(["a"])),
-    returned(
-      "#0/merge/findings",
-      value.object([#("items", JArray([JString("a")]))]),
-    ),
-    call("#1", "worker", JNull),
-    returned("#1", findings(["b", "c"])),
-  ]
-  let assert [Deliver("#1", _)] = last(events)
-  assert state_of(events, "findings") == JArray([JString("b"), JString("c")])
-  assert state_of(events, "archive") == JArray([JString("a")])
-  assert snapshot_get(replay(events).0, "merge_calls.findings") == JInt(1)
-}
-
-pub fn llm_merge_failure_falls_back_test() {
-  let events = [
-    started(merging(5)),
-    call("#0", "worker", JNull),
-    returned("#0", findings(["a", "b", "c"])),
-    failed("#0/merge/findings", "bad"),
-  ]
-  let assert [Deliver("#0", _)] = last(events)
-  assert state_of(events, "findings") == JArray([JString("b"), JString("c")])
-}
-
-pub fn llm_merge_refused_in_parallel_branch_test() {
-  let events = [
-    started(merging(5)),
-    branch_call("#0.x#0", "x", "worker", JNull),
-    returned("#0.x#0", findings(["a"])),
-  ]
-  let assert [
-    Refuse(Some("#0.x#0"), NonCommutativeWriteInBranch("findings", "x")),
-  ] = last(events)
 }
 
 pub fn top_k_in_parallel_branch_test() {
