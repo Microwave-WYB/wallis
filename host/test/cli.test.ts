@@ -147,7 +147,9 @@ test("fork copies a log prefix into a new run; the original is untouched", () =>
 	const child = logOf(root, forkId);
 	const cut = parent.findIndex((e) => e.type === "requested" && e.id === "#1") + 1;
 	assert.deepEqual(child.slice(0, cut), parent.slice(0, cut));
-	assert.deepEqual(child[cut], { type: "alias_rebound", alias: "writer", from: "fake/default", to: "forked/model" });
+	// The fork is owned by whoever forked it, then rebinds as asked.
+	assert.equal(child[cut]!.type, "claimed");
+	assert.deepEqual(child[cut + 1], { type: "alias_rebound", alias: "writer", from: "fake/default", to: "forked/model" });
 	assert.equal(status(root, forkId).status.type, "finished");
 	assert.equal(status(root, forkId).nodes.find((n) => n.id === "#1")!.model, "forked/model");
 

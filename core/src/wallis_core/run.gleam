@@ -62,6 +62,7 @@ type Run {
     models: Dict(String, String),
     budget: types.Budget,
     executor: Option(String),
+    owner: Option(String),
     state: Dict(String, Value),
     requests: Dict(String, Record),
     journal: Dict(String, Entry),
@@ -121,6 +122,10 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
     NotYetStarted, _ -> #(run, [Refuse(None, NotStarted)])
     Active(_), Started(..) -> #(run, [Refuse(None, AlreadyStarted)])
     Active(r), Resumed(pin:) -> #(run, resume(r, pin))
+    // Ownership changes even on a finished run.
+    Active(r), types.Claimed(owner:) -> #(Active(Run(..r, owner: Some(owner))), [
+      Checkpoint,
+    ])
     Active(Run(lifecycle: Live, ..) as r), _ -> {
       let #(r, effects) = live_event(r, event)
       #(Active(r), effects)
@@ -152,6 +157,7 @@ fn start(
           models: pin.models,
           budget: workflow.budget,
           executor: None,
+          owner: None,
           state:,
           requests: dict.new(),
           journal: dict.new(),
@@ -277,6 +283,7 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
     ExecutorChanged(name:) -> #(Run(..run, executor: Some(name)), [Checkpoint])
     RetryUnavailable -> retry_unavailable(run)
     CancelRequested -> finish(run, Cancelled)
+    types.Claimed(owner:) -> #(Run(..run, owner: Some(owner)), [Checkpoint])
     BodyFinished(output:) -> finish(run, Done(output))
     BodyFailed(reason:) -> finish(run, Failed(reason))
     Started(..) | Resumed(..) -> #(run, [])
@@ -1108,6 +1115,7 @@ pub fn snapshot(run: RunState) -> json.Json {
         #("budget", types.budget_to_json(r.budget)),
         #("models", sorted_object(r.models, json.string)),
         #("executor", json.nullable(r.executor, json.string)),
+        #("owner", json.nullable(r.owner, json.string)),
       ])
   }
 }

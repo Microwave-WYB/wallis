@@ -634,3 +634,16 @@ pub fn interrupted_run_log_equals_uninterrupted_test() {
   assert list.append(log, log2) == expected_log
   assert run.snapshot(s) == run.snapshot(expected)
 }
+
+// --- Ownership ---
+
+pub fn claim_is_logged_and_works_on_finished_runs_test() {
+  let events = [started(basic()), types.Claimed("harness:a")]
+  let #(s, effects, log) = replay(events)
+  assert effects == [Checkpoint]
+  assert list.length(log) == 2
+  assert snapshot_get(s, "owner") == JString("harness:a")
+  let #(s, _, _) =
+    replay_from(s, [types.BodyFinished(JNull), types.Claimed("harness:b")])
+  assert snapshot_get(s, "owner") == JString("harness:b")
+}

@@ -408,6 +408,8 @@ pub type Event {
   ExecutorChanged(name: String)
   RetryUnavailable
   CancelRequested
+  /// Ownership: who may wait on, answer and steer the run.
+  Claimed(owner: String)
   BodyFinished(output: Value)
   BodyFailed(reason: FailReason)
 }
@@ -514,6 +516,11 @@ pub fn event_to_json(event: Event) -> json.Json {
       json.object([
         #("type", json.string("cancel_requested")),
       ])
+    Claimed(owner:) ->
+      json.object([
+        #("type", json.string("claimed")),
+        #("owner", json.string(owner)),
+      ])
     BodyFinished(output:) ->
       json.object([
         #("type", json.string("body_finished")),
@@ -608,6 +615,10 @@ pub fn event_decoder() -> decode.Decoder(Event) {
     }
     "retry_unavailable" -> decode.success(RetryUnavailable)
     "cancel_requested" -> decode.success(CancelRequested)
+    "claimed" -> {
+      use owner <- decode.field("owner", decode.string)
+      decode.success(Claimed(owner:))
+    }
     "body_finished" -> {
       use output <- decode.field("output", json_value.decoder())
       decode.success(BodyFinished(output:))

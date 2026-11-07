@@ -41,7 +41,9 @@ Runs live under `.wallis/runs/` of the project. The CLI (run it with
 ```sh
 wallis run <workflow> --input '{...}' --executor <module>   # until it needs attention
 wallis wait <run>        # in the background: returns when a node asks, the run pauses or ends
-wallis pending           # idle nodes and runs here; prints nothing when there are none
+wallis wait              # in the background: returns when any of your own runs needs attention
+wallis pending           # your idle nodes and runs here; prints nothing when there are none
+wallis claim <run>       # take over a run (a logged event); others' runs are read-only
 wallis send <run> <node> <text>
 wallis resume <run> [--model alias=provider/model:thinking] [--budget usd=60]
 wallis fork <run> --at <events|node> [--model ...]

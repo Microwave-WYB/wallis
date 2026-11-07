@@ -7,7 +7,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Json } from "../sdk/index.ts";
-import { attention, describe, pending, type RunView, waitForAttention } from "./query.ts";
+import { mayControl, NotOwner } from "./owner.ts";
+import { attention, claimable, describe, pending, type RunView, waitForAttention } from "./query.ts";
 import { type Runs, SendRefused } from "./runs.ts";
 import { RunRefused } from "./session.ts";
 import { runPaths, runsDir } from "./store.ts";
@@ -38,14 +39,17 @@ export function createMcpServer(runs: Runs): McpServer {
 	const server = new McpServer({ name: "wallis", version: "0.0.0" }, { instructions: INSTRUCTIONS });
 
 	const reply = (text: string, data?: Json, isError = false): Text => {
-		const items = pending(runs.root);
-		const tail = items.length > 0 ? `\n\nPending in this project:\n${describe(items)}` : "\n\nNothing else is pending in this project.";
+		const items = pending(runs.root, runs.owner);
+		const orphans = claimable(runs.root).filter((v) => !mayControl(runs.owner, v.owner));
+		let tail = items.length > 0 ? `\n\nPending in this project:\n${describe(items)}` : "\n\nNothing else is pending in this project.";
+		if (orphans.length > 0) tail += `\n${orphans.length} run(s) have no live owner and can be claimed: ${orphans.map((v) => v.runId).join(", ")}`;
 		const content: Text["content"] = [{ type: "text", text: `${text}${tail}` }];
 		if (data !== undefined) content.push({ type: "text", text: JSON.stringify(data) });
 		return isError ? { content, isError } : { content };
 	};
 	const failure = (error: unknown): Text => {
 		if (error instanceof RunRefused || error instanceof SendRefused) return reply(`Refused: ${JSON.stringify(error.refusal)}`, { refusal: error.refusal }, true);
+		if (error instanceof NotOwner) return reply(`Not yours: ${error.message}`, { error: "not_owner" }, true);
 		return reply(`Error: ${error instanceof Error ? error.message : String(error)}`, undefined, true);
 	};
 	const data = (view: RunView): Json =>
@@ -128,6 +132,7 @@ export function createMcpServer(runs: Runs): McpServer {
 		},
 		async ({ run_id, timeout_s }) => {
 			try {
+				runs.control(run_id);
 				const dir = runPaths(join(runsDir(runs.root), run_id)).dir;
 				const timeoutMs = Math.min(timeout_s ?? WAIT_CAP_SECONDS, WAIT_CAP_SECONDS) * 1000;
 				const items = await waitForAttention(dir, { timeoutMs });

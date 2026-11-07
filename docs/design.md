@@ -192,6 +192,41 @@ Prototype choices:
   `meta.json`, and reused on resume. There is no default executor until pi
   is built.
 
+## Ownership and notification (decided, round 3)
+
+- A run records its owner. A run started over MCP is owned by the harness
+  process: the parent of `wallis serve`. A CLI caller's owner is its nearest
+  harness ancestor, or the human when there is none.
+- `wallis wait` with no run waits on the caller's own runs. `wait <run>`,
+  `send`, `cancel`, `resume` and `fork` work only on own runs, with a clear
+  error otherwise.
+- The human at a terminal with no harness ancestor owns everything.
+  Read-only queries work on any run.
+- `wallis claim <run>` reassigns ownership, as a logged event (`Claimed`).
+- `wallis pending` lists only own runs, and mentions unowned runs that can
+  be claimed.
+- Notifications carry content: run, node, the question or a result summary
+  (truncated), and how to answer. They go through a `Notifier` interface.
+  The backends now are the background `wait`, the pending hook, and pending
+  items appended to MCP tool results; a Paseo backend comes later.
+
+Prototype choices:
+
+- Identities are `human` or `harness:<name>:<pid>:<start time>`, read from
+  `/proc` (the start time makes a reused pid a different owner).
+  `WALLIS_OWNER` overrides the caller's identity, for tests and scripted
+  callers.
+- Harness names: claude, codex, cursor-agent, cursor, gemini, pi, opencode,
+  aider, goose, amp, paseo. They are matched on the process name or the
+  first arguments, and `WALLIS_HARNESSES` overrides the list.
+- A run is claimable when it is unfinished and its owner is gone: a harness
+  pid that no longer exists with that start time, or no owner at all. An
+  owner without a pid (from `WALLIS_OWNER`) counts as alive.
+- `Claimed` is accepted on finished runs too. Without a live driver, the
+  CLI applies it under the run's lock; otherwise it goes through the inbox.
+- A fork is claimed by whoever forked it.
+- Truncation: questions at 1200 characters, result summaries at 600.
+
 ## Recovery (decided)
 
 - Result-defining changes are refused on resume: workflow digest, pinned

@@ -5,9 +5,10 @@ import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
 import { blobPath, refsIn, shareBlobs } from "./artifacts.ts";
-import { Core, type Event, type IdleReason, type Outcome, type Snapshot } from "./core.ts";
+import { Core, type Event, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
-import { listRuns, lockHolder, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
+import { mayControl, type Owner, ownerAlive } from "./owner.ts";
+import { acquireLock, listRuns, lockHolder, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
 
 export interface RunView {
 	readonly runId: string;
@@ -17,6 +18,9 @@ export interface RunView {
 	readonly stopped: boolean;
 	readonly driver: number | null;
 	readonly events: number;
+	readonly owner: string | null;
+	/** The owner still exists (a harness process that is still running, or the human). */
+	readonly ownerAlive: boolean;
 }
 
 export function inspectRun(dir: string): RunView {
@@ -32,6 +36,8 @@ export function inspectRun(dir: string): RunView {
 		stopped: run.status !== null && run.status.type !== "finished" && driver === null,
 		driver,
 		events: events.length,
+		owner: run.owner ?? null,
+		ownerAlive: ownerAlive(run.owner ?? null),
 	};
 }
 
@@ -72,12 +78,21 @@ export function attentionKey(item: Attention): string {
 	}
 }
 
-/** Idle nodes and idle runs under `root`. */
-export function pending(root: string): Attention[] {
+/** Idle nodes and idle runs under `root`, of runs the caller controls (all of them when no caller is given). */
+export function pending(root: string, caller?: Owner): Attention[] {
 	return listRuns(root)
-		.map((p) => attention(inspectRun(p.dir)))
+		.map((p) => inspectRun(p.dir))
+		.filter((v) => caller === undefined || mayControl(caller, v.owner))
+		.map((v) => attention(v))
 		.flat()
 		.filter((a) => a.kind === "node_idle" || a.kind === "run_idle");
+}
+
+/** Unfinished runs whose owner is gone (or never set): anyone may claim them. */
+export function claimable(root: string): RunView[] {
+	return listRuns(root)
+		.map((p) => inspectRun(p.dir))
+		.filter((v) => v.run.status?.type !== "finished" && !v.ownerAlive);
 }
 
 function describeReason(reason: IdleReason): string {
@@ -89,14 +104,22 @@ function describeReason(reason: IdleReason): string {
 	}
 }
 
+/** Notifications carry content, truncated. */
+export const MESSAGE_CAP = 1200;
+export const RESULT_CAP = 600;
+
+export function truncate(text: string, cap: number): string {
+	return text.length <= cap ? text : `${text.slice(0, cap)}… [${text.length - cap} more chars]`;
+}
+
 function describeOutcome(outcome: Outcome): string {
 	switch (outcome.type) {
 		case "done":
-			return `done: ${JSON.stringify(outcome.value)}`;
+			return `done: ${truncate(JSON.stringify(outcome.value), RESULT_CAP)}`;
 		case "cancelled":
 			return "cancelled";
 		case "failed":
-			return `failed: ${JSON.stringify(outcome.reason)}`;
+			return `failed: ${truncate(JSON.stringify(outcome.reason), RESULT_CAP)}`;
 	}
 }
 
@@ -108,7 +131,9 @@ export function describe(items: readonly Attention[]): string {
 				case "node_idle":
 					return [
 						`Run ${item.runId}: node ${item.node} (${item.agent}) is waiting for a reply:`,
-						...item.message.split("\n").map((l) => `  > ${l}`),
+						...truncate(item.message, MESSAGE_CAP)
+							.split("\n")
+							.map((l) => `  > ${l}`),
 						`Reply with: npx wallis send ${item.runId} '${item.node}' "<your reply>"`,
 					].join("\n");
 				case "run_idle":
@@ -196,4 +221,49 @@ export function exportArtifact(dir: string, selector: string, target: string): s
 	const path = join(target, ref.name);
 	copyFileSync(blobPath(runPaths(dir).dir, ref.digest), path);
 	return path;
+}
+
+/**
+ * Applies a control event (a claim) to a run no process drives: takes the
+ * lock, refolds, steps the core and appends the event if it is accepted.
+ */
+export function applyControl(dir: string, event: Event): Refusal | null {
+	const paths = runPaths(dir);
+	const release = acquireLock(paths);
+	try {
+		const log = new EventLog(paths.log);
+		const core = Core.refold(log.read());
+		const effects = core.step(event);
+		const refused = effects.find((e) => e.type === "refuse");
+		if (refused && refused.type === "refuse") return refused.refusal;
+		if (effects.some((e) => e.type === "checkpoint")) log.append(event);
+		return null;
+	} finally {
+		release();
+	}
+}
+
+/**
+ * Waits on every unfinished run the caller controls: returns when one of
+ * them needs attention (as `waitForAttention` decides), or null on timeout.
+ */
+export async function waitForOwn(root: string, caller: Owner, options: { timeoutMs?: number; pollMs?: number } = {}): Promise<Attention[] | null> {
+	const start = Date.now();
+	const own = () => listRuns(root).map((p) => inspectRun(p.dir)).filter((v) => mayControl(caller, v.owner) && v.run.status?.type !== "finished");
+	const watched = new Set(own().map((v) => v.runId));
+	const baseline = new Set(own().flatMap((v) => attention(v).filter((a) => a.kind === "node_idle").map(attentionKey)));
+	for (;;) {
+		const views = listRuns(root)
+			.map((p) => inspectRun(p.dir))
+			.filter((v) => watched.has(v.runId) || (mayControl(caller, v.owner) && v.run.status?.type !== "finished"));
+		for (const v of views) watched.add(v.runId);
+		const items = views.flatMap((v) => {
+			const all = attention(v);
+			const whole = v.run.status?.type !== "running" || v.stopped;
+			return whole ? all : all.filter((a) => !baseline.has(attentionKey(a)));
+		});
+		if (items.length > 0) return items;
+		if (options.timeoutMs !== undefined && Date.now() - start >= options.timeoutMs) return null;
+		await new Promise((r) => setTimeout(r, options.pollMs ?? 200));
+	}
 }

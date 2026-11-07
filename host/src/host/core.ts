@@ -29,6 +29,7 @@ export type Event =
 	| { type: "executor_changed"; name: string }
 	| { type: "retry_unavailable" }
 	| { type: "cancel_requested" }
+	| { type: "claimed"; owner: string }
 	| { type: "body_finished"; output: Json }
 	| { type: "body_failed"; reason: FailReason };
 
@@ -57,6 +58,7 @@ export type Snapshot = {
 	budget: { usd: number | null; tokens: number | null; turns: number | null; compute_minutes: number | null };
 	models: Record<string, string>;
 	executor: string | null;
+	owner: string | null;
 };
 
 export type Effect =

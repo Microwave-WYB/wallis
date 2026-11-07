@@ -55,6 +55,8 @@ export interface SessionOptions {
 	/** Messages to idle nodes, sent once the body has replayed. */
 	readonly sends?: readonly { readonly node: string; readonly text: string }[];
 	readonly cancel?: boolean;
+	/** New runs: the owner, logged as `claimed` right after `started`. */
+	readonly owner?: string;
 	/** How often to read the inbox, in ms; `null` to not poll. */
 	readonly inboxPollMs?: number | null;
 	/** Lock owner; a parent that spawned this driver may have written it already. */
@@ -228,6 +230,7 @@ export class Session {
 			input = o.input ?? null;
 			this.#refuseOn(this.#feed({ type: "started", workflow: decl.core as unknown as Json, pin, input }));
 			this.#feed({ type: "executor_changed", name: o.executor.id });
+			if (o.owner) this.#feed({ type: "claimed", owner: o.owner });
 		} else {
 			const first = prior[0]!;
 			if (first.type !== "started") throw new Error(`log ${this.paths.log} does not begin with a started event`);
@@ -318,6 +321,7 @@ export class Session {
 			this.#seen.add(entry.id);
 			appendFileSync(this.#doneInbox(), `${entry.id}\n`);
 			if (entry.type === "cancel") this.cancel();
+			else if (entry.type === "claim") this.#feed({ type: "claimed", owner: entry.owner });
 			else {
 				const refusal = this.send(entry.node, entry.text, entry.id);
 				if (refusal) process.stderr.write(`wallis: message ${entry.id} to ${entry.node} refused: ${JSON.stringify(refusal)}\n`);

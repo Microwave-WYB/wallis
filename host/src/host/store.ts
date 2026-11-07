@@ -67,7 +67,7 @@ export interface RunMeta {
 	readonly created: string;
 	readonly forked_from?: { readonly run_id: string; readonly at: number };
 	/** Parameters for the first session of a run started detached. */
-	readonly start?: { readonly input?: Json; readonly seed?: number; readonly models?: Readonly<Record<string, string>> };
+	readonly start?: { readonly input?: Json; readonly seed?: number; readonly models?: Readonly<Record<string, string>>; readonly owner?: string };
 }
 
 export function readMeta(paths: RunPaths): RunMeta | null {
@@ -136,7 +136,10 @@ function releaseLock(paths: RunPaths, pid: number): void {
 
 // --- Inbox ---------------------------------------------------------------------
 
-export type InboxEntry = { readonly id: string; readonly type: "send"; readonly node: string; readonly text: string } | { readonly id: string; readonly type: "cancel" };
+export type InboxEntry =
+	| { readonly id: string; readonly type: "send"; readonly node: string; readonly text: string }
+	| { readonly id: string; readonly type: "cancel" }
+	| { readonly id: string; readonly type: "claim"; readonly owner: string };
 
 export function newMessageId(): string {
 	return `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;

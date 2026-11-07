@@ -13,8 +13,8 @@ import { cli, fakeExecutor, project } from "./util.ts";
 
 type Result = { content: { type: string; text: string }[]; isError?: boolean };
 
-async function connect(root: string) {
-	const server = createMcpServer(new Runs(root, await loadExecutor(fakeExecutor), fakeExecutor));
+async function connect(root: string, owner = "harness:mcp-test") {
+	const server = createMcpServer(new Runs(root, await loadExecutor(fakeExecutor), fakeExecutor, owner));
 	const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
 	await server.connect(serverSide);
 	const client = new Client({ name: "test", version: "0.0.0" });
@@ -83,5 +83,25 @@ test("MCP over stdio: wallis serve lists tools and runs a workflow", async () =>
 		assert.match(w.content[0]!.text, /finished, done/);
 	} finally {
 		await client.close();
+	}
+});
+
+test("MCP: runs belong to the server's harness; another harness may read but not answer", async () => {
+	const root = project();
+	const mine = await connect(root, "harness:mine");
+	const theirs = await connect(root, "harness:theirs");
+	try {
+		const started = await mine.call("run", { workflow: "ask", input: { topic: "x" } });
+		const runId = started.data.run_id as string;
+		await mine.call("wait", { run_id: runId, timeout_s: 10 });
+		const read = await theirs.call("get_run", { run_id: runId });
+		assert.equal(read.isError, false);
+		assert.match(read.text, /Nothing else is pending/, "pending lists only own runs");
+		const send = await theirs.call("send", { run_id: runId, node_id: "#0", text: "hi" });
+		assert.equal(send.isError, true);
+		assert.match(send.text, /owned by harness:mine/);
+	} finally {
+		await mine.close();
+		await theirs.close();
 	}
 });

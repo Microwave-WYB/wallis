@@ -9,6 +9,7 @@ import type { BudgetKind } from "./core.ts";
 import type { Executor, ScriptRunner } from "./executor.ts";
 import { inspectRun, type RunView } from "./query.ts";
 import { type Session, type SessionOptions, startSession } from "./session.ts";
+import { mayControl, NotOwner, type Owner, serverOwner } from "./owner.ts";
 import { newRunId, runPaths, runsDir } from "./store.ts";
 
 export interface ExecutorKit {
@@ -69,11 +70,20 @@ export class Runs {
 	readonly #kit: ExecutorKit;
 	readonly #executorModule: string | null;
 	readonly #live = new Map<string, Session>();
+	/** Who this process acts for: the harness that runs `wallis serve`. */
+	readonly owner: Owner;
 
-	constructor(root: string, kit: ExecutorKit, executorModule: string | null = null) {
+	constructor(root: string, kit: ExecutorKit, executorModule: string | null = null, owner: Owner = serverOwner()) {
 		this.root = resolve(root);
 		this.#kit = kit;
 		this.#executorModule = executorModule;
+		this.owner = owner;
+	}
+
+	/** Changing or answering a run needs ownership; reading does not. */
+	control(runId: string): void {
+		const view = this.view(runId);
+		if (!mayControl(this.owner, view.owner)) throw new NotOwner(runId, view.owner, this.owner);
 	}
 
 	#track(session: Session): Session {
@@ -93,11 +103,12 @@ export class Runs {
 		const name = workflow.split("/").at(-2) ?? "run";
 		const dir = join(runsDir(this.root), newRunId(name));
 		return this.#track(
-			await startSession({ ...this.#options(dir), workflow, input: request.input ?? null, seed: request.seed, models: request.models }),
+			await startSession({ ...this.#options(dir), workflow, input: request.input ?? null, seed: request.seed, models: request.models, owner: this.owner }),
 		);
 	}
 
 	async resume(runId: string, request: ResumeRun = {}): Promise<Session> {
+		this.control(runId);
 		const live = this.#live.get(runId);
 		if (live && !live.settled) {
 			for (const s of request.sends ?? []) {

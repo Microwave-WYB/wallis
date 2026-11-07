@@ -9,6 +9,8 @@
 //   wallis status <run> [--json]
 //   wallis wait <run> [--timeout seconds] [--json]
 //   wallis pending [--json]
+//   wallis claim <run>
+//   wallis wait [<run>] waits on one run, or on all of the caller's own runs
 //   wallis fork <run> --at <events|node> [--model a=m]... [--detach]
 //   wallis export <run> <artifact> <dir>
 //   wallis serve [--executor module]
@@ -21,7 +23,8 @@ import { parseArgs } from "node:util";
 import type { Json } from "../sdk/index.ts";
 import type { BudgetKind } from "../host/core.ts";
 import { EventLog } from "../host/log.ts";
-import { attention, describe, exportArtifact, forkRun, inspectRun, pending, waitForAttention } from "../host/query.ts";
+import { applyControl, attention, claimable, describe, exportArtifact, forkRun, inspectRun, pending, waitForAttention, waitForOwn } from "../host/query.ts";
+import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { ProcessScripts } from "../host/scripts.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
@@ -48,6 +51,13 @@ const { values, positionals } = parseArgs({
 });
 
 const root = resolve(values.root ?? process.cwd());
+const caller = callerIdentity();
+
+/** Commands that change or answer a run work only on the caller's own runs. */
+function control(dir: string): void {
+	const view = inspectRun(dir);
+	if (!mayControl(caller, view.owner)) throw new NotOwner(view.runId, view.owner, caller);
+}
 const [command, ...args] = positionals;
 
 function pairs(list: string[] | undefined): Record<string, string> {
@@ -138,6 +148,7 @@ async function main(): Promise<number> {
 				input: values.input ? (JSON.parse(values.input) as Json) : null,
 				seed: values.seed ? Number(values.seed) : undefined,
 				models: pairs(values.model),
+				owner: caller,
 			};
 			const executor = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? null);
 			writeMeta(runPaths(dir), { run_id: runPaths(dir).id, workflow, root, executor, created: new Date().toISOString(), start });
@@ -153,6 +164,7 @@ async function main(): Promise<number> {
 		case "resume":
 		case "drive": {
 			const dir = command === "drive" ? resolve(args[0]!) : resolveRun(root, args[0] ?? "");
+			if (command === "resume") control(dir);
 			const options = { models: pairs(values.model), budget: budgets(values.budget) };
 			if (values.detach) {
 				detach(dir, [...(values.model ?? []).flatMap((m) => ["--model", m]), ...(values.budget ?? []).flatMap((b) => ["--budget", b])]);
@@ -166,6 +178,7 @@ async function main(): Promise<number> {
 		case "send": {
 			const [run, node, ...words] = args;
 			const dir = resolveRun(root, run ?? "");
+			control(dir);
 			const view = inspectRun(dir);
 			const target = view.run.nodes.find((n) => n.id === node);
 			if (!target || target.status.type !== "node_idle") {
@@ -178,6 +191,7 @@ async function main(): Promise<number> {
 		}
 		case "cancel": {
 			const dir = resolveRun(root, args[0] ?? "");
+			control(dir);
 			if (inspectRun(dir).run.status?.type === "finished") {
 				report(dir);
 				return 0;
@@ -192,27 +206,60 @@ async function main(): Promise<number> {
 			report(resolveRun(root, args[0] ?? ""));
 			return 0;
 		case "wait": {
-			const dir = resolveRun(root, args[0] ?? "");
-			const items = await waitForAttention(dir, values.timeout ? { timeoutMs: Number(values.timeout) * 1000 } : {});
-			if (!items) {
-				out(`Run ${runPaths(dir).id} is still running.`);
-				return 2;
+			const timeout = values.timeout ? { timeoutMs: Number(values.timeout) * 1000 } : {};
+			let items;
+			if (args[0] === undefined) {
+				// No run: wait on the caller's own runs.
+				items = await waitForOwn(root, caller, timeout);
+				if (!items) {
+					out("Your runs are still running.");
+					return 2;
+				}
+			} else {
+				const dir = resolveRun(root, args[0]);
+				control(dir);
+				items = await waitForAttention(dir, timeout);
+				if (!items) {
+					out(`Run ${runPaths(dir).id} is still running.`);
+					return 2;
+				}
 			}
 			out(values.json ? JSON.stringify(items) : describe(items));
 			return 0;
 		}
 		case "pending": {
-			const items = pending(root);
-			if (items.length > 0) out(values.json ? JSON.stringify(items) : describe(items));
+			const items = pending(root, caller);
+			const orphans = claimable(root).filter((v) => !mayControl(caller, v.owner));
+			if (values.json) {
+				if (items.length > 0 || orphans.length > 0) out(JSON.stringify({ pending: items, claimable: orphans.map((v) => v.runId) }));
+				return 0;
+			}
+			if (items.length > 0) out(describe(items));
+			if (orphans.length > 0) {
+				out(`${orphans.length} run(s) have no live owner and can be claimed: ${orphans.map((v) => `npx wallis claim ${v.runId}`).join("; ")}`);
+			}
+			return 0;
+		}
+		case "claim": {
+			const dir = resolveRun(root, args[0] ?? "");
+			const paths = runPaths(dir);
+			if (lockHolder(paths) !== null) await deliver(dir, { id: newMessageId(), type: "claim", owner: caller });
+			else {
+				const refusal = applyControl(dir, { type: "claimed", owner: caller });
+				if (refusal) throw new RunRefused(refusal);
+			}
+			out(`Run ${paths.id} is now owned by ${caller}.`);
 			return 0;
 		}
 		case "fork": {
 			const source = resolveRun(root, args[0] ?? "");
+			control(source);
 			if (!values.at) throw new Error("--at <events|node> is required");
 			const at = /^\d+$/.test(values.at) ? Number(values.at) : values.at;
 			const meta = readMeta(runPaths(source));
 			const name = meta ? (meta.workflow.split("/").at(-2) ?? "run") : "run";
 			const target = forkRun(source, join(runsDir(root), newRunId(name)), at);
+			applyControl(target.dir, { type: "claimed", owner: caller });
 			out(`Forked ${runPaths(source).id} at ${values.at} into ${target.id}.`);
 			if (values.detach) {
 				detach(target.dir, (values.model ?? []).flatMap((m) => ["--model", m]));
@@ -246,6 +293,7 @@ main().then(
 	(code) => process.exit(code),
 	(error: unknown) => {
 		if (error instanceof RunRefused) out(`Refused: ${JSON.stringify(error.refusal)}`);
+		else if (error instanceof NotOwner) process.stderr.write(`wallis: ${error.message}\n`);
 		else process.stderr.write(`wallis: ${error instanceof Error ? error.message : String(error)}\n`);
 		process.exit(1);
 	},
