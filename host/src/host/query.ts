@@ -1,7 +1,10 @@
 // Reading runs without driving them: status from a refold of the log, the
 // derived `stopped`, what needs attention, and agent-readable summaries.
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { ArtifactRef, Json } from "../sdk/index.ts";
+import { blobPath, refsIn, shareBlobs } from "./artifacts.ts";
 import { Core, type Event, type IdleReason, type Outcome, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { listRuns, lockHolder, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
@@ -167,5 +170,30 @@ export function forkRun(source: string, target: string, at: number | string): Ru
 	writeFileSync(to.log, events.slice(0, count).map((e) => `${JSON.stringify(e)}\n`).join(""));
 	const meta = readMeta(from);
 	if (meta) writeMeta(to, { ...meta, run_id: to.id, created: new Date().toISOString(), forked_from: { run_id: from.id, at: count } });
+	shareBlobs(from.dir, to.dir);
 	return to;
+}
+
+/** Every artifact a run's log refers to, in first-seen order. */
+export function artifactsOf(dir: string): ArtifactRef[] {
+	return refsIn(new EventLog(runPaths(dir).log).read() as unknown as Json);
+}
+
+/**
+ * Copies one artifact out of a run, selected by digest (or a prefix of its
+ * hex) or by name, into `target/<name>`. Promoting artifacts across runs is
+ * the main agent's job; this is the only way out.
+ */
+export function exportArtifact(dir: string, selector: string, target: string): string {
+	const refs = artifactsOf(dir);
+	const hex = selector.replace(/^sha256:/, "");
+	const matches = refs.filter((r) => r.name === selector || r.digest.slice("sha256:".length).startsWith(hex));
+	const digests = new Set(matches.map((m) => m.digest));
+	if (digests.size === 0) throw new Error(`run ${runPaths(dir).id} has no artifact ${selector}`);
+	if (digests.size > 1) throw new Error(`artifact ${selector} is ambiguous: ${[...digests].join(", ")}`);
+	const ref = matches[0]!;
+	mkdirSync(target, { recursive: true });
+	const path = join(target, ref.name);
+	copyFileSync(blobPath(runPaths(dir).dir, ref.digest), path);
+	return path;
 }

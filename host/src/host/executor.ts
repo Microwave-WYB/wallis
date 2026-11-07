@@ -14,9 +14,10 @@
 //   `ExecutorUnavailable` (provider, auth, billing), leaves the call
 //   incomplete and pauses the run.
 
-import type { Json } from "../sdk/index.ts";
+import type { ArtifactRef, Json } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 import { schemaErrors } from "../sdk/validate.ts";
+import type { NodeDirs } from "./artifacts.ts";
 import type { Message, Usage, Write } from "./core.ts";
 
 export type AgentDeclaration = Declarations["agents"][string];
@@ -37,6 +38,10 @@ export interface AgentCall {
 	readonly transcript: readonly Message[];
 	/** JSON Schema of the result: pass it to the provider as structured output and check `submit_result` with it. */
 	readonly outputSchema: Json;
+	/** The node's dirs: its sandbox level, mounted input artifacts, scratch dir and data dirs. */
+	readonly workspace: NodeDirs;
+	/** The `export_artifact` tool: stores a file from the node's scratch dir and returns its ref for `submit_result`. */
+	readonly exportArtifact: (path: string, media: string, name?: string) => ArtifactRef;
 }
 
 export type AgentTurn =
@@ -74,6 +79,8 @@ export interface ScriptCall {
 	readonly computeMinutes: number | null;
 	readonly digest: string;
 	readonly outputSchema: Json;
+	readonly workspace: NodeDirs;
+	readonly resources: { readonly gpu?: number; readonly memoryGb?: number };
 }
 
 export interface ScriptResult {

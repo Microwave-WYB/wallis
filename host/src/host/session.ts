@@ -17,14 +17,16 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import type { Json, Refusal } from "../sdk/index.ts";
+import type { ArtifactRef, Json, Refusal } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors } from "../sdk/validate.ts";
+import { ArtifactError, discardNode, manifestDigest, type NodeDirs, prepareNode, resolveDrafts } from "./artifacts.ts";
 import { bundleWorkflow } from "./bundle.ts";
 import { Core, type BudgetKind, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
 import { type AgentCall, AgentFailure, type Executor, type ScriptRunner } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
+import { type LocalProfile, loadProfile } from "./profile.ts";
 import { Sandbox } from "./sandbox.ts";
 import { acquireLock, newMessageId, readInbox, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
 
@@ -46,6 +48,8 @@ export interface SessionOptions {
 	/** New run: call-time alias remaps. Resume: rebinds, each logged as `alias_rebound`. */
 	readonly models?: Readonly<Record<string, string>>;
 	readonly profile?: Profile;
+	/** The local profile (data dirs, provider limits, slots). Defaults to the one on disk. */
+	readonly local?: LocalProfile;
 	/** Resume: raised limits, each logged as `budget_raised`. */
 	readonly budget?: Readonly<Partial<Record<BudgetKind, number>>>;
 	/** Messages to idle nodes, sent once the body has replayed. */
@@ -140,6 +144,7 @@ export class Session {
 	#core = new Core();
 	#sandbox: Sandbox | null = null;
 	#decl!: Declarations;
+	#local!: LocalProfile;
 	#resumed = false;
 	#settled = false;
 	#timer: ReturnType<typeof setInterval> | null = null;
@@ -203,7 +208,10 @@ export class Session {
 		});
 		const decl = this.#sandbox.declare();
 		this.#decl = decl;
-		const inputs = Object.fromEntries(decl.pin.files.map((f) => [f, digestFile(resolve(this.#root, f))]));
+		this.#local = o.local ?? loadProfile(this.#root);
+		const inputs: Record<string, string> = Object.fromEntries(decl.pin.files.map((f) => [f, digestFile(resolve(this.#root, f))]));
+		// Datasets are mounted, not copied: their manifest digest is pinned.
+		for (const name of this.#dataNames()) inputs[`data.${name}`] = manifestDigest(this.#dataPath(name));
 
 		let input: Json;
 		let seed: number;
@@ -212,7 +220,7 @@ export class Session {
 			seed = o.seed ?? 0;
 			const pin: Pin = {
 				workflow_digest: this.#digest,
-				models: resolveModels(decl.core.name, decl.models, { callTime: o.models, profile: o.profile }),
+				models: resolveModels(decl.core.name, decl.models, { callTime: o.models, profile: o.profile ?? this.#local.models }),
 				seed,
 				inputs,
 				semantics: SEMANTICS,
@@ -260,6 +268,21 @@ export class Session {
 		if (!this.#settled && poll !== null) {
 			this.#timer = setInterval(() => this.#later(() => this.#drainInbox()), poll);
 		}
+	}
+
+	#dataNames(): string[] {
+		const names = [...Object.values(this.#decl.agents).flatMap((a) => a.data), ...Object.values(this.#decl.scripts).flatMap((s) => s.data)];
+		return [...new Set(names)].sort();
+	}
+
+	#dataPath(name: string): string {
+		const path = this.#local.data?.[name];
+		if (!path) throw new Error(`data dir ${name} is not in the local profile (data.${name} in .wallis/profile.json)`);
+		return resolve(this.#root, path);
+	}
+
+	#dirs(id: string, level: NodeDirs["level"], input: Json, data: readonly string[]): NodeDirs {
+		return prepareNode(this.paths.dir, id, level, input, Object.fromEntries(data.map((n) => [n, this.#dataPath(n)])));
 	}
 
 	#preflight(): void {
@@ -413,6 +436,7 @@ export class Session {
 
 	#callAgent(effect: Extract<Effect, { type: "call_agent" }>): void {
 		const declaration = this.#decl.agents[effect.agent]!;
+		const workspace = this.#dirs(effect.id, declaration.sandbox, effect.input, declaration.data);
 		const call: AgentCall = {
 			id: effect.id,
 			agent: effect.agent,
@@ -425,8 +449,12 @@ export class Session {
 			digest: effect.digest,
 			transcript: effect.transcript,
 			outputSchema: declaration.output as unknown as Json,
+			workspace,
+			exportArtifact: (path, media, name) =>
+				resolveDrafts(name === undefined ? { artifact: path, media } : { artifact: path, media, name }, this.paths.dir, workspace.scratch) as unknown as ArtifactRef,
 		};
 		const base = { id: effect.id, model: effect.model };
+		const done = () => discardNode(this.paths.dir, effect.id);
 		this.#options.executor.call(call).then(
 			(turn) =>
 				this.#later(() => {
@@ -435,14 +463,28 @@ export class Session {
 						this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
 						return;
 					}
-					const emits = [...(turn.emits ?? [])];
-					const invalid = this.#resultErrors(effect, turn.output, emits);
+					let output: Json;
+					let emits: { field: string; value: Json }[];
+					try {
+						output = resolveDrafts(turn.output, this.paths.dir, call.workspace.scratch);
+						emits = (turn.emits ?? []).map((e) => ({ field: e.field, value: resolveDrafts(e.value, this.paths.dir, call.workspace.scratch) }));
+					} catch (error) {
+						if (!(error instanceof ArtifactError)) throw error;
+						this.#feed({ type: "agent_failed", ...base, error: error.message, usage });
+						done();
+						return;
+					}
+					const invalid = this.#resultErrors(effect, output, emits);
 					if (invalid) this.#feed({ type: "agent_failed", ...base, error: invalid, usage });
-					else this.#feed({ type: "agent_returned", ...base, output: turn.output, emits, usage });
+					else this.#feed({ type: "agent_returned", ...base, output, emits, usage });
+					done();
 				}),
 			(error: unknown) =>
 				this.#later(() => {
-					if (error instanceof AgentFailure) this.#feed({ type: "agent_failed", ...base, error: error.message, usage: error.usage ?? NO_USAGE });
+					if (error instanceof AgentFailure) {
+						this.#feed({ type: "agent_failed", ...base, error: error.message, usage: error.usage ?? NO_USAGE });
+						done();
+					}
 					else this.#feed({ type: "executor_failed", id: effect.id, error: errorText(error) });
 				}),
 		);
@@ -456,6 +498,14 @@ export class Session {
 			return;
 		}
 		const declaration = this.#decl.scripts[effect.script];
+		let workspace: NodeDirs;
+		try {
+			workspace = this.#dirs(id, declaration?.sandbox ?? "workspace", effect.args, declaration?.data ?? []);
+		} catch (error) {
+			queueMicrotask(() => this.#later(() => this.#feed({ type: "script_failed", id, error: errorText(error), minutes: 0 })));
+			return;
+		}
+		const done = () => discardNode(this.paths.dir, id);
 		runner
 			.run({
 				id,
@@ -464,18 +514,34 @@ export class Session {
 				computeMinutes: effect.compute_minutes,
 				digest: effect.digest,
 				outputSchema: (declaration?.output ?? {}) as Json,
+				workspace,
+				resources: declaration?.resources ?? {},
 			})
 			.then(
 				(result) =>
 					this.#later(() => {
-						const errors = declaration ? schemaErrors(declaration.output, result.output) : [];
+						let output: Json;
+						try {
+							output = resolveDrafts(result.output, this.paths.dir, workspace.scratch);
+						} catch (error) {
+							if (!(error instanceof ArtifactError)) throw error;
+							this.#feed({ type: "script_failed", id, error: error.message, minutes: result.minutes });
+							done();
+							return;
+						}
+						const errors = declaration ? schemaErrors(declaration.output, output) : [];
 						if (errors.length > 0) {
 							this.#feed({ type: "script_failed", id, error: `output does not match its schema: ${errors.join("; ")}`, minutes: result.minutes });
 						} else {
-							this.#feed({ type: "script_returned", id, output: result.output, minutes: result.minutes });
+							this.#feed({ type: "script_returned", id, output, minutes: result.minutes });
 						}
+						done();
 					}),
-				(error: unknown) => this.#later(() => this.#feed({ type: "script_failed", id, error: errorText(error), minutes: 0 })),
+				(error: unknown) =>
+					this.#later(() => {
+						this.#feed({ type: "script_failed", id, error: errorText(error), minutes: 0 });
+						done();
+					}),
 			);
 	}
 

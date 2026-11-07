@@ -139,6 +139,7 @@ function agentDeclaration(agent: AgentDef) {
 		skills: agent.skills,
 		needs: agent.needs ?? {},
 		sandbox: agent.sandbox,
+		data: agent.data,
 		max_turns: agent.maxTurns,
 	};
 }
@@ -174,7 +175,9 @@ export function declarations(def: WorkflowDef) {
 		models: spec.models.table,
 		pin: { files: [...(spec.pin?.files ?? [])] },
 		agents: Object.fromEntries(spec.agents.map((a) => [a.name, agentDeclaration(a)])),
-		scripts: Object.fromEntries(scripts.map((s) => [s.name, { description: s.description, input: s.input, output: s.output }])),
+		scripts: Object.fromEntries(
+			scripts.map((s) => [s.name, { description: s.description, input: s.input, output: s.output, sandbox: s.sandbox, data: s.data, resources: s.resources }]),
+		),
 		/** Per state field: the schema every write must match. */
 		fields: Object.fromEntries(Object.entries(spec.state.fields).map(([name, r]) => [name, r.schema])),
 		mcp: spec.mcp?.config ?? null,

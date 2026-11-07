@@ -39,6 +39,8 @@ the SIDERIUS code, the code's behavior is noted here.
 | Trial rounds, `force_formal_round`, `formal_round_strategy = full_clone` | `isTrial = round < maxRounds`. The Formal round inherits the best Trial config. |
 | `attempts_per_round = 3`, `attempts_per_formal_round = 5`, `max_fail_rounds = 3` | `input.tuning.*`. OOM and gate refusals count as attempts. |
 | Training, inference and `evaluate_metric` skills | Scripts `train` and `evaluate`. Trial and formal time and epoch caps are script arguments. |
+| Model plugin and checkpoints on disk (`iteration_NNN/attempt_NNN/impl_NNN/`, plugin dirs) | Artifacts: the implementor exports the plugin (`ModelPlugin`), `train` mounts it with the dataset and returns a `Checkpoint` artifact, which `evaluate` and Health mount. Nodes share no directories. |
+| `resolved_data_scope` data files | The dataset is mounted read-only from the local profile (`data.siderius_data`); its manifest digest is pinned next to `data_scope.json` |
 | Health (`round_health.py`), effective Health config | Script `health` on every scored round. `siderius/health_config.yaml` is pinned. |
 | `best_denoising_score` vs `best_valid_formal_denoising_score` | `best_score` (unfiltered) vs `best_valid_formal_score` (Formal and Health-valid); only the latter drives the incumbent and the cache rank. |
 | Collapse fingerprints, `collapse_fingerprint_history` | Script `fingerprint`, then `pruneCollapse` (window 3, at most 8 per model) and `replace` |
@@ -143,11 +145,15 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 17. **Compute budgets.** SIDERIUS budgets wall time per attempt (Trial and
     Formal), VRAM (`trial_vram_budget_gb`, `gpu_pair_ceiling_gib`), epochs
     and data portions. Here they are script arguments plus one run-level
-    `computeMinutes`. The prototype host has no real script sandbox, so
-    nothing enforces them.
-18. **Resource envelope and access policy for data analysis.** The
-    anti-leakage policy, per-skill timeouts, device and memory are declared
-    only as `sandbox: "read-only"` and a tool. Nothing enforces them.
+    `computeMinutes` (a script is killed when it runs out). `train` and
+    `evaluate` declare `resources` (GPU, memory) and wait for machine slots;
+    VRAM is not measured.
+18. **Resource envelope and access policy for data analysis.** Scripts run
+    under bubblewrap and see only their input artifacts, the mounted dataset
+    and their scratch dir. Not expressed: SIDERIUS's anti-leakage policy
+    (which files and columns an analysis may read), per-skill timeouts,
+    device and memory envelopes. The analysis agent's `read-only` level is
+    enforced by the executor's tool layer.
 19. **Scheduling.** `scheduling_mode: parallel` and `host_budget` (parallel
     chains in the candidate worker) are not expressed. The loop is serial.
 20. **Telemetry.** SIDERIUS writes token rows labeled by node, iteration and

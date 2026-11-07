@@ -275,6 +275,60 @@ Prototype choices:
 - The log keeps only a call's final valid output, with the usage of the whole
   call.
 
+## Artifacts and per-node workspaces (decided)
+
+- **Artifacts.** Files handed downstream are typed artifacts in outputs:
+  `Artifact(media)` = `{ digest: "sha256:…", name, media }`. The host copies
+  each into the run's content-addressed store, `.wallis/runs/<id>/blobs/`.
+  The journal and replay carry refs only. A fork shares blobs (hardlink, or
+  copy across filesystems).
+- **Sandbox levels:**
+  - `none`: no filesystem tools at all;
+  - `read-only`: read-only mounts of the node's input artifacts and its
+    declared data dirs (named in the local profile);
+  - `workspace`: the same plus a private writable scratch dir.
+  A node's dirs live while it runs or is idle and are deleted when it is
+  done; files not exported as artifacts are discarded. No directory is
+  shared between nodes.
+- **Scripts follow the same model.** `train` mounts the model artifact and
+  the data and returns the checkpoint as an artifact.
+- **Datasets** are mounted, not copied; their manifest digest goes into the
+  pin, so a changed dataset is a result-defining change.
+- **Enforcement** uses bubblewrap on Linux for scripts. Without it, the host
+  warns and runs unconfined (`confine: "auto"`) or refuses
+  (`confine: "require"`); tests skip the confinement assertions with a
+  message.
+- `wallis export <run> <artifact> <dir>` copies an artifact out. Promoting
+  artifacts across runs is the main agent's job; wallis has no other
+  cross-run mechanism.
+
+Prototype choices:
+
+- Layout: `blobs/<sha256 hex>` (read-only files), and per node
+  `work/<node>/inputs/<hex>/<name>` (hardlinked input artifacts) and
+  `work/<node>/scratch/`.
+- Producers name files with drafts: a script's output may contain
+  `{ "artifact": "<path in scratch>", "media": "…" }`, which the host stores
+  and replaces with a ref before the output is checked and logged. A draft
+  outside the scratch dir is an error. Agents call `export_artifact`
+  (`AgentCall.exportArtifact` for executors) and submit the ref.
+- Scripts get `WALLIS_INPUTS`, `WALLIS_SCRATCH`, `WALLIS_DATA_<NAME>` and
+  `WALLIS_COMPUTE_MINUTES`. They read JSON args on stdin and write JSON to
+  stdout. The interpreter follows the extension: `.py` python3, `.sh` sh,
+  `.mjs`/`.js`/`.ts` node.
+- bwrap mounts: `/usr` and `/etc` read-only, the merged-`/usr` symlinks, the
+  interpreter's prefix and the scripts dir read-only, inputs and data
+  read-only, scratch read-write. It also gives private `/proc`, `/dev` and
+  `/tmp`, no network, a clean environment, and kills the sandbox when the
+  host dies.
+- A dataset manifest digest covers the sorted relative paths, sizes and
+  mtimes of its files. A content change that keeps size and mtime is not
+  detected.
+- The local profile is `~/.config/wallis/profile.json` merged with
+  `<project>/.wallis/profile.json` (the project wins). It holds `models`
+  (global and per-workflow remaps), `data` (name → dir), `providers`
+  (concurrent LLM calls) and `slots` (machine resources).
+
 ## State, views and reducers (proposed)
 
 - One state per run. Agents never touch it directly: they read through a view

@@ -46,6 +46,46 @@ export type McpSelection<J extends McpConfig> = {
 	readonly [S in keyof J["mcpServers"] & string]?: readonly string[] | "*";
 };
 
+// --- Artifacts -------------------------------------------------------------------
+
+/**
+ * A file handed downstream: a reference into the run's content-addressed
+ * store (`.wallis/runs/<id>/blobs/`). Journal and replay carry only refs.
+ */
+export function Artifact<const M extends string = string>(media?: M) {
+	return Type.Object(
+		{
+			digest: Type.String({ pattern: "^sha256:[0-9a-f]{64}$" }),
+			name: Type.String({ minLength: 1 }),
+			media: (media === undefined ? Type.String() : Type.Literal(media)) as M extends string ? ReturnType<typeof Type.Literal<M>> : never,
+		},
+		{ additionalProperties: false },
+	);
+}
+
+export type ArtifactRef = { readonly digest: string; readonly name: string; readonly media: string };
+
+/**
+ * How a producer (a script, or an agent's `export_artifact` tool) names a
+ * file in its scratch dir; the host stores it and replaces the draft with an
+ * `ArtifactRef` before the result is checked and logged.
+ */
+export type ArtifactDraft = { readonly artifact: string; readonly media: string; readonly name?: string };
+
+/**
+ * What a node may touch on disk. `none`: no filesystem tools. `read-only`:
+ * its input artifacts and declared data dirs, read-only. `workspace`: the
+ * same plus a private writable scratch dir, kept while the node is idle and
+ * deleted when it is done.
+ */
+export type SandboxLevel = "none" | "read-only" | "workspace";
+
+/** Machine resources a script needs; scripts wait for a free slot. */
+export interface Resources {
+	readonly gpu?: number;
+	readonly memoryGb?: number;
+}
+
 // --- Scripts and tools ---------------------------------------------------------
 
 /** A domain script under `scripts/`, run in the sandbox. Args and output are checked against the schemas. */
@@ -55,6 +95,11 @@ export interface ScriptDef<I extends TSchema = TSchema, O extends TSchema = TSch
 	readonly description: string;
 	readonly input: I;
 	readonly output: O;
+	/** Default `workspace`: input artifacts and data read-only, a private scratch dir. */
+	readonly sandbox: SandboxLevel;
+	/** Data dirs (names from the local profile), mounted read-only. */
+	readonly data: readonly string[];
+	readonly resources: Resources;
 }
 
 export function defineScript<I extends TSchema, O extends TSchema>(spec: {
@@ -62,8 +107,11 @@ export function defineScript<I extends TSchema, O extends TSchema>(spec: {
 	readonly description?: string;
 	readonly input: I;
 	readonly output: O;
+	readonly sandbox?: SandboxLevel;
+	readonly data?: readonly string[];
+	readonly resources?: Resources;
 }): ScriptDef<I, O> {
-	return { kind: "script", description: "", ...spec };
+	return { kind: "script", description: "", sandbox: "workspace", data: [], resources: {}, ...spec };
 }
 
 export interface ToolDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
@@ -274,8 +322,10 @@ export interface AgentSpec<M extends ModelTable, F extends Fields, J extends Mcp
 	readonly maxTurns?: number;
 	/** Capabilities checked in preflight. */
 	readonly needs?: { readonly structuredOutput?: boolean; readonly toolCalls?: boolean; readonly contextTokens?: number };
-	/** Sandbox for scripts and `sandbox_exec`. `none` means no filesystem at all. */
-	readonly sandbox?: "none" | "read-only" | "workspace";
+	/** What the node may touch on disk; see `SandboxLevel`. Default `none`. */
+	readonly sandbox?: SandboxLevel;
+	/** Data dirs (names from the local profile), mounted read-only. */
+	readonly data?: readonly string[];
 }
 
 export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
@@ -292,7 +342,8 @@ export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSche
 	readonly skills: readonly string[];
 	readonly maxTurns: number;
 	readonly needs: AgentSpec<ModelTable, Fields, McpConfig, I, O>["needs"];
-	readonly sandbox: "none" | "read-only" | "workspace";
+	readonly sandbox: SandboxLevel;
+	readonly data: readonly string[];
 }
 
 const NO_VIEW: ViewSpec = { fields: [], maxChars: 0, maxItems: 0 };
@@ -316,6 +367,7 @@ export function defineAgent<const M extends ModelTable, const F extends Fields, 
 		maxTurns: spec.maxTurns ?? 16,
 		needs: spec.needs,
 		sandbox: spec.sandbox ?? "none",
+		data: spec.data ?? [],
 	};
 }
 

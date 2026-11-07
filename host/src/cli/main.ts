@@ -10,6 +10,7 @@
 //   wallis wait <run> [--timeout seconds] [--json]
 //   wallis pending [--json]
 //   wallis fork <run> --at <events|node> [--model a=m]... [--detach]
+//   wallis export <run> <artifact> <dir>
 //   wallis serve [--executor module]
 
 import { spawn } from "node:child_process";
@@ -20,7 +21,7 @@ import { parseArgs } from "node:util";
 import type { Json } from "../sdk/index.ts";
 import type { BudgetKind } from "../host/core.ts";
 import { EventLog } from "../host/log.ts";
-import { attention, describe, forkRun, inspectRun, pending, waitForAttention } from "../host/query.ts";
+import { attention, describe, exportArtifact, forkRun, inspectRun, pending, waitForAttention } from "../host/query.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
 import { acquireLock, appendInbox, lockHolder, newMessageId, newRunId, readMeta, runPaths, runsDir, writeMeta } from "../host/store.ts";
@@ -216,6 +217,12 @@ async function main(): Promise<number> {
 			}
 			await drive(target.dir, { models: pairs(values.model) });
 			report(target.dir);
+			return 0;
+		}
+		case "export": {
+			const [run, artifact, target] = args;
+			if (!artifact || !target) throw new Error("usage: wallis export <run> <artifact digest or name> <dir>");
+			out(`Exported ${exportArtifact(resolveRun(root, run ?? ""), artifact, resolve(target))}`);
 			return 0;
 		}
 		case "serve": {

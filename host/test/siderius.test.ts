@@ -3,7 +3,7 @@
 // and the carried state fit together, not SIDERIUS itself.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -80,7 +80,10 @@ function agents(overrides: Record<string, unknown> = {}) {
 				},
 			};
 		},
-		implement: { output: { model_file_path: "plugins/model.py", config_path: "plugins/config.yaml", capability_metadata: {} } },
+		implement: (call: AgentCall) => {
+			writeFileSync(join(call.workspace.scratch!, "model.py"), "class Model: pass\n");
+			return { submit: { model: call.exportArtifact("model.py", "text/x-python"), capability_metadata: {} } };
+		},
 		// The first review of each candidate fails, the retry passes.
 		validate: [
 			{ output: { passed: false, error: "gradient does not flow", error_signatures: [{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad", last_frames: ["forward"] }] } },
@@ -99,7 +102,14 @@ function scripts() {
 	return new FakeScripts({
 		metric_order: { output: { metric_id: "mse_gain", direction: "higher_is_better" }, minutes: 0 },
 		validate: { output: { passed: true, error: null, checks: { plugin_loads: true } }, minutes: 1 },
-		train: (call: ScriptCall) => ({ output: { status: "ok", checkpoint: `ck-${(call.args as { scope: string }).scope}`, minutes: 2 }, minutes: 2 }),
+		// train gets the model plugin as a mounted artifact and returns the checkpoint as one.
+		train: (call: ScriptCall) => {
+			const model = (call.args as { model: { digest: string; name: string } }).model;
+			const plugin = readFileSync(join(call.workspace.inputs, model.digest.slice(7), model.name), "utf8");
+			const scope = (call.args as { scope: string }).scope;
+			writeFileSync(join(call.workspace.scratch!, "ckpt.bin"), `${plugin}${scope}`);
+			return { output: { status: "ok", checkpoint: { artifact: "ckpt.bin", media: "application/x-checkpoint" }, minutes: 2 } as never, minutes: 2 };
+		},
 		// Scores rise, then dip: the cache must keep the best plus the current model.
 		evaluate: () => {
 			const n = evaluations++;
@@ -116,12 +126,16 @@ function scripts() {
 	});
 }
 
+const local = { data: { siderius_data: "data" } };
+
 function projectRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "wallis-siderius-"));
 	mkdirSync(join(root, "siderius"));
 	writeFileSync(join(root, "siderius/data_scope.json"), JSON.stringify(["data/train.h5ad"]));
 	writeFileSync(join(root, "siderius/health_config.yaml"), "gates: [variance_collapse]\n");
 	writeFileSync(join(root, "siderius/advice.md"), "Prefer simple losses.\n");
+	mkdirSync(join(root, "data"));
+	writeFileSync(join(root, "data", "train.h5ad"), "cells");
 	return root;
 }
 
@@ -130,7 +144,7 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 
 	const executor = agents();
 	const runner = scripts();
-	const result = await runWorkflow({ workflow, dir: join(root, "run"), executor, scripts: runner, input, root, seed: 11, inboxPollMs: null });
+	const result = await runWorkflow({ workflow, dir: join(root, "run"), executor, scripts: runner, input, root, seed: 11, inboxPollMs: null, local });
 	assert.equal(result.outcome?.type, "done", JSON.stringify(result.status));
 	const out = (result.outcome as unknown as { value: { stop_reason: string; iterations: number; incumbent: { score: number } } }).value;
 	assert.equal(out.stop_reason, "iterations_exhausted");
@@ -190,13 +204,13 @@ test("JudgeStop request_input: the stop-check node asks the operator, and the re
 			stop_check: conversation({ idle: question }, { submit: { decision: "stop", note: "operator agreed" } }),
 		});
 	const askInput = { ...input, stops: { noImprovementBodies: 0, judgeCriterion: "stop when evidence repeats", judgeOnMet: "request_input" } };
-	const first = await runWorkflow({ workflow, dir, executor: make(), scripts: scripts(), input: askInput, root, seed: 11, inboxPollMs: null });
+	const first = await runWorkflow({ workflow, dir, executor: make(), scripts: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local });
 	assert.deepEqual(first.status, { type: "idle", reason: null });
 	const asking = first.run.nodes.find((n) => n.agent === "stop_check")!;
 	assert.deepEqual(asking.status, { type: "node_idle", last_message: question });
 
 	const executor = make();
-	const done = await runWorkflow({ workflow, dir, executor, scripts: scripts(), root, sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
+	const done = await runWorkflow({ workflow, dir, executor, scripts: scripts(), root, local, sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
 	const out = (done.outcome as unknown as { value: { stop_reason: string; iterations: number } }).value;
 	assert.equal(out.stop_reason, "operator_stop");
 	assert.equal(out.iterations, 2);

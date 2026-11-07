@@ -7,6 +7,7 @@
 
 import {
 	AgentFailed,
+	Artifact,
 	append,
 	countByKey,
 	defineAgent,
@@ -145,33 +146,49 @@ const S = Type.Script(
 
 const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheEntry, CollapseEntry, Evidence, Incumbent, Proposal, Scope, Direction, HealthCheck, SkillInput, SkillOutput } = S;
 
+// --- Artifacts and data ------------------------------------------------------------
+//
+// Files handed downstream are artifacts: the implementor exports the model
+// plugin, train mounts it and returns the checkpoint, evaluate and Health
+// mount the checkpoint. The dataset is mounted read-only from the local
+// profile (`data.siderius_data`); its manifest digest is pinned.
+
+const ModelPlugin = Artifact("text/x-python");
+const Checkpoint = Artifact("application/x-checkpoint");
+const DATA = "siderius_data";
+
 // --- Scripts: the task package's domain code, with typed args and outputs ------
 
 const trainScript = defineScript({
 	name: "train",
 	description: "Train one candidate config on the trial or formal scope (training_skill).",
-	input: Type.Script({ Config, Scope, Int }, `{
-		config: Config, scope: Scope, max_epochs: Int, time_budget_minutes: number,
-		seed: Int, data_scope: string
+	input: Type.Script({ ModelPlugin, Config, Scope, Int }, `{
+		model: ModelPlugin, config: Config, scope: Scope, max_epochs: Int,
+		time_budget_minutes: number, seed: Int, data_scope: string
 	}`),
-	output: Type.Script(`{
+	output: Type.Script({ Checkpoint }, `{
 		status: "ok" | "oom" | "gate_refused" | "infrastructure_abort",
-		checkpoint: string | null, minutes: number
+		checkpoint: Checkpoint | null, minutes: number
 	}`),
+	data: [DATA],
+	resources: { gpu: 1, memoryGb: 32 },
 });
 
 const evaluateScript = defineScript({
 	name: "evaluate",
 	description: "Score a checkpoint on the trial or formal evaluation portion (inference_skill, evaluate_metric).",
-	input: Type.Script({ Scope }, `{ checkpoint: string, scope: Scope }`),
+	input: Type.Script({ Checkpoint, Scope }, `{ checkpoint: Checkpoint, scope: Scope }`),
 	output: Type.Script({ Score }, `{ scoreable: boolean, score: Score, metric_id: string }`),
+	data: [DATA],
+	resources: { gpu: 1, memoryGb: 16 },
 });
 
 const healthScript = defineScript({
 	name: "health",
 	description: "Run the scientific Health gates of the effective Health config (round_health.py).",
-	input: Type.Script(`{ checkpoint: string, health_config: string, model_type: string }`),
+	input: Type.Script({ Checkpoint }, `{ checkpoint: Checkpoint, health_config: string, model_type: string }`),
 	output: Type.Script({ HealthCheck }, `{ valid: boolean, policy: "blocking" | "recording", failed_checks: HealthCheck[] }`),
+	data: [DATA],
 });
 
 const fingerprintScript = defineScript({
@@ -191,7 +208,7 @@ const metricOrderScript = defineScript({
 const validateScript = defineScript({
 	name: "validate",
 	description: "Deterministic validator checks 1-7 and 9.",
-	input: Type.Script({ Int }, `{ model_file_path: string, probe_seed: Int }`),
+	input: Type.Script({ ModelPlugin, Int }, `{ model: ModelPlugin, probe_seed: Int }`),
 	output: Type.Script(`{ passed: boolean, error: string | null, checks: Record<string, boolean> }`),
 });
 
@@ -311,6 +328,7 @@ const dataAnalyst = defineAgent(env, {
 	writes: { evidence: "evidence" },
 	tools: [runSkill],
 	sandbox: "read-only",
+	data: [DATA],
 	maxTurns: 24,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -362,7 +380,8 @@ const implementor = defineAgent(env, {
 	model: "implement",
 	prompt: implementPrompt,
 	input: Type.Object({ proposal: Proposal, previous_validation_failure: Type.Union([Type.String(), Type.Null()]), probe_seed: Type.Integer() }),
-	output: Type.Object({ model_file_path: Type.String(), config_path: Type.String(), capability_metadata: Type.Record(Type.String(), Type.String()) }),
+	// The plugin is exported from the node's scratch dir as an artifact.
+	output: Type.Object({ model: ModelPlugin, capability_metadata: Type.Record(Type.String(), Type.String()) }),
 	sandbox: "workspace",
 	maxTurns: 40,
 	needs: { structuredOutput: true, toolCalls: true },
@@ -372,7 +391,7 @@ const validator = defineAgent(env, {
 	name: "validate",
 	model: "validate",
 	prompt: validatePrompt,
-	input: Type.Object({ model_file_path: Type.String(), deterministic_report: validateScript.output }),
+	input: Type.Object({ model: ModelPlugin, deterministic_report: validateScript.output }),
 	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), error_signatures: Type.Array(RawSignature) }),
 	sandbox: "read-only",
 	maxTurns: 4,
@@ -559,7 +578,7 @@ const ImplementInput = Type.Object({
 
 const ImplementOutput = Type.Object({
 	passed: Type.Boolean(),
-	model_file_path: Type.Union([Type.String(), Type.Null()]),
+	model: Type.Union([ModelPlugin, Type.Null()]),
 	attempts: Type.Integer(),
 	last_error: Type.Union([Type.String(), Type.Null()]),
 	error_signatures: Type.Array(RawSignature),
@@ -578,15 +597,15 @@ const implementAndValidate = subWorkflow({
 				previous_validation_failure: feedback,
 				probe_seed: probeSeed(input.seed, input.iteration, attempt),
 			});
-			const report = await ctx.script(validateScript, { model_file_path: impl.model_file_path, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
-			const review = await ctx.call(validator, { model_file_path: impl.model_file_path, deterministic_report: report });
+			const report = await ctx.script(validateScript, { model: impl.model, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
+			const review = await ctx.call(validator, { model: impl.model, deterministic_report: report });
 			signatures.push(...review.error_signatures);
 			if (review.passed) {
-				return { passed: true, model_file_path: impl.model_file_path, attempts: attempt, last_error: null, error_signatures: signatures };
+				return { passed: true, model: impl.model, attempts: attempt, last_error: null, error_signatures: signatures };
 			}
 			feedback = review.error ?? "validation failed";
 		}
-		return { passed: false, model_file_path: null, attempts: input.max_attempts, last_error: feedback, error_signatures: signatures };
+		return { passed: false, model: null, attempts: input.max_attempts, last_error: feedback, error_signatures: signatures };
 	},
 });
 
@@ -594,7 +613,7 @@ const implementAndValidate = subWorkflow({
 
 const TuneInput = Type.Object({
 	model_type: Type.String(),
-	model_file_path: Type.String(),
+	model: ModelPlugin,
 	baseline_config: Config,
 	iteration: Type.Integer(),
 	seed: Type.Integer(),
@@ -648,11 +667,12 @@ const tune = subWorkflow({
 			const config: Static<typeof Config> = isTrial ? plan.config : { ...(bestTrialConfig ?? plan.config), ...plan.config };
 
 			// Gate refusals and OOM count as attempts, not rounds.
-			let scored: { score: number; checkpoint: string } | null = null;
+			let scored: { score: number; checkpoint: Static<typeof Checkpoint> } | null = null;
 			const attempts = isTrial ? input.attempts_trial : input.attempts_formal;
 			const scope = isTrial ? "trial" : "formal";
 			for (let attempt = 1; attempt <= attempts && scored === null; attempt++) {
 				const trained = await ctx.script(trainScript, {
+					model: input.model,
 					config,
 					scope,
 					max_epochs: isTrial ? input.trial_max_epochs : input.formal_max_epochs,
@@ -830,7 +850,7 @@ export default workflow({
 			// 4. Propose, then implement with a bounded validate/retry sub-workflow.
 			const failures = [...lastRejections];
 			const signatures: ErrorSignature[] = [];
-			let candidate: { proposal: Static<typeof Proposal>; modelFile: string } | null = null;
+			let candidate: { proposal: Static<typeof Proposal>; model: Static<typeof ModelPlugin> } | null = null;
 			for (let attempt = 1; attempt <= input.maxProposalAttempts && candidate === null; attempt++) {
 				try {
 					const proposal = await ctx.call(proposer, {
@@ -848,7 +868,7 @@ export default workflow({
 						iteration,
 					});
 					signatures.push(...impl.error_signatures.map((e) => ({ ...e, evidence_iters: [iteration] })));
-					if (impl.passed && impl.model_file_path !== null) candidate = { proposal, modelFile: impl.model_file_path };
+					if (impl.passed && impl.model !== null) candidate = { proposal, model: impl.model };
 					else failures.push(impl.last_error ?? "validation failed");
 				} catch (error) {
 					if (!(error instanceof AgentFailed)) throw error;
@@ -873,7 +893,7 @@ export default workflow({
 			// 5. Tuning: Trial rounds, then the forced Formal round, Health per round.
 			const tuned = await ctx.sub(tune, {
 				model_type: candidate.proposal.model_type,
-				model_file_path: candidate.modelFile,
+				model: candidate.model,
 				baseline_config: candidate.proposal.baseline_config,
 				iteration,
 				seed: ctx.seed,
