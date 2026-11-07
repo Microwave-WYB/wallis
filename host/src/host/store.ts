@@ -66,12 +66,20 @@ export interface RunMeta {
 	readonly executor: string | null;
 	readonly created: string;
 	readonly forked_from?: { readonly run_id: string; readonly at: number };
+	/** Every required binary: the absolute path resolved at run creation (reused on resume), and its version. */
+	readonly bins?: Readonly<Record<string, { readonly path: string; readonly version?: string }>>;
+	/** The host base the sandboxes run on. */
+	readonly base?: { readonly distro: string; readonly kernel: string };
+	/** Whether the run's sandboxes were built with bwrap. */
+	readonly confined?: boolean;
 	/** Parameters for the first session of a run started detached. */
 	readonly start?: {
 		readonly input?: Json;
 		readonly seed?: number;
 		readonly models?: Readonly<Record<string, string>>;
 		readonly mounts?: Readonly<Record<string, string>>;
+		readonly bins?: Readonly<Record<string, string>>;
+		readonly callerPath?: string;
 		readonly owner?: string;
 	};
 }
@@ -144,10 +152,10 @@ function releaseLock(paths: RunPaths, pid: number): void {
 
 /** An intervention from another process. Each carries `by`, checked when the driver applies it. */
 export type InboxEntry =
-	| { readonly id: string; readonly type: "answer"; readonly node: string; readonly text: string; readonly by: string }
+	| { readonly id: string; readonly type: "answer"; readonly node: string; readonly text: string; readonly by: string; readonly turns?: number }
 	| { readonly id: string; readonly type: "steer"; readonly node: string; readonly text: string; readonly by: string }
 	| { readonly id: string; readonly type: "interrupt"; readonly node: string; readonly text?: string; readonly by: string }
-	| { readonly id: string; readonly type: "restart"; readonly node: string; readonly note?: string; readonly by: string }
+	| { readonly id: string; readonly type: "restart"; readonly node: string; readonly note?: string; readonly by: string; readonly turns?: number }
 	| { readonly id: string; readonly type: "cancel_node"; readonly node: string; readonly by: string }
 	| { readonly id: string; readonly type: "cancel"; readonly by: string }
 	| { readonly id: string; readonly type: "pause"; readonly by: string }

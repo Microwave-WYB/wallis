@@ -16,17 +16,17 @@ pub type Workflow {
   Workflow(
     name: String,
     agents: List(Agent),
-    scripts: List(String),
+    commands: List(String),
     budget: Budget,
   )
 }
 
 pub fn workflow_to_json(workflow: Workflow) -> json.Json {
-  let Workflow(name:, agents:, scripts:, budget:) = workflow
+  let Workflow(name:, agents:, commands:, budget:) = workflow
   json.object([
     #("name", json.string(name)),
     #("agents", json.array(agents, agent_to_json)),
-    #("scripts", json.array(scripts, json.string)),
+    #("commands", json.array(commands, json.string)),
     #("budget", budget_to_json(budget)),
   ])
 }
@@ -34,9 +34,9 @@ pub fn workflow_to_json(workflow: Workflow) -> json.Json {
 pub fn workflow_decoder() -> decode.Decoder(Workflow) {
   use name <- decode.field("name", decode.string)
   use agents <- decode.field("agents", decode.list(agent_decoder()))
-  use scripts <- decode.field("scripts", decode.list(decode.string))
+  use commands <- decode.field("commands", decode.list(decode.string))
   use budget <- decode.field("budget", budget_decoder())
-  decode.success(Workflow(name:, agents:, scripts:, budget:))
+  decode.success(Workflow(name:, agents:, commands:, budget:))
 }
 
 /// `steerable: False` admits only cancel and a restart without a note.
@@ -62,26 +62,16 @@ pub fn agent_decoder() -> decode.Decoder(Agent) {
   decode.success(Agent(name:, model:, max_turns:, steerable:))
 }
 
+/// Attention points, not hard caps: once spend reaches a limit no new call
+/// is admitted and the run goes `Idle(BudgetReached)`; in-flight calls
+/// finish. USD and tokens are recorded for information only.
 pub type Budget {
-  Budget(
-    usd: Option(Float),
-    tokens: Option(Int),
-    turns: Option(Int),
-    compute_minutes: Option(Float),
-  )
+  Budget(turns: Option(Int), compute_minutes: Option(Float))
 }
 
 pub fn budget_to_json(budget: Budget) -> json.Json {
-  let Budget(usd:, tokens:, turns:, compute_minutes:) = budget
+  let Budget(turns:, compute_minutes:) = budget
   json.object([
-    #("usd", case usd {
-      option.None -> json.null()
-      option.Some(value) -> json.float(value)
-    }),
-    #("tokens", case tokens {
-      option.None -> json.null()
-      option.Some(value) -> json.int(value)
-    }),
     #("turns", case turns {
       option.None -> json.null()
       option.Some(value) -> json.int(value)
@@ -94,27 +84,21 @@ pub fn budget_to_json(budget: Budget) -> json.Json {
 }
 
 pub fn budget_decoder() -> decode.Decoder(Budget) {
-  use usd <- decode.field("usd", decode.optional(decode.float))
-  use tokens <- decode.field("tokens", decode.optional(decode.int))
   use turns <- decode.field("turns", decode.optional(decode.int))
   use compute_minutes <- decode.field(
     "compute_minutes",
     decode.optional(decode.float),
   )
-  decode.success(Budget(usd:, tokens:, turns:, compute_minutes:))
+  decode.success(Budget(turns:, compute_minutes:))
 }
 
 pub type BudgetKind {
-  Usd
-  Tokens
   Turns
   ComputeMinutes
 }
 
 pub fn budget_kind_to_json(budget_kind: BudgetKind) -> json.Json {
   case budget_kind {
-    Usd -> json.string("usd")
-    Tokens -> json.string("tokens")
     Turns -> json.string("turns")
     ComputeMinutes -> json.string("compute_minutes")
   }
@@ -123,11 +107,9 @@ pub fn budget_kind_to_json(budget_kind: BudgetKind) -> json.Json {
 pub fn budget_kind_decoder() -> decode.Decoder(BudgetKind) {
   use variant <- decode.then(decode.string)
   case variant {
-    "usd" -> decode.success(Usd)
-    "tokens" -> decode.success(Tokens)
     "turns" -> decode.success(Turns)
     "compute_minutes" -> decode.success(ComputeMinutes)
-    _ -> decode.failure(Usd, "BudgetKind")
+    _ -> decode.failure(Turns, "BudgetKind")
   }
 }
 
@@ -137,6 +119,8 @@ pub fn budget_kind_decoder() -> decode.Decoder(BudgetKind) {
 pub type Pin {
   Pin(
     workflow_digest: String,
+    /// Earlier code of this run, oldest first: digests replaced by `CodeChanged`.
+    prior_digests: List(String),
     models: Dict(String, String),
     seed: Int,
     inputs: Dict(String, String),
@@ -145,9 +129,11 @@ pub type Pin {
 }
 
 pub fn pin_to_json(pin: Pin) -> json.Json {
-  let Pin(workflow_digest:, models:, seed:, inputs:, semantics:) = pin
+  let Pin(workflow_digest:, prior_digests:, models:, seed:, inputs:, semantics:) =
+    pin
   json.object([
     #("workflow_digest", json.string(workflow_digest)),
+    #("prior_digests", json.array(prior_digests, json.string)),
     #("models", json.dict(models, fn(string) { string }, json.string)),
     #("seed", json.int(seed)),
     #("inputs", json.dict(inputs, fn(string) { string }, json.string)),
@@ -157,6 +143,7 @@ pub fn pin_to_json(pin: Pin) -> json.Json {
 
 pub fn pin_decoder() -> decode.Decoder(Pin) {
   use workflow_digest <- decode.field("workflow_digest", decode.string)
+  use prior_digests <- decode.field("prior_digests", decode.list(decode.string))
   use models <- decode.field(
     "models",
     decode.dict(decode.string, decode.string),
@@ -167,7 +154,14 @@ pub fn pin_decoder() -> decode.Decoder(Pin) {
     decode.dict(decode.string, decode.string),
   )
   use semantics <- decode.field("semantics", decode.string)
-  decode.success(Pin(workflow_digest:, models:, seed:, inputs:, semantics:))
+  decode.success(Pin(
+    workflow_digest:,
+    prior_digests:,
+    models:,
+    seed:,
+    inputs:,
+    semantics:,
+  ))
 }
 
 // --- Events (host to core) ---------------------------------------------------
@@ -177,28 +171,44 @@ pub fn pin_decoder() -> decode.Decoder(Pin) {
 pub type Event {
   Started(workflow: Workflow, pin: Pin, input: Value)
   Resumed(pin: Pin)
-  Requested(id: String, request: Request)
+  /// The workflow code changed since the last session; calls whose node
+  /// and input are unchanged still hit the journal.
+  CodeChanged(from: String, to: String)
+  /// A call of the body. `node_digest` is the digest of the node's
+  /// definition; with the canonical input and `occurrence` (the nth such
+  /// call in this execution of the body) it keys the journal, a cache.
+  /// `id` is for display and interventions only.
+  Requested(id: String, request: Request, node_digest: String, occurrence: Int)
   AgentReturned(id: String, output: Value, usage: Usage, model: String)
   /// The agent ended its turn without submitting a result.
   AgentIdle(id: String, message: String, usage: Usage, model: String)
   AgentFailed(id: String, failure: AgentFailure, usage: Usage, model: String)
+  /// The agent used its turns without submitting: the node waits for more
+  /// turns (or a restart, or a cancel), with its progress kept.
+  TurnLimitReached(
+    id: String,
+    used: Int,
+    limit: Int,
+    usage: Usage,
+    model: String,
+  )
   /// A provider, auth or billing error: the call stays incomplete.
   ExecutorFailed(id: String, error: String)
   /// The rendered input does not fit the resolved model's context window.
   InputRejected(id: String, field: Option(String), chars: Int, limit: Int)
-  ScriptReturned(id: String, output: Value, minutes: Float)
-  ScriptFailed(id: String, error: String, minutes: Float)
+  CommandReturned(id: String, output: Value, minutes: Float)
+  CommandFailed(id: String, failure: CommandFailure, minutes: Float)
   /// Monitoring only: never matched on replay, never delivered to the body.
   Observed(at: String, label: String, value: Value)
-  /// An answer to an idle node.
-  Sent(node: String, text: String, message_id: String, by: String)
+  /// An answer to an idle node; `turns` more turns are granted with it.
+  Sent(node: String, text: String, message_id: String, by: String, turns: Int)
   /// A message to a running node, delivered at its next step boundary.
   Steered(node: String, text: String, message_id: String, by: String)
   /// The running node's current step was aborted; its message follows as `Sent`.
   Interrupted(node: String, by: String)
   /// Discards the node's progress and reissues its call with the original
-  /// input, plus an operator note.
-  Restarted(node: String, note: Option(String), by: String)
+  /// input, plus an operator note; `turns` > 0 sets its turn allowance.
+  Restarted(node: String, note: Option(String), by: String, turns: Int)
   /// Fails one node as an agent failure, for the body to handle.
   NodeCancelled(node: String, by: String)
   AliasRebound(alias: String, from: String, to: String)
@@ -229,11 +239,19 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("type", json.string("resumed")),
         #("pin", pin_to_json(pin)),
       ])
-    Requested(id:, request:) ->
+    CodeChanged(from:, to:) ->
+      json.object([
+        #("type", json.string("code_changed")),
+        #("from", json.string(from)),
+        #("to", json.string(to)),
+      ])
+    Requested(id:, request:, node_digest:, occurrence:) ->
       json.object([
         #("type", json.string("requested")),
         #("id", json.string(id)),
         #("request", request_to_json(request)),
+        #("node_digest", json.string(node_digest)),
+        #("occurrence", json.int(occurrence)),
       ])
     AgentReturned(id:, output:, usage:, model:) ->
       json.object([
@@ -259,6 +277,15 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("usage", usage_to_json(usage)),
         #("model", json.string(model)),
       ])
+    TurnLimitReached(id:, used:, limit:, usage:, model:) ->
+      json.object([
+        #("type", json.string("turn_limit_reached")),
+        #("id", json.string(id)),
+        #("used", json.int(used)),
+        #("limit", json.int(limit)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
     ExecutorFailed(id:, error:) ->
       json.object([
         #("type", json.string("executor_failed")),
@@ -276,18 +303,18 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("chars", json.int(chars)),
         #("limit", json.int(limit)),
       ])
-    ScriptReturned(id:, output:, minutes:) ->
+    CommandReturned(id:, output:, minutes:) ->
       json.object([
-        #("type", json.string("script_returned")),
+        #("type", json.string("command_returned")),
         #("id", json.string(id)),
         #("output", json_value.to_json(output)),
         #("minutes", json.float(minutes)),
       ])
-    ScriptFailed(id:, error:, minutes:) ->
+    CommandFailed(id:, failure:, minutes:) ->
       json.object([
-        #("type", json.string("script_failed")),
+        #("type", json.string("command_failed")),
         #("id", json.string(id)),
-        #("error", json.string(error)),
+        #("failure", command_failure_to_json(failure)),
         #("minutes", json.float(minutes)),
       ])
     Observed(at:, label:, value:) ->
@@ -297,13 +324,14 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("label", json.string(label)),
         #("value", json_value.to_json(value)),
       ])
-    Sent(node:, text:, message_id:, by:) ->
+    Sent(node:, text:, message_id:, by:, turns:) ->
       json.object([
         #("type", json.string("sent")),
         #("node", json.string(node)),
         #("text", json.string(text)),
         #("message_id", json.string(message_id)),
         #("by", json.string(by)),
+        #("turns", json.int(turns)),
       ])
     Steered(node:, text:, message_id:, by:) ->
       json.object([
@@ -319,7 +347,7 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("node", json.string(node)),
         #("by", json.string(by)),
       ])
-    Restarted(node:, note:, by:) ->
+    Restarted(node:, note:, by:, turns:) ->
       json.object([
         #("type", json.string("restarted")),
         #("node", json.string(node)),
@@ -328,6 +356,7 @@ pub fn event_to_json(event: Event) -> json.Json {
           option.Some(value) -> json.string(value)
         }),
         #("by", json.string(by)),
+        #("turns", json.int(turns)),
       ])
     NodeCancelled(node:, by:) ->
       json.object([
@@ -403,10 +432,17 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use pin <- decode.field("pin", pin_decoder())
       decode.success(Resumed(pin:))
     }
+    "code_changed" -> {
+      use from <- decode.field("from", decode.string)
+      use to <- decode.field("to", decode.string)
+      decode.success(CodeChanged(from:, to:))
+    }
     "requested" -> {
       use id <- decode.field("id", decode.string)
       use request <- decode.field("request", request_decoder())
-      decode.success(Requested(id:, request:))
+      use node_digest <- decode.field("node_digest", decode.string)
+      use occurrence <- decode.field("occurrence", decode.int)
+      decode.success(Requested(id:, request:, node_digest:, occurrence:))
     }
     "agent_returned" -> {
       use id <- decode.field("id", decode.string)
@@ -429,6 +465,14 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use model <- decode.field("model", decode.string)
       decode.success(AgentFailed(id:, failure:, usage:, model:))
     }
+    "turn_limit_reached" -> {
+      use id <- decode.field("id", decode.string)
+      use used <- decode.field("used", decode.int)
+      use limit <- decode.field("limit", decode.int)
+      use usage <- decode.field("usage", usage_decoder())
+      use model <- decode.field("model", decode.string)
+      decode.success(TurnLimitReached(id:, used:, limit:, usage:, model:))
+    }
     "executor_failed" -> {
       use id <- decode.field("id", decode.string)
       use error <- decode.field("error", decode.string)
@@ -441,17 +485,17 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use limit <- decode.field("limit", decode.int)
       decode.success(InputRejected(id:, field:, chars:, limit:))
     }
-    "script_returned" -> {
+    "command_returned" -> {
       use id <- decode.field("id", decode.string)
       use output <- decode.field("output", json_value.decoder())
       use minutes <- decode.field("minutes", decode.float)
-      decode.success(ScriptReturned(id:, output:, minutes:))
+      decode.success(CommandReturned(id:, output:, minutes:))
     }
-    "script_failed" -> {
+    "command_failed" -> {
       use id <- decode.field("id", decode.string)
-      use error <- decode.field("error", decode.string)
+      use failure <- decode.field("failure", command_failure_decoder())
       use minutes <- decode.field("minutes", decode.float)
-      decode.success(ScriptFailed(id:, error:, minutes:))
+      decode.success(CommandFailed(id:, failure:, minutes:))
     }
     "observed" -> {
       use at <- decode.field("at", decode.string)
@@ -464,7 +508,8 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use text <- decode.field("text", decode.string)
       use message_id <- decode.field("message_id", decode.string)
       use by <- decode.field("by", decode.string)
-      decode.success(Sent(node:, text:, message_id:, by:))
+      use turns <- decode.field("turns", decode.int)
+      decode.success(Sent(node:, text:, message_id:, by:, turns:))
     }
     "steered" -> {
       use node <- decode.field("node", decode.string)
@@ -482,7 +527,8 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use node <- decode.field("node", decode.string)
       use note <- decode.field("note", decode.optional(decode.string))
       use by <- decode.field("by", decode.string)
-      decode.success(Restarted(node:, note:, by:))
+      use turns <- decode.field("turns", decode.int)
+      decode.success(Restarted(node:, note:, by:, turns:))
     }
     "node_cancelled" -> {
       use node <- decode.field("node", decode.string)
@@ -535,7 +581,7 @@ pub fn event_decoder() -> decode.Decoder(Event) {
 
 pub type Request {
   Call(agent: String, input: Value)
-  Script(script: String, args: Value)
+  Command(command: String, input: Value)
 }
 
 pub fn request_to_json(request: Request) -> json.Json {
@@ -546,11 +592,11 @@ pub fn request_to_json(request: Request) -> json.Json {
         #("agent", json.string(agent)),
         #("input", json_value.to_json(input)),
       ])
-    Script(script:, args:) ->
+    Command(command:, input:) ->
       json.object([
-        #("type", json.string("script")),
-        #("script", json.string(script)),
-        #("args", json_value.to_json(args)),
+        #("type", json.string("command")),
+        #("command", json.string(command)),
+        #("input", json_value.to_json(input)),
       ])
   }
 }
@@ -563,10 +609,10 @@ pub fn request_decoder() -> decode.Decoder(Request) {
       use input <- decode.field("input", json_value.decoder())
       decode.success(Call(agent:, input:))
     }
-    "script" -> {
-      use script <- decode.field("script", decode.string)
-      use args <- decode.field("args", json_value.decoder())
-      decode.success(Script(script:, args:))
+    "command" -> {
+      use command <- decode.field("command", decode.string)
+      use input <- decode.field("input", json_value.decoder())
+      decode.success(Command(command:, input:))
     }
     _ -> decode.failure(Call(agent: "", input: json_value.JNull), "Request")
   }
@@ -633,11 +679,88 @@ pub fn role_decoder() -> decode.Decoder(Role) {
 
 /// Why an agent call failed, as the body sees it.
 pub type AgentFailure {
-  /// Never submitted a valid result, or ran out of turns.
+  /// Gave up: never submitted a valid result.
   GaveUp(error: String)
   /// The conversation outgrew the model's window and compaction is off.
   ContextExhausted
   CancelledByOwner
+}
+
+/// Why a command call failed, as the body sees it.
+pub type CommandFailure {
+  ExitCode(code: Int, stderr_head: String)
+  OutputMismatch(errors: List(String))
+  /// It ran out of compute minutes and was killed.
+  TimedOut(minutes: Float)
+  /// `r.file(name)` named a file the command did not write.
+  MissingFile(name: String)
+  /// It could not be started (no sandbox, an unresolvable binary).
+  Unrunnable(error: String)
+  CommandCancelled
+}
+
+pub fn command_failure_to_json(command_failure: CommandFailure) -> json.Json {
+  case command_failure {
+    ExitCode(code:, stderr_head:) ->
+      json.object([
+        #("type", json.string("exit_code")),
+        #("code", json.int(code)),
+        #("stderr_head", json.string(stderr_head)),
+      ])
+    OutputMismatch(errors:) ->
+      json.object([
+        #("type", json.string("output_mismatch")),
+        #("errors", json.array(errors, json.string)),
+      ])
+    TimedOut(minutes:) ->
+      json.object([
+        #("type", json.string("timed_out")),
+        #("minutes", json.float(minutes)),
+      ])
+    MissingFile(name:) ->
+      json.object([
+        #("type", json.string("missing_file")),
+        #("name", json.string(name)),
+      ])
+    Unrunnable(error:) ->
+      json.object([
+        #("type", json.string("unrunnable")),
+        #("error", json.string(error)),
+      ])
+    CommandCancelled ->
+      json.object([
+        #("type", json.string("command_cancelled")),
+      ])
+  }
+}
+
+pub fn command_failure_decoder() -> decode.Decoder(CommandFailure) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "exit_code" -> {
+      use code <- decode.field("code", decode.int)
+      use stderr_head <- decode.field("stderr_head", decode.string)
+      decode.success(ExitCode(code:, stderr_head:))
+    }
+    "output_mismatch" -> {
+      use errors <- decode.field("errors", decode.list(decode.string))
+      decode.success(OutputMismatch(errors:))
+    }
+    "timed_out" -> {
+      use minutes <- decode.field("minutes", decode.float)
+      decode.success(TimedOut(minutes:))
+    }
+    "missing_file" -> {
+      use name <- decode.field("name", decode.string)
+      decode.success(MissingFile(name:))
+    }
+    "unrunnable" -> {
+      use error <- decode.field("error", decode.string)
+      decode.success(Unrunnable(error:))
+    }
+    "command_cancelled" -> decode.success(CommandCancelled)
+    _ -> decode.failure(CommandCancelled, "CommandFailure")
+  }
 }
 
 pub fn agent_failure_to_json(agent_failure: AgentFailure) -> json.Json {
@@ -683,15 +806,17 @@ pub type Effect {
     agent: String,
     model: String,
     input: Value,
-    max_turns: Int,
+    /// Model turns this node has used so far, and how many it may use.
+    turn: Int,
+    turn_limit: Int,
     digest: String,
     transcript: List(Message),
     note: Option(String),
   )
-  RunScript(
+  RunCommand(
     id: String,
-    script: String,
-    args: Value,
+    command: String,
+    input: Value,
     compute_minutes: Option(Float),
     digest: String,
   )
@@ -714,7 +839,8 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
       agent:,
       model:,
       input:,
-      max_turns:,
+      turn:,
+      turn_limit:,
       digest:,
       transcript:,
       note:,
@@ -725,7 +851,8 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
         #("agent", json.string(agent)),
         #("model", json.string(model)),
         #("input", json_value.to_json(input)),
-        #("max_turns", json.int(max_turns)),
+        #("turn", json.int(turn)),
+        #("turn_limit", json.int(turn_limit)),
         #("digest", json.string(digest)),
         #("transcript", json.array(transcript, message_to_json)),
         #("note", case note {
@@ -733,12 +860,12 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
           option.Some(value) -> json.string(value)
         }),
       ])
-    RunScript(id:, script:, args:, compute_minutes:, digest:) ->
+    RunCommand(id:, command:, input:, compute_minutes:, digest:) ->
       json.object([
-        #("type", json.string("run_script")),
+        #("type", json.string("run_command")),
         #("id", json.string(id)),
-        #("script", json.string(script)),
-        #("args", json_value.to_json(args)),
+        #("command", json.string(command)),
+        #("input", json_value.to_json(input)),
         #("compute_minutes", case compute_minutes {
           option.None -> json.null()
           option.Some(value) -> json.float(value)
@@ -783,7 +910,8 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
       use agent <- decode.field("agent", decode.string)
       use model <- decode.field("model", decode.string)
       use input <- decode.field("input", json_value.decoder())
-      use max_turns <- decode.field("max_turns", decode.int)
+      use turn <- decode.field("turn", decode.int)
+      use turn_limit <- decode.field("turn_limit", decode.int)
       use digest <- decode.field("digest", decode.string)
       use transcript <- decode.field(
         "transcript",
@@ -795,22 +923,29 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
         agent:,
         model:,
         input:,
-        max_turns:,
+        turn:,
+        turn_limit:,
         digest:,
         transcript:,
         note:,
       ))
     }
-    "run_script" -> {
+    "run_command" -> {
       use id <- decode.field("id", decode.string)
-      use script <- decode.field("script", decode.string)
-      use args <- decode.field("args", json_value.decoder())
+      use command <- decode.field("command", decode.string)
+      use input <- decode.field("input", json_value.decoder())
       use compute_minutes <- decode.field(
         "compute_minutes",
         decode.optional(decode.float),
       )
       use digest <- decode.field("digest", decode.string)
-      decode.success(RunScript(id:, script:, args:, compute_minutes:, digest:))
+      decode.success(RunCommand(
+        id:,
+        command:,
+        input:,
+        compute_minutes:,
+        digest:,
+      ))
     }
     "deliver" -> {
       use id <- decode.field("id", decode.string)
@@ -837,9 +972,8 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
 
 pub type Refusal {
   PinMismatch(field: String, recorded: String, current: String)
-  PathDiverged(request: String)
   UnknownAgent(name: String)
-  UnknownScript(name: String)
+  UnknownCommand(name: String)
   NeedsUnmet(agent: String, need: String)
   MountUnset(mount: String)
   InputTooLarge(agent: String, field: Option(String), chars: Int, limit: Int)
@@ -848,6 +982,16 @@ pub type Refusal {
   NodeNotRunning(node: String)
   NotSteerable(node: String)
   NotLive(node: String)
+  /// Answers, steering and notes are for agents; a command has no dialogue.
+  NotAnAgent(node: String)
+  /// A node at its turn limit needs more turns with the message.
+  NoTurnsLeft(node: String)
+  RequiresMissing(name: String)
+  RequiresBroken(name: String, exit: Int, stderr_head: String)
+  SetupFailed(sandbox: String, exit: Int, stderr_head: String)
+  /// An allowlisted MCP tool declares writes outside the agent's sandbox.
+  ToolWritesOutside(server: String, tool: String)
+  UnknownBin(name: String)
   UnknownAlias(alias: String)
   JournalMissing(request: String)
   InvalidDeclaration(message: String)
@@ -866,19 +1010,14 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
         #("recorded", json.string(recorded)),
         #("current", json.string(current)),
       ])
-    PathDiverged(request:) ->
-      json.object([
-        #("type", json.string("path_diverged")),
-        #("request", json.string(request)),
-      ])
     UnknownAgent(name:) ->
       json.object([
         #("type", json.string("unknown_agent")),
         #("name", json.string(name)),
       ])
-    UnknownScript(name:) ->
+    UnknownCommand(name:) ->
       json.object([
-        #("type", json.string("unknown_script")),
+        #("type", json.string("unknown_command")),
         #("name", json.string(name)),
       ])
     NeedsUnmet(agent:, need:) ->
@@ -932,6 +1071,46 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
         #("type", json.string("not_live")),
         #("node", json.string(node)),
       ])
+    NotAnAgent(node:) ->
+      json.object([
+        #("type", json.string("not_an_agent")),
+        #("node", json.string(node)),
+      ])
+    NoTurnsLeft(node:) ->
+      json.object([
+        #("type", json.string("no_turns_left")),
+        #("node", json.string(node)),
+      ])
+    RequiresMissing(name:) ->
+      json.object([
+        #("type", json.string("requires_missing")),
+        #("name", json.string(name)),
+      ])
+    RequiresBroken(name:, exit:, stderr_head:) ->
+      json.object([
+        #("type", json.string("requires_broken")),
+        #("name", json.string(name)),
+        #("exit", json.int(exit)),
+        #("stderr_head", json.string(stderr_head)),
+      ])
+    SetupFailed(sandbox:, exit:, stderr_head:) ->
+      json.object([
+        #("type", json.string("setup_failed")),
+        #("sandbox", json.string(sandbox)),
+        #("exit", json.int(exit)),
+        #("stderr_head", json.string(stderr_head)),
+      ])
+    ToolWritesOutside(server:, tool:) ->
+      json.object([
+        #("type", json.string("tool_writes_outside")),
+        #("server", json.string(server)),
+        #("tool", json.string(tool)),
+      ])
+    UnknownBin(name:) ->
+      json.object([
+        #("type", json.string("unknown_bin")),
+        #("name", json.string(name)),
+      ])
     UnknownAlias(alias:) ->
       json.object([
         #("type", json.string("unknown_alias")),
@@ -976,17 +1155,13 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use current <- decode.field("current", decode.string)
       decode.success(PinMismatch(field:, recorded:, current:))
     }
-    "path_diverged" -> {
-      use request <- decode.field("request", decode.string)
-      decode.success(PathDiverged(request:))
-    }
     "unknown_agent" -> {
       use name <- decode.field("name", decode.string)
       decode.success(UnknownAgent(name:))
     }
-    "unknown_script" -> {
+    "unknown_command" -> {
       use name <- decode.field("name", decode.string)
-      decode.success(UnknownScript(name:))
+      decode.success(UnknownCommand(name:))
     }
     "needs_unmet" -> {
       use agent <- decode.field("agent", decode.string)
@@ -1025,6 +1200,39 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use node <- decode.field("node", decode.string)
       decode.success(NotLive(node:))
     }
+    "not_an_agent" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(NotAnAgent(node:))
+    }
+    "no_turns_left" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(NoTurnsLeft(node:))
+    }
+    "requires_missing" -> {
+      use name <- decode.field("name", decode.string)
+      decode.success(RequiresMissing(name:))
+    }
+    "requires_broken" -> {
+      use name <- decode.field("name", decode.string)
+      use exit <- decode.field("exit", decode.int)
+      use stderr_head <- decode.field("stderr_head", decode.string)
+      decode.success(RequiresBroken(name:, exit:, stderr_head:))
+    }
+    "setup_failed" -> {
+      use sandbox <- decode.field("sandbox", decode.string)
+      use exit <- decode.field("exit", decode.int)
+      use stderr_head <- decode.field("stderr_head", decode.string)
+      decode.success(SetupFailed(sandbox:, exit:, stderr_head:))
+    }
+    "tool_writes_outside" -> {
+      use server <- decode.field("server", decode.string)
+      use tool <- decode.field("tool", decode.string)
+      decode.success(ToolWritesOutside(server:, tool:))
+    }
+    "unknown_bin" -> {
+      use name <- decode.field("name", decode.string)
+      decode.success(UnknownBin(name:))
+    }
     "unknown_alias" -> {
       use alias <- decode.field("alias", decode.string)
       decode.success(UnknownAlias(alias:))
@@ -1051,7 +1259,9 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
 pub type FailReason {
   BodyError(message: String)
   AgentGaveUp(agent: String, failure: AgentFailure)
-  ScriptCrashed(script: String, error: String)
+  CommandCrashed(command: String, failure: CommandFailure)
+  /// A nested workflow failed; its reason propagates.
+  WorkflowFailed(workflow: String, reason: FailReason)
 }
 
 pub fn fail_reason_to_json(fail_reason: FailReason) -> json.Json {
@@ -1067,11 +1277,17 @@ pub fn fail_reason_to_json(fail_reason: FailReason) -> json.Json {
         #("agent", json.string(agent)),
         #("failure", agent_failure_to_json(failure)),
       ])
-    ScriptCrashed(script:, error:) ->
+    CommandCrashed(command:, failure:) ->
       json.object([
-        #("type", json.string("script_crashed")),
-        #("script", json.string(script)),
-        #("error", json.string(error)),
+        #("type", json.string("command_crashed")),
+        #("command", json.string(command)),
+        #("failure", command_failure_to_json(failure)),
+      ])
+    WorkflowFailed(workflow:, reason:) ->
+      json.object([
+        #("type", json.string("workflow_failed")),
+        #("workflow", json.string(workflow)),
+        #("reason", fail_reason_to_json(reason)),
       ])
   }
 }
@@ -1088,10 +1304,15 @@ pub fn fail_reason_decoder() -> decode.Decoder(FailReason) {
       use failure <- decode.field("failure", agent_failure_decoder())
       decode.success(AgentGaveUp(agent:, failure:))
     }
-    "script_crashed" -> {
-      use script <- decode.field("script", decode.string)
-      use error <- decode.field("error", decode.string)
-      decode.success(ScriptCrashed(script:, error:))
+    "command_crashed" -> {
+      use command <- decode.field("command", decode.string)
+      use failure <- decode.field("failure", command_failure_decoder())
+      decode.success(CommandCrashed(command:, failure:))
+    }
+    "workflow_failed" -> {
+      use workflow <- decode.field("workflow", decode.string)
+      use reason <- decode.field("reason", fail_reason_decoder())
+      decode.success(WorkflowFailed(workflow:, reason:))
     }
     _ -> decode.failure(BodyError(message: ""), "FailReason")
   }
@@ -1188,16 +1409,19 @@ pub fn run_status_decoder() -> decode.Decoder(RunStatus) {
 }
 
 pub type IdleReason {
-  BudgetExhausted(kind: BudgetKind, spent: Float, limit: Float)
+  BudgetReached(kind: BudgetKind, spent: Float, limit: Float)
   ExecutorUnavailable(alias: String, error: String)
   PausedByUser
+  /// A node failed and the body did not handle it: restart the node, or
+  /// cancel it to let the failure propagate.
+  NodeFailure(node: String, reason: FailReason)
 }
 
 pub fn idle_reason_to_json(idle_reason: IdleReason) -> json.Json {
   case idle_reason {
-    BudgetExhausted(kind:, spent:, limit:) ->
+    BudgetReached(kind:, spent:, limit:) ->
       json.object([
-        #("type", json.string("budget_exhausted")),
+        #("type", json.string("budget_reached")),
         #("kind", budget_kind_to_json(kind)),
         #("spent", json.float(spent)),
         #("limit", json.float(limit)),
@@ -1212,17 +1436,23 @@ pub fn idle_reason_to_json(idle_reason: IdleReason) -> json.Json {
       json.object([
         #("type", json.string("paused_by_user")),
       ])
+    NodeFailure(node:, reason:) ->
+      json.object([
+        #("type", json.string("node_failure")),
+        #("node", json.string(node)),
+        #("reason", fail_reason_to_json(reason)),
+      ])
   }
 }
 
 pub fn idle_reason_decoder() -> decode.Decoder(IdleReason) {
   use variant <- decode.field("type", decode.string)
   case variant {
-    "budget_exhausted" -> {
+    "budget_reached" -> {
       use kind <- decode.field("kind", budget_kind_decoder())
       use spent <- decode.field("spent", decode.float)
       use limit <- decode.field("limit", decode.float)
-      decode.success(BudgetExhausted(kind:, spent:, limit:))
+      decode.success(BudgetReached(kind:, spent:, limit:))
     }
     "executor_unavailable" -> {
       use alias <- decode.field("alias", decode.string)
@@ -1230,11 +1460,16 @@ pub fn idle_reason_decoder() -> decode.Decoder(IdleReason) {
       decode.success(ExecutorUnavailable(alias:, error:))
     }
     "paused_by_user" -> decode.success(PausedByUser)
+    "node_failure" -> {
+      use node <- decode.field("node", decode.string)
+      use reason <- decode.field("reason", fail_reason_decoder())
+      decode.success(NodeFailure(node:, reason:))
+    }
     _ -> decode.failure(PausedByUser, "IdleReason")
   }
 }
 
-/// One agent call and its dialogue. Each variant carries only what is
+/// One call of an agent or a command. Each variant carries only what is
 /// meaningful in that state; `inbox` lists the messages that reached it.
 pub type Node {
   NodeRunning(
@@ -1244,14 +1479,14 @@ pub type Node {
     steerable: Bool,
     inbox: List(InboxMessage),
   )
-  /// Waiting for an answer: the agent ended its turn with this question.
+  /// Waiting for the owner: a question, or the turn limit.
   NodeIdle(
     id: String,
     agent: String,
     model: String,
     steerable: Bool,
     inbox: List(InboxMessage),
-    question: String,
+    cause: IdleCause,
   )
   NodeDone(
     id: String,
@@ -1260,6 +1495,14 @@ pub type Node {
     steerable: Bool,
     inbox: List(InboxMessage),
     outcome: NodeOutcome,
+  )
+  /// A command call: no dialogue, so no idle state.
+  CommandRunning(id: String, command: String, inbox: List(InboxMessage))
+  CommandDone(
+    id: String,
+    command: String,
+    inbox: List(InboxMessage),
+    outcome: CommandOutcome,
   )
 }
 
@@ -1274,7 +1517,7 @@ pub fn node_to_json(node: Node) -> json.Json {
         #("steerable", json.bool(steerable)),
         #("inbox", json.array(inbox, inbox_message_to_json)),
       ])
-    NodeIdle(id:, agent:, model:, steerable:, inbox:, question:) ->
+    NodeIdle(id:, agent:, model:, steerable:, inbox:, cause:) ->
       json.object([
         #("type", json.string("node_idle")),
         #("id", json.string(id)),
@@ -1282,7 +1525,7 @@ pub fn node_to_json(node: Node) -> json.Json {
         #("model", json.string(model)),
         #("steerable", json.bool(steerable)),
         #("inbox", json.array(inbox, inbox_message_to_json)),
-        #("question", json.string(question)),
+        #("cause", idle_cause_to_json(cause)),
       ])
     NodeDone(id:, agent:, model:, steerable:, inbox:, outcome:) ->
       json.object([
@@ -1293,6 +1536,21 @@ pub fn node_to_json(node: Node) -> json.Json {
         #("steerable", json.bool(steerable)),
         #("inbox", json.array(inbox, inbox_message_to_json)),
         #("outcome", node_outcome_to_json(outcome)),
+      ])
+    CommandRunning(id:, command:, inbox:) ->
+      json.object([
+        #("type", json.string("command_running")),
+        #("id", json.string(id)),
+        #("command", json.string(command)),
+        #("inbox", json.array(inbox, inbox_message_to_json)),
+      ])
+    CommandDone(id:, command:, inbox:, outcome:) ->
+      json.object([
+        #("type", json.string("command_done")),
+        #("id", json.string(id)),
+        #("command", json.string(command)),
+        #("inbox", json.array(inbox, inbox_message_to_json)),
+        #("outcome", command_outcome_to_json(outcome)),
       ])
   }
 }
@@ -1314,15 +1572,8 @@ pub fn node_decoder() -> decode.Decoder(Node) {
       use model <- decode.field("model", decode.string)
       use steerable <- decode.field("steerable", decode.bool)
       use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      use question <- decode.field("question", decode.string)
-      decode.success(NodeIdle(
-        id:,
-        agent:,
-        model:,
-        steerable:,
-        inbox:,
-        question:,
-      ))
+      use cause <- decode.field("cause", idle_cause_decoder())
+      decode.success(NodeIdle(id:, agent:, model:, steerable:, inbox:, cause:))
     }
     "node_done" -> {
       use id <- decode.field("id", decode.string)
@@ -1333,11 +1584,91 @@ pub fn node_decoder() -> decode.Decoder(Node) {
       use outcome <- decode.field("outcome", node_outcome_decoder())
       decode.success(NodeDone(id:, agent:, model:, steerable:, inbox:, outcome:))
     }
-    _ ->
-      decode.failure(
-        NodeRunning(id: "", agent: "", model: "", steerable: False, inbox: []),
-        "Node",
-      )
+    "command_running" -> {
+      use id <- decode.field("id", decode.string)
+      use command <- decode.field("command", decode.string)
+      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
+      decode.success(CommandRunning(id:, command:, inbox:))
+    }
+    "command_done" -> {
+      use id <- decode.field("id", decode.string)
+      use command <- decode.field("command", decode.string)
+      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
+      use outcome <- decode.field("outcome", command_outcome_decoder())
+      decode.success(CommandDone(id:, command:, inbox:, outcome:))
+    }
+    _ -> decode.failure(CommandRunning(id: "", command: "", inbox: []), "Node")
+  }
+}
+
+/// Why an agent node waits.
+pub type IdleCause {
+  /// It ended its turn without submitting: the message is its question.
+  Question(message: String)
+  /// It used `used` of `limit` turns without submitting.
+  TurnLimit(used: Int, limit: Int)
+}
+
+pub fn idle_cause_to_json(idle_cause: IdleCause) -> json.Json {
+  case idle_cause {
+    Question(message:) ->
+      json.object([
+        #("type", json.string("question")),
+        #("message", json.string(message)),
+      ])
+    TurnLimit(used:, limit:) ->
+      json.object([
+        #("type", json.string("turn_limit")),
+        #("used", json.int(used)),
+        #("limit", json.int(limit)),
+      ])
+  }
+}
+
+pub fn idle_cause_decoder() -> decode.Decoder(IdleCause) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "question" -> {
+      use message <- decode.field("message", decode.string)
+      decode.success(Question(message:))
+    }
+    "turn_limit" -> {
+      use used <- decode.field("used", decode.int)
+      use limit <- decode.field("limit", decode.int)
+      decode.success(TurnLimit(used:, limit:))
+    }
+    _ -> decode.failure(Question(message: ""), "IdleCause")
+  }
+}
+
+pub type CommandOutcome {
+  Succeeded
+  FailedWith(failure: CommandFailure)
+}
+
+pub fn command_outcome_to_json(command_outcome: CommandOutcome) -> json.Json {
+  case command_outcome {
+    Succeeded ->
+      json.object([
+        #("type", json.string("succeeded")),
+      ])
+    FailedWith(failure:) ->
+      json.object([
+        #("type", json.string("failed_with")),
+        #("failure", command_failure_to_json(failure)),
+      ])
+  }
+}
+
+pub fn command_outcome_decoder() -> decode.Decoder(CommandOutcome) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "succeeded" -> decode.success(Succeeded)
+    "failed_with" -> {
+      use failure <- decode.field("failure", command_failure_decoder())
+      decode.success(FailedWith(failure:))
+    }
+    _ -> decode.failure(Succeeded, "CommandOutcome")
   }
 }
 

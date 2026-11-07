@@ -34,11 +34,16 @@ export interface McpConfig {
 export interface Mcp<J extends McpConfig = McpConfig> {
 	readonly kind: "mcp";
 	readonly config: J;
+	readonly overlay: McpOverlay<J>;
 }
 
-/** Wraps an imported `mcp.json` (`import m from "./mcp.json" with { type: "json" }`). */
-export function defineMcp<const J extends McpConfig>(config: J): Mcp<J> {
-	return { kind: "mcp", config };
+/**
+ * Wraps an imported `mcp.json` (`import m from "./mcp.json" with { type: "json" }`).
+ * The TS overlay gives each stdio server its sandbox (with its own network
+ * allowlist), and names tools allowed to write outside the agent's sandbox.
+ */
+export function defineMcp<const J extends McpConfig>(config: J, overlay: McpOverlay<J> = {}): Mcp<J> {
+	return { kind: "mcp", config, overlay };
 }
 
 /** Per agent: a subset of servers, each with a tool allowlist or `"*"`. */
@@ -66,21 +71,13 @@ export function Artifact<const M extends string = string>(media?: M) {
 export type ArtifactRef = { readonly digest: string; readonly name: string; readonly media: string };
 
 /**
- * How a producer (a script, or an agent's `export_artifact` tool) names a
+ * How a producer (a command, or an agent's `export_artifact` tool) names a
  * file in its scratch dir; the host stores it and replaces the draft with an
  * `ArtifactRef` before the result is checked and logged.
  */
 export type ArtifactDraft = { readonly artifact: string; readonly media: string; readonly name?: string };
 
-/**
- * What a node may touch on disk. `none`: no filesystem tools. `read-only`:
- * its input artifacts and declared mounts, read-only. `workspace`: the
- * same plus a private writable scratch dir, kept while the node is idle and
- * deleted when it is done.
- */
-export type SandboxLevel = "none" | "read-only" | "workspace";
-
-/** Machine resources a script needs; scripts wait for a free slot. */
+/** Machine resources a command needs; calls wait for a free slot. */
 export interface Resources {
 	readonly gpu?: number;
 	readonly memoryGb?: number;
@@ -92,7 +89,8 @@ export interface Resources {
  * Mount table: name -> default host dir. Relative paths resolve against the
  * workflow dir; an empty string means the caller or the local profile must
  * supply it. Mounts are read-only: there is no writable variant. Writes
- * leave a node only as returned artifacts (and `wallis export`).
+ * leave a call only as returned artifacts (and a run only through
+ * `wallis export`).
  */
 export type MountTable = { readonly [name: string]: string };
 
@@ -105,52 +103,54 @@ export function defineMounts<const T extends MountTable>(table: T): Mounts<T> {
 	return { kind: "mounts", table };
 }
 
-// --- Scripts and tools ---------------------------------------------------------
+// --- Sandboxes -------------------------------------------------------------------
 
-/** A domain script under `scripts/`, run in the sandbox. Args and output are checked against the schemas. */
-export interface ScriptDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
-	readonly kind: "script";
-	readonly name: string;
-	readonly description: string;
-	readonly input: I;
-	readonly output: O;
-	/** Default `workspace`: input artifacts and mounts read-only, a private scratch dir. */
-	readonly sandbox: SandboxLevel;
-	/** Mounted read-only, by name from the workflow's mount table. */
-	readonly mounts: readonly string[];
-	readonly resources: Resources;
-}
+/** A binary the base must provide, checked inside the sandbox (default `<name> --version`). */
+export type Requirement<R extends string> = R | { readonly name: R; readonly check: readonly string[] };
 
-export interface ScriptSpec<T extends MountTable, I extends TSchema, O extends TSchema> {
+export interface SandboxSpec<T extends MountTable, R extends string> {
+	/** Names the sandbox in logs, run metadata and the setup cache. */
 	readonly name: string;
-	readonly description?: string;
-	readonly input: I;
-	readonly output: O;
-	readonly sandbox?: SandboxLevel;
+	/** Commands the base must provide; each is bound alone, read-only, at `/run/wallis/bin/<name>`. */
+	readonly requires?: readonly Requirement<R>[];
+	/** Run once per digest WITH network, writing into `$WALLIS_ENV`; runs then see it read-only. */
+	readonly setup?: readonly (readonly string[])[];
+	/** Read-only, by name from `defineMounts`; seen at `/w/<name>`. There is no writable mount. */
 	readonly mounts?: readonly (keyof T & string)[];
-	readonly resources?: Resources;
+	/** Domains the sandbox may reach at run time. Default: none. */
+	readonly network?: readonly string[];
+	/** Reserved for a container backend: an image. bwrap ignores it. */
+	readonly base?: string;
 }
 
-/** `env` is needed only to name mounts: `defineScript({ mounts }, { ..., mounts: ["data"] })`. */
-export function defineScript<I extends TSchema, O extends TSchema>(spec: ScriptSpec<{}, I, O>): ScriptDef<I, O>;
-export function defineScript<const T extends MountTable, I extends TSchema, O extends TSchema>(env: { readonly mounts: Mounts<T> }, spec: ScriptSpec<T, I, O>): ScriptDef<I, O>;
-export function defineScript(a: unknown, b?: unknown): ScriptDef {
-	const spec = (b ?? a) as ScriptSpec<MountTable, TSchema, TSchema>;
-	return { kind: "script", description: "", sandbox: "workspace", resources: {}, ...spec, mounts: [...(spec.mounts ?? [])] };
-}
-
-export interface ToolDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
-	readonly kind: "tool";
+/**
+ * A sandbox the workflow declares. Nothing is implicit: the workflow dir is
+ * not mounted; whatever the sandbox needs comes through its mounts. Each call
+ * gets a private writable scratch dir (`/w`, the working directory).
+ */
+export interface SandboxDef<R extends string = string> {
+	readonly kind: "sandbox";
 	readonly name: string;
-	readonly description: string;
-	readonly input: I;
-	readonly output: O;
-	/** Script under `scripts/` that serves the tool, run in the sandbox. */
-	readonly script: string;
+	readonly requires: readonly { readonly name: R; readonly check: readonly string[] }[];
+	readonly setup: readonly (readonly string[])[];
+	readonly mounts: readonly string[];
+	readonly network: readonly string[];
+	readonly base: string | null;
 }
 
-export function defineTool<I extends TSchema, O extends TSchema>(spec: Omit<ToolDef<I, O>, "kind">): ToolDef<I, O> {
-	return { kind: "tool", ...spec };
+export function defineSandbox<const T extends MountTable, const R extends string = never>(
+	_env: { readonly mounts?: Mounts<T> },
+	spec: SandboxSpec<T, R>,
+): SandboxDef<R> {
+	return {
+		kind: "sandbox",
+		name: spec.name,
+		requires: (spec.requires ?? []).map((r) => (typeof r === "string" ? { name: r, check: [r, "--version"] } : r)),
+		setup: spec.setup ?? [],
+		mounts: [...(spec.mounts ?? [])],
+		network: [...(spec.network ?? [])],
+		base: spec.base ?? null,
+	};
 }
 
 // --- Large inputs --------------------------------------------------------------------
@@ -169,43 +169,106 @@ export function Foldable<S extends TSchema>(schema: S, options: { readonly maxCh
 	return { ...schema, [FOLD]: { maxChars: options.maxChars } };
 }
 
-// --- Agents --------------------------------------------------------------------
+// --- Commands: typed adapters, called by workflow code only ---------------------
 
-export interface Env<M extends ModelTable, J extends McpConfig, T extends MountTable> {
-	readonly models: Models<M>;
-	readonly mcp?: Mcp<J>;
-	readonly mounts?: Mounts<T>;
+/** An input artifact as a command's `run` sees it: the ref plus where it is mounted. */
+export type Mounted<T> = T extends ArtifactRef
+	? T & { readonly path: string }
+	: T extends readonly (infer E)[]
+		? readonly Mounted<E>[]
+		: T extends object
+			? { readonly [K in keyof T]: Mounted<T[K]> }
+			: T;
+
+/** What a command's `parse` gets. */
+export interface CommandResult {
+	readonly exit: number;
+	readonly stdout: string;
+	readonly stderr: string;
+	/** A file the command wrote in its scratch dir, as an artifact. The host checks it exists (`missing_file`). */
+	file<const M extends string = string>(name: string, media?: M): { readonly digest: string; readonly name: string; readonly media: M };
 }
 
-export interface AgentSpec<M extends ModelTable, J extends McpConfig, T extends MountTable, I extends TSchema, O extends TSchema> {
+/** An argv whose program is one of the sandbox's required binaries. */
+export type Argv<R extends string> = readonly [R, ...string[]];
+
+export interface CommandSpec<R extends string, I extends TSchema, O extends TSchema> {
+	readonly name: string;
+	readonly description?: string;
+	readonly sandbox: SandboxDef<R>;
+	readonly input: I;
+	readonly output: O;
+	/** Pure, run in the workflow sandbox. The input JSON is also on stdin. A plain argv is the default protocol. */
+	readonly run: Argv<NoInfer<R>> | ((input: Mounted<Static<I>>) => Argv<NoInfer<R>>);
+	/** Pure, run in the workflow sandbox. Default: the output JSON on stdout. Checked against `output` either way. */
+	readonly parse?: (result: CommandResult) => Static<O>;
+	/** Machine resources; calls wait for free slots. GPU devices are bound only when `gpu` is set. */
+	readonly resources?: Resources;
+}
+
+export interface CommandDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+	readonly kind: "command";
+	readonly name: string;
+	readonly description: string;
+	readonly sandbox: SandboxDef;
+	readonly input: I;
+	readonly output: O;
+	readonly run: Argv<string> | ((input: never) => Argv<string>);
+	readonly parse: ((result: CommandResult) => unknown) | null;
+	readonly resources: Resources;
+}
+
+/** A command: a typed adapter around a program in a sandbox. Only workflow code calls it, with `ctx.call`. */
+export function command<const R extends string, I extends TSchema, O extends TSchema>(spec: CommandSpec<R, I, O>): CommandDef<I, O> {
+	return {
+		kind: "command",
+		name: spec.name,
+		description: spec.description ?? "",
+		sandbox: spec.sandbox,
+		input: spec.input,
+		output: spec.output,
+		run: spec.run as CommandDef["run"],
+		parse: spec.parse ?? null,
+		resources: spec.resources ?? {},
+	};
+}
+
+// --- Agents --------------------------------------------------------------------
+
+export interface Env<M extends ModelTable, J extends McpConfig> {
+	readonly models: Models<M>;
+	readonly mcp?: Mcp<J>;
+}
+
+export interface AgentSpec<M extends ModelTable, J extends McpConfig, I extends TSchema, O extends TSchema> {
 	readonly name: string;
 	readonly model: keyof M & string;
-	/** Prompt text, usually `import p from "./p.md" with { type: "text" }`. */
+	/** Prompt text, usually `import p from "./prompts/p.md" with { type: "text" }`. */
 	readonly prompt: string;
 	/** Everything the agent needs is pushed in here; agents never read workflow memory. */
 	readonly input: I;
 	/** The result the agent submits; executors pass it to the model as the structured-output schema. */
 	readonly output: O;
+	/** The agent's tools beyond codemode and submit_result: allowlisted MCP tools only. */
 	readonly mcp?: McpSelection<J>;
-	readonly tools?: readonly ToolDef[];
 	readonly skills?: readonly string[];
-	/** Model turns per call. A codemode call is a turn, so at least 2. Default 16. */
+	/**
+	 * Turns per call before the node stops and asks its owner for more
+	 * (`Idle(turn_limit)`). The model sees "Turn k of N" every turn. A
+	 * codemode call is a turn, so at least 2. Default 16.
+	 */
 	readonly maxTurns?: number;
 	/** Capabilities checked in preflight. */
 	readonly needs?: { readonly structuredOutput?: boolean; readonly toolCalls?: boolean; readonly contextTokens?: number };
-	/** What the node may touch on disk; see `SandboxLevel`. Default `none`. */
-	readonly sandbox?: SandboxLevel;
-	/** Mounted read-only, by name from the workflow's mount table. */
-	readonly mounts?: readonly (keyof T & string)[];
 	/**
-	 * Default true. A non-steerable node accepts only cancel and a restart
-	 * without a note: no answers, steering or interrupts.
+	 * With a sandbox the agent gets a `bash` tool and file tools confined to
+	 * its scratch dir and the sandbox's mounts. Without one it has no
+	 * filesystem at all.
 	 */
+	readonly sandbox?: SandboxDef;
+	/** Default true. A non-steerable node accepts only cancel and a restart without a note. */
 	readonly steerable?: boolean;
-	/**
-	 * Default true: a dialogue that outgrows the model's window is compacted
-	 * (logged). `false`: it fails as `context_exhausted` instead.
-	 */
+	/** Default true: an overlong dialogue is compacted (logged); `false`: it fails as `context_exhausted`. */
 	readonly compaction?: boolean;
 }
 
@@ -217,22 +280,20 @@ export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSche
 	readonly input: I;
 	readonly output: O;
 	readonly mcp: { readonly [server: string]: readonly string[] | "*" };
-	readonly tools: readonly ToolDef[];
 	readonly skills: readonly string[];
 	readonly maxTurns: number;
-	readonly needs: AgentSpec<ModelTable, McpConfig, MountTable, I, O>["needs"];
-	readonly sandbox: SandboxLevel;
-	readonly mounts: readonly string[];
+	readonly needs: AgentSpec<ModelTable, McpConfig, I, O>["needs"];
+	readonly sandbox: SandboxDef | null;
 	readonly steerable: boolean;
 	readonly compaction: boolean;
 }
 
-export function defineAgent<const M extends ModelTable, const J extends McpConfig, const T extends MountTable, I extends TSchema, O extends TSchema>(
-	_env: Env<M, J, T>,
-	spec: AgentSpec<M, J, T, I, O>,
+export function defineAgent<const M extends ModelTable, const J extends McpConfig, I extends TSchema, O extends TSchema>(
+	_env: Env<M, J>,
+	spec: AgentSpec<M, J, I, O>,
 ): AgentDef<I, O> {
 	const maxTurns = spec.maxTurns ?? 16;
-	// Codemode is always on and a codemode call is a turn.
+	// Codemode is always offered and a codemode call is a turn.
 	if (maxTurns < 2) throw new Error(`agent ${spec.name}: maxTurns must be at least 2 (a codemode call is a turn)`);
 	return {
 		kind: "agent",
@@ -242,12 +303,10 @@ export function defineAgent<const M extends ModelTable, const J extends McpConfi
 		input: spec.input,
 		output: spec.output,
 		mcp: (spec.mcp ?? {}) as AgentDef["mcp"],
-		tools: spec.tools ?? [],
 		skills: spec.skills ?? [],
 		maxTurns,
 		needs: spec.needs,
-		sandbox: spec.sandbox ?? "none",
-		mounts: [...(spec.mounts ?? [])],
+		sandbox: spec.sandbox ?? null,
 		steerable: spec.steerable ?? true,
 		compaction: spec.compaction ?? true,
 	};
@@ -260,7 +319,7 @@ export type Refusal =
 	| { readonly type: "pin_mismatch"; readonly field: string; readonly recorded: string; readonly current: string }
 	| { readonly type: "path_diverged"; readonly request: string }
 	| { readonly type: "unknown_agent"; readonly name: string }
-	| { readonly type: "unknown_script"; readonly name: string }
+	| { readonly type: "unknown_command"; readonly name: string }
 	| { readonly type: "needs_unmet"; readonly agent: string; readonly need: string }
 	| { readonly type: "mount_unset"; readonly mount: string }
 	| { readonly type: "input_too_large"; readonly agent: string; readonly field: string | null; readonly chars: number; readonly limit: number }
@@ -269,6 +328,13 @@ export type Refusal =
 	| { readonly type: "node_not_running"; readonly node: string }
 	| { readonly type: "not_steerable"; readonly node: string }
 	| { readonly type: "not_live"; readonly node: string }
+	| { readonly type: "not_an_agent"; readonly node: string }
+	| { readonly type: "no_turns_left"; readonly node: string }
+	| { readonly type: "requires_missing"; readonly name: string }
+	| { readonly type: "requires_broken"; readonly name: string; readonly exit: number; readonly stderr_head: string }
+	| { readonly type: "setup_failed"; readonly sandbox: string; readonly exit: number; readonly stderr_head: string }
+	| { readonly type: "tool_writes_outside"; readonly server: string; readonly tool: string }
+	| { readonly type: "unknown_bin"; readonly name: string }
 	| { readonly type: "unknown_alias"; readonly alias: string }
 	| { readonly type: "journal_missing"; readonly request: string }
 	| { readonly type: "invalid_declaration"; readonly message: string }
@@ -283,20 +349,41 @@ export type AgentFailure =
 	| { readonly type: "context_exhausted" }
 	| { readonly type: "cancelled_by_owner" };
 
-/** Why a run failed. Mirrors `FailReason` in the core. */
+/** Why a command call failed. Mirrors `CommandFailure` in the core. */
+export type CommandFailure =
+	| { readonly type: "exit_code"; readonly code: number; readonly stderr_head: string }
+	| { readonly type: "output_mismatch"; readonly errors: readonly string[] }
+	| { readonly type: "timed_out"; readonly minutes: number }
+	| { readonly type: "missing_file"; readonly name: string }
+	| { readonly type: "unrunnable"; readonly error: string }
+	| { readonly type: "command_cancelled" };
+
+/** Why a run (or a nested workflow) failed. Mirrors `FailReason` in the core. */
 export type FailReason =
 	| { readonly type: "body_error"; readonly message: string }
 	| { readonly type: "agent_gave_up"; readonly agent: string; readonly failure: AgentFailure }
-	| { readonly type: "script_crashed"; readonly script: string; readonly error: string };
+	| { readonly type: "command_crashed"; readonly command: string; readonly failure: CommandFailure }
+	| { readonly type: "workflow_failed"; readonly workflow: string; readonly reason: FailReason };
 
-export function failureText(failure: AgentFailure): string {
+export function failureText(failure: AgentFailure | CommandFailure): string {
 	switch (failure.type) {
 		case "gave_up":
 			return failure.error;
 		case "context_exhausted":
 			return "context exhausted";
 		case "cancelled_by_owner":
+		case "command_cancelled":
 			return "cancelled by the owner";
+		case "exit_code":
+			return `exited ${failure.code}: ${failure.stderr_head}`;
+		case "output_mismatch":
+			return `output does not match its schema: ${failure.errors.join("; ")}`;
+		case "timed_out":
+			return `timed out after ${failure.minutes} minutes`;
+		case "missing_file":
+			return `it wrote no file ${failure.name}`;
+		case "unrunnable":
+			return failure.error;
 	}
 }
 
@@ -309,7 +396,7 @@ export class Refused extends Error {
 	}
 }
 
-/** The agent call failed: it gave up, ran out of turns or context, or its owner cancelled it. */
+/** The agent call failed: it gave up, ran out of context, or its owner cancelled it. */
 export class AgentFailed extends Error {
 	override readonly name = "AgentFailed";
 	readonly agent: string;
@@ -321,19 +408,31 @@ export class AgentFailed extends Error {
 	}
 }
 
-/** The script crashed, or its output did not match its schema. */
-export class ScriptFailed extends Error {
-	override readonly name = "ScriptFailed";
-	readonly script: string;
-	readonly error: string;
-	constructor(script: string, error: string) {
-		super(`${script}: ${error}`);
-		this.script = script;
-		this.error = error;
+/** The command call failed: exit code, output mismatch, timeout, a missing file, or a cancel. */
+export class CommandFailed extends Error {
+	override readonly name = "CommandFailed";
+	readonly command: string;
+	readonly failure: CommandFailure;
+	constructor(command: string, failure: CommandFailure) {
+		super(`${command}: ${failureText(failure)}`);
+		this.command = command;
+		this.failure = failure;
 	}
 }
 
-/** The body passed a value that does not match its schema (agent input, script args). */
+/** A nested workflow failed; `reason` is why, typed (it may nest). */
+export class WorkflowFailed extends Error {
+	override readonly name = "WorkflowFailed";
+	readonly workflow: string;
+	readonly reason: FailReason;
+	constructor(workflow: string, reason: FailReason) {
+		super(`${workflow}: ${reason.type}`);
+		this.workflow = workflow;
+		this.reason = reason;
+	}
+}
+
+/** The body passed a value that does not match its schema (a node's input). */
 export class SchemaError extends Error {
 	override readonly name = "SchemaError";
 	readonly subject: string;
@@ -345,14 +444,18 @@ export class SchemaError extends Error {
 	}
 }
 
-// --- Workflow ------------------------------------------------------------------
+// --- Nodes and the workflow ------------------------------------------------------
 
+/**
+ * Attention points, not hard caps: when spend reaches a limit no new call is
+ * admitted and the run goes `Idle(budget_reached)`; calls in flight finish,
+ * so a small overshoot is expected. USD and tokens are recorded, never
+ * budgeted.
+ */
 export interface Budget {
-	readonly usd?: number;
-	readonly tokens?: number;
-	/** Agent turns for the whole run; each call is also capped by its agent's `maxTurns`. */
+	/** Agent model turns for the whole run. */
 	readonly turns?: number;
-	/** Compute budget passed to scripts and enforced by the sandbox. */
+	/** Command compute minutes for the whole run. */
 	readonly computeMinutes?: number;
 }
 
@@ -361,56 +464,68 @@ export interface PinSpec {
 	readonly files?: readonly string[];
 }
 
-/**
- * What the workflow body sees: typed calls, each affecting the body only
- * through its return value. Run memory is the body's own local variables;
- * a resume rebuilds them by replaying the body over the journal.
- */
-export interface Ctx {
-	/** Run seed from the pin. `Math.random` is already seeded from it. */
-	readonly seed: number;
-	/**
-	 * Calls an agent. Throws `SchemaError` for a bad input, `AgentFailed` when
-	 * the call fails, `Refused` when the core refuses it (for example
-	 * `input_too_large`). An exhausted budget pauses the run instead.
-	 */
-	call<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>, input: Static<I>): Promise<Static<O>>;
-	/** Runs a script. Throws `SchemaError` for bad args, `ScriptFailed` on a crash or a bad output. */
-	script<I extends TSchema, O extends TSchema>(script: ScriptDef<I, O>, args: Static<I>): Promise<Static<O>>;
-	/** Runs branches concurrently; each gets its own request ids. */
-	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(
-		branches: B,
-	): Promise<{ -readonly [K in keyof B]: Awaited<ReturnType<B[K]>> }>;
-	/** Runs a sub-workflow and returns its output. */
-	sub<I extends TSchema, O extends TSchema>(workflow: SubWorkflowDef<I, O>, input: Static<I>): Promise<Static<O>>;
-	/**
-	 * Monitoring only: logged for `wallis status`, `tree` and `show`, never
-	 * returned to the body and never matched on replay.
-	 */
-	observe(label: string, value: Json): void;
-}
-
-export interface SubWorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
-	readonly kind: "sub-workflow";
+/** A workflow is a node too: calling it runs its body with its own request ids. */
+export interface WorkflowNode<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+	readonly kind: "workflow";
 	readonly name: string;
 	readonly input: I;
 	readonly output: O;
 	readonly run: (ctx: Ctx, input: Static<I>) => Promise<Static<O>>;
 }
 
-export function subWorkflow<I extends TSchema, O extends TSchema>(spec: Omit<SubWorkflowDef<I, O>, "kind">): SubWorkflowDef<I, O> {
-	return { kind: "sub-workflow", ...spec };
+/** Everything `ctx.call` can invoke, discriminated by `kind`. */
+export type Node<I extends TSchema = TSchema, O extends TSchema = TSchema> = AgentDef<I, O> | CommandDef<I, O> | WorkflowNode<I, O>;
+
+/**
+ * What the workflow body sees: typed calls, each affecting the body only
+ * through its return value. Run memory is the body's own local variables.
+ *
+ * Request ids: `ctx.call` takes its id synchronously, when it is invoked, so
+ * `Promise.all([ctx.call(a, x), ctx.call(b, y)])` is deterministic whatever
+ * order results arrive in. A branch with several sequential steps must run
+ * in `ctx.parallel` or `ctx.map`, which give each branch its own counter:
+ * QuickJS has no async context tracking, so ids taken after an `await` in
+ * plain concurrent code would depend on arrival order.
+ */
+export interface Ctx {
+	/** Run seed from the pin. `Math.random` is already seeded from it. */
+	readonly seed: number;
+	/**
+	 * Calls a node: an agent, a command or a workflow. Throws `SchemaError`
+	 * for a bad input, `AgentFailed`, `CommandFailed` or `WorkflowFailed`
+	 * when it fails, `Refused` when the core refuses it. A reached budget
+	 * holds the call instead.
+	 */
+	call<I extends TSchema, O extends TSchema>(node: Node<I, O>, input: Static<I>): Promise<Static<O>>;
+	/** Runs branches concurrently; each gets its own request ids. */
+	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(
+		branches: B,
+	): Promise<{ -readonly [K in keyof B]: Awaited<ReturnType<B[K]>> }>;
+	/** One branch per item, concurrently, each with its own request ids; results in item order. */
+	map<T, U>(items: readonly T[], each: (ctx: Ctx, item: T, index: number) => Promise<U>): Promise<U[]>;
+	/** Monitoring only: logged for `status`, `tree` and `show`, never returned, never matched on replay. */
+	observe(label: string, value: Json): void;
 }
+
+/** A nested workflow: a node whose body runs inside the caller's run. */
+export function subWorkflow<I extends TSchema, O extends TSchema>(spec: Omit<WorkflowNode<I, O>, "kind">): WorkflowNode<I, O> {
+	return { kind: "workflow", ...spec };
+}
+
+/** Per server in mcp.json: the sandbox its process runs in, and tools allowed to write outside. */
+export type McpOverlay<J extends McpConfig> = {
+	readonly [S in keyof J["mcpServers"] & string]?: { readonly sandbox?: SandboxDef; readonly allowWrites?: readonly string[] };
+};
 
 export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T extends MountTable, I extends TSchema, O extends TSchema> {
 	readonly name: string;
 	readonly models: Models<M>;
 	readonly mcp?: Mcp<J>;
 	readonly mounts?: Mounts<T>;
-	/** Every agent the body may call. */
+	/** Every agent the body may call, nested workflows included. */
 	readonly agents: readonly AgentDef[];
-	/** Every script the body may run. */
-	readonly scripts?: readonly ScriptDef[];
+	/** Every command the body may call, nested workflows included. */
+	readonly commands?: readonly CommandDef[];
 	readonly budget?: Budget;
 	readonly pin?: PinSpec;
 	readonly input: I;
@@ -418,13 +533,12 @@ export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T exten
 	readonly run: (ctx: Ctx, input: Static<I>) => Promise<Static<O>>;
 }
 
-export interface WorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
-	readonly kind: "workflow";
+export interface WorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> extends WorkflowNode<I, O> {
 	readonly spec: WorkflowSpec<ModelTable, McpConfig, MountTable, I, O>;
 }
 
 export function workflow<const M extends ModelTable, const J extends McpConfig, const T extends MountTable, I extends TSchema, O extends TSchema>(
 	spec: WorkflowSpec<M, J, T, I, O>,
 ): WorkflowDef<I, O> {
-	return { kind: "workflow", spec: spec as unknown as WorkflowSpec<ModelTable, McpConfig, MountTable, I, O> };
+	return { kind: "workflow", name: spec.name, input: spec.input, output: spec.output, run: spec.run, spec: spec as unknown as WorkflowSpec<ModelTable, McpConfig, MountTable, I, O> };
 }

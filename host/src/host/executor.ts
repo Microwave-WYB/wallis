@@ -1,11 +1,11 @@
-// Executors handle `CallAgent`; script runners handle `RunScript`. The fakes
+// Executors handle `CallAgent`; command runners (commands.ts) handle `RunCommand`. The fakes
 // answer from scripted responses, for tests and examples: no model, network
 // or device.
 //
 // The contract:
 //   Executor    { id, capabilities, contextWindow?(model), start(NodeSpec) -> NodeSession }
 //   NodeSession { turn(message?) -> TurnResult, rebind?(model), steer?(text), interrupt?(), handle(), close() }
-//   TurnResult  = submitted | ended | agent_error | executor_error
+//   TurnResult  = submitted | ended | turn_limit | agent_error | executor_error
 //
 // An agent is a function: (input, inbox) -> dialogue -> submitted(output) | failure.
 // - A node is one agent call and its dialogue. `turn()` runs the first
@@ -17,8 +17,11 @@
 //   structured output) and validates `submit_result` against it, returning
 //   the errors to the model so it can retry within its turn.
 // - `ended`: the turn ended without a result; the node goes idle and the
-//   message is its question. `agent_error` (gave up, maxTurns) reaches the
-//   body as a typed failure. `executor_error` (provider, auth, billing)
+//   message is its question. `turn_limit`: the node used its turns without
+//   submitting; it goes idle, progress kept, until its owner grants more
+//   turns, restarts or cancels it. Every turn the model sees "Turn k of N".
+//   `agent_error` (gave up, context exhausted) reaches the body as a typed
+//   failure. `executor_error` (provider, auth, billing)
 //   leaves the call incomplete and pauses the run; so does anything thrown.
 // - A submitted output is `unknown` here: the host parses it against the
 //   agent's output schema (and its artifact refs against the store) before
@@ -28,6 +31,9 @@ import type { AgentFailure, ArtifactRef, Json } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 import { schemaErrors } from "../sdk/validate.ts";
 import type { NodeDirs } from "./artifacts.ts";
+import type { CommandCall, CommandRun, CommandRunner } from "./commands.ts";
+import type { Spawn } from "./confine.ts";
+import type { McpSpawn } from "./tools.ts";
 import type { Message, Usage } from "./core.ts";
 
 export type AgentDeclaration = Declarations["agents"][string];
@@ -55,21 +61,38 @@ export interface NodeSpec {
 	readonly note: string | null;
 	/** The resolved model's window in tokens, when the executor knows it. */
 	readonly contextTokens: number | undefined;
-	readonly maxTurns: number;
+	/** Model turns this node has used, and how many it may use before it stops (`turn_limit`). */
+	readonly turn: number;
+	readonly turnLimit: number;
+	/** Where the executor checkpoints the node's conversation after every completed step (in its work dir). */
+	readonly checkpoint: string;
 	readonly digest: string;
 	/** Messages after the first prompt, so far: the agent's questions and the replies. */
 	readonly transcript: readonly Message[];
 	/** JSON Schema of the result: pass it to the provider as structured output and check `submit_result` with it. */
 	readonly outputSchema: Json;
-	/** The node's dirs: its sandbox level, mounted input artifacts, scratch dir, mounts and spill dir. */
+	/** The node's dirs: mounted input artifacts, scratch dir, mounts and spill dir. */
 	readonly workspace: NodeDirs;
+	/** The agent's sandbox, for its `bash` and file tools. */
+	readonly sandbox: AgentSandbox;
 	/** The `export_artifact` tool: stores a file from the node's scratch dir and returns its ref for `submit_result`. */
 	readonly exportArtifact: (path: string, media: string, name?: string) => ArtifactRef;
 	/** Configs of the MCP servers this agent selected (from the workflow's mcp.json). */
 	readonly mcp: Json | null;
+	/** How a stdio MCP server starts in its sandbox; absent with confinement off. */
+	readonly mcpSpawn?: McpSpawn;
 	/** Appends to the node's observational transcript. */
 	readonly log: (entry: TranscriptEntry) => void;
 }
+
+/**
+ * An agent's sandbox: none declared (no filesystem at all), one the host
+ * can build (bwrap), or one declared that cannot be built here.
+ */
+export type AgentSandbox =
+	| { readonly type: "none" }
+	| { readonly type: "bwrap"; readonly name: string; readonly spawn: (argv: readonly string[]) => Spawn }
+	| { readonly type: "unavailable"; readonly name: string; readonly reason: string };
 
 /** What a scripted fake sees for one turn: the spec with the transcript including the current message. */
 export type AgentCall = NodeSpec;
@@ -78,10 +101,13 @@ export type TurnResult =
 	| { readonly type: "submitted"; readonly output: unknown; readonly usage?: Usage }
 	| { readonly type: "ended"; readonly message: string; readonly usage?: Usage }
 	| { readonly type: "agent_error"; readonly failure: AgentFailure; readonly usage?: Usage }
+	/** The node used its turns without submitting: it waits for more (progress kept). */
+	| { readonly type: "turn_limit"; readonly used: number; readonly limit: number; readonly usage?: Usage }
 	| { readonly type: "executor_error"; readonly error: string };
 
 export interface NodeSession {
-	turn(message?: string): Promise<TurnResult>;
+	/** `turnLimit`: the node's allowance now (an answer may grant more turns). */
+	turn(message?: string, turnLimit?: number): Promise<TurnResult>;
 	/** Switches the model for later turns; without it the host restarts the session. */
 	rebind?(model: string): void;
 	/** Delivers a message to a running turn at its next step boundary. */
@@ -110,28 +136,6 @@ export interface Executor {
 /** The `submit_result` check: empty when the result matches the schema. */
 export function validateSubmission(spec: NodeSpec, output: unknown): string[] {
 	return schemaErrors(spec.outputSchema, output);
-}
-
-export interface ScriptCall {
-	readonly id: string;
-	readonly script: string;
-	readonly args: Json;
-	/** Remaining compute budget, for the sandbox to enforce. */
-	readonly computeMinutes: number | null;
-	readonly digest: string;
-	readonly outputSchema: Json;
-	readonly workspace: NodeDirs;
-	readonly resources: { readonly gpu?: number; readonly memoryGb?: number };
-}
-
-export interface ScriptResult {
-	/** Parsed by the host against the script's output schema. */
-	readonly output: unknown;
-	readonly minutes: number;
-}
-
-export interface ScriptRunner {
-	run(call: ScriptCall): Promise<ScriptResult>;
 }
 
 // --- Fakes ---------------------------------------------------------------------
@@ -225,10 +229,13 @@ export class FakeExecutor implements Executor {
 	start(spec: NodeSpec): NodeSession {
 		const transcript: Message[] = [...spec.transcript];
 		let model = spec.model;
+		let used = spec.turn;
+		let limit = spec.turnLimit;
 		return {
-			turn: async (message) => {
+			turn: async (message, turnLimit) => {
+				if (turnLimit !== undefined) limit = turnLimit;
 				if (message !== undefined) transcript.push({ role: "user", text: message });
-				const call: AgentCall = { ...spec, model, transcript: [...transcript] };
+				const call: AgentCall = { ...spec, model, transcript: [...transcript], turn: used, turnLimit: limit };
 				this.calls.push(call);
 				this.#onCall?.(call);
 				// A continued call stays on the same scripted response.
@@ -236,6 +243,8 @@ export class FakeExecutor implements Executor {
 				const replies = transcript.filter((m) => m.role === "user").length;
 				const turn = "conversation" in scripted ? scripted.conversation[Math.min(replies, scripted.conversation.length - 1)]! : scripted;
 				const result = this.#play(call, turn);
+				if (result.type !== "executor_error") used += result.usage?.turns ?? 0;
+				if (result.type === "turn_limit") used = result.used;
 				if (result.type === "ended") transcript.push({ role: "assistant", text: result.message });
 				return result;
 			},
@@ -256,7 +265,9 @@ export class FakeExecutor implements Executor {
 		for (const [i, output] of attempts.entries()) {
 			const n = i + 1;
 			const spent = turn.usage ?? { usd: 0.01 * n, tokens: 100 * n, turns: n };
-			if (n > call.maxTurns) return { type: "agent_error", failure: { type: "gave_up", error: `maxTurns exceeded (${call.maxTurns})` }, usage: spent };
+			if (call.turn + n > call.turnLimit) {
+				return { type: "turn_limit", used: call.turnLimit, limit: call.turnLimit, usage: turn.usage ?? { usd: 0.01 * i, tokens: 100 * i, turns: i } };
+			}
 			const errors = validateSubmission(call, output);
 			this.submissions.push({ id: call.id, output, errors });
 			if (errors.length === 0) return { type: "submitted", output, usage: spent };
@@ -269,16 +280,21 @@ export class FakeExecutor implements Executor {
 	}
 }
 
-export class FakeScripts implements ScriptRunner {
-	readonly calls: ScriptCall[] = [];
-	readonly #scripts: Scripts<ScriptCall, ScriptResult>;
+/** A scripted command: what it prints, and the files it writes in its scratch dir. */
+export type FakeRun = { readonly stdout?: string; readonly stderr?: string; readonly exit?: number; readonly minutes?: number; readonly timedOut?: boolean };
 
-	constructor(responses: Responses<ScriptCall, ScriptResult>) {
+/** Plays scripted command results; a function may write files into `call.workspace.scratch` first. */
+export class FakeCommands implements CommandRunner {
+	readonly calls: CommandCall[] = [];
+	readonly #scripts: Scripts<CommandCall, FakeRun>;
+
+	constructor(responses: Responses<CommandCall, FakeRun>) {
 		this.#scripts = new Scripts(responses);
 	}
 
-	async run(call: ScriptCall): Promise<ScriptResult> {
+	async run(call: CommandCall): Promise<CommandRun> {
 		this.calls.push(call);
-		return this.#scripts.pick(call.script, call, true);
+		const r = await this.#scripts.pick(call.command, call, true);
+		return { exit: r.exit ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "", minutes: r.minutes ?? 0, timedOut: r.timedOut ?? false };
 	}
 }

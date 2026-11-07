@@ -1,0 +1,8 @@
+# wallis SIDERIUS example: the trainer environment (placeholder).
+# `setup` builds it once per digest with `uv sync --frozen` into $WALLIS_ENV;
+# runs then use it offline and read-only.
+[project]
+name = "siderius-trainer"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = []

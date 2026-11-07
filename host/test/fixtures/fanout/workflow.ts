@@ -1,15 +1,20 @@
-// Test fixture: parallel branches, a sub-workflow with retries, an explicit
-// merge call, scripts, observations and a budget-limited loop. Run memory is
+// Test fixture: parallel branches, a nested workflow with retries, an explicit
+// merge call, commands, observations and a budget-limited loop. Run memory is
 // local variables; every agent gets what it needs in its input.
 
-import { defineAgent, defineModels, defineScript, subWorkflow, Type, workflow } from "wallis";
+import { command, defineAgent, defineModels, defineSandbox, subWorkflow, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "fake/default" });
 
-const train = defineScript({
+const box = defineSandbox({}, { name: "box", requires: ["sh"] });
+
+/** The default protocol: input JSON on stdin, output JSON on stdout. */
+const train = command({
 	name: "train",
+	sandbox: box,
 	input: Type.Object({ minutes: Type.Number() }),
 	output: Type.Object({ budget: Type.Union([Type.Number(), Type.Null()]) }),
+	run: ["sh", "-c", "cat >/dev/null; echo '{\"budget\":null}'"],
 });
 
 const Finding = Type.Object({ content: Type.String(), confidence: Type.Number() });
@@ -70,8 +75,8 @@ export default workflow({
 	name: "fanout",
 	models,
 	agents: [scout, judge, merger, attempt],
-	scripts: [train],
-	budget: { usd: 1, computeMinutes: 5 },
+	commands: [train],
+	budget: { turns: 100, computeMinutes: 5 },
 	input: Type.Null(),
 	output: Type.Any(),
 	run: async (ctx) => {
@@ -90,10 +95,10 @@ export default workflow({
 		const merged = await ctx.call(merger, { current: findings, incoming: verdict.findings, max: 2 });
 		findings = merged.items.slice(-2);
 		archive.push(...merged.archived);
-		const tries = await ctx.sub(retry, { max: 3 });
-		const trained = await ctx.script(train, { minutes: 5 });
+		const tries = await ctx.call(retry, { max: 3 });
+		const trained = await ctx.call(train, { minutes: 5 });
 		// The compute budget is spent: this pauses the run until it is raised.
-		const again = await ctx.script(train, { minutes: 1 });
+		const again = await ctx.call(train, { minutes: 1 });
 		return { errors, verdict, tries, trained, again, findings, archive };
 	},
 });

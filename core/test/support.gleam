@@ -22,8 +22,8 @@ pub fn workflow(agents: List(Agent)) -> Workflow {
   Workflow(
     name: "test",
     agents:,
-    scripts: ["train"],
-    budget: Budget(usd: None, tokens: None, turns: None, compute_minutes: None),
+    commands: ["train"],
+    budget: Budget(turns: None, compute_minutes: None),
   )
 }
 
@@ -35,6 +35,7 @@ pub fn basic() -> Workflow {
 pub fn pin() -> types.Pin {
   Pin(
     workflow_digest: "wf1",
+    prior_digests: [],
     models: dict.from_list([#("default", "fake/model")]),
     seed: 7,
     inputs: dict.from_list([#("advice.md", "a1")]),
@@ -46,8 +47,39 @@ pub fn started(wf: Workflow) -> Event {
   Started(workflow: wf, pin: pin(), input: JNull)
 }
 
+/// A call whose journal slot is unique to its id, so tests that are not
+/// about the cache keep one slot per request.
 pub fn call(id: String, agent: String, input: Value) -> Event {
-  Requested(id:, request: Call(agent:, input:))
+  Requested(
+    id:,
+    request: Call(agent:, input:),
+    node_digest: agent <> "@" <> id,
+    occurrence: 0,
+  )
+}
+
+/// A call keyed as the host keys it: by node digest, input and occurrence.
+pub fn cached(
+  id: String,
+  node: String,
+  input: Value,
+  occurrence: Int,
+) -> Event {
+  Requested(
+    id:,
+    request: Call(agent: "worker", input:),
+    node_digest: node,
+    occurrence:,
+  )
+}
+
+pub fn command(id: String, input: Value) -> Event {
+  Requested(
+    id:,
+    request: types.Command(command: "train", input:),
+    node_digest: "train@" <> id,
+    occurrence: 0,
+  )
 }
 
 pub fn returned(id: String, output: Value) -> Event {

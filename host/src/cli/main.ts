@@ -15,7 +15,7 @@
 //   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> [<node>]
 //   wallis interrupt <run> <node> [text] | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
-//   wallis fork <run> --at <events|node> [--model a=m]... [--detach]
+//   wallis fork <run> [--model a=m]... [--detach]   (copies the journal; unchanged calls hit)
 //   wallis export <run> <artifact> <dir>
 //   wallis serve [--executor module]
 
@@ -50,7 +50,8 @@ import type { Refusal } from "../sdk/index.ts";
 import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { loadProfile } from "../host/profile.ts";
-import { ProcessScripts } from "../host/scripts.ts";
+import { ProcessCommands } from "../host/commands.ts";
+import { CONTINUE } from "../host/query.ts";
 import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
 import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, runPaths, runsDir, writeMeta } from "../host/store.ts";
@@ -67,12 +68,13 @@ const { values, positionals } = parseArgs({
 		seed: { type: "string" },
 		model: { type: "string", multiple: true },
 		mount: { type: "string", multiple: true },
+		bin: { type: "string", multiple: true },
+		turns: { type: "string" },
 		budget: { type: "string", multiple: true },
 		executor: { type: "string" },
 		detach: { type: "boolean" },
 		json: { type: "boolean" },
 		timeout: { type: "string" },
-		at: { type: "string" },
 		since: { type: "string" },
 		limit: { type: "string" },
 		follow: { type: "boolean" },
@@ -112,7 +114,7 @@ function pairs(list: string[] | undefined): Record<string, string> {
 }
 
 function budgets(list: string[] | undefined): Partial<Record<BudgetKind, number>> {
-	const kinds: Record<string, BudgetKind> = { usd: "usd", tokens: "tokens", turns: "turns", computeMinutes: "compute_minutes", compute_minutes: "compute_minutes" };
+	const kinds: Record<string, BudgetKind> = { turns: "turns", computeMinutes: "compute_minutes", compute_minutes: "compute_minutes" };
 	return Object.fromEntries(
 		Object.entries(pairs(list)).map(([k, v]) => {
 			const kind = kinds[k];
@@ -193,7 +195,7 @@ async function drive(dir: string, options: Partial<SessionOptions>): Promise<voi
 	const session = await startSession({
 		dir,
 		executor: limitProviders(kit.executor, local.providers ?? {}),
-		scripts: kit.scripts ?? (workflow ? new ProcessScripts({ workflowDir: dirname(workflow), slots: new MachineSlots(local.slots) }) : undefined),
+		commands: kit.commands ?? new ProcessCommands({ slots: new MachineSlots(local.slots) }),
 		executorModule: module,
 		root: meta?.root ?? root,
 		by: caller,
@@ -237,6 +239,9 @@ async function main(): Promise<number> {
 				seed: values.seed ? Number(values.seed) : undefined,
 				models: pairs(values.model),
 				mounts: pairs(values.mount),
+				bins: pairs(values.bin),
+				// Binaries resolve against the CALLER's PATH, not the detached host's.
+				callerPath: process.env.PATH,
 				owner: caller,
 			};
 			const executor = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? null);
@@ -270,7 +275,9 @@ async function main(): Promise<number> {
 			const { dir, node } = target(run, id);
 			// Checked here and again by the driver when it applies the answer.
 			must(IdleNode.check(control(dir), node), refused);
-			await deliver(dir, { id: newMessageId(), type: "answer", node, text: words.join(" "), by: caller });
+			const turns = values.turns ? Number(values.turns) : 0;
+			const text = words.join(" ") || (turns > 0 ? CONTINUE : "");
+			await deliver(dir, turns > 0 ? { id: newMessageId(), type: "answer", node, text, by: caller, turns } : { id: newMessageId(), type: "answer", node, text, by: caller });
 			out(`Sent to ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
@@ -296,7 +303,19 @@ async function main(): Promise<number> {
 			const [run, id, ...words] = args;
 			const { dir, node } = target(run, id);
 			must(LiveNode.check(control(dir), node), refused);
-			await deliver(dir, words.length > 0 ? { id: newMessageId(), type: "restart", node, note: words.join(" "), by: caller } : { id: newMessageId(), type: "restart", node, by: caller });
+			const turns = values.turns ? Number(values.turns) : 0;
+			// `--model alias=...` rebinds first (a logged alias_rebound), so the restarted call uses it.
+			if ((values.model ?? []).length > 0) {
+				if (lockHolder(runPaths(dir)) !== null) throw new Error("rebind with resume --model while no host drives the run, then restart");
+				for (const [alias, to] of Object.entries(pairs(values.model))) {
+					const from = inspectRun(dir).run.models[alias];
+					if (from === undefined) throw new RunRefused({ type: "unknown_alias", alias });
+					const refusal = applyControl(dir, { type: "alias_rebound", alias, from, to });
+					if (refusal) throw new RunRefused(refusal);
+				}
+			}
+			const entry = { id: newMessageId(), type: "restart" as const, node, by: caller, ...(words.length > 0 ? { note: words.join(" ") } : {}), ...(turns > 0 ? { turns } : {}) };
+			await deliver(dir, entry);
 			out(`Restarted ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
@@ -422,15 +441,14 @@ async function main(): Promise<number> {
 			return 0;
 		}
 		case "fork": {
-			const source = resolveRun(root, args[0] ?? "");
+			// A fork copies the whole journal (a cache): positions do not matter.
+			const source = resolveRun(root, parseRunId(args[0]));
 			control(source);
-			if (!values.at) throw new Error("--at <events|node> is required");
-			const at = /^\d+$/.test(values.at) ? Number(values.at) : values.at;
 			const meta = readMeta(runPaths(source));
 			const name = meta ? (meta.workflow.split("/").at(-2) ?? "run") : "run";
-			const target = forkRun(source, join(runsDir(root), newRunId(name)), at);
+			const target = forkRun(source, join(runsDir(root), newRunId(name)));
 			applyControl(target.dir, { type: "claimed", owner: caller });
-			out(`Forked ${runPaths(source).id} at ${values.at} into ${target.id}.`);
+			out(`Forked ${runPaths(source).id} into ${target.id}.`);
 			if (values.detach) {
 				detach(target.dir, (values.model ?? []).flatMap((m) => ["--model", m]));
 				return 0;
@@ -451,7 +469,7 @@ async function main(): Promise<number> {
 			const module = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
 			const kit = await loadExecutor(module);
 			const local = loadProfile(root);
-			const server = await createMcpServer(new Runs(root, { executor: limitProviders(kit.executor, local.providers ?? {}), scripts: kit.scripts }, module));
+			const server = await createMcpServer(new Runs(root, { executor: limitProviders(kit.executor, local.providers ?? {}), commands: kit.commands }, module));
 			await server.connect(new StdioServerTransport());
 			return new Promise<number>(() => {});
 		}

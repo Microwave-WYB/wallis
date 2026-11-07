@@ -1,7 +1,7 @@
 // The pi executor on pi-ai's faux provider: no real model calls.
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -34,11 +34,9 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 			input: {},
 			output: {},
 			mcp: {},
-			tools: [],
 			skills: [],
 			needs: {},
-			sandbox: "none",
-			mounts: [],
+			sandbox: null,
 			steerable: true,
 			compaction: true,
 			max_turns: 6,
@@ -48,11 +46,14 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		input: { question: "how many?" },
 		note: null,
 		contextTokens: undefined,
-		maxTurns: 6,
+		turn: 0,
+		turnLimit: 6,
 		digest: "d",
 		transcript: [],
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
-		workspace: { level: "none", root: "/nonexistent", inputs: "/nonexistent", scratch: null, mounts: {}, spill: join(tmp(), "spill") },
+		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", mounts: {}, spill: join(tmp(), "spill") },
+		sandbox: { type: "none" },
+		checkpoint: join(tmp(), "session.json"),
 		exportArtifact: () => {
 			throw new Error("no scratch");
 		},
@@ -129,12 +130,12 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	const opts = { workflow: ask, dir, executor, models: { default: "faux/faux-1" }, inboxPollMs: null } as const;
 	const first = await runWorkflow({ ...opts, input: { topic: "folds" } });
 	const node = first.run.nodes[0]!;
-	assert.equal(node.type === "node_idle" && node.question, "Who is the audience?");
+	assert.equal(node.type === "node_idle" && node.cause.type === "question" && node.cause.message, "Who is the audience?");
 	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0", text: "newcomers" }] });
 	assert.equal(done.outcome?.type, "done", JSON.stringify(done.status));
-	// The rebuilt session carried the conversation so far.
-	assert.match(prompts[0]!, /Conversation so far:.*Who is the audience\?/);
-	assert.match(prompts[0]!, /The human: newcomers/);
+	// The new session resumed from the node's checkpoint: the real conversation, with the quota on each newest message.
+	assert.match(prompts[0]!, /"role":"assistant","content":\[\{"type":"text","text":"Who is the audience\?"/);
+	assert.match(prompts[0]!, /newcomers\\n\\n\[Turn 2 of 16\]/);
 	const transcript = readFileSync(join(dir, "nodes", "_0.jsonl"), "utf8");
 	assert.match(transcript, /"kind":"assistant","text":"Who is the audience\?"/);
 	assert.match(transcript, /"kind":"user","text":"newcomers"/);
@@ -230,16 +231,30 @@ test("pi: a provider error is an executor error: the run pauses, a resume reissu
 	assert.deepEqual(resumed.outcome, { type: "done", value: { summary: "fine now" } });
 });
 
-test("the tool layer: every tool is offered directly and through codemode; disallowed names are refused and logged", async () => {
+test("the tool layer: a sandboxed agent gets bash and file tools mapped onto its sandbox; disallowed names are refused and logged", async () => {
 	const dir = tmp();
-	const s = spec({ workspace: { level: "read-only", root: dir, inputs: dir, scratch: null, mounts: {}, spill: join(dir, "spill") } });
+	const mount = tmp();
+	writeFileSync(join(mount, "notes.txt"), "from the mount");
+	const s = spec({
+		workspace: { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), mounts: { data: mount }, spill: join(dir, "spill") },
+		sandbox: { type: "unavailable", name: "shell", reason: "test" },
+	});
+	mkdirSync(join(dir, "scratch"), { recursive: true });
 	const tools = await buildNodeTools(s);
-	assert.deepEqual(tools.agentTools().map((t) => t.name).sort(), ["codemode", "list_dir", "read_file", "read_spill", "submit_result"]);
+	assert.deepEqual(tools.agentTools().map((t) => t.name).sort(), ["bash", "codemode", "export_artifact", "list_dir", "read_file", "read_spill", "submit_result", "write_file"]);
+	// Paths are the sandbox's: /w is scratch, /w/<mount> is the mount (read-only).
+	assert.equal((await tools.invoke("read_file", { path: "/w/data/notes.txt" }, false)).text, "from the mount");
+	assert.equal((await tools.invoke("write_file", { path: "data/x", content: "no" }, false)).isError, true);
+	assert.equal((await tools.invoke("write_file", { path: "out.txt", content: "yes" }, false)).text, "wrote out.txt");
+	assert.equal(readFileSync(join(dir, "scratch", "out.txt"), "utf8"), "yes");
+	assert.equal((await tools.invoke("read_file", { path: "/etc/passwd" }, false)).isError, true);
+	// Declared but not buildable here: bash says so, typed as an error for the model.
+	assert.match((await tools.invoke("bash", { command: "id" }, false)).text, /no sandbox: test/);
 	const refused = await tools.invoke("exec", { command: "id" }, true);
 	assert.equal(refused.isError, true);
 	assert.match(refused.text, /not allowed/);
 	assert.ok(s.entries.some((e) => e.kind === "tool_call" && e.tool === "exec"));
-	// A sandbox "none" agent gets codemode too, and no fs tools.
+	// An agent without a sandbox gets codemode too, and no filesystem at all.
 	const none = await buildNodeTools(spec());
 	assert.deepEqual(none.agentTools().map((t) => t.name).sort(), ["codemode", "read_spill", "submit_result"]);
 });

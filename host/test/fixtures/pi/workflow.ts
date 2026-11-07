@@ -2,9 +2,10 @@
 // foldable input, so it works through codemode and reads its full input
 // there.
 
-import { defineAgent, defineModels, Foldable, Type, workflow } from "wallis";
+import { defineAgent, defineModels, defineSandbox, Foldable, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "faux/faux-1" });
+const shell = defineSandbox({}, { name: "shell", requires: ["bash"] });
 
 const reader = defineAgent(
 	{ models },
@@ -14,7 +15,7 @@ const reader = defineAgent(
 		prompt: "Read your input and summarize it.",
 		input: Type.Object({ topic: Type.String(), notes: Foldable(Type.Array(Type.String()), { maxChars: 40 }) }),
 		output: Type.Object({ summary: Type.String({ minLength: 1 }) }),
-		sandbox: "read-only",
+		sandbox: shell,
 	},
 );
 

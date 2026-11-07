@@ -1,13 +1,13 @@
-"""wallis SIDERIUS example: placeholder for the `train` script.
+"""wallis SIDERIUS example: placeholder for the `train` command.
 
 Train one candidate config. Args: model (an artifact ref; the plugin is
-mounted read-only at $WALLIS_INPUTS/<sha256 hex>/<name>), config, scope
+mounted read-only; its path is in the input (`model.path`)), config, scope
 (trial|formal), max_epochs, time_budget_minutes, seed, data_scope. The
-dataset is mounted read-only at $WALLIS_DATA_SIDERIUS_DATA. Output: {status,
+dataset is the read-only mount at /w/data (cwd is /w, the call's scratch dir). Output: {status,
 checkpoint, minutes}, where checkpoint is an artifact draft
-{"artifact": "<file in $WALLIS_SCRATCH>", "media": "application/x-checkpoint"}.
+{"artifact": "<file in the scratch dir>", "media": "application/x-checkpoint"}.
 
-Reads JSON args on stdin and writes JSON to stdout. The remaining compute
+Reads its JSON input on stdin and writes JSON to stdout. The remaining compute
 budget (minutes) is in the WALLIS_COMPUTE_MINUTES environment variable.
 This placeholder does no work.
 """

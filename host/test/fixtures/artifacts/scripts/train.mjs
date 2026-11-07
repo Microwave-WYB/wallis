@@ -1,7 +1,6 @@
-// The model arrives as a mounted input artifact, the corpus as a mounted dataset.
+// The model arrives as a mounted input artifact (its path as argv[2]), the corpus as a mount at /w/corpus.
 import { readFileSync, writeFileSync } from "node:fs";
-const args = JSON.parse(readFileSync(0, "utf8"));
-const model = readFileSync(`${process.env.WALLIS_INPUTS}/${args.model.digest.slice(7)}/${args.model.name}`, "utf8");
-const corpus = readFileSync(`${process.env.WALLIS_MOUNT_CORPUS}/words.txt`, "utf8");
-writeFileSync(`${process.env.WALLIS_SCRATCH}/ckpt.bin`, `${model}+${corpus}`);
-process.stdout.write(JSON.stringify({ checkpoint: { artifact: "ckpt.bin", media: "application/octet-stream" } }));
+const model = readFileSync(process.argv[2], "utf8");
+const corpus = readFileSync("corpus/words.txt", "utf8");
+writeFileSync("ckpt.bin", `${model}+${corpus}`);
+process.stdout.write(String(model.length + corpus.length));

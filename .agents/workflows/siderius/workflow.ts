@@ -17,27 +17,28 @@ import {
 	defineAgent,
 	defineMcp,
 	defineModels,
+	command,
 	defineMounts,
-	defineScript,
-	defineTool,
+	defineSandbox,
 	Foldable,
+	type Ctx,
 	type Static,
 	subWorkflow,
 	Type,
 	workflow,
 } from "wallis";
 import mcpConfig from "./mcp.json" with { type: "json" };
-import consolidatePrompt from "./consolidate-findings.md" with { type: "text" };
-import dataAnalysisPrompt from "./data-analysis.md" with { type: "text" };
-import evidenceJudgePrompt from "./evidence-judge.md" with { type: "text" };
-import implementPrompt from "./implement.md" with { type: "text" };
-import interpretPrompt from "./interpret.md" with { type: "text" };
-import literaturePrompt from "./literature-review.md" with { type: "text" };
-import proposePrompt from "./propose.md" with { type: "text" };
-import stopCheckPrompt from "./stop-check.md" with { type: "text" };
-import tunePlannerPrompt from "./tune-planner.md" with { type: "text" };
-import tuneReflectorPrompt from "./tune-reflector.md" with { type: "text" };
-import validatePrompt from "./validate.md" with { type: "text" };
+import consolidatePrompt from "./prompts/consolidate-findings.md" with { type: "text" };
+import dataAnalysisPrompt from "./prompts/data-analysis.md" with { type: "text" };
+import evidenceJudgePrompt from "./prompts/evidence-judge.md" with { type: "text" };
+import implementPrompt from "./prompts/implement.md" with { type: "text" };
+import interpretPrompt from "./prompts/interpret.md" with { type: "text" };
+import literaturePrompt from "./prompts/literature-review.md" with { type: "text" };
+import proposePrompt from "./prompts/propose.md" with { type: "text" };
+import stopCheckPrompt from "./prompts/stop-check.md" with { type: "text" };
+import tunePlannerPrompt from "./prompts/tune-planner.md" with { type: "text" };
+import tuneReflectorPrompt from "./prompts/tune-reflector.md" with { type: "text" };
+import validatePrompt from "./prompts/validate.md" with { type: "text" };
 
 // --- Models: one alias per SIDERIUS llm.json route ----------------------------
 
@@ -57,7 +58,6 @@ const models = defineModels({
 	consolidate: "",
 });
 
-const mcp = defineMcp(mcpConfig);
 
 // --- Schemas -----------------------------------------------------------------
 //
@@ -134,38 +134,77 @@ const S = Type.Script(
 	type Scope = "trial" | "formal"
 	type Direction = "higher_is_better" | "lower_is_better"
 	type HealthCheck = { check_name: string, metrics: Record<string, number> }
-	type SkillInput = { skill: string, args: Record<string, string> }
-	type SkillOutput = { result_ref: string, summary: string }
 	`,
 );
 
-const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheEntry, CollapseEntry, Evidence, Incumbent, Proposal, Scope, Direction, HealthCheck, SkillInput, SkillOutput } = S;
+const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheEntry, CollapseEntry, Evidence, Incumbent, Proposal, Scope, Direction, HealthCheck } = S;
 
-// --- Artifacts and mounts ----------------------------------------------------------
+// --- Artifacts, mounts and sandboxes ------------------------------------------------
 //
 // Files handed downstream are artifacts: the implementor exports the model
 // plugin, train mounts it and returns the checkpoint, evaluate and Health
-// mount the checkpoint. Two read-only mounts, both supplied by the caller or
-// the local profile: `data` (the dataset) and `config` (data_scope.json,
-// health_config.yaml, advice.md: run_invariants.py's locked files). Their
-// content digests are pinned.
+// mount the checkpoint.
+//
+// Nothing is implicit: the workflow dir is never mounted. Each sandbox sees
+// only the mounts it names, read-only, plus its call's private scratch dir.
+// `trainer/` and `checks/` are workflow-relative mounts; `prompts/` is
+// never mounted anywhere, so no agent or command can read the judge's
+// prompt or the Health code it is graded by. `data` (the dataset) and
+// `config` (data_scope.json, health_config.yaml, advice.md: the locked
+// files of run_invariants.py) are supplied by the caller or the local
+// profile. Every mount's content digest is pinned.
 
 const ModelPlugin = Artifact("text/x-python");
 const Checkpoint = Artifact("application/x-checkpoint");
-const mounts = defineMounts({ data: "", config: "" });
+const mounts = defineMounts({ trainer: "./trainer", checks: "./checks", data: "", config: "" });
 
-/** Files in the `config` mount, by name. */
+/** Files in the `config` mount, as the sandboxes see them. */
 const files = {
-	dataScope: "data_scope.json",
-	healthConfig: "health_config.yaml",
-	advice: "advice.md",
+	dataScope: "config/data_scope.json",
+	healthConfig: "config/health_config.yaml",
+	advice: "config/advice.md",
 };
 
-// --- Scripts: the task package's domain code, with typed args and outputs ------
+/** train and evaluate: the trainer's locked environment, built once by `uv sync`, then used offline. */
+const trainerBox = defineSandbox(
+	{ mounts },
+	{
+		name: "trainer",
+		requires: ["uv", "sh"],
+		setup: [["sh", "-c", 'UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" uv sync --frozen --project trainer']],
+		mounts: ["trainer", "data", "config"],
+	},
+);
 
-const trainScript = defineScript({ mounts }, {
+/** The deterministic checks: Health, fingerprints, the validator, the metric order. */
+const checksBox = defineSandbox({ mounts }, { name: "checks", requires: ["python3"], mounts: ["checks", "data", "config"] });
+
+/** The implementor: the data only, never the trainer or the checks it is judged by. */
+const codingBox = defineSandbox({ mounts }, { name: "coding", requires: ["bash", "python3"], mounts: ["data"] });
+
+/** The data analyst: the data read-only and a shell (this replaces SIDERIUS's run_skill tool). */
+const analysisBox = defineSandbox({ mounts }, { name: "analysis", requires: ["bash", "python3"], mounts: ["data"] });
+
+/** Interpretation and proposal read the run's advice. */
+const readingBox = defineSandbox({ mounts }, { name: "reading", requires: ["bash"], mounts: ["config"] });
+
+/** The LLM validator reviews the plugin, an input artifact; it sees nothing else. */
+const reviewBox = defineSandbox({ mounts }, { name: "review", requires: ["bash"] });
+
+/** MCP servers run in their own sandboxes, each with its network allowlist. */
+const arxivBox = defineSandbox({}, { name: "arxiv-mcp", requires: ["uvx"], network: ["arxiv.org", "export.arxiv.org", "pypi.org", "files.pythonhosted.org"] });
+const scholarBox = defineSandbox({}, { name: "scholar-mcp", requires: ["uvx"], network: ["api.semanticscholar.org", "pypi.org", "files.pythonhosted.org"] });
+const mcp = defineMcp(mcpConfig, { arxiv: { sandbox: arxivBox }, semantic_scholar: { sandbox: scholarBox } });
+
+/** The default protocol: input JSON on stdin, output JSON (with artifact drafts) on stdout. */
+const trainerRun = (script: string) => ["sh", "-c", `UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" exec uv run --offline --no-sync --project trainer python trainer/${script}`] as const;
+
+// --- Commands: the task package's domain code, as typed adapters ------------------
+
+const trainScript = command({
 	name: "train",
 	description: "Train one candidate config on the trial or formal scope (training_skill).",
+	sandbox: trainerBox,
 	input: Type.Script({ ModelPlugin, Config, Scope, Int }, `{
 		model: ModelPlugin, config: Config, scope: Scope, max_epochs: Int,
 		time_budget_minutes: number, seed: Int, data_scope: string
@@ -174,54 +213,54 @@ const trainScript = defineScript({ mounts }, {
 		status: "ok" | "oom" | "gate_refused" | "infrastructure_abort",
 		checkpoint: Checkpoint | null, minutes: number
 	}`),
-	mounts: ["data", "config"],
+	run: trainerRun("train.py"),
 	resources: { gpu: 1, memoryGb: 32 },
 });
 
-const evaluateScript = defineScript({ mounts }, {
+const evaluateScript = command({
 	name: "evaluate",
 	description: "Score a checkpoint on the trial or formal evaluation portion (inference_skill, evaluate_metric).",
+	sandbox: trainerBox,
 	input: Type.Script({ Checkpoint, Scope }, `{ checkpoint: Checkpoint, scope: Scope }`),
 	output: Type.Script({ Score }, `{ scoreable: boolean, score: Score, metric_id: string }`),
-	mounts: ["data"],
+	run: trainerRun("evaluate.py"),
 	resources: { gpu: 1, memoryGb: 16 },
 });
 
-const healthScript = defineScript({ mounts }, {
+const healthScript = command({
 	name: "health",
 	description: "Run the scientific Health gates of the effective Health config (round_health.py).",
+	sandbox: checksBox,
 	input: Type.Script({ Checkpoint }, `{ checkpoint: Checkpoint, health_config: string, model_type: string }`),
 	output: Type.Script({ HealthCheck }, `{ valid: boolean, policy: "blocking" | "recording", failed_checks: HealthCheck[] }`),
-	mounts: ["data", "config"],
+	run: ["python3", "checks/health.py"],
 });
 
-const fingerprintScript = defineScript({
+const fingerprintScript = command({
 	name: "fingerprint",
 	description: "Turn failed Health checks into collapse fingerprints.",
+	sandbox: checksBox,
 	input: Type.Script({ HealthCheck, Int }, `{ failed_checks: HealthCheck[], model_type: string, iteration: Int }`),
 	output: Type.Script({ CollapseEntry }, `{ entries: CollapseEntry[] }`),
+	run: ["python3", "checks/fingerprint.py"],
 });
 
-const metricOrderScript = defineScript({ mounts }, {
+const metricOrderScript = command({
 	name: "metric_order",
 	description: "Reconcile the run's MetricSpec and report its direction (MetricOrder).",
+	sandbox: checksBox,
 	input: Type.Script(`{ data_scope: string }`),
 	output: Type.Script({ Direction }, `{ metric_id: string, direction: Direction }`),
-	mounts: ["config"],
+	run: ["python3", "checks/metric_order.py"],
 });
 
-const validateScript = defineScript({
-	name: "validate",
+const validateScript = command({
+	name: "check_plugin",
 	description: "Deterministic validator checks 1-7 and 9.",
+	sandbox: checksBox,
 	input: Type.Script({ ModelPlugin, Int }, `{ model: ModelPlugin, probe_seed: Int }`),
 	output: Type.Script(`{ passed: boolean, error: string | null, checks: Record<string, boolean> }`),
-});
-
-const runSkillScript = defineScript({
-	name: "run_skill",
-	description: "Serve the data-analysis tool run_skill: one authorized analysis skill under the access policy.",
-	input: SkillInput,
-	output: SkillOutput,
+	run: ["python3", "checks/validate.py"],
 });
 
 // --- Findings consolidation (cache_consolidator.list_merge) ---------------------
@@ -288,19 +327,9 @@ const PredictionMemory = Type.Object({
 	info_gain_v2: Type.Number(),
 });
 
-// --- Tools ---------------------------------------------------------------------
-
-const runSkill = defineTool({
-	name: "run_skill",
-	description: "Run one authorized analysis skill inside the declared data scope.",
-	input: SkillInput,
-	output: SkillOutput,
-	script: runSkillScript.name,
-});
-
 // --- Agents: SIDERIUS nodes ----------------------------------------------------
 
-const env = { models, mcp, mounts };
+const env = { models, mcp };
 
 const interpreter = defineAgent(env, {
 	name: "interpret",
@@ -320,8 +349,7 @@ const interpreter = defineAgent(env, {
 		analysis_brief: Type.String(),
 	}),
 	// advice.md is read from the config mount.
-	sandbox: "read-only",
-	mounts: ["config"],
+	sandbox: readingBox,
 	maxTurns: 4,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -332,9 +360,7 @@ const dataAnalyst = defineAgent(env, {
 	prompt: dataAnalysisPrompt,
 	input: Type.Object({ at: Type.String(), analysis_brief: Type.String(), resource_minutes: Type.Number(), recent_runs: Type.Array(RunSummary) }),
 	output: Type.Object({ evidence: Type.Array(Evidence) }),
-	tools: [runSkill],
-	sandbox: "read-only",
-	mounts: ["data"],
+	sandbox: analysisBox,
 	maxTurns: 24,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -350,8 +376,8 @@ const literature = defineAgent(env, {
 		knowledge_cache: Foldable(Type.Array(CacheEntry), { maxChars: 6000 }),
 	}),
 	output: Type.Object({ evidence: Type.Array(Evidence), search_rounds_used: Type.Integer() }),
+	// MCP only: no sandbox, so no filesystem.
 	mcp: { arxiv: ["search_papers", "download_paper", "read_paper"], semantic_scholar: "*" },
-	sandbox: "none",
 	maxTurns: 32,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -387,8 +413,7 @@ const proposer = defineAgent(env, {
 		history: History,
 	}),
 	output: Proposal,
-	sandbox: "read-only",
-	mounts: ["config"],
+	sandbox: readingBox,
 	maxTurns: 6,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -400,7 +425,7 @@ const implementor = defineAgent(env, {
 	input: Type.Object({ proposal: Proposal, previous_validation_failure: Type.Union([Type.String(), Type.Null()]), probe_seed: Type.Integer() }),
 	// The plugin is exported from the node's scratch dir as an artifact.
 	output: Type.Object({ model: ModelPlugin, capability_metadata: Type.Record(Type.String(), Type.String()) }),
-	sandbox: "workspace",
+	sandbox: codingBox,
 	maxTurns: 40,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -411,7 +436,7 @@ const validator = defineAgent(env, {
 	prompt: validatePrompt,
 	input: Type.Object({ model: ModelPlugin, deterministic_report: validateScript.output }),
 	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), error_signatures: Type.Array(RawSignature) }),
-	sandbox: "read-only",
+	sandbox: reviewBox,
 	maxTurns: 4,
 	needs: { structuredOutput: true },
 });
@@ -469,8 +494,8 @@ const Input = Type.Object({
 	evidence: Type.Object({
 		dataAnalysis: Type.Boolean(),
 		literature: Type.Boolean(),
-		/** SIDERIUS runs the two in sequence; `parallel` is the fan-out form. */
-		order: Type.Union([Type.Literal("parallel"), Type.Literal("analysis_then_literature"), Type.Literal("literature_then_analysis")]),
+		/** Default `parallel` (the two are independent). SIDERIUS runs them in sequence; either order is available. */
+		order: Type.Optional(Type.Union([Type.Literal("parallel"), Type.Literal("analysis_then_literature"), Type.Literal("literature_then_analysis")])),
 		literatureMaxRounds: Type.Integer({ minimum: 1 }),
 	}),
 	/** Authored-loop stops (definition/models.py). Zero or empty turns them off. */
@@ -627,7 +652,7 @@ const implementAndValidate = subWorkflow({
 				previous_validation_failure: feedback,
 				probe_seed: probeSeed(input.seed, input.iteration, attempt),
 			});
-			const report = await ctx.script(validateScript, { model: impl.model, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
+			const report = await ctx.call(validateScript, { model: impl.model, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
 			const review = await ctx.call(validator, { model: impl.model, deterministic_report: report });
 			signatures.push(...review.error_signatures);
 			if (review.passed) {
@@ -698,12 +723,13 @@ const tune = subWorkflow({
 			});
 			const config: Static<typeof Config> = isTrial ? plan.config : { ...(bestTrialConfig ?? plan.config), ...plan.config };
 
-			// Gate refusals and OOM count as attempts, not rounds.
-			let scored: { score: number; checkpoint: Static<typeof Checkpoint> } | null = null;
+			// Gate refusals and OOM count as attempts, not rounds. Each attempt
+			// trains, then scores and runs Health on its checkpoint in parallel.
+			type Attempt = { status: string; scored: { score: number; checkpoint: Static<typeof Checkpoint>; health: Static<typeof healthScript.output> } | null };
 			const attempts = isTrial ? input.attempts_trial : input.attempts_formal;
 			const scope = isTrial ? "trial" : "formal";
-			for (let attempt = 1; attempt <= attempts && scored === null; attempt++) {
-				const trained = await ctx.script(trainScript, {
+			const tryOnce = async (c: Ctx, attempt: number): Promise<Attempt> => {
+				const trained = await c.call(trainScript, {
 					model: input.model,
 					config,
 					scope,
@@ -712,20 +738,33 @@ const tune = subWorkflow({
 					seed: probeSeed(input.seed, input.iteration * 100 + round, attempt),
 					data_scope: files.dataScope,
 				});
-				if (trained.status === "infrastructure_abort") {
-					return {
-						best_score: bestScore,
-						best_formal_score: bestFormal,
-						best_valid_formal_score: bestValidFormal,
-						termination_reason: "infrastructure_abort",
-						physical_rejections: rejections,
-						failed_checks: failedChecks,
-					};
-				}
-				if (trained.status !== "ok" || trained.checkpoint === null) continue;
-				const evaluated = await ctx.script(evaluateScript, { checkpoint: trained.checkpoint, scope });
-				if (evaluated.scoreable && evaluated.score !== null) scored = { score: evaluated.score, checkpoint: trained.checkpoint };
+				if (trained.status !== "ok" || trained.checkpoint === null) return { status: trained.status, scored: null };
+				const checkpoint = trained.checkpoint;
+				const { evaluated, health } = await c.parallel({
+					evaluated: (b) => b.call(evaluateScript, { checkpoint, scope }),
+					health: (b) => b.call(healthScript, { checkpoint, health_config: files.healthConfig, model_type: input.model_type }),
+				});
+				return { status: "ok", scored: evaluated.scoreable && evaluated.score !== null ? { score: evaluated.score, checkpoint, health } : null };
+			};
+			// Trial attempts of one round run in parallel (resource slots throttle the GPUs);
+			// Formal attempts stay sequential, stopping at the first scored one.
+			const tried: Attempt[] = [];
+			if (isTrial) tried.push(...(await ctx.map(Array.from({ length: attempts }, (_, i) => i + 1), (c, attempt) => tryOnce(c, attempt))));
+			else for (let attempt = 1; attempt <= attempts && !tried.some((t) => t.scored); attempt++) tried.push(await ctx.parallel({ one: (c) => tryOnce(c, attempt) }).then((r) => r.one));
+			if (tried.some((t) => t.status === "infrastructure_abort")) {
+				return {
+					best_score: bestScore,
+					best_formal_score: bestFormal,
+					best_valid_formal_score: bestValidFormal,
+					termination_reason: "infrastructure_abort",
+					physical_rejections: rejections,
+					failed_checks: failedChecks,
+				};
 			}
+			// The best scored attempt of the round, in attempt order on ties.
+			const scored = tried
+				.flatMap((t) => (t.scored ? [t.scored] : []))
+				.reduce<Attempt["scored"]>((best, t) => (best === null || better(input.direction, t.score, best.score) ? t : best), null);
 
 			if (scored === null) {
 				failRounds++;
@@ -735,7 +774,7 @@ const tune = subWorkflow({
 			failRounds = 0;
 
 			// Health: scientific gates on every scored round.
-			const health = await ctx.script(healthScript, { checkpoint: scored.checkpoint, health_config: files.healthConfig, model_type: input.model_type });
+			const health = scored.health;
 			failedChecks.push(...health.failed_checks);
 			if (better(input.direction, scored.score, bestScore)) bestScore = scored.score;
 			if (isTrial && better(input.direction, scored.score, bestTrialScore)) {
@@ -779,11 +818,12 @@ export default workflow({
 	mcp,
 	mounts,
 	agents: [interpreter, dataAnalyst, literature, evidenceJudge, stopCheck, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
-	scripts: [trainScript, evaluateScript, healthScript, fingerprintScript, metricOrderScript, validateScript, runSkillScript],
-	// LLM spend is new in wallis (SIDERIUS only logs tokens). A spent budget
-	// pauses the run, which `wallis resume --budget usd=...` continues;
-	// compute minutes reach every script as its remaining budget.
-	budget: { usd: 40, turns: 3000, computeMinutes: 24 * 60 },
+	commands: [trainScript, evaluateScript, healthScript, fingerprintScript, metricOrderScript, validateScript],
+	// Attention points, not caps: agent turns and command compute minutes.
+	// When one is reached no new call starts (calls in flight finish) and the
+	// run waits for its owner: `wallis resume --budget turns=...`, or cancel.
+	// USD and tokens are recorded for information only.
+	budget: { turns: 3000, computeMinutes: 24 * 60 },
 	// run_invariants.py: resolved_data_scope, health_config_sha256 and
 	// advice_sha256 are the `config` mount's content digest, pinned with the
 	// `data` mount's. The seed, workflow digest and resolved alias table are
@@ -803,7 +843,7 @@ export default workflow({
 		}),
 	}),
 	run: async (ctx, input: Input) => {
-		const { direction } = await ctx.script(metricOrderScript, { data_scope: files.dataScope });
+		const { direction } = await ctx.call(metricOrderScript, { data_scope: files.dataScope });
 		const sign = direction === "higher_is_better" ? 1 : -1;
 
 		// --- Run memory: SIDERIUS ChainState, as local variables -------------
@@ -853,24 +893,27 @@ export default workflow({
 			// (cache_consolidator: at most one call per list, on a cache hit).
 			const byModel = new Map<string, Finding[]>();
 			for (const f of interpretation.key_findings) byModel.set(f.model_type, [...(byModel.get(f.model_type) ?? []), f]);
-			for (const [modelType, found] of byModel) {
+			// Per model, concurrently (ctx.map: each model's branch has its own request ids).
+			const consolidated = await ctx.map([...byModel], async (c, [modelType, found]) => {
 				const entry = knowledgeCache.find((e) => e.model_type === modelType);
-				if (!entry) {
-					// A cache miss: nothing to consolidate into.
-					findingsArchive.push(...found);
-					continue;
-				}
+				// A cache miss: nothing to consolidate into.
+				if (!entry) return { modelType, updated: null, archived: found };
 				const updated: CacheEntry = { ...entry };
+				const archived: Finding[] = [];
 				for (const kind of ["finding", "bottleneck"] as const) {
 					const incoming = found.filter((f) => f.kind === kind);
 					if (incoming.length === 0) continue;
 					const list = kind === "finding" ? "key_findings" : "bottlenecks";
-					const merged = await ctx.call(consolidator, { model_type: modelType, kind, current: entry[list], incoming, max: MAX_SURVIVORS });
+					const merged = await c.call(consolidator, { model_type: modelType, kind, current: entry[list], incoming, max: MAX_SURVIVORS });
 					const pruned = rankPrune(merged.items);
 					updated[list] = pruned.kept;
-					findingsArchive.push(...merged.archived, ...pruned.archived);
+					archived.push(...merged.archived, ...pruned.archived);
 				}
-				knowledgeCache = knowledgeCache.map((e) => (e.model_type === modelType ? updated : e));
+				return { modelType, updated, archived };
+			});
+			for (const { modelType, updated, archived } of consolidated) {
+				findingsArchive.push(...archived);
+				if (updated) knowledgeCache = knowledgeCache.map((e) => (e.model_type === modelType ? updated : e));
 			}
 
 			// 3. Optional evidence stage, then the judge over its capped projection.
@@ -881,14 +924,15 @@ export default workflow({
 				const analysis = () => ({ at, analysis_brief: interpretation.analysis_brief, resource_minutes: 30, recent_runs: runs.slice(-4) });
 				const lit = () => ({ at, bottlenecks, max_rounds: input.evidence.literatureMaxRounds, knowledge_cache: knowledgeCache });
 				const found: Evidence[] = [];
-				if (input.evidence.order === "parallel") {
+				const order = input.evidence.order ?? "parallel";
+				if (order === "parallel") {
 					const r = await ctx.parallel({
 						analysis: async (c) => (input.evidence.dataAnalysis ? c.call(dataAnalyst, analysis()) : null),
 						literature: async (c) => (input.evidence.literature ? c.call(literature, lit()) : null),
 					});
 					found.push(...(r.analysis?.evidence ?? []), ...(r.literature?.evidence ?? []));
 				} else {
-					for (const node of input.evidence.order === "analysis_then_literature" ? ["analysis", "literature"] : ["literature", "analysis"]) {
+					for (const node of order === "analysis_then_literature" ? ["analysis", "literature"] : ["literature", "analysis"]) {
 						if (node === "analysis" && input.evidence.dataAnalysis) found.push(...(await ctx.call(dataAnalyst, analysis())).evidence);
 						if (node === "literature" && input.evidence.literature) found.push(...(await ctx.call(literature, lit())).evidence);
 					}
@@ -925,7 +969,7 @@ export default workflow({
 						vram_budget_gb: input.tuning.vramBudgetGb,
 						history: history(),
 					});
-					const impl = await ctx.sub(implementAndValidate, {
+					const impl = await ctx.call(implementAndValidate, {
 						proposal,
 						previous_failure: null,
 						max_attempts: input.maxImplAttempts,
@@ -956,7 +1000,7 @@ export default workflow({
 			}
 
 			// 5. Tuning: Trial rounds, then the forced Formal round, Health per round.
-			const tuned = await ctx.sub(tune, {
+			const tuned = await ctx.call(tune, {
 				model_type: candidate.proposal.model_type,
 				model: candidate.model,
 				baseline_config: candidate.proposal.baseline_config,
@@ -983,7 +1027,7 @@ export default workflow({
 			}
 
 			// 6. Health feedback: collapse fingerprints per model.
-			const fingerprints = await ctx.script(fingerprintScript, { failed_checks: tuned.failed_checks, model_type: candidate.proposal.model_type, iteration });
+			const fingerprints = await ctx.call(fingerprintScript, { failed_checks: tuned.failed_checks, model_type: candidate.proposal.model_type, iteration });
 			collapseHistory = pruneCollapse(collapseHistory, fingerprints.entries, iteration);
 
 			// 7. Fold the iteration into the carried history (advance_completed_history).

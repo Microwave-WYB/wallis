@@ -3,20 +3,20 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import support.{
-  basic, call, human, idle, last, nodes_after, pin, replay, replay_from,
-  returned, snapshot_get, started, status_after,
+  basic, cached, call, command, human, idle, last, nodes_after, pin, replay,
+  replay_from, returned, snapshot_get, started, status_after,
 }
 import wallis_core/run
 import wallis_core/types.{
-  AgentGaveUp, AliasRebound, Answer, Assistant, Budget, BudgetExhausted,
-  BudgetRaised, CallAgent, CancelRequested, Cancelled, CancelledByOwner,
+  AgentGaveUp, AliasRebound, Answer, Assistant, Budget, BudgetRaised,
+  BudgetReached, CallAgent, CancelRequested, Cancelled, CancelledByOwner,
   Checkpoint, ComputeMinutes, ContextExhausted, Deliver, Done, ExecutorFailed,
   ExecutorUnavailable, Fail, Finish, Finished, GaveUp, Idle, InboxMessage,
   InputRejected, InputTooLarge, Interrupt, InvalidDeclaration, Message, NodeDone,
   NodeFailed, NodeIdle, NodeNotRunning, NodeRunning, NotIdle, NotLive, NotOwner,
-  NotRunning, NotSteerable, PathDiverged, Pin, PinMismatch, Refuse, Requested,
-  Restart, Resumed, RetryUnavailable, RunScript, Running, Script, Sent, Steer,
-  Tokens, UnknownAlias, Usage, Usd, User, Workflow,
+  NotRunning, NotSteerable, Pin, PinMismatch, Refuse, Restart, Resumed,
+  RetryUnavailable, RunCommand, Running, Sent, Steer, Turns, UnknownAlias, Usage,
+  User, Workflow,
 }
 import wallis_core/value.{JArray, JInt, JNull, JString}
 
@@ -29,7 +29,7 @@ fn failed(id, error) {
 }
 
 fn sent(node, text) {
-  Sent(node, text, "m1", human)
+  Sent(node, text, "m1", human, 0)
 }
 
 // --- Start ---
@@ -183,7 +183,16 @@ pub fn agent_ending_turn_without_result_idles_its_node_test() {
   assert last(asked()) == []
   assert status_after(asked()) == Some(Idle(None))
   assert nodes_after(asked())
-    == [NodeIdle("#0", "worker", "fake/model", True, [], "Which dataset?")]
+    == [
+      NodeIdle(
+        "#0",
+        "worker",
+        "fake/model",
+        True,
+        [],
+        types.Question("Which dataset?"),
+      ),
+    ]
 }
 
 pub fn an_answer_continues_the_same_dialogue_and_is_in_the_inbox_test() {
@@ -238,12 +247,12 @@ pub fn replaying_an_idle_node_does_nothing_test() {
 
 pub fn interventions_need_the_owner_or_the_human_test() {
   let events = list.append(asked(), [types.Claimed("harness:a")])
-  assert last(list.append(events, [Sent("#0", "x", "m1", "harness:b")]))
+  assert last(list.append(events, [Sent("#0", "x", "m1", "harness:b", 0)]))
     == [Refuse(None, NotOwner("harness:b", Some("harness:a")))]
   let assert [CallAgent(..)] =
-    last(list.append(events, [Sent("#0", "x", "m1", "harness:a")]))
+    last(list.append(events, [Sent("#0", "x", "m1", "harness:a", 0)]))
   let assert [CallAgent(..)] =
-    last(list.append(events, [Sent("#0", "x", "m1", human)]))
+    last(list.append(events, [Sent("#0", "x", "m1", human, 0)]))
   assert last(list.append(events, [types.PauseRequested("harness:b")]))
     == [Refuse(None, NotOwner("harness:b", Some("harness:a")))]
   // An unowned run is the human's only.
@@ -301,8 +310,10 @@ pub fn a_non_steerable_node_refuses_steer_interrupt_and_answers_test() {
     == [NodeRunning("#0", "judge", "fake/model", False, [])]
   // It accepts cancel, and a restart without a note.
   let assert [CallAgent(id: "#0", note: None, ..)] =
-    last(list.append(asking, [types.Restarted("#0", None, human)]))
-  assert last(list.append(asking, [types.Restarted("#0", Some("hint"), human)]))
+    last(list.append(asking, [types.Restarted("#0", None, human, 0)]))
+  assert last(
+      list.append(asking, [types.Restarted("#0", Some("hint"), human, 0)]),
+    )
     == [Refuse(None, NotSteerable("#0"))]
   let assert [Fail("#0", AgentGaveUp("judge", CancelledByOwner))] =
     last(list.append(asking, [types.NodeCancelled("#0", human)]))
@@ -326,7 +337,7 @@ pub fn interrupt_is_logged_for_a_running_steerable_node_test() {
 pub fn restart_discards_progress_and_reissues_with_the_note_test() {
   let events =
     list.append(asked(), [
-      types.Restarted("#0", Some("use the 2024 data"), human),
+      types.Restarted("#0", Some("use the 2024 data"), human, 0),
     ])
   let assert [
     CallAgent(id: "#0", input: JNull, transcript: [], note: Some(note), ..),
@@ -343,7 +354,7 @@ pub fn restart_discards_progress_and_reissues_with_the_note_test() {
     NodeDone(inbox: [InboxMessage(Restart, "use the 2024 data", 1)], ..),
   ] = nodes_after(done)
   // A done node has nothing to restart.
-  assert last(list.append(done, [types.Restarted("#0", None, human)]))
+  assert last(list.append(done, [types.Restarted("#0", None, human, 0)]))
     == [Refuse(None, NotLive("#0"))]
 }
 
@@ -382,91 +393,164 @@ fn budgeted(budget) {
   Workflow(..basic(), budget:)
 }
 
-pub fn exhausted_budget_pauses_then_raise_continues_test() {
-  let wf =
-    budgeted(Budget(
-      usd: Some(0.5),
-      tokens: None,
-      turns: None,
-      compute_minutes: None,
-    ))
+pub fn a_reached_turn_budget_admits_no_new_call_and_lets_in_flight_ones_finish_test() {
+  let wf = budgeted(Budget(turns: Some(1), compute_minutes: None))
   let events = [
     started(wf),
-    call("#0", "worker", JNull),
-    returned("#0", summary("s")),
-    call("#1", "worker", JNull),
+    call("#0.a#0", "worker", JNull),
+    call("#0.b#0", "worker", JNull),
+    returned("#0.a#0", summary("a")),
+    call("#0.a#1", "worker", JNull),
   ]
+  // The budget is reached: the new call is held, the run stays running for the one in flight.
   assert last(events) == []
-  assert status_after(events)
-    == Some(Idle(Some(BudgetExhausted(Usd, 0.5, 0.5))))
-  // The paused call is logged; replay leaves it paused.
-  let #(s, _, log) = replay(events)
-  assert list.length(log) == 4
-  let #(_, effects) = run.step(s, call("#1", "worker", JNull))
-  assert effects == []
-  let raised = list.append(events, [BudgetRaised(Usd, 1.0)])
-  let assert [CallAgent(id: "#1", ..)] = last(raised)
-  assert status_after(raised) == Some(Running)
-  // A raise that is not enough leaves it paused.
-  let assert [] = last(list.append(events, [BudgetRaised(Usd, 0.4)]))
+  assert status_after(events) == Some(Running)
+  // The call in flight finishes normally, overshooting the budget by its turn.
+  let done = list.append(events, [returned("#0.b#0", summary("b"))])
+  let assert [Deliver("#0.b#0", _)] = last(done)
+  assert status_after(done) == Some(Idle(Some(BudgetReached(Turns, 2.0, 1.0))))
+  let #(s, _, log) = replay(done)
+  assert snapshot_get(s, "spent.turns") == JInt(2)
+  assert list.length(log) == 6
+  // The owner raises it: the held call is issued.
+  let raised = list.append(done, [BudgetRaised(Turns, 10.0)])
+  let assert [CallAgent(id: "#0.a#1", ..)] = last(raised)
+  // A raise that is not enough leaves it held.
+  let assert [] = last(list.append(done, [BudgetRaised(Turns, 2.0)]))
 }
 
-pub fn budget_caps_turns_of_call_test() {
-  let wf =
-    budgeted(Budget(
-      usd: None,
-      tokens: None,
-      turns: Some(3),
-      compute_minutes: None,
-    ))
+pub fn usd_and_tokens_are_recorded_and_never_hold_a_call_test() {
   let events = [
-    started(wf),
+    started(basic()),
     call("#0", "worker", JNull),
-    types.AgentReturned("#0", summary("s"), Usage(0.0, 0, 2), "fake/model"),
+    types.AgentReturned(
+      "#0",
+      summary("s"),
+      Usage(999.5, 10_000_000, 1),
+      "fake/model",
+    ),
     call("#1", "worker", JNull),
   ]
-  let assert [CallAgent(max_turns: 1, ..)] = last(events)
+  let assert [CallAgent(id: "#1", ..)] = last(events)
+  let #(s, _, _) = replay(events)
+  assert snapshot_get(s, "spent.usd") == value.JFloat(999.5)
+  assert snapshot_get(s, "budget")
+    == value.object([#("compute_minutes", JNull), #("turns", JNull)])
 }
 
-pub fn token_budget_pauses_test() {
-  let wf =
-    budgeted(Budget(
-      usd: None,
-      tokens: Some(100),
-      turns: None,
-      compute_minutes: None,
-    ))
-  let events = [
-    started(wf),
+pub fn a_call_carries_its_turns_so_far_and_its_allowance_test() {
+  let assert [CallAgent(turn: 0, turn_limit: 8, ..)] =
+    last([started(basic()), call("#0", "worker", JNull)])
+  // Continued after a question: the turns used so far come along.
+  let assert [CallAgent(turn: 1, turn_limit: 8, ..)] =
+    last(list.append(asked(), [sent("#0", "yes")]))
+}
+
+fn at_limit() {
+  [
+    started(basic()),
     call("#0", "worker", JNull),
-    returned("#0", summary("s")),
-    call("#1", "worker", JNull),
+    types.TurnLimitReached("#0", 8, 8, Usage(0.0, 0, 8), "fake/model"),
   ]
-  assert status_after(events)
-    == Some(Idle(Some(BudgetExhausted(Tokens, 100.0, 100.0))))
 }
 
-pub fn compute_minutes_pass_to_scripts_and_pause_test() {
-  let wf =
-    budgeted(Budget(
-      usd: None,
-      tokens: None,
-      turns: None,
-      compute_minutes: Some(10.0),
-    ))
-  let script = fn(id) { Requested(id, Script("train", JNull)) }
-  let assert [RunScript(compute_minutes: Some(10.0), ..)] =
-    last([started(wf), script("#0")])
+pub fn reaching_the_turn_limit_idles_the_node_with_its_progress_test() {
+  assert last(at_limit()) == []
+  assert status_after(at_limit()) == Some(Idle(None))
+  assert nodes_after(at_limit())
+    == [
+      NodeIdle("#0", "worker", "fake/model", True, [], types.TurnLimit(8, 8)),
+    ]
+}
+
+pub fn more_turns_with_an_answer_continue_the_node_test() {
+  // An answer without turns is refused: the node would stop again at once.
+  assert last(list.append(at_limit(), [sent("#0", "go on")]))
+    == [Refuse(None, types.NoTurnsLeft("#0"))]
+  let events = list.append(at_limit(), [Sent("#0", "go on", "m1", human, 5)])
+  let assert [CallAgent(id: "#0", turn: 8, turn_limit: 13, transcript:, ..)] =
+    last(events)
+  assert transcript == [Message(User, "go on")]
+  let done = list.append(events, [returned("#0", summary("s"))])
+  let assert [Deliver("#0", _)] = last(done)
+  // Replay of the log reaches the same run.
+  let #(live, _, log) = replay(done)
+  let #(refolded, _, _) = replay(log)
+  assert run.snapshot(live) == run.snapshot(refolded)
+  // A restart resets the allowance to the agent's maxTurns.
+  let restarted =
+    list.append(at_limit(), [types.Restarted("#0", None, human, 0)])
+  let assert [CallAgent(turn: 0, turn_limit: 8, ..)] = last(restarted)
+}
+
+pub fn compute_minutes_pass_to_commands_and_pause_test() {
+  let wf = budgeted(Budget(turns: None, compute_minutes: Some(10.0)))
+  let assert [RunCommand(compute_minutes: Some(10.0), ..)] =
+    last([started(wf), command("#0", JNull)])
   let events = [
     started(wf),
-    script("#0"),
-    types.ScriptReturned("#0", JInt(1), 10.0),
-    script("#1"),
+    command("#0", JNull),
+    types.CommandReturned("#0", JInt(1), 10.0),
+    command("#1", JNull),
   ]
   assert status_after(events)
-    == Some(Idle(Some(BudgetExhausted(ComputeMinutes, 10.0, 10.0))))
-  let assert [RunScript(id: "#1", compute_minutes: Some(5.0), ..)] =
+    == Some(Idle(Some(BudgetReached(ComputeMinutes, 10.0, 10.0))))
+  let assert [RunCommand(id: "#1", compute_minutes: Some(5.0), ..)] =
     last(list.append(events, [BudgetRaised(ComputeMinutes, 15.0)]))
+}
+
+// --- Commands: nodes without a dialogue ---
+
+pub fn a_command_is_a_node_running_then_done_test() {
+  let events = [started(basic()), command("#0", JInt(3))]
+  let assert [RunCommand(id: "#0", command: "train", input: JInt(3), ..)] =
+    last(events)
+  assert nodes_after(events) == [types.CommandRunning("#0", "train", [])]
+  let done = list.append(events, [types.CommandReturned("#0", JInt(9), 1.0)])
+  assert last(done) == [Deliver("#0", JInt(9))]
+  assert nodes_after(done)
+    == [types.CommandDone("#0", "train", [], types.Succeeded)]
+}
+
+pub fn a_command_failure_is_typed_test() {
+  let failure = types.ExitCode(2, "Traceback: boom")
+  let events = [
+    started(basic()),
+    command("#0", JNull),
+    types.CommandFailed("#0", failure, 0.5),
+  ]
+  assert last(events) == [Fail("#0", types.CommandCrashed("train", failure))]
+  assert nodes_after(events)
+    == [types.CommandDone("#0", "train", [], types.FailedWith(failure))]
+}
+
+pub fn a_command_takes_restart_and_cancel_but_no_dialogue_test() {
+  let running = [started(basic()), command("#0", JInt(3))]
+  assert last(list.append(running, [sent("#0", "hi")]))
+    == [Refuse(None, types.NotAnAgent("#0"))]
+  assert last(list.append(running, [types.Steered("#0", "x", "m", human)]))
+    == [Refuse(None, types.NotAnAgent("#0"))]
+  assert last(
+      list.append(running, [types.Restarted("#0", Some("n"), human, 0)]),
+    )
+    == [Refuse(None, types.NotAnAgent("#0"))]
+  // A restart reruns it with the same input.
+  let restarted = list.append(running, [types.Restarted("#0", None, human, 0)])
+  let assert [RunCommand(id: "#0", input: JInt(3), ..)] = last(restarted)
+  let assert [types.CommandRunning(inbox: [InboxMessage(Restart, "", 0)], ..)] =
+    nodes_after(restarted)
+  assert last(list.append(running, [types.NodeCancelled("#0", human)]))
+    == [Fail("#0", types.CommandCrashed("train", types.CommandCancelled))]
+}
+
+pub fn a_nested_workflow_failure_round_trips_test() {
+  let reason =
+    types.WorkflowFailed(
+      "tune",
+      types.CommandCrashed("train", types.TimedOut(5.0)),
+    )
+  assert last([started(basic()), types.BodyFailed(reason)])
+    == [Finish(types.Failed(reason))]
 }
 
 // --- Models: rebinding mid-run ---
@@ -604,8 +688,6 @@ pub fn resume_names_each_result_defining_field_test() {
     r
   }
   assert refusal(Pin(..pin(), seed: 8)) == PinMismatch("seed", "7", "8")
-  assert refusal(Pin(..pin(), workflow_digest: "wf2"))
-    == PinMismatch("workflow_digest", "wf1", "wf2")
   assert refusal(Pin(..pin(), semantics: "wallis-core/1"))
     == PinMismatch("semantics", run.semantics, "wallis-core/1")
   assert refusal(
@@ -626,11 +708,146 @@ pub fn replayed_request_is_answered_from_journal_test() {
   let assert [CallAgent(id: "#1", input: JInt(1), ..)] = effects
 }
 
-pub fn replay_divergence_is_refused_without_changing_the_run_test() {
+// --- The journal is a cache: (node digest, input, occurrence) ---
+
+fn ok(id, result) {
+  types.AgentReturned(id, JString(result), support.usage(), "fake/model")
+}
+
+pub fn a_changed_input_misses_an_unchanged_one_hits_whatever_the_id_test() {
+  let first = [
+    started(basic()),
+    cached("#0", "plan", JInt(1), 0),
+    ok("#0", "p"),
+    cached("#1", "write", JString("p"), 0),
+    ok("#1", "w"),
+  ]
+  let #(s, _, _) = replay(first)
+  let #(s, _) = run.step(s, Resumed(pin()))
+  // An inserted node runs; its neighbours still hit under their new ids.
+  let #(s, effects) = run.step(s, cached("#0", "check", JNull, 0))
+  let assert [CallAgent(id: "#0", ..)] =
+    list.filter(effects, fn(e) { e != Checkpoint })
+  let #(s, _) = run.step(s, ok("#0", "c"))
+  let #(s, effects) = run.step(s, cached("#1", "plan", JInt(1), 0))
+  assert effects == [Deliver("#1", JString("p"))]
+  // A changed upstream result changes the downstream input: a miss.
+  let #(_, effects) = run.step(s, cached("#2", "write", JString("other"), 0))
+  let assert [Checkpoint, CallAgent(..)] = effects
+  // An unchanged result keeps the downstream hit.
+  let #(_, effects) = run.step(s, cached("#2", "write", JString("p"), 0))
+  assert effects == [Deliver("#2", JString("w"))]
+}
+
+pub fn a_changed_node_definition_misses_test() {
+  let #(s, _, _) =
+    replay([
+      started(basic()),
+      cached("#0", "plan-v1", JInt(1), 0),
+      ok("#0", "p"),
+    ])
+  let #(_, effects) = run.step(s, cached("#0", "plan-v2", JInt(1), 0))
+  let assert [Checkpoint, CallAgent(..)] = effects
+}
+
+pub fn identical_calls_get_their_own_recorded_results_by_occurrence_test() {
+  let events = [
+    started(basic()),
+    cached("#0.0#0", "n", JNull, 0),
+    cached("#0.1#0", "n", JNull, 1),
+    cached("#0.2#0", "n", JNull, 2),
+    ok("#0.1#0", "b"),
+    ok("#0.0#0", "a"),
+    ok("#0.2#0", "c"),
+  ]
+  let #(_, _, log) = replay(events)
+  let #(refolded, _, _) = replay(log)
+  let #(s, _) = run.step(refolded, Resumed(pin()))
+  // Issue order may differ (ids too): occurrence n gets the nth result.
+  let #(s, e0) = run.step(s, cached("x", "n", JNull, 0))
+  let #(s, e1) = run.step(s, cached("y", "n", JNull, 1))
+  let #(_, e2) = run.step(s, cached("z", "n", JNull, 2))
+  assert [e0, e1, e2]
+    == [
+      [Deliver("x", JString("a"))],
+      [Deliver("y", JString("b"))],
+      [Deliver("z", JString("c"))],
+    ]
+}
+
+pub fn a_crash_resume_reissues_only_what_was_in_flight_and_logs_a_moved_id_test() {
+  let #(s, _, _) = replay([started(basic()), cached("#0.a#0", "n", JInt(1), 0)])
+  let #(s, _) = run.step(s, Resumed(pin()))
+  // The same call under another id (a reordered parallel): the record moves, logged, and is reissued once.
+  let #(s, effects) = run.step(s, cached("#0.b#0", "n", JInt(1), 0))
+  let assert [Checkpoint, CallAgent(id: "#0.b#0", ..)] = effects
+  let #(_, effects) = run.step(s, cached("#0.b#0", "n", JInt(1), 0))
+  assert effects == []
+}
+
+pub fn a_code_change_is_logged_and_never_refused_test() {
   let #(s, _, _) = replay(first_run())
-  let #(s2, effects) = run.step(s, call("#0", "worker", JInt(99)))
-  assert effects == [Refuse(None, PathDiverged("#0"))]
-  assert run.snapshot(s2) == run.snapshot(s)
+  let #(s, effects) = run.step(s, types.CodeChanged("wf1", "wf2"))
+  assert effects == [Checkpoint]
+  let #(s, effects) = run.step(s, Resumed(Pin(..pin(), workflow_digest: "wf2")))
+  assert effects == []
+  assert snapshot_get(s, "status.type") == JString("running")
+}
+
+// --- An uncaught node failure holds the run ---
+
+fn held_events() {
+  [
+    started(basic()),
+    call("#0.a#0", "worker", JNull),
+    call("#0.b#0", "worker", JInt(1)),
+    failed("#0.a#0", "bad output"),
+    types.BodyFailed(AgentGaveUp("worker", GaveUp("bad output"))),
+  ]
+}
+
+pub fn an_uncaught_failure_holds_its_node_and_siblings_continue_test() {
+  assert last(held_events()) == []
+  // The sibling is still running.
+  assert status_after(held_events()) == Some(Running)
+  let done = list.append(held_events(), [returned("#0.b#0", summary("b"))])
+  assert status_after(done)
+    == Some(
+      Idle(
+        Some(types.NodeFailure(
+          "#0.a#0",
+          AgentGaveUp("worker", GaveUp("bad output")),
+        )),
+      ),
+    )
+}
+
+pub fn restarting_a_held_node_reissues_it_and_the_body_runs_again_test() {
+  let done = list.append(held_events(), [returned("#0.b#0", summary("b"))])
+  let restarted =
+    list.append(done, [types.Restarted("#0.a#0", Some("fix it"), human, 0)])
+  let assert [CallAgent(id: "#0.a#0", note: Some("fix it"), ..)] =
+    last(restarted)
+  let fixed = list.append(restarted, [returned("#0.a#0", summary("a"))])
+  // The body runs again against the journal: both calls hit.
+  let #(s, _, _) = replay(fixed)
+  let #(s, e) = run.step(s, call("#0.a#0", "worker", JNull))
+  assert e == [Deliver("#0.a#0", summary("a"))]
+  let #(_, e) = run.step(s, call("#0.b#0", "worker", JInt(1)))
+  assert e == [Deliver("#0.b#0", summary("b"))]
+}
+
+pub fn cancelling_a_held_node_lets_the_failure_propagate_test() {
+  let reason = AgentGaveUp("worker", GaveUp("bad output"))
+  let events =
+    list.append(held_events(), [types.NodeCancelled("#0.a#0", human)])
+  assert last(events) == [Finish(types.Failed(reason))]
+}
+
+pub fn a_failure_the_owner_cancelled_ends_the_run_test() {
+  let reason = AgentGaveUp("worker", CancelledByOwner)
+  assert last([started(basic()), types.BodyFailed(reason)])
+    == [Finish(types.Failed(reason))]
 }
 
 pub fn resumed_finished_run_reports_outcome_test() {

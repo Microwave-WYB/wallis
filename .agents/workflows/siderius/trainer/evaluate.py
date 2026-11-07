@@ -1,8 +1,8 @@
-"""wallis SIDERIUS example: placeholder for the `evaluate` script.
+"""wallis SIDERIUS example: placeholder for the `evaluate` command.
 
 Score a trained checkpoint on the trial or formal evaluation portion. Output: {scoreable, score, metric_id}.
 
-Reads JSON args on stdin and writes JSON to stdout. The remaining compute
+Reads its JSON input on stdin and writes JSON to stdout. The remaining compute
 budget (minutes) is in the WALLIS_COMPUTE_MINUTES environment variable.
 This placeholder does no work.
 """

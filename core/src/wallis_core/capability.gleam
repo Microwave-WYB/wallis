@@ -14,7 +14,7 @@ import gleam/option.{type Option, Some}
 import gleam/result
 import gleam/string
 import wallis_core/types.{
-  type Pin, type Refusal, NodeNotRunning, NotIdle, NotLive, NotOwner,
+  type Pin, type Refusal, NodeNotRunning, NotAnAgent, NotIdle, NotLive, NotOwner,
   NotSteerable, PinMismatch,
 }
 
@@ -46,6 +46,8 @@ pub type NodeFacts {
   Faulted(steerable: Bool)
   /// Held back by a pause or the budget before it was issued.
   Held(steerable: Bool)
+  /// A command in flight: no dialogue.
+  CommandWorking
   Settled
   Absent
 }
@@ -63,6 +65,7 @@ pub fn check_idle(
   case facts {
     Waiting(steerable: True) -> Ok(IdleNode(node))
     Waiting(steerable: False) -> Error(NotSteerable(node))
+    CommandWorking -> Error(NotAnAgent(node))
     _ -> Error(NotIdle(node))
   }
 }
@@ -84,6 +87,7 @@ pub fn check_steerable(
   case facts {
     Working(steerable: True) -> Ok(SteerableNode(node))
     Working(steerable: False) -> Error(NotSteerable(node))
+    CommandWorking -> Error(NotAnAgent(node))
     _ -> Error(NodeNotRunning(node))
   }
 }
@@ -92,8 +96,14 @@ pub fn steerable_id(node: SteerableNode) -> String {
   node.node
 }
 
+/// What a live node is: an agent (steerable or not) or a command.
+pub type LiveKind {
+  LiveAgent(steerable: Bool)
+  LiveCommand
+}
+
 pub opaque type LiveNode {
-  LiveNode(node: String, steerable: Bool)
+  LiveNode(node: String, kind: LiveKind)
 }
 
 /// Cancel and restart reach any node that is not done.
@@ -106,7 +116,8 @@ pub fn check_live(
     Working(steerable:)
     | Waiting(steerable:)
     | Faulted(steerable:)
-    | Held(steerable:) -> Ok(LiveNode(node, steerable))
+    | Held(steerable:) -> Ok(LiveNode(node, LiveAgent(steerable)))
+    CommandWorking -> Ok(LiveNode(node, LiveCommand))
     Settled | Absent -> Error(NotLive(node))
   }
 }
@@ -115,17 +126,17 @@ pub fn live_id(node: LiveNode) -> String {
   node.node
 }
 
-pub fn live_steerable(node: LiveNode) -> Bool {
-  node.steerable
+pub fn live_kind(node: LiveNode) -> LiveKind {
+  node.kind
 }
 
 pub opaque type ResumableRun {
   ResumableRun
 }
 
-/// Only result-defining fields are compared, in this order: workflow
-/// digest, seed, semantics, then each pinned input. The alias table is
-/// operational.
+/// Only result-defining fields are compared, in this order: seed,
+/// semantics, then each pinned input (files and mounts). The alias table is
+/// operational, and a code change is allowed and logged (`CodeChanged`).
 pub fn check_pin(recorded: Pin, now: Pin) -> Result(ResumableRun, Refusal) {
   let differs = fn(field, a, b) {
     case a == b {
@@ -133,11 +144,6 @@ pub fn check_pin(recorded: Pin, now: Pin) -> Result(ResumableRun, Refusal) {
       False -> Error(PinMismatch(field:, recorded: a, current: b))
     }
   }
-  use _ <- result.try(differs(
-    "workflow_digest",
-    recorded.workflow_digest,
-    now.workflow_digest,
-  ))
   use _ <- result.try(differs(
     "seed",
     int.to_string(recorded.seed),

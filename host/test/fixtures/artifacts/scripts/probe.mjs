@@ -9,7 +9,7 @@ const attempt = (f) => {
 		return false;
 	}
 };
-const input = `${process.env.WALLIS_INPUTS}/${args.model.digest.slice(7)}/${args.model.name}`;
+const input = args.model.path;
 process.stdout.write(
 	JSON.stringify({
 		reads_input: attempt(() => readFileSync(input)),
@@ -18,5 +18,7 @@ process.stdout.write(
 		reads_outside: attempt(() => readFileSync(args.outside)),
 		writes_outside: attempt(() => writeFileSync(`${args.outside}.copy`, "leak")),
 		sees_home: attempt(() => readFileSync(`${process.env.WALLIS_HOME_PROBE ?? "/home"}`)),
+		sees_workflow_dir: attempt(() => readFileSync("../workflow.ts")) || attempt(() => readFileSync("/w/workflow.ts")),
+		writes_mount: attempt(() => writeFileSync("scripts/x", "leak")),
 	}),
 );

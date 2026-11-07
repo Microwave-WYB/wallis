@@ -2,23 +2,23 @@
 // from modules, and the sessions this process drives.
 
 import { existsSync, readdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Json, Refusal } from "../sdk/index.ts";
 import type { BudgetKind } from "./core.ts";
-import type { Executor, ScriptRunner } from "./executor.ts";
+import { type CommandRunner, ProcessCommands } from "./commands.ts";
+import type { Executor } from "./executor.ts";
 import { IdleNode, LiveNode, must, type NodeId, OwnedRun, type RunId, SteerableNode } from "./capability.ts";
 import { NotOwner, type Owner, serverOwner } from "./owner.ts";
 import { loadProfile } from "./profile.ts";
 import { applyControl, inspectRun, type RunView } from "./query.ts";
-import { ProcessScripts } from "./scripts.ts";
 import { type Session, type SessionOptions, startSession } from "./session.ts";
 import { MachineSlots } from "./slots.ts";
 import { appendInbox, type InboxEntry, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir } from "./store.ts";
 
 export interface ExecutorKit {
 	readonly executor: Executor;
-	readonly scripts?: ScriptRunner;
+	readonly commands?: CommandRunner;
 }
 
 /** Loads an executor module: its default export returns `{ executor, scripts? }`. */
@@ -60,12 +60,13 @@ export interface StartRun {
 	readonly seed?: number;
 	readonly models?: Readonly<Record<string, string>>;
 	readonly mounts?: Readonly<Record<string, string>>;
+	readonly bins?: Readonly<Record<string, string>>;
 }
 
 export interface ResumeRun {
 	readonly models?: Readonly<Record<string, string>>;
 	readonly budget?: Readonly<Partial<Record<BudgetKind, number>>>;
-	readonly sends?: readonly { readonly node: string; readonly text: string }[];
+	readonly sends?: readonly { readonly node: string; readonly text: string; readonly turns?: number }[];
 	readonly cancel?: boolean;
 	readonly unpause?: boolean;
 }
@@ -107,10 +108,10 @@ export class Runs {
 		return session;
 	}
 
-	/** Without a script runner from the executor module: domain scripts as bwrap processes with machine-wide slots, as the CLI does. */
-	#options(dir: string, workflow: string): Pick<SessionOptions, "dir" | "executor" | "scripts" | "executorModule" | "root" | "by"> {
-		const scripts = this.#kit.scripts ?? new ProcessScripts({ workflowDir: dirname(workflow), slots: new MachineSlots(loadProfile(this.root).slots) });
-		return { dir, executor: this.#kit.executor, scripts, executorModule: this.#executorModule, root: this.root, by: this.owner };
+	/** Without a command runner from the executor module: sandboxed processes with machine-wide slots, as the CLI does. */
+	#options(dir: string): Pick<SessionOptions, "dir" | "executor" | "commands" | "executorModule" | "root" | "by"> {
+		const commands = this.#kit.commands ?? new ProcessCommands({ slots: new MachineSlots(loadProfile(this.root).slots) });
+		return { dir, executor: this.#kit.executor, commands, executorModule: this.#executorModule, root: this.root, by: this.owner };
 	}
 
 	async start(request: StartRun): Promise<Session> {
@@ -119,12 +120,14 @@ export class Runs {
 		const dir = join(runsDir(this.root), newRunId(name));
 		return this.#track(
 			await startSession({
-				...this.#options(dir, workflow),
+				...this.#options(dir),
 				workflow,
 				input: request.input ?? null,
 				seed: request.seed,
 				models: request.models,
 				mounts: request.mounts,
+				bins: request.bins,
+				callerPath: process.env.PATH,
 				owner: this.owner,
 			}),
 		);
@@ -137,7 +140,7 @@ export class Runs {
 		const dir = resolveRunDir(this.root, runId);
 		const meta = readMeta(runPaths(dir));
 		if (!meta) throw new Error(`run ${runId} has no meta.json`);
-		return this.#track(await startSession({ ...this.#options(dir, meta.workflow), ...request }));
+		return this.#track(await startSession({ ...this.#options(dir), ...request }));
 	}
 
 	async resume(runId: RunId, request: ResumeRun = {}): Promise<Session> {
@@ -146,7 +149,7 @@ export class Runs {
 		if (live && !live.settled) {
 			const owned = must(live.owned(this.owner), refused);
 			for (const s of request.sends ?? []) {
-				const refusal = live.answer(must(IdleNode.check(owned, s.node), refused), s.text);
+				const refusal = live.answer(must(IdleNode.check(owned, s.node), refused), s.text, undefined, s.turns ?? 0);
 				if (refusal) throw new SendRefused(refusal);
 			}
 			if (request.cancel) live.cancel(owned);
@@ -157,8 +160,8 @@ export class Runs {
 	}
 
 	/** Answers an idle node. */
-	async answer(runId: RunId, node: NodeId, text: string): Promise<void> {
-		await this.resume(runId, { sends: [{ node, text }] });
+	async answer(runId: RunId, node: NodeId, text: string, turns = 0): Promise<void> {
+		await this.resume(runId, { sends: [{ node, text, turns }] });
 	}
 
 	/** Steers a running node of a live run. */
@@ -183,13 +186,13 @@ export class Runs {
 	}
 
 	/** Discards a node's progress and reissues its call with the note. */
-	async restart(runId: RunId, node: NodeId, note?: string): Promise<void> {
+	async restart(runId: RunId, node: NodeId, note?: string, turns = 0): Promise<void> {
 		const owned = this.control(runId);
 		must(LiveNode.check(owned, node), refused);
 		const live = this.#live.get(runId);
-		const entry: InboxEntry = note === undefined ? { id: newMessageId(), type: "restart", node, by: this.owner } : { id: newMessageId(), type: "restart", node, note, by: this.owner };
+		const entry: InboxEntry = { id: newMessageId(), type: "restart", node, by: this.owner, ...(note === undefined ? {} : { note }), ...(turns > 0 ? { turns } : {}) };
 		if (live && !live.settled) {
-			const refusal = live.restart(must(LiveNode.check(must(live.owned(this.owner), refused), node), refused), note);
+			const refusal = live.restart(must(LiveNode.check(must(live.owned(this.owner), refused), node), refused), note, turns);
 			if (refusal) throw new SendRefused(refusal);
 		} else await this.#viaInbox(runId, entry);
 	}

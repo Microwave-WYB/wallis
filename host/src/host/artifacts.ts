@@ -2,7 +2,7 @@
 //
 //   .wallis/runs/<id>/blobs/<sha256 hex>        one file per distinct content
 //   .wallis/runs/<id>/work/<node>/inputs/<hex>/<name>   read-only input artifacts
-//   .wallis/runs/<id>/work/<node>/scratch/      the node's writable dir (workspace level)
+//   .wallis/runs/<id>/work/<node>/scratch/      the call's private writable dir (/w in its sandbox)
 //
 // Journal and replay carry refs only. A node's dir lives while the node is
 // running or idle and is deleted when it is done; files it did not export
@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
-import type { ArtifactDraft, ArtifactRef, Json, SandboxLevel } from "../sdk/index.ts";
+import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
@@ -61,6 +61,12 @@ export function storeFile(runDir: string, path: string, media: string, name = ba
 
 export class ArtifactError extends Error {
 	override readonly name = "ArtifactError";
+	/** Set when a draft names a file that is not in the scratch dir. */
+	readonly missing: string | undefined;
+	constructor(message: string, missing?: string) {
+		super(message);
+		this.missing = missing;
+	}
 }
 
 /**
@@ -74,7 +80,7 @@ export function resolveDrafts(value: Json, runDir: string, scratch: string | nul
 		const path = resolve(scratch, value.artifact);
 		const rel = relative(scratch, path);
 		if (rel.startsWith("..") || rel.startsWith(sep) || rel === "") throw new ArtifactError(`artifact ${value.artifact} is outside the node's scratch dir`);
-		if (!existsSync(path) || !lstatSync(path).isFile()) throw new ArtifactError(`artifact ${value.artifact} is not a file in the node's scratch dir`);
+		if (!existsSync(path) || !lstatSync(path).isFile()) throw new ArtifactError(`artifact ${value.artifact} is not a file in the node's scratch dir`, value.artifact);
 		return storeFile(runDir, path, value.media, value.name ?? basename(path)) as unknown as Json;
 	}
 	if (Array.isArray(value)) return value.map((v) => resolveDrafts(v, runDir, scratch));
@@ -102,11 +108,11 @@ export function linkOrCopy(source: string, target: string): void {
 // --- Node directories ------------------------------------------------------------
 
 export interface NodeDirs {
-	readonly level: SandboxLevel;
 	readonly root: string;
 	/** `<inputs>/<sha256 hex>/<name>` for every artifact in the node's input. */
 	readonly inputs: string;
-	readonly scratch: string | null;
+	/** The call's private writable dir: `/w` inside its sandbox. */
+	readonly scratch: string;
 	/** Mounts by name, read-only. */
 	readonly mounts: Readonly<Record<string, string>>;
 	/** Host-owned: where capped tool and codemode output spills. Not a tool-visible dir. */
@@ -122,14 +128,13 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
 	return join(dirs.inputs, ref.digest.slice("sha256:".length), ref.name);
 }
 
-/** Creates (or reuses, for a continued node) a node's dirs and mounts its input artifacts. */
-export function prepareNode(runDir: string, id: string, level: SandboxLevel, input: Json, mounts: Readonly<Record<string, string>>): NodeDirs {
+/** Creates (or reuses, for a continued node) a node's dirs and links its input artifacts. */
+export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
-	const dirs: NodeDirs = { level, root, inputs: join(root, "inputs"), scratch: level === "workspace" ? join(root, "scratch") : null, mounts, spill: join(root, "spill") };
+	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: join(root, "scratch"), mounts, spill: join(root, "spill") };
 	verifyRefs(input, runDir);
-	if (level === "none") return dirs;
 	mkdirSync(dirs.inputs, { recursive: true });
-	if (dirs.scratch) mkdirSync(dirs.scratch, { recursive: true });
+	mkdirSync(dirs.scratch, { recursive: true });
 	for (const ref of refsIn(input)) {
 		const blob = blobPath(runDir, ref.digest);
 		const target = inputPath(dirs, ref);
@@ -138,6 +143,14 @@ export function prepareNode(runDir: string, id: string, level: SandboxLevel, inp
 		linkOrCopy(blob, target);
 	}
 	return dirs;
+}
+
+/** The input as a command's `run` sees it: every artifact ref with its `path` inside the sandbox. */
+export function mountedInput(value: Json, inputsAt: string): Json {
+	if (isRef(value)) return { ...value, path: `${inputsAt}/${value.digest.slice("sha256:".length)}/${value.name}` };
+	if (Array.isArray(value)) return value.map((v) => mountedInput(v, inputsAt));
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mountedInput(v, inputsAt)]));
+	return value;
 }
 
 /** Deletes a done node's dirs: what it did not export is discarded. */

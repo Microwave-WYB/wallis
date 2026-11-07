@@ -1,4 +1,4 @@
-// Runs the SIDERIUS example end to end with scripted agents and scripts.
+// Runs the SIDERIUS example end to end with scripted agents and commands.
 // No model, network or device: this checks that the declarations, the loop
 // and the carried history (the body's local variables) fit together, not
 // SIDERIUS itself.
@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { Json } from "../src/sdk/index.ts";
-import { type AgentCall, conversation, FakeExecutor, FakeScripts, runWorkflow, type ScriptCall } from "../src/host/index.ts";
+import { type AgentCall, type CommandCall, conversation, FakeCommands, FakeExecutor, runWorkflow } from "../src/host/index.ts";
 
 const workflow = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.agents/workflows/siderius/workflow.ts");
 
@@ -25,7 +25,7 @@ const input = {
 	tuning: {
 		maxRounds: 2,
 		maxFailRounds: 3,
-		attemptsPerTrialRound: 3,
+		attemptsPerTrialRound: 1,
 		attemptsPerFormalRound: 5,
 		trialMinutes: 2,
 		formalMinutes: 5,
@@ -98,36 +98,38 @@ function agents(overrides: Record<string, unknown> = {}) {
 	});
 }
 
+/** The domain commands, scripted: each prints its JSON output (artifact drafts for files it wrote). */
 function scripts() {
 	let evaluations = 0;
-	return new FakeScripts({
-		metric_order: { output: { metric_id: "mse_gain", direction: "higher_is_better" }, minutes: 0 },
-		validate: { output: { passed: true, error: null, checks: { plugin_loads: true } }, minutes: 1 },
-		// train gets the model plugin as a mounted artifact and returns the checkpoint as one.
-		train: (call: ScriptCall) => {
-			const model = (call.args as { model: { digest: string; name: string } }).model;
+	const out = (value: unknown, minutes = 0) => ({ stdout: JSON.stringify(value), minutes });
+	return new FakeCommands({
+		metric_order: out({ metric_id: "mse_gain", direction: "higher_is_better" }),
+		check_plugin: out({ passed: true, error: null, checks: { plugin_loads: true } }, 1),
+		// train gets the model plugin as a mounted input artifact and returns the checkpoint as one.
+		train: (call: CommandCall) => {
+			const model = (call.input as { model: { digest: string; name: string; path: string } }).model;
+			assert.equal(model.path, `/run/wallis/inputs/${model.digest.slice(7)}/${model.name}`);
 			const plugin = readFileSync(join(call.workspace.inputs, model.digest.slice(7), model.name), "utf8");
-			const scope = (call.args as { scope: string }).scope;
-			writeFileSync(join(call.workspace.scratch!, "ckpt.bin"), `${plugin}${scope}`);
-			return { output: { status: "ok", checkpoint: { artifact: "ckpt.bin", media: "application/x-checkpoint" }, minutes: 2 } as never, minutes: 2 };
+			const scope = (call.input as { scope: string }).scope;
+			writeFileSync(join(call.workspace.scratch, "ckpt.bin"), `${plugin}${scope}`);
+			return out({ status: "ok", checkpoint: { artifact: "ckpt.bin", media: "application/x-checkpoint" }, minutes: 2 }, 2);
 		},
 		// Scores rise, then dip: the cache must keep the best plus the current model.
 		evaluate: () => {
 			const n = evaluations++;
-			return { output: { scoreable: true, metric_id: "mse_gain", score: [0.1, 0.2, 0.3, 0.9, 0.8, 0.7, 0.05, 0.06, 0.4, 0.5, 0.2, 0.25, 0.01, 0.02][n] ?? 0 }, minutes: 1 };
+			return out({ scoreable: true, metric_id: "mse_gain", score: [0.1, 0.2, 0.3, 0.9, 0.8, 0.7, 0.05, 0.06, 0.4, 0.5, 0.2, 0.25, 0.01, 0.02][n] ?? 0 }, 1);
 		},
-		health: { output: { valid: true, policy: "blocking", failed_checks: [{ check_name: "variance_collapse", metrics: { ratio: 0.1 } }] }, minutes: 1 },
-		fingerprint: (call: ScriptCall) => {
-			const args = call.args as { model_type: string; iteration: number };
-			return {
-				output: { entries: [{ model_type: args.model_type, iteration: args.iteration, signature: "var<0.2", check_name: "variance_collapse", count: 1, human_readable: "variance collapsed" }] },
-				minutes: 0,
-			};
+		health: out({ valid: true, policy: "blocking", failed_checks: [{ check_name: "variance_collapse", metrics: { ratio: 0.1 } }] }, 1),
+		fingerprint: (call: CommandCall) => {
+			const args = call.input as { model_type: string; iteration: number };
+			return out({ entries: [{ model_type: args.model_type, iteration: args.iteration, signature: "var<0.2", check_name: "variance_collapse", count: 1, human_readable: "variance collapsed" }] });
 		},
 	});
 }
 
 const mountsOf = (root: string) => ({ data: join(root, "data"), config: join(root, "siderius") });
+/** Commands are scripted here: no sandbox preflight (bins are still resolved and recorded). */
+const offline = { confine: "off", bins: { uv: "/bin/true", sh: "/bin/sh", python3: "/bin/true", bash: "/bin/bash", uvx: "/bin/true" } } as const;
 const local = {};
 
 function projectRoot(): string {
@@ -141,12 +143,12 @@ function projectRoot(): string {
 	return root;
 }
 
-test("the SIDERIUS workflow runs end to end on scripted agents and scripts", async () => {
+test("the SIDERIUS workflow runs end to end on scripted agents and commands", async () => {
 	const root = projectRoot();
 
 	const executor = agents();
 	const runner = scripts();
-	const result = await runWorkflow({ workflow, dir: join(root, "run"), executor, scripts: runner, input, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
+	const result = await runWorkflow({ ...offline, workflow, dir: join(root, "run"), executor, commands: runner, input, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
 	assert.equal(result.outcome?.type, "done", JSON.stringify(result.status));
 	const out = (result.outcome as unknown as { value: { stop_reason: string; iterations: number; incumbent: { score: number }; carried: Record<string, never> } }).value;
 	assert.equal(out.stop_reason, "iterations_exhausted");
@@ -198,19 +200,24 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 	}
 	assert.equal((judged.at(-1)!.input as { evidence: unknown[] }).evidence.length, 14, "two entries per iteration");
 	// The judge is not steerable; agents get the carried history pushed into their input.
-	assert.equal(result.run.nodes.find((n) => n.agent === "evidence_judge")!.steerable, false);
+	const judgeNode = result.run.nodes.find((n) => "agent" in n && n.agent === "evidence_judge")!;
+	assert.equal("steerable" in judgeNode && judgeNode.steerable, false);
 	const lastInterpret = executor.calls.filter((c) => c.agent === "interpret").at(-1)!;
 	assert.equal((lastInterpret.input as { history: { runs: unknown[] } }).history.runs.length, 6);
 	assert.ok(lastInterpret.workspace.mounts.config, "the config mount (advice.md) is readable");
 
 	// Each candidate: Trial rounds, then one forced Formal round.
-	const scopes = runner.calls.filter((c) => c.script === "train").map((c) => (c.args as { scope: string }).scope);
+	const scopes = runner.calls.filter((c) => c.command === "train").map((c) => (c.input as { scope: string }).scope);
 	assert.deepEqual(scopes.slice(0, 2), ["trial", "formal"]);
-	// Compute minutes reach the scripts and shrink as they are spent.
+	// Compute minutes reach the commands and shrink as they are spent.
 	const budgets = runner.calls.map((c) => c.computeMinutes!);
 	assert.equal(budgets[0], 24 * 60);
 	assert.ok(budgets.at(-1)! < budgets[0]!);
-	assert.ok(JSON.parse(result.snapshot).spent.usd > 0);
+	assert.ok(JSON.parse(result.snapshot).spent.turns > 0);
+	// The implementor's sandbox has the data, never the trainer or the checks.
+	const implement = executor.calls.find((c) => c.agent === "implement")!;
+	assert.deepEqual(Object.keys(implement.workspace.mounts), ["data"]);
+	assert.equal(executor.calls.find((c) => c.agent === "literature_review")!.sandbox.type, "none");
 });
 
 test("JudgeStop request_input: the stop-check node asks the operator, and the reply decides", async () => {
@@ -223,13 +230,13 @@ test("JudgeStop request_input: the stop-check node asks the operator, and the re
 			stop_check: conversation({ idle: question }, { submit: { decision: "stop", note: "operator agreed" } }),
 		});
 	const askInput = { ...input, stops: { noImprovementBodies: 0, judgeCriterion: "stop when evidence repeats", judgeOnMet: "request_input" } };
-	const first = await runWorkflow({ workflow, dir, executor: make(), scripts: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
+	const first = await runWorkflow({ ...offline, workflow, dir, executor: make(), commands: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
 	assert.deepEqual(first.status, { type: "idle", reason: null });
-	const asking = first.run.nodes.find((n) => n.agent === "stop_check")!;
-	assert.equal(asking.type === "node_idle" && asking.question, question);
+	const asking = first.run.nodes.find((n) => "agent" in n && n.agent === "stop_check")!;
+	assert.deepEqual(asking.type === "node_idle" && asking.cause, { type: "question", message: question });
 
 	const executor = make();
-	const done = await runWorkflow({ workflow, dir, executor, scripts: scripts(), root, local, mounts: mountsOf(root), sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
+	const done = await runWorkflow({ ...offline, workflow, dir, executor, commands: scripts(), root, local, mounts: mountsOf(root), sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
 	const out = (done.outcome as unknown as { value: { stop_reason: string; iterations: number } }).value;
 	assert.equal(out.stop_reason, "operator_stop");
 	assert.equal(out.iterations, 2);

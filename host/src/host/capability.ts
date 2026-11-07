@@ -9,7 +9,7 @@
 // nothing else is branded.
 
 import type { Refusal } from "../sdk/index.ts";
-import type { Core, IdleNodeState, LiveNodeState, Pin, RunningNode, Snapshot } from "./core.ts";
+import type { CommandDone, Core, DoneNode, IdleNodeState, LiveNodeState, Pin, RunningNode, Snapshot } from "./core.ts";
 
 /** A run id parsed from outside input. */
 export type RunId = string & { readonly __brand: "RunId" };
@@ -65,7 +65,7 @@ export class OwnedRun extends Capability {
 
 }
 
-/** An idle node of a steerable agent: the only node an answer may go to. */
+/** An idle node of a steerable agent (never a command): the only node an answer may go to. */
 export class IdleNode extends Capability {
 	readonly owned: OwnedRun;
 	readonly node: IdleNodeState & { steerable: true };
@@ -79,12 +79,13 @@ export class IdleNode extends Capability {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
 		if (node?.type === "node_idle" && node.steerable) return new IdleNode(owned, node);
 		if (node?.type === "node_idle") return { type: "not_steerable", node: id };
+		if (node?.type === "command_running" || node?.type === "command_done") return { type: "not_an_agent", node: id };
 		return { type: "not_idle", node: id };
 	}
 
 }
 
-/** A running node of a steerable agent: the only node steer and interrupt reach. */
+/** A running node of a steerable agent (never a command): the only node steer and interrupt reach. */
 export class SteerableNode extends Capability {
 	readonly owned: OwnedRun;
 	readonly node: RunningNode & { steerable: true };
@@ -98,16 +99,17 @@ export class SteerableNode extends Capability {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
 		if (node?.type === "node_running" && node.steerable) return new SteerableNode(owned, node);
 		if (node?.type === "node_running") return { type: "not_steerable", node: id };
+		if (node?.type === "command_running" || node?.type === "command_done") return { type: "not_an_agent", node: id };
 		return { type: "node_not_running", node: id };
 	}
 
 }
 
-/** A node that is not done: what cancel and restart reach. */
+/** A node that is not done, or a failed one the run is held on: what cancel and restart reach. */
 export class LiveNode extends Capability {
 	readonly owned: OwnedRun;
-	readonly node: LiveNodeState;
-	private constructor(owned: OwnedRun, node: LiveNodeState) {
+	readonly node: LiveNodeState | DoneNode | CommandDone;
+	private constructor(owned: OwnedRun, node: LiveNodeState | DoneNode | CommandDone) {
 		super();
 		this.owned = owned;
 		this.node = node;
@@ -115,7 +117,7 @@ export class LiveNode extends Capability {
 
 	static check(owned: OwnedRun, id: string): LiveNode | Refusal {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
-		if (node !== undefined && node.type !== "node_done") return new LiveNode(owned, node);
+		if (node !== undefined && (owned.snapshot.held === id || (node.type !== "node_done" && node.type !== "command_done"))) return new LiveNode(owned, node);
 		return { type: "not_live", node: id };
 	}
 

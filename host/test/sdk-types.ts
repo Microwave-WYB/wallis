@@ -1,17 +1,29 @@
 // Compile-time checks of the SDK's and the host's typing. `tsc --noEmit`
 // fails if any `@ts-expect-error` line stops being an error.
 
-import { defineAgent, defineMcp, defineModels, defineMounts, defineScript, Foldable, Type, workflow } from "wallis";
+import { command, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, subWorkflow, Type, workflow } from "wallis";
 import { IdleNode, LiveNode, OwnedRun, SteerableNode } from "../src/host/capability.ts";
-import type { IdleNodeState, Node, RunningNode, Snapshot } from "../src/host/core.ts";
+import type { CommandRunning, IdleNodeState, Node, RunningNode, Snapshot } from "../src/host/core.ts";
 import type { Session } from "../src/host/session.ts";
 
 const models = defineModels({ default: "p/m", judge: "" });
 const mcp = defineMcp({ mcpServers: { arxiv: { command: "uvx", args: ["arxiv-mcp-server==0.2.10"] } } });
 const mounts = defineMounts({ kb: "./knowledge", data: "" });
 
+const py = defineSandbox({ mounts }, { name: "py", requires: ["uv", { name: "bash", check: ["bash", "--version"] }], mounts: ["kb"] });
+
+const train = command({
+	name: "train",
+	sandbox: py,
+	input: Type.Object({ model: Type.Object({ digest: Type.String(), name: Type.String(), media: Type.String() }), epochs: Type.Integer() }),
+	output: Type.Object({ score: Type.Number() }),
+	// An input artifact appears in `run` as its mounted form, with its path.
+	run: (i) => ["uv", "run", "--offline", "train.py", "--model", i.model.path, "--epochs", String(i.epochs)],
+	parse: (r) => ({ score: Number(r.stdout.trim()) }),
+});
+
 const ok = defineAgent(
-	{ models, mcp, mounts },
+	{ models, mcp },
 	{
 		name: "ok",
 		model: "judge",
@@ -19,7 +31,7 @@ const ok = defineAgent(
 		input: Type.Object({ q: Type.String(), papers: Foldable(Type.Array(Type.String()), { maxChars: 4000 }) }),
 		output: Type.Object({ answer: Type.String(), n: Type.Number() }),
 		mcp: { arxiv: ["search"] },
-		mounts: ["kb"],
+		sandbox: py,
 		steerable: false,
 	},
 );
@@ -30,36 +42,59 @@ defineAgent({ models }, { name: "x", model: "nope", prompt: "", input: Type.Null
 // @ts-expect-error: MCP server must exist in mcp.json
 defineAgent({ models, mcp }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { scholar: "*" } });
 
-// @ts-expect-error: a mount must be in the mount table
-defineAgent({ models, mounts }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mounts: ["ghost"] });
+// @ts-expect-error: a command cannot be handed to an agent as a tool; only workflow code calls it
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), tools: [train] });
 
-// @ts-expect-error: scripts name mounts from the table too
-defineScript({ mounts }, { name: "s", input: Type.Null(), output: Type.Null(), mounts: ["ghost"] });
+// @ts-expect-error: a sandbox mount must be in the mount table
+defineSandbox({ mounts }, { name: "s", mounts: ["ghost"] });
 
-// @ts-expect-error: agents have no views or state writes any more
-defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), writes: {} });
+// @ts-expect-error: a sandbox has no writable-mount option
+defineSandbox({ mounts }, { name: "s", mounts: [{ name: "kb", writable: true }] });
+
+// @ts-expect-error: nor a writable flag
+defineSandbox({ mounts }, { name: "s", mounts: ["kb"], writable: ["kb"] });
+
+// @ts-expect-error: a sandbox is a declared value, not a name
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), sandbox: "py" });
+
+command({
+	name: "bad",
+	sandbox: py,
+	input: Type.Null(),
+	output: Type.Null(),
+	// @ts-expect-error: argv[0] must be a binary the sandbox requires
+	run: ["python3", "train.py"],
+});
+
+const inner = subWorkflow({ name: "inner", input: Type.Null(), output: Type.Number(), run: async () => 1 });
 
 export default workflow({
 	name: "types",
 	models,
 	mounts,
 	agents: [ok],
+	commands: [train],
 	input: Type.Null(),
 	output: Type.Number(),
 	run: async (ctx) => {
+		// One `ctx.call` for every kind of node.
 		const out = await ctx.call(ok, { q: "?", papers: [] });
+		const trained = await ctx.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: 2 });
+		const n: number = await ctx.call(inner, null);
 		const answer: string = out.answer;
-		// @ts-expect-error: call input is typed by the agent's input schema
+		// @ts-expect-error: call input is typed by the node's input schema
 		await ctx.call(ok, { q: 1, papers: [] });
 		// @ts-expect-error: outputs are typed too
 		const wrong: number = out.answer;
 		ctx.observe("answer", answer);
+		const each: number[] = await ctx.map([1, 2], async (c, i) => (await c.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: i })).score);
 		// @ts-expect-error: ctx has no state-writing API
 		await ctx.emit("total", 3);
-		// @ts-expect-error: nor state reads
-		await ctx.read({ fields: ["total"], maxChars: 1, maxItems: 1 });
+		// @ts-expect-error: and no ctx.script or ctx.sub: ctx.call is the only way to invoke a node
+		await ctx.script(train, {});
 		void wrong;
-		return out.n;
+		void each;
+		return out.n + trained.score + n;
 	},
 });
 
@@ -68,6 +103,7 @@ export default workflow({
 declare const session: Session;
 declare const snapshot: Snapshot;
 declare const node: Node;
+declare const commandNode: CommandRunning;
 
 const owned = OwnedRun.check(snapshot, "human");
 if (owned instanceof OwnedRun) {
@@ -84,6 +120,8 @@ if (owned instanceof OwnedRun) {
 	if (idle instanceof IdleNode) session.steer(idle, "go left");
 	// @ts-expect-error: and an unchecked running node is not one either
 	session.interrupt({ owned, node: node as RunningNode & { steerable: true } });
+	// @ts-expect-error: a command can never be steered: SteerableNode holds only agents
+	session.steer({ owned, node: commandNode }, "faster");
 
 	const liveNode = LiveNode.check(owned, "#0");
 	if (liveNode instanceof LiveNode) session.restart(liveNode, "note");
@@ -102,4 +140,8 @@ if (node.type === "node_running") {
 	// @ts-expect-error: without the steerable check the variant may be non-steerable
 	const unchecked: RunningNode & { steerable: true } = node;
 	void unchecked;
+}
+if (node.type === "command_running") {
+	// @ts-expect-error: a command node has no steerable flag at all
+	void node.steerable;
 }

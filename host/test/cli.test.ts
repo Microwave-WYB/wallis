@@ -3,7 +3,7 @@
 // cancel and pending.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fakeExecutor, lines, logOf, normalized, onlyRun, project, runDir, tmp, wallis } from "./util.ts";
@@ -63,7 +63,7 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	const log = logOf(root, id);
 	const sentEvents = log.filter((e) => e.type === "sent");
 	assert.equal(sentEvents.length, 1);
-	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0", text: "newcomers", message_id: "<id>", by: sentEvents[0]!.by });
+	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0", text: "newcomers", message_id: "<id>", by: sentEvents[0]!.by, turns: 0 });
 	assert.match(String(sentEvents[0]!.by), /^(human|harness:.+)$/, "the sender's identity is logged");
 	assert.ok(log.some((e) => e.type === "agent_idle" && e.message === "Who is the audience: experts or newcomers?"));
 	// The idle turn was not replayed: the reply continued the conversation.
@@ -140,29 +140,24 @@ test("an executor error pauses the run; a rebind and resume reissue the call", (
 	assert.deepEqual(types.slice(types.indexOf("executor_failed")), ["executor_failed", "retry_unavailable", "executor_failed", "alias_rebound", "retry_unavailable", "agent_returned", "observed", "body_finished"]);
 });
 
-test("fork copies a log prefix into a new run; the original is untouched", () => {
+test("fork copies the journal (a cache): the fork re-executes and every unchanged call hits; the original is untouched", () => {
 	const root = project();
 	const { id } = askAndReply(root);
 	const original = readFileSync(join(runDir(root, id), "log.jsonl"), "utf8");
-	const forked = wallis(root, ["fork", id, "--at", "#1", "--model", "writer=forked/model"]);
+	const execLog = join(tmp(), "exec.jsonl");
+	writeFileSync(execLog, "");
+	const forked = wallis(root, ["fork", id, "--model", "writer=forked/model"], { WALLIS_FAKE_EXEC_LOG: execLog });
 	assert.equal(forked.status, 0, forked.stderr);
 	const forkId = /into (\S+)\./.exec(forked.stdout)![1]!;
 	assert.notEqual(forkId, id);
 	assert.equal(readFileSync(join(runDir(root, id), "log.jsonl"), "utf8"), original);
-
-	const parent = logOf(root, id);
+	// Nothing ran again: every call hit the copied journal, and the fork finished the same way.
+	assert.equal(readFileSync(execLog, "utf8"), "");
+	assert.deepEqual(status(root, forkId).status, status(root, id).status);
 	const child = logOf(root, forkId);
-	const cut = parent.findIndex((e) => e.type === "requested" && e.id === "#1") + 1;
-	assert.deepEqual(child.slice(0, cut), parent.slice(0, cut));
-	// The fork is owned by whoever forked it, then rebinds as asked.
-	assert.equal(child[cut]!.type, "claimed");
-	assert.deepEqual(child[cut + 1], { type: "alias_rebound", alias: "writer", from: "fake/default", to: "forked/model" });
-	assert.equal(status(root, forkId).status.type, "finished");
-	assert.equal(status(root, forkId).nodes.find((n) => n.id === "#1")!.model, "forked/model");
-
-	// Forking by event count works too.
-	const byCount = wallis(root, ["fork", id, "--at", "3"]);
-	assert.equal(byCount.status, 0, byCount.stderr);
+	assert.ok(child.some((e) => e.type === "claimed"), "the fork is owned by whoever forked it");
+	assert.deepEqual(child.find((e) => e.type === "alias_rebound"), { type: "alias_rebound", alias: "writer", from: "fake/default", to: "forked/model" });
+	assert.equal(wallis(root, ["fork", id, "--at", "3"]).status, 1, "--at is gone: positions do not matter");
 });
 
 test("cancel finishes an idle run as cancelled", () => {

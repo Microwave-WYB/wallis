@@ -1,13 +1,16 @@
 // The guest half of the sandbox bridge. The bundler appends
 // `install(workflow)` to every bundled workflow. Inside QuickJS the host
 // provides `__wallis_send`, `__wallis_done` and `__wallis_fail`; it calls
-// `__wallis_declare`, `__wallis_start` and `__wallis_deliver`.
+// `__wallis_declare`, `__wallis_start` and `__wallis_deliver`, and, for a
+// command call, `__wallis_argv` (the command's `run`) and `__wallis_parse`
+// (its `parse`), both pure.
 //
-// Request ids come from the branch path and a per-branch counter, so they
-// are the same on every replay regardless of the order results arrive in.
+// Request ids come from the branch path and a per-branch counter, taken
+// synchronously when `ctx.call` is invoked, so they are the same on every
+// replay regardless of the order results arrive in.
 
-import type { AgentDef, Ctx, FailReason, Json, Refusal, ScriptDef, SubWorkflowDef, WorkflowDef } from "./index.ts";
-import { AgentFailed, Refused, SchemaError, ScriptFailed } from "./index.ts";
+import type { AgentDef, CommandDef, CommandResult, Ctx, FailReason, Json, Node, Refusal, SandboxDef, WorkflowDef, WorkflowNode } from "./index.ts";
+import { AgentFailed, CommandFailed, Refused, SchemaError, WorkflowFailed } from "./index.ts";
 import { schemaErrors } from "./validate.ts";
 
 /** What the host answers a request with. */
@@ -36,19 +39,25 @@ function request(id: string, req: Json): Promise<Reply> {
 	});
 }
 
+function thrown(reason: FailReason): Error {
+	switch (reason.type) {
+		case "agent_gave_up":
+			return new AgentFailed(reason.agent, reason.failure);
+		case "command_crashed":
+			return new CommandFailed(reason.command, reason.failure);
+		case "workflow_failed":
+			return new WorkflowFailed(reason.workflow, reason.reason);
+		case "body_error":
+			return new Error(reason.message);
+	}
+}
+
 function unwrap(reply: Reply): Json {
 	switch (reply.type) {
 		case "deliver":
 			return reply.value;
 		case "fail":
-			switch (reply.reason.type) {
-				case "agent_gave_up":
-					throw new AgentFailed(reply.reason.agent, reply.reason.failure);
-				case "script_crashed":
-					throw new ScriptFailed(reply.reason.script, reply.reason.error);
-				case "body_error":
-					throw new Error(reply.reason.message);
-			}
+			throw thrown(reply.reason);
 		case "refuse":
 			throw new Refused(reply.refusal);
 		case "schema":
@@ -61,41 +70,74 @@ function check(schema: unknown, value: unknown, subject: string): void {
 	if (errors.length > 0) throw new SchemaError(subject, errors);
 }
 
+function failReason(error: unknown): FailReason {
+	if (error instanceof AgentFailed) return { type: "agent_gave_up", agent: error.agent, failure: error.failure };
+	if (error instanceof CommandFailed) return { type: "command_crashed", command: error.command, failure: error.failure };
+	if (error instanceof WorkflowFailed) return { type: "workflow_failed", workflow: error.workflow, reason: error.reason };
+	return { type: "body_error", message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
+}
+
 /**
- * Request ids: `<path>#<n>`. Observations take their own counter
- * (`<path>~<n>`), so adding or removing one never shifts a request id.
+ * Request ids: `<path>#<n>`, taken synchronously by `call`, `parallel` and
+ * `map` before anything is awaited. A branch of `parallel` or `map` gets
+ * its own path (`#2.key`, `#2.0`), so its later steps never depend on the
+ * order other branches' results arrive in. Observations take their own
+ * counter (`<path>~<n>`), so adding or removing one never shifts a request id.
  */
 function makeCtx(path: string, seed: number): Ctx {
 	let counter = 0;
 	let observed = 0;
 	const next = () => `${path}#${counter++}`;
+	const callAgent = async (id: string, agent: AgentDef, input: unknown) => {
+		const output = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json }));
+		const errors = schemaErrors(agent.output, output);
+		if (errors.length > 0) throw new AgentFailed(agent.name, { type: "gave_up", error: `output does not match its schema: ${errors.join("; ")}` });
+		return output;
+	};
+	const callCommand = async (id: string, command: CommandDef, input: unknown) => {
+		const output = unwrap(await request(id, { type: "command", command: command.name, input: input as Json }));
+		const errors = schemaErrors(command.output, output);
+		if (errors.length > 0) throw new CommandFailed(command.name, { type: "output_mismatch", errors });
+		return output;
+	};
+	const callWorkflow = async (id: string, sub: WorkflowNode, input: unknown) => {
+		let output: unknown;
+		try {
+			output = await sub.run(makeCtx(`${id}>${sub.name}`, seed), input as never);
+			check(sub.output, output, `output of workflow ${sub.name}`);
+		} catch (error) {
+			// A nested workflow's failure propagates, typed, with its cause.
+			throw new WorkflowFailed(sub.name, failReason(error));
+		}
+		return output;
+	};
 	const ctx: Ctx = {
 		seed,
-		async call(agent: AgentDef, input) {
-			check(agent.input, input, `input of agent ${agent.name}`);
-			const output = unwrap(await request(next(), { type: "call", agent: agent.name, input: input as Json }));
-			const errors = schemaErrors(agent.output, output);
-			if (errors.length > 0) throw new AgentFailed(agent.name, { type: "gave_up", error: `output does not match its schema: ${errors.join("; ")}` });
-			return output as never;
+		call(node: Node, input) {
+			// Checked and numbered now, synchronously: the id never depends on arrival order.
+			const subject = `input of ${node.kind} ${node.name}`;
+			const errors = schemaErrors(node.input, input);
+			if (errors.length > 0) return Promise.reject(new SchemaError(subject, errors));
+			const id = next();
+			switch (node.kind) {
+				case "agent":
+					return callAgent(id, node, input) as never;
+				case "command":
+					return callCommand(id, node, input) as never;
+				case "workflow":
+					return callWorkflow(id, node, input) as never;
+			}
 		},
-		async script(script: ScriptDef, args) {
-			check(script.input, args, `args of script ${script.name}`);
-			const output = unwrap(await request(next(), { type: "script", script: script.name, args: args as Json }));
-			const errors = schemaErrors(script.output, output);
-			if (errors.length > 0) throw new ScriptFailed(script.name, `output does not match its schema: ${errors.join("; ")}`);
-			return output as never;
-		},
-		async parallel(branches) {
+		parallel(branches) {
 			const at = next();
 			const keys = Object.keys(branches);
-			const results = await Promise.all(keys.map((key) => branches[key]!(makeCtx(`${at}.${key}`, seed))));
-			return Object.fromEntries(keys.map((key, i) => [key, results[i]])) as never;
+			return Promise.all(keys.map((key) => branches[key]!(makeCtx(`${at}.${key}`, seed)))).then(
+				(results) => Object.fromEntries(keys.map((key, i) => [key, results[i]])) as never,
+			);
 		},
-		async sub(sub: SubWorkflowDef, input) {
-			check(sub.input, input, `input of sub-workflow ${sub.name}`);
-			const output = await sub.run(makeCtx(`${next()}>${sub.name}`, seed), input as never);
-			check(sub.output, output, `output of sub-workflow ${sub.name}`);
-			return output as never;
+		map(items, each) {
+			const at = next();
+			return Promise.all(items.map((item, i) => each(makeCtx(`${at}.${i}`, seed), item, i)));
 		},
 		observe(label, value) {
 			host().__wallis_send(JSON.stringify({ type: "observed", at: `${path}~${observed++}`, label, value }));
@@ -116,57 +158,79 @@ function seededRandom(seed: number): () => number {
 	};
 }
 
-function agentDeclaration(agent: AgentDef) {
-	return {
-		model: agent.model,
-		prompt: agent.prompt,
-		input: agent.input,
-		output: agent.output,
-		mcp: agent.mcp,
-		tools: agent.tools.map((t) => ({ name: t.name, description: t.description, input: t.input, output: t.output, script: t.script })),
-		skills: agent.skills,
-		needs: agent.needs ?? {},
-		sandbox: agent.sandbox,
-		mounts: agent.mounts,
-		steerable: agent.steerable,
-		compaction: agent.compaction,
-		max_turns: agent.maxTurns,
-	};
+function sandboxDeclaration(s: SandboxDef) {
+	return { requires: s.requires, setup: s.setup, mounts: s.mounts, network: s.network, base: s.base };
 }
 
 /** Declarations: the core's workflow plus what the host and executors need. */
 export function declarations(def: WorkflowDef) {
 	const spec = def.spec;
 	const names = new Set<string>();
-	for (const agent of spec.agents) {
-		if (names.has(agent.name)) throw new Error(`duplicate agent name ${agent.name}`);
-		names.add(agent.name);
+	for (const node of [...spec.agents, ...(spec.commands ?? [])]) {
+		if (names.has(node.name)) throw new Error(`duplicate node name ${node.name}`);
+		names.add(node.name);
 	}
-	const scripts = spec.scripts ?? [];
+	const commands = spec.commands ?? [];
 	const mounts = spec.mounts?.table ?? {};
-	for (const m of [...spec.agents.flatMap((a) => a.mounts), ...scripts.flatMap((s) => s.mounts)]) {
-		if (!(m in mounts)) throw new Error(`mount ${m} is not in the workflow's mount table`);
+	const overlay = (spec.mcp?.overlay ?? {}) as Record<string, { sandbox?: SandboxDef; allowWrites?: readonly string[] } | undefined>;
+	// Every sandbox, by name: from commands, agents and MCP servers.
+	const sandboxes = new Map<string, SandboxDef>();
+	const use = (s: SandboxDef | null | undefined): string | null => {
+		if (!s) return null;
+		const prior = sandboxes.get(s.name);
+		if (prior && JSON.stringify(sandboxDeclaration(prior)) !== JSON.stringify(sandboxDeclaration(s))) throw new Error(`two different sandboxes are named ${s.name}`);
+		for (const m of s.mounts) if (!(m in mounts)) throw new Error(`sandbox ${s.name}: mount ${m} is not in the workflow's mount table`);
+		sandboxes.set(s.name, s);
+		return s.name;
+	};
+	for (const a of spec.agents) {
+		if (a.sandbox && !a.sandbox.requires.some((r) => r.name === "bash")) throw new Error(`agent ${a.name}: its sandbox ${a.sandbox.name} must require bash`);
 	}
 	return {
 		core: {
 			name: spec.name,
 			agents: spec.agents.map((a) => ({ name: a.name, model: a.model, max_turns: a.maxTurns, steerable: a.steerable })),
-			scripts: scripts.map((s) => s.name),
-			budget: {
-				usd: spec.budget?.usd ?? null,
-				tokens: spec.budget?.tokens ?? null,
-				turns: spec.budget?.turns ?? null,
-				compute_minutes: spec.budget?.computeMinutes ?? null,
-			},
+			commands: commands.map((c) => c.name),
+			budget: { turns: spec.budget?.turns ?? null, compute_minutes: spec.budget?.computeMinutes ?? null },
 		},
 		models: spec.models.table,
 		mounts,
 		pin: { files: [...(spec.pin?.files ?? [])] },
-		agents: Object.fromEntries(spec.agents.map((a) => [a.name, agentDeclaration(a)])),
-		scripts: Object.fromEntries(
-			scripts.map((s) => [s.name, { description: s.description, input: s.input, output: s.output, sandbox: s.sandbox, mounts: s.mounts, resources: s.resources }]),
+		agents: Object.fromEntries(
+			spec.agents.map((a) => [
+				a.name,
+				{
+					model: a.model,
+					prompt: a.prompt,
+					input: a.input,
+					output: a.output,
+					mcp: a.mcp,
+					skills: a.skills,
+					needs: a.needs ?? {},
+					sandbox: use(a.sandbox),
+					steerable: a.steerable,
+					compaction: a.compaction,
+					max_turns: a.maxTurns,
+				},
+			]),
+		),
+		commands: Object.fromEntries(
+			commands.map((c) => [
+				c.name,
+				{
+					description: c.description,
+					input: c.input,
+					output: c.output,
+					sandbox: use(c.sandbox)!,
+					resources: c.resources,
+					// The adapter's code, for the node digest: a change to `run` or `parse` misses the journal.
+					code: [typeof c.run === "function" ? c.run.toString() : JSON.stringify(c.run), c.parse ? c.parse.toString() : "stdout-json"],
+				},
+			]),
 		),
 		mcp: spec.mcp?.config ?? null,
+		mcpServers: Object.fromEntries(Object.entries(overlay).map(([server, o]) => [server, { sandbox: use(o?.sandbox), allow_writes: [...(o?.allowWrites ?? [])] }])),
+		sandboxes: Object.fromEntries([...sandboxes].map(([name, s]) => [name, sandboxDeclaration(s)])),
 		input: spec.input,
 		output: spec.output,
 	};
@@ -174,20 +238,50 @@ export function declarations(def: WorkflowDef) {
 
 export type Declarations = ReturnType<typeof declarations>;
 
-function failReason(error: unknown): FailReason {
-	if (error instanceof AgentFailed) return { type: "agent_gave_up", agent: error.agent, failure: error.failure };
-	if (error instanceof ScriptFailed) return { type: "script_crashed", script: error.script, error: error.error };
-	return { type: "body_error", message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
+/** The commands of a workflow, by name, for the host's `run` and `parse` calls. */
+function commandsOf(def: WorkflowDef): Map<string, CommandDef> {
+	return new Map((def.spec.commands ?? []).map((c) => [c.name, c]));
 }
 
 export function install(def: WorkflowDef): void {
 	const g = globalThis as Record<string, unknown>;
+	const commands = commandsOf(def);
 	g.__wallis_declare = () => JSON.stringify(declarations(def));
+	// False when no request of this body waits for `id` (a result for an
+	// earlier execution of the body; it is in the journal and hits later).
 	g.__wallis_deliver = (id: string, json: string) => {
 		const resolve = pending.get(id);
-		if (!resolve) throw new Error(`no pending request ${id}`);
+		if (!resolve) return false;
 		pending.delete(id);
 		resolve(JSON.parse(json) as Reply);
+		return true;
+	};
+	// The command's argv for this (mounted) input: `{ ok, argv }` or `{ ok: false, error }`.
+	g.__wallis_argv = (name: string, inputJson: string) => {
+		try {
+			const c = commands.get(name);
+			if (!c) throw new Error(`no command ${name}`);
+			const argv = typeof c.run === "function" ? c.run(JSON.parse(inputJson) as never) : c.run;
+			return JSON.stringify({ ok: true, argv });
+		} catch (error) {
+			return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+		}
+	};
+	// The command's output from its process result; files it names become artifact drafts.
+	g.__wallis_parse = (name: string, resultJson: string) => {
+		try {
+			const c = commands.get(name);
+			if (!c) throw new Error(`no command ${name}`);
+			const raw = JSON.parse(resultJson) as { exit: number; stdout: string; stderr: string };
+			const result: CommandResult = {
+				...raw,
+				file: (file, media) => ({ artifact: file, media: media ?? "application/octet-stream" }) as never,
+			};
+			const output = c.parse ? c.parse(result) : JSON.parse(raw.stdout);
+			return JSON.stringify({ ok: true, output: output ?? null });
+		} catch (error) {
+			return JSON.stringify({ ok: false, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
+		}
 	};
 	g.__wallis_start = (inputJson: string, seed: number) => {
 		Math.random = seededRandom(seed);

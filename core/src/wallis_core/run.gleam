@@ -2,7 +2,7 @@
 ////
 //// A run is a fold of the workflow body over its journal. The body is a
 //// deterministic program whose only interface to the world is typed
-//// requests (agent calls and scripts); each request affects the body only
+//// requests (agent and command calls); each request affects the body only
 //// through its answer. Run memory is the body's local variables, rebuilt
 //// on replay, so the core holds no workflow state: it keeps the journal,
 //// replay matching, budget, pin, status, ownership and the interventions.
@@ -41,7 +41,7 @@ import wallis_core/types.{
 import wallis_core/value.{type Value}
 
 /// Bumped when a change to the core changes what a log means.
-pub const semantics = "wallis-core/3"
+pub const semantics = "wallis-core/4"
 
 pub opaque type RunState {
   NotYetStarted
@@ -53,7 +53,7 @@ type Lifecycle {
   Ended(Outcome)
 }
 
-/// Whether new calls and scripts are issued: `Holding` after a pause.
+/// Whether new calls are issued: `Holding` after a pause.
 type Admission {
   Admitting
   Holding
@@ -70,8 +70,16 @@ type Run {
     executor: Option(String),
     owner: Option(String),
     admission: Admission,
+    /// By request id (display and interventions only).
     requests: Dict(String, Record),
+    /// The journal: a cache from slot (node, input, occurrence) to result.
     journal: Dict(String, Entry),
+    /// Which request id holds each slot that has a record.
+    slots: Dict(String, String),
+    /// Slots whose call was issued in this session (not logged).
+    issued: Dict(String, Nil),
+    /// A failed node the body did not handle: its id and the body's reason.
+    hold: Option(#(String, FailReason)),
     spent: Spent,
     /// Newest first.
     observations: List(Observation),
@@ -89,8 +97,16 @@ type Record {
 type Kind {
   /// `inbox` (newest first) and `steps` (model turns so far) outlive the
   /// call: they are what its journal entry records about its dialogue.
-  AgentKind(agent: String, input: Value, inbox: List(InboxMessage), steps: Int)
-  ScriptKind(script: String, args: Value)
+  /// `allowed`: the turns this node may use (its agent's maxTurns plus the
+  /// turns granted with answers).
+  AgentKind(
+    agent: String,
+    input: Value,
+    inbox: List(InboxMessage),
+    steps: Int,
+    allowed: Int,
+  )
+  CommandKind(command: String, input: Value, inbox: List(InboxMessage))
   RefusedKind
 }
 
@@ -105,10 +121,10 @@ type Progress {
   Blocked(reason: IdleReason, note: Option(String))
   AwaitingAgent(dialogue: Dialogue)
   /// The agent asked something: waiting for an answer.
-  AgentWaiting(dialogue: Dialogue, model: String)
+  AgentWaiting(dialogue: Dialogue, model: String, cause: types.IdleCause)
   /// The executor could not serve the call; reissued after a fix.
   Unavailable(dialogue: Dialogue, alias: String, error: String)
-  AwaitingScript
+  AwaitingCommand
   Completed(model: Option(String))
 }
 
@@ -133,7 +149,10 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
     Active(r), types.Resumed(pin:) ->
       case capability.check_pin(r.pin, pin) {
         Error(refusal) -> #(run, [types.Refuse(None, refusal)])
-        Ok(resumable) -> #(run, resume(r, resumable))
+        Ok(resumable) -> #(
+          Active(Run(..r, issued: dict.new())),
+          resume(r, resumable),
+        )
       }
     // Ownership changes even on a finished run.
     Active(r), types.Claimed(owner:) -> #(Active(Run(..r, owner: Some(owner))), [
@@ -141,7 +160,7 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
     ])
     Active(Run(lifecycle: Live, ..) as r), _ -> {
       let #(r, effects) = live_event(r, event)
-      #(Active(r), effects)
+      #(Active(issued(r, effects)), effects)
     }
     Active(_), _ -> #(run, [types.Refuse(None, types.NotRunning)])
   }
@@ -184,6 +203,9 @@ fn start(
           admission: Admitting,
           requests: dict.new(),
           journal: dict.new(),
+          slots: dict.new(),
+          issued: dict.new(),
+          hold: None,
           spent: Spent(0.0, 0, 0, 0.0),
           observations: [],
         ),
@@ -217,7 +239,19 @@ fn resume(run: Run, _resumable: ResumableRun) -> List(Effect) {
 
 fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
   case event {
-    types.Requested(id:, request:) -> requested(run, id, request)
+    types.Requested(id:, request:, node_digest:, occurrence:) ->
+      requested(run, id, request, node_digest, occurrence)
+    types.CodeChanged(from:, to:) -> #(
+      Run(
+        ..run,
+        pin: types.Pin(
+          ..run.pin,
+          workflow_digest: to,
+          prior_digests: list.append(run.pin.prior_digests, [from]),
+        ),
+      ),
+      [types.Checkpoint],
+    )
     types.AgentReturned(id:, output:, usage:, model:) ->
       agent_settled(run, id, usage, model, fn(_) { Answered(output) })
     types.AgentFailed(id:, failure:, usage:, model:) ->
@@ -229,21 +263,39 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
         Refused(types.InputTooLarge(name, field, chars, limit))
       })
     types.AgentIdle(id:, message:, usage:, model:) ->
-      agent_idle(run, id, message, usage, model)
+      agent_idle(run, id, fn(_) { types.Question(message) }, usage, model)
+    types.TurnLimitReached(id:, usage:, model:, ..) ->
+      agent_idle(
+        run,
+        id,
+        fn(kind) {
+          case kind {
+            AgentKind(steps:, allowed:, ..) -> types.TurnLimit(steps, allowed)
+            _ -> types.TurnLimit(0, 0)
+          }
+        },
+        usage,
+        model,
+      )
     types.ExecutorFailed(id:, error:) -> executor_failed(run, id, error)
-    types.ScriptReturned(id:, output:, minutes:) ->
-      script_settled(run, id, Answered(output), minutes)
-    types.ScriptFailed(id:, error:, minutes:) ->
-      script_failed(run, id, error, minutes)
+    types.CommandReturned(id:, output:, minutes:) ->
+      command_settled(run, id, fn(_) { Answered(output) }, minutes)
+    types.CommandFailed(id:, failure:, minutes:) ->
+      command_settled(
+        run,
+        id,
+        fn(name) { Errored(types.CommandCrashed(name, failure)) },
+        minutes,
+      )
     types.Observed(at:, label:, value:) -> observe(run, at, label, value)
-    types.Sent(node:, text:, by:, ..) ->
+    types.Sent(node:, text:, by:, turns:, ..) ->
       intervene(run, by, fn(owned) {
         use idle <- result.map(capability.check_idle(
           owned,
           node,
           facts(run, node),
         ))
-        answer(run, idle, text)
+        answer(run, idle, text, turns)
       })
     types.Steered(node:, text:, by:, ..) ->
       intervene(run, by, fn(owned) {
@@ -264,14 +316,14 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
         let id = capability.steerable_id(node)
         #(add_inbox(run, id, types.Interrupt, ""), [types.Checkpoint])
       })
-    types.Restarted(node:, note:, by:) ->
+    types.Restarted(node:, note:, by:, turns:) ->
       intervene(run, by, fn(owned) {
         use node <- result.try(capability.check_live(
           owned,
           node,
           facts(run, node),
         ))
-        restart(run, node, note)
+        restart(run, node, note, turns)
       })
     types.NodeCancelled(node:, by:) ->
       intervene(run, by, fn(owned) {
@@ -312,7 +364,7 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       types.Checkpoint,
     ])
     types.BodyFinished(output:) -> finish(run, types.Done(output))
-    types.BodyFailed(reason:) -> finish(run, types.Failed(reason))
+    types.BodyFailed(reason:) -> body_failed(run, reason)
     types.Started(..) | types.Resumed(..) -> #(run, [])
   }
 }
@@ -328,6 +380,47 @@ fn intervene(
     Ok(done) -> done
     Error(refusal) -> #(run, [types.Refuse(None, refusal)])
   }
+}
+
+/// An uncaught node failure holds the run on that node instead of ending
+/// it: the owner restarts the node (the body then runs again against the
+/// journal) or cancels it (the failure propagates). Other failures, and a
+/// failure the owner already accepted, end the run.
+fn body_failed(run: Run, reason: FailReason) -> #(Run, List(Effect)) {
+  case run.hold {
+    Some(_) -> #(run, [])
+    None ->
+      case leaf(reason) {
+        types.AgentGaveUp(failure: types.CancelledByOwner, ..)
+        | types.CommandCrashed(failure: types.CommandCancelled, ..)
+        | types.BodyError(..) -> finish(run, types.Failed(reason))
+        failure ->
+          case failed_node(run, failure) {
+            Ok(id) -> #(Run(..run, hold: Some(#(id, reason))), [
+              types.Checkpoint,
+            ])
+            Error(Nil) -> finish(run, types.Failed(reason))
+          }
+      }
+  }
+}
+
+fn leaf(reason: FailReason) -> FailReason {
+  case reason {
+    types.WorkflowFailed(reason:, ..) -> leaf(reason)
+    _ -> reason
+  }
+}
+
+/// The first node, by id, that failed with this reason.
+fn failed_node(run: Run, failure: FailReason) -> Result(String, Nil) {
+  sorted_requests(run)
+  |> list.find_map(fn(e) {
+    case dict.get(run.journal, { e.1 }.digest) {
+      Ok(Errored(f)) if f == failure -> Ok(e.0)
+      _ -> Error(Nil)
+    }
+  })
 }
 
 fn finish(run: Run, outcome: Outcome) -> #(Run, List(Effect)) {
@@ -359,55 +452,122 @@ fn observe(
 
 // --- Requests ------------------------------------------------------------------
 
-fn request_digest(id: String, request: Request) -> String {
+/// The journal slot of a call: the node's definition digest, the request
+/// and its canonical input, and its occurrence in this execution of the body.
+fn slot_of(node_digest: String, request: Request, occurrence: Int) -> String {
   let #(kind, name, body) = case request {
     types.Call(agent:, input:) -> #("call", agent, input)
-    types.Script(script:, args:) -> #("script", script, args)
+    types.Command(command:, input:) -> #("command", command, input)
   }
-  digest.hex(string.join([id, kind, name, value.canonical(body)], "\n"))
+  digest.hex(string.join([node_digest, kind, name, value.canonical(body)], "\n"))
+  <> "#"
+  <> int.to_string(occurrence)
 }
 
-fn requested(run: Run, id: String, request: Request) -> #(Run, List(Effect)) {
-  let d = request_digest(id, request)
-  case dict.get(run.requests, id) {
-    Ok(record) -> replay(run, id, d, record)
-    Error(Nil) -> {
-      let #(run, effects) = live_request(run, id, d, request)
-      #(run, [types.Checkpoint, ..effects])
-    }
-  }
-}
-
-/// Replays answer from the journal or re-emit what was in flight. They do
-/// not change the run, so a refold of the log reaches the same state.
-fn replay(
+/// The journal is a cache. A slot with a result is a hit: answered, not
+/// logged. A slot with a call in flight or waiting is the same call (its
+/// record moves to this request id, and that move is logged). Anything
+/// else is a new call.
+fn requested(
   run: Run,
   id: String,
-  d: String,
+  request: Request,
+  node_digest: String,
+  occurrence: Int,
+) -> #(Run, List(Effect)) {
+  let slot = slot_of(node_digest, request, occurrence)
+  case dict.get(run.journal, slot), dict.get(run.slots, slot) {
+    Ok(entry), _ -> #(run, [answer_effect(id, entry)])
+    Error(Nil), Ok(old) ->
+      case dict.get(run.requests, old) {
+        Ok(record) -> {
+          let moved = old != id
+          let run = case moved {
+            False -> run
+            True ->
+              Run(
+                ..run,
+                requests: run.requests
+                  |> dict.delete(old)
+                  |> dict.insert(id, record),
+                slots: dict.insert(run.slots, slot, id),
+              )
+          }
+          let #(run, effects) = reissue(run, id, slot, record)
+          case moved {
+            True -> #(run, [types.Checkpoint, ..effects])
+            False -> #(run, effects)
+          }
+        }
+        Error(Nil) -> new_request(run, id, slot, request)
+      }
+    Error(Nil), Error(Nil) -> new_request(run, id, slot, request)
+  }
+}
+
+fn new_request(
+  run: Run,
+  id: String,
+  slot: String,
+  request: Request,
+) -> #(Run, List(Effect)) {
+  let run = Run(..run, slots: dict.insert(run.slots, slot, id))
+  let #(run, effects) = live_request(run, id, slot, request)
+  #(mark_issued(run, slot, effects), [types.Checkpoint, ..effects])
+}
+
+/// Every call issued by these effects, so a replay in the same session does
+/// not issue it again.
+fn issued(run: Run, effects: List(Effect)) -> Run {
+  list.fold(effects, run, fn(run, e) {
+    case e {
+      types.CallAgent(digest:, ..) | types.RunCommand(digest:, ..) ->
+        Run(..run, issued: dict.insert(run.issued, digest, Nil))
+      _ -> run
+    }
+  })
+}
+
+fn mark_issued(run: Run, slot: String, effects: List(Effect)) -> Run {
+  case
+    list.any(effects, fn(e) {
+      case e {
+        types.CallAgent(..) | types.RunCommand(..) -> True
+        _ -> False
+      }
+    })
+  {
+    True -> Run(..run, issued: dict.insert(run.issued, slot, Nil))
+    False -> run
+  }
+}
+
+/// A call already recorded and requested again: re-emitted only if it was in
+/// flight and not yet issued in this session (after a crash); waiting calls
+/// wait for the events that unblock them (`Sent`, `BudgetRaised`,
+/// `RetryUnavailable`).
+fn reissue(
+  run: Run,
+  id: String,
+  slot: String,
   record: Record,
 ) -> #(Run, List(Effect)) {
-  case record.digest == d {
-    False -> #(run, [types.Refuse(None, types.PathDiverged(id))])
-    True ->
-      case record.progress, record.kind {
-        Completed(..), _ ->
-          case dict.get(run.journal, d) {
-            Ok(entry) -> #(run, [answer_effect(id, entry)])
-            Error(Nil) -> #(run, [types.Refuse(None, types.JournalMissing(id))])
-          }
+  case dict.has_key(run.issued, slot) {
+    True -> #(run, [])
+    False -> {
+      let effects = case record.progress, record.kind {
         AwaitingAgent(dialogue:), AgentKind(agent:, input:, ..) ->
-          case call_effect(run, id, agent, input, d, dialogue) {
-            Ok(call) -> #(run, [call])
-            Error(_) -> #(run, [])
+          case call_effect(run, id, agent, input, slot, dialogue) {
+            Ok(call) -> [call]
+            Error(_) -> []
           }
-        AwaitingScript, ScriptKind(script:, args:) -> #(run, [
-          script_effect(run, id, script, args, d),
-        ])
-        // Waiting for an answer, for budget, or for an executor fix: the
-        // events that unblock them (`Sent`, `BudgetRaised`,
-        // `RetryUnavailable`) are logged and reissue the call.
-        _, _ -> #(run, [])
+        AwaitingCommand, CommandKind(command:, input:, ..) -> [
+          command_effect(run, id, command, input, slot),
+        ]
+        _, _ -> []
       }
+      #(mark_issued(run, slot, effects), effects)
+    }
   }
 }
 
@@ -435,8 +595,8 @@ fn live_request(
             Record(d, RefusedKind, Completed(None)),
             Refused(types.UnknownAgent(name)),
           )
-        Ok(_) -> {
-          let kind = AgentKind(name, input, [], 0)
+        Ok(agent) -> {
+          let kind = AgentKind(name, input, [], 0, agent.max_turns)
           case admit(run) {
             Error(reason) -> #(
               record(run, id, Record(d, kind, Blocked(reason, None))),
@@ -461,10 +621,10 @@ fn live_request(
           }
         }
       }
-    types.Script(script:, args:) -> {
-      let kind = ScriptKind(script, args)
+    types.Command(command:, input:) -> {
+      let kind = CommandKind(command, input, [])
       case
-        list.contains(run.workflow.scripts, script),
+        list.contains(run.workflow.commands, command),
         result.try(admission(run), fn(_) { compute_check(run) })
       {
         False, _ ->
@@ -472,14 +632,14 @@ fn live_request(
             run,
             id,
             Record(d, RefusedKind, Completed(None)),
-            Refused(types.UnknownScript(script)),
+            Refused(types.UnknownCommand(command)),
           )
         True, Error(reason) -> #(
           record(run, id, Record(d, kind, Blocked(reason, None))),
           [],
         )
-        True, Ok(Nil) -> #(record(run, id, Record(d, kind, AwaitingScript)), [
-          script_effect(run, id, script, args, d),
+        True, Ok(Nil) -> #(record(run, id, Record(d, kind, AwaitingCommand)), [
+          command_effect(run, id, command, input, d),
         ])
       }
     }
@@ -504,29 +664,35 @@ fn call_effect(
     resolve_model(run.models, agent.model)
     |> result.replace_error(types.UnknownAlias(agent.model)),
   )
+  // The node's turns so far and its allowance (a new call has neither yet).
+  let #(turn, turn_limit) = case dict.get(run.requests, id) {
+    Ok(Record(kind: AgentKind(steps:, allowed:, ..), ..)) -> #(steps, allowed)
+    _ -> #(0, agent.max_turns)
+  }
   Ok(types.CallAgent(
     id:,
     agent: agent.name,
     model:,
     input:,
-    max_turns: turn_cap(run, agent),
+    turn:,
+    turn_limit:,
     digest: d,
     transcript: dialogue.transcript,
     note: dialogue.note,
   ))
 }
 
-fn script_effect(
+fn command_effect(
   run: Run,
   id: String,
-  script: String,
-  args: Value,
+  command: String,
+  input: Value,
   d: String,
 ) -> Effect {
-  types.RunScript(
+  types.RunCommand(
     id:,
-    script:,
-    args:,
+    command:,
+    input:,
     compute_minutes: option.map(run.budget.compute_minutes, fn(limit) {
       limit -. run.spent.compute_minutes
     }),
@@ -546,29 +712,14 @@ fn admit(run: Run) -> Result(Nil, IdleReason) {
   result.try(admission(run), fn(_) { budget_check(run) })
 }
 
-/// Checked before every agent call. An exhausted budget pauses the call.
+/// Checked before every agent call. A reached budget is an attention
+/// point: no new call is admitted, calls in flight finish.
 fn budget_check(run: Run) -> Result(Nil, IdleReason) {
-  let b = run.budget
-  let s = run.spent
-  use _ <- result.try(case b.usd {
-    Some(limit) if s.usd >=. limit ->
-      Error(types.BudgetExhausted(types.Usd, s.usd, limit))
-    _ -> Ok(Nil)
-  })
-  use _ <- result.try(case b.tokens {
-    Some(limit) if s.tokens >= limit ->
-      Error(types.BudgetExhausted(
-        types.Tokens,
-        int.to_float(s.tokens),
-        int.to_float(limit),
-      ))
-    _ -> Ok(Nil)
-  })
-  case b.turns {
-    Some(limit) if s.turns >= limit ->
-      Error(types.BudgetExhausted(
+  case run.budget.turns {
+    Some(limit) if run.spent.turns >= limit ->
+      Error(types.BudgetReached(
         types.Turns,
-        int.to_float(s.turns),
+        int.to_float(run.spent.turns),
         int.to_float(limit),
       ))
     _ -> Ok(Nil)
@@ -578,19 +729,12 @@ fn budget_check(run: Run) -> Result(Nil, IdleReason) {
 fn compute_check(run: Run) -> Result(Nil, IdleReason) {
   case run.budget.compute_minutes {
     Some(limit) if run.spent.compute_minutes >=. limit ->
-      Error(types.BudgetExhausted(
+      Error(types.BudgetReached(
         types.ComputeMinutes,
         run.spent.compute_minutes,
         limit,
       ))
     _ -> Ok(Nil)
-  }
-}
-
-fn turn_cap(run: Run, agent: Agent) -> Int {
-  case run.budget.turns {
-    Some(limit) -> int.max(1, int.min(agent.max_turns, limit - run.spent.turns))
-    None -> agent.max_turns
   }
 }
 
@@ -677,10 +821,12 @@ fn agent_settled(
   }
 }
 
+/// The node waits for its owner: with a question (which joins its
+/// dialogue), or at its turn limit (progress kept, nothing added).
 fn agent_idle(
   run: Run,
   id: String,
-  message: String,
+  cause: fn(Kind) -> types.IdleCause,
   usage: Usage,
   model: String,
 ) -> #(Run, List(Effect)) {
@@ -688,19 +834,20 @@ fn agent_idle(
     Ok(rec) ->
       case in_flight(rec) {
         Some(#(_, d)) -> {
-          let d =
-            Dialogue(
-              ..d,
-              transcript: list.append(d.transcript, [
-                types.Message(types.Assistant, message),
-              ]),
-            )
+          let kind = add_steps(rec.kind, usage)
+          let cause = cause(kind)
+          let d = case cause {
+            types.Question(message:) ->
+              Dialogue(
+                ..d,
+                transcript: list.append(d.transcript, [
+                  types.Message(types.Assistant, message),
+                ]),
+              )
+            types.TurnLimit(..) -> d
+          }
           let rec =
-            Record(
-              ..rec,
-              kind: add_steps(rec.kind, usage),
-              progress: AgentWaiting(d, model),
-            )
+            Record(..rec, kind:, progress: AgentWaiting(d, model, cause))
           #(record(spend(run, usage), id, rec), [types.Checkpoint])
         }
         None -> #(run, [])
@@ -772,7 +919,35 @@ fn retry_unavailable(run: Run) -> #(Run, List(Effect)) {
 
 // --- Interventions -------------------------------------------------------------
 
+fn held(run: Run, node: String) -> Bool {
+  case run.hold {
+    Some(#(id, _)) -> id == node
+    None -> False
+  }
+}
+
 fn facts(run: Run, node: String) -> NodeFacts {
+  case dict.get(run.requests, node) {
+    // A held failure is live again for restart and cancel.
+    Ok(Record(kind: AgentKind(agent:, ..), ..)) if run.hold != None ->
+      case held(run, node) {
+        True ->
+          capability.Faulted(case find_agent(run.workflow, agent) {
+            Ok(a) -> a.steerable
+            Error(Nil) -> False
+          })
+        False -> agent_facts(run, node)
+      }
+    Ok(Record(kind: CommandKind(..), progress: Completed(..), ..)) ->
+      case held(run, node) {
+        True -> capability.CommandWorking
+        False -> capability.Settled
+      }
+    _ -> agent_facts(run, node)
+  }
+}
+
+fn agent_facts(run: Run, node: String) -> NodeFacts {
   case dict.get(run.requests, node) {
     Ok(Record(kind: AgentKind(agent:, ..), progress:, ..)) -> {
       let steerable = case find_agent(run.workflow, agent) {
@@ -784,10 +959,13 @@ fn facts(run: Run, node: String) -> NodeFacts {
         AgentWaiting(..) -> capability.Waiting(steerable)
         Unavailable(..) -> capability.Faulted(steerable)
         Blocked(..) -> capability.Held(steerable)
-        AwaitingScript | Completed(..) -> capability.Settled
+        AwaitingCommand | Completed(..) -> capability.Settled
       }
     }
-    _ -> capability.Absent
+    Ok(Record(kind: CommandKind(..), progress: AwaitingCommand, ..)) ->
+      capability.CommandWorking
+    Ok(_) -> capability.Settled
+    Error(Nil) -> capability.Absent
   }
 }
 
@@ -801,15 +979,55 @@ fn add_inbox(run: Run, id: String, kind: InboxKind, text: String) -> Run {
         Record(..rec, kind: AgentKind(..k, inbox: [message, ..k.inbox])),
       )
     }
+    Ok(Record(kind: CommandKind(..) as k, ..) as rec) -> {
+      let message = types.InboxMessage(kind:, text:, step: 0)
+      record(
+        run,
+        id,
+        Record(..rec, kind: CommandKind(..k, inbox: [message, ..k.inbox])),
+      )
+    }
     _ -> run
   }
 }
 
 /// An answer continues the idle node's dialogue, with the model its alias
 /// resolves to now.
-fn answer(run: Run, node: IdleNode, text: String) -> #(Run, List(Effect)) {
+fn answer(
+  run: Run,
+  node: IdleNode,
+  text: String,
+  turns: Int,
+) -> #(Run, List(Effect)) {
   let id = capability.idle_id(node)
-  let run = add_inbox(run, id, types.Answer, text)
+  case dict.get(run.requests, id) {
+    // At its turn limit a node continues only with more turns.
+    Ok(Record(progress: AgentWaiting(cause: types.TurnLimit(..), ..), ..))
+      if turns <= 0
+    -> #(run, [types.Refuse(None, types.NoTurnsLeft(id))])
+    Ok(Record(kind: AgentKind(..) as k, ..) as rec) ->
+      continue_with(
+        add_inbox(
+          record(
+            run,
+            id,
+            Record(
+              ..rec,
+              kind: AgentKind(..k, allowed: k.allowed + int.max(0, turns)),
+            ),
+          ),
+          id,
+          types.Answer,
+          text,
+        ),
+        id,
+        text,
+      )
+    _ -> #(run, [types.Refuse(None, types.NotIdle(id))])
+  }
+}
+
+fn continue_with(run: Run, id: String, text: String) -> #(Run, List(Effect)) {
   case dict.get(run.requests, id) {
     Ok(
       Record(
@@ -869,18 +1087,64 @@ fn restart(
   run: Run,
   node: LiveNode,
   note: Option(String),
+  turns: Int,
 ) -> Result(#(Run, List(Effect)), Refusal) {
   let id = capability.live_id(node)
-  use _ <- result.try(case note, capability.live_steerable(node) {
-    Some(_), False -> Error(types.NotSteerable(id))
+  // A held failure: its journal entry is invalidated and the hold lifted;
+  // the call is then reissued like one in flight.
+  let run = case held(run, id), dict.get(run.requests, id) {
+    True, Ok(rec) -> {
+      let progress = case rec.kind {
+        CommandKind(..) -> AwaitingCommand
+        _ -> AwaitingAgent(Dialogue([], None))
+      }
+      Run(
+        ..record(run, id, Record(..rec, progress:)),
+        journal: dict.delete(run.journal, rec.digest),
+        hold: None,
+      )
+    }
+    _, _ -> run
+  }
+  use _ <- result.try(case note, capability.live_kind(node) {
+    Some(_), capability.LiveAgent(steerable: False) ->
+      Error(types.NotSteerable(id))
+    Some(_), capability.LiveCommand -> Error(types.NotAnAgent(id))
     _, _ -> Ok(Nil)
   })
   case dict.get(run.requests, id) {
+    // A command reruns with the same input.
+    Ok(Record(
+      kind: CommandKind(command:, input:, ..),
+      progress: AwaitingCommand,
+      ..,
+    )) -> {
+      let run = add_inbox(run, id, types.Restart, "")
+      Ok(
+        #(run, [
+          types.Checkpoint,
+          command_effect(run, id, command, input, run_digest(run, id)),
+        ]),
+      )
+    }
     Ok(Record(kind: AgentKind(agent:, input:, ..), progress:, ..) as rec) ->
       case progress {
         AwaitingAgent(..) | AgentWaiting(..) | Unavailable(..) -> {
           let run = add_inbox(run, id, types.Restart, option.unwrap(note, ""))
           let rec = dict.get(run.requests, id) |> result.unwrap(rec)
+          // Progress is discarded: the turn count and allowance start over.
+          let rec = case rec.kind, find_agent(run.workflow, agent) {
+            AgentKind(..) as k, Ok(a) ->
+              Record(
+                ..rec,
+                kind: AgentKind(..k, steps: 0, allowed: case turns > 0 {
+                  True -> turns
+                  False -> a.max_turns
+                }),
+              )
+            _, _ -> rec
+          }
+          let run = record(run, id, rec)
           let d = Dialogue([], note)
           case admit(run) {
             Error(reason) ->
@@ -921,7 +1185,26 @@ fn restart(
 /// Fails one node as an agent failure; the body gets a typed error.
 fn cancel_node(run: Run, node: LiveNode) -> #(Run, List(Effect)) {
   let id = capability.live_id(node)
+  case run.hold, dict.get(run.requests, id) {
+    // Accepting a held failure: it propagates, and the run ends Failed.
+    Some(#(held_id, reason)), _ if held_id == id ->
+      finish(Run(..run, hold: None), types.Failed(reason))
+    _, _ -> cancel_live(run, id)
+  }
+}
+
+fn cancel_live(run: Run, id: String) -> #(Run, List(Effect)) {
   case dict.get(run.requests, id) {
+    Ok(Record(kind: CommandKind(command:, ..), ..) as rec) -> {
+      let #(run, effects) =
+        settle(
+          run,
+          id,
+          Record(..rec, progress: Completed(None)),
+          Errored(types.CommandCrashed(command, types.CommandCancelled)),
+        )
+      #(run, [types.Checkpoint, ..effects])
+    }
     Ok(Record(kind: AgentKind(agent:, ..), ..) as rec) -> {
       let #(run, effects) =
         settle(
@@ -953,8 +1236,6 @@ fn raise_budget(
 ) -> #(Run, List(Effect)) {
   let b = run.budget
   let budget = case kind {
-    types.Usd -> types.Budget(..b, usd: Some(limit))
-    types.Tokens -> types.Budget(..b, tokens: Some(float.round(limit)))
     types.Turns -> types.Budget(..b, turns: Some(float.round(limit)))
     types.ComputeMinutes -> types.Budget(..b, compute_minutes: Some(limit))
   }
@@ -993,12 +1274,12 @@ fn unblock(run: Run) -> #(Run, List(Effect)) {
           }
           Error(_) -> acc
         }
-      Record(kind: ScriptKind(script:, args:), progress: Blocked(..), ..) as rec ->
+      Record(kind: CommandKind(command:, input:, ..), progress: Blocked(..), ..) as rec ->
         case result.try(admission(run), fn(_) { compute_check(run) }) {
           Ok(Nil) -> #(
-            record(run, id, Record(..rec, progress: AwaitingScript)),
+            record(run, id, Record(..rec, progress: AwaitingCommand)),
             list.append(effects, [
-              script_effect(run, id, script, args, rec.digest),
+              command_effect(run, id, command, input, rec.digest),
             ]),
           )
           Error(_) -> acc
@@ -1008,14 +1289,16 @@ fn unblock(run: Run) -> #(Run, List(Effect)) {
   })
 }
 
-fn script_settled(
+fn command_settled(
   run: Run,
   id: String,
-  entry: Entry,
+  entry: fn(String) -> Entry,
   minutes: Float,
 ) -> #(Run, List(Effect)) {
   case dict.get(run.requests, id) {
-    Ok(Record(progress: AwaitingScript, ..) as rec) -> {
+    Ok(
+      Record(kind: CommandKind(command:, ..), progress: AwaitingCommand, ..) as rec,
+    ) -> {
       let run =
         Run(
           ..run,
@@ -1025,24 +1308,23 @@ fn script_settled(
           ),
         )
       let #(run, effects) =
-        settle(run, id, Record(..rec, progress: Completed(None)), entry)
+        settle(
+          run,
+          id,
+          Record(..rec, progress: Completed(None)),
+          entry(command),
+        )
       #(run, [types.Checkpoint, ..effects])
     }
     _ -> #(run, [])
   }
 }
 
-fn script_failed(
-  run: Run,
-  id: String,
-  error: String,
-  minutes: Float,
-) -> #(Run, List(Effect)) {
-  let script = case dict.get(run.requests, id) {
-    Ok(Record(kind: ScriptKind(script:, ..), ..)) -> script
-    _ -> ""
+fn run_digest(run: Run, id: String) -> String {
+  case dict.get(run.requests, id) {
+    Ok(rec) -> rec.digest
+    Error(Nil) -> ""
   }
-  script_settled(run, id, Errored(types.ScriptCrashed(script, error)), minutes)
 }
 
 fn find_agent(workflow: Workflow, name: String) -> Result(Agent, Nil) {
@@ -1064,14 +1346,14 @@ pub fn status(run: RunState) -> Option(RunStatus) {
       let running =
         list.any(records, fn(p) {
           case p {
-            AwaitingAgent(..) | AwaitingScript -> True
+            AwaitingAgent(..) | AwaitingCommand -> True
             _ -> False
           }
         })
       let reason =
         list.find_map(records, fn(p) {
           case p {
-            Blocked(reason:, ..) -> Ok(reason)
+            Blocked(reason:, ..) -> Ok(current(r, reason))
             Unavailable(alias:, error:, ..) ->
               Ok(types.ExecutorUnavailable(alias, error))
             _ -> Error(Nil)
@@ -1086,6 +1368,12 @@ pub fn status(run: RunState) -> Option(RunStatus) {
         })
       case running, r.admission, reason, waiting {
         True, _, _, _ -> Some(types.Running)
+        False, _, _, _ if r.hold != None ->
+          case r.hold {
+            Some(#(id, reason)) ->
+              Some(types.Idle(Some(types.NodeFailure(id, reason))))
+            None -> Some(types.Running)
+          }
         False, Holding, _, _ -> Some(types.Idle(Some(types.PausedByUser)))
         False, Admitting, Ok(reason), _ -> Some(types.Idle(Some(reason)))
         False, Admitting, Error(Nil), True -> Some(types.Idle(None))
@@ -1095,7 +1383,20 @@ pub fn status(run: RunState) -> Option(RunStatus) {
   }
 }
 
-/// Agent calls that started a dialogue. Calls held back by a pause, the
+/// A held request's reason with the spend as it is now: calls in flight
+/// when the budget was reached may have added to it.
+fn current(run: Run, reason: IdleReason) -> IdleReason {
+  case reason {
+    types.BudgetReached(kind: types.Turns, ..) ->
+      budget_check(run) |> result.unwrap_error(reason)
+    types.BudgetReached(kind: types.ComputeMinutes, ..) ->
+      compute_check(run) |> result.unwrap_error(reason)
+    _ -> reason
+  }
+}
+
+/// Agent calls that started a dialogue, and command calls that started.
+/// Calls held back by a pause, the
 /// budget or an executor fault, and calls refused before they started, are
 /// not nodes; the run's idle reason names the held ones.
 pub fn nodes(run: RunState) -> List(Node) {
@@ -1122,15 +1423,8 @@ pub fn nodes(run: RunState) -> List(Node) {
             case rec.progress {
               AwaitingAgent(..) ->
                 Ok(types.NodeRunning(id, agent, current(), steerable, inbox))
-              AgentWaiting(dialogue:, model:) ->
-                Ok(types.NodeIdle(
-                  id,
-                  agent,
-                  model,
-                  steerable,
-                  inbox,
-                  last_text(dialogue),
-                ))
+              AgentWaiting(model:, cause:, ..) ->
+                Ok(types.NodeIdle(id, agent, model, steerable, inbox, cause))
               Completed(model:) ->
                 case dict.get(r.journal, rec.digest) {
                   Ok(Answered(_)) ->
@@ -1156,16 +1450,29 @@ pub fn nodes(run: RunState) -> List(Node) {
               _ -> Error(Nil)
             }
           }
-          _ -> Error(Nil)
+          CommandKind(command:, inbox:, ..) -> {
+            let inbox = list.reverse(inbox)
+            case rec.progress {
+              AwaitingCommand -> Ok(types.CommandRunning(id, command, inbox))
+              Completed(..) ->
+                case dict.get(r.journal, rec.digest) {
+                  Ok(Answered(_)) ->
+                    Ok(types.CommandDone(id, command, inbox, types.Succeeded))
+                  Ok(Errored(types.CommandCrashed(failure:, ..))) ->
+                    Ok(types.CommandDone(
+                      id,
+                      command,
+                      inbox,
+                      types.FailedWith(failure),
+                    ))
+                  _ -> Error(Nil)
+                }
+              _ -> Error(Nil)
+            }
+          }
+          RefusedKind -> Error(Nil)
         }
       })
-  }
-}
-
-fn last_text(d: Dialogue) -> String {
-  case list.last(d.transcript) {
-    Ok(m) -> m.text
-    Error(Nil) -> ""
   }
 }
 
@@ -1197,6 +1504,14 @@ pub fn snapshot(run: RunState) -> json.Json {
         #("budget", types.budget_to_json(r.budget)),
         #("models", sorted_object(r.models, json.string)),
         #("executor", json.nullable(r.executor, json.string)),
+        #("held", json.nullable(option.map(r.hold, fn(h) { h.0 }), json.string)),
+        #(
+          "code",
+          json.array(
+            [r.pin.workflow_digest, ..list.reverse(r.pin.prior_digests)],
+            json.string,
+          ),
+        ),
         #("owner", json.nullable(r.owner, json.string)),
       ])
   }

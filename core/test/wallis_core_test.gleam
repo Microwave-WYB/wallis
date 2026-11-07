@@ -9,10 +9,10 @@ pub fn main() -> Nil {
 // The JSON entry point: events in, effects out, both as text.
 pub fn step_json_roundtrip_test() {
   let wf =
-    "{\"name\":\"t\",\"agents\":[{\"name\":\"a\",\"model\":\"default\",\"max_turns\":4,\"steerable\":true}],\"scripts\":[],"
-    <> "\"budget\":{\"usd\":null,\"tokens\":null,\"turns\":null,\"compute_minutes\":null}}"
+    "{\"name\":\"t\",\"agents\":[{\"name\":\"a\",\"model\":\"default\",\"max_turns\":4,\"steerable\":true}],\"commands\":[],"
+    <> "\"budget\":{\"turns\":null,\"compute_minutes\":null}}"
   let pin =
-    "{\"workflow_digest\":\"d\",\"models\":{\"default\":\"fake/m\"},\"seed\":1,\"inputs\":{},\"semantics\":\""
+    "{\"workflow_digest\":\"d\",\"prior_digests\":[],\"models\":{\"default\":\"fake/m\"},\"seed\":1,\"inputs\":{},\"semantics\":\""
     <> wallis_core.semantics()
     <> "\"}"
   let #(s, effects) =
@@ -28,7 +28,7 @@ pub fn step_json_roundtrip_test() {
   let #(s, effects) =
     wallis_core.step_json(
       s,
-      "{\"type\":\"requested\",\"id\":\"#0\",\"request\":{\"type\":\"call\",\"agent\":\"a\",\"input\":{\"x\":1}}}",
+      "{\"type\":\"requested\",\"id\":\"#0\",\"node_digest\":\"nd\",\"occurrence\":0,\"request\":{\"type\":\"call\",\"agent\":\"a\",\"input\":{\"x\":1}}}",
     )
   assert string.contains(effects, "\"type\":\"call_agent\"")
   assert string.contains(effects, "\"model\":\"fake/m\"")

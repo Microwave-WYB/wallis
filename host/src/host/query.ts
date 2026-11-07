@@ -5,7 +5,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
 import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
-import { Core, type Event, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
+import { Core, type Event, type FailReason, type IdleCause, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
 import { acquireLock, listRuns, lockHolder, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
@@ -47,10 +47,12 @@ function workflowName(path: string): string {
 }
 
 export type Attention =
-	| { readonly kind: "node_idle"; readonly runId: string; readonly node: string; readonly agent: string; readonly message: string; readonly steerable: boolean }
+	| { readonly kind: "node_idle"; readonly runId: string; readonly node: string; readonly agent: string; readonly cause: IdleCause; readonly steerable: boolean }
 	| { readonly kind: "run_idle"; readonly runId: string; readonly reason: IdleReason }
 	| { readonly kind: "finished"; readonly runId: string; readonly outcome: Outcome }
-	| { readonly kind: "stopped"; readonly runId: string };
+	| { readonly kind: "stopped"; readonly runId: string }
+	/** A node failure the body did not handle: the run waits on it, other branches go on. */
+	| { readonly kind: "node_failed"; readonly runId: string; readonly node: string; readonly reason: FailReason };
 
 /** What a human or harness should look at in this run, in a stable order. */
 export function attention(view: RunView): Attention[] {
@@ -58,9 +60,21 @@ export function attention(view: RunView): Attention[] {
 	const status = view.run.status;
 	if (status?.type === "finished") return [{ kind: "finished", runId: view.runId, outcome: status.outcome }];
 	for (const node of view.run.nodes) {
-		if (node.type === "node_idle") items.push({ kind: "node_idle", runId: view.runId, node: node.id, agent: node.agent, message: node.question, steerable: node.steerable });
+		if (node.type === "node_idle") items.push({ kind: "node_idle", runId: view.runId, node: node.id, agent: node.agent, cause: node.cause, steerable: node.steerable });
 	}
-	if (status?.type === "idle" && status.reason) items.push({ kind: "run_idle", runId: view.runId, reason: status.reason });
+	if (status?.type === "idle" && status.reason?.type === "node_failure") items.push({ kind: "node_failed", runId: view.runId, node: status.reason.node, reason: status.reason.reason });
+	else if (status?.type === "idle" && status.reason) items.push({ kind: "run_idle", runId: view.runId, reason: status.reason });
+	else if (view.run.held !== null && view.run.held !== undefined) {
+		const held = view.run.held;
+		const node = view.run.nodes.find((n) => n.id === held);
+		const reason: FailReason =
+			node?.type === "node_done" && node.outcome.type === "node_failed"
+				? { type: "agent_gave_up", agent: node.agent, failure: node.outcome.failure }
+				: node?.type === "command_done" && node.outcome.type === "failed_with"
+					? { type: "command_crashed", command: node.command, failure: node.outcome.failure }
+					: { type: "body_error", message: "failed" };
+		items.push({ kind: "node_failed", runId: view.runId, node: held, reason });
+	}
 	if (view.stopped && status?.type === "running") items.push({ kind: "stopped", runId: view.runId });
 	return items;
 }
@@ -68,7 +82,9 @@ export function attention(view: RunView): Attention[] {
 export function attentionKey(item: Attention): string {
 	switch (item.kind) {
 		case "node_idle":
-			return `${item.runId} node ${item.node} ${item.message}`;
+			return `${item.runId} node ${item.node} ${JSON.stringify(item.cause)}`;
+		case "node_failed":
+			return `${item.runId} failed ${item.node}`;
 		case "run_idle":
 			return `${item.runId} idle ${JSON.stringify(item.reason)}`;
 		default:
@@ -95,14 +111,19 @@ export function claimable(root: string): RunView[] {
 
 function describeReason(reason: IdleReason): string {
 	switch (reason.type) {
-		case "budget_exhausted":
-			return `the ${reason.kind} budget is spent (${reason.spent} of ${reason.limit})`;
+		case "budget_reached":
+			return `the ${reason.kind} budget is reached (${reason.spent} of ${reason.limit}; calls in flight finished)`;
 		case "executor_unavailable":
 			return `the executor cannot serve model alias ${reason.alias}: ${reason.error}`;
 		case "paused_by_user":
 			return "its owner paused it";
+		case "node_failure":
+			return `node ${reason.node} failed and the workflow did not handle it`;
 	}
 }
+
+/** The message sent with granted turns when the caller gives none. */
+export const CONTINUE = "Continue.";
 
 /** Notifications carry content, truncated. */
 export const MESSAGE_CAP = 1200;
@@ -128,24 +149,38 @@ export function describe(items: readonly Attention[]): string {
 	return items
 		.map((item) => {
 			switch (item.kind) {
-				case "node_idle":
+				case "node_idle": {
+					const other = `restart it (npx wallis restart ${item.runId} '${item.node}' [note]) or cancel it (npx wallis cancel ${item.runId} --node '${item.node}')`;
+					if (item.cause.type === "turn_limit") {
+						return [
+							`Run ${item.runId}: node ${item.node} (${item.agent}) used ${item.cause.used} of ${item.cause.limit} turns without submitting; its progress is kept.`,
+							item.steerable
+								? `Grant more turns with: npx wallis send ${item.runId} '${item.node}' --turns <n> ["<message>"]; or ${other}`
+								: `Its agent is not steerable: ${other}`,
+						].join("\n");
+					}
 					return [
 						`Run ${item.runId}: node ${item.node} (${item.agent}) is waiting for a reply:`,
-						...truncate(item.message, MESSAGE_CAP)
+						...truncate(item.cause.message, MESSAGE_CAP)
 							.split("\n")
 							.map((l) => `  > ${l}`),
-						item.steerable
-							? `Reply with: npx wallis send ${item.runId} '${item.node}' "<your reply>"`
-							: `Its agent is not steerable: restart it (npx wallis restart ${item.runId} '${item.node}') or cancel it (npx wallis cancel ${item.runId} --node '${item.node}')`,
+						item.steerable ? `Reply with: npx wallis send ${item.runId} '${item.node}' "<your reply>"` : `Its agent is not steerable: ${other}`,
 					].join("\n");
+				}
 				case "run_idle":
 					return [
 						`Run ${item.runId} is paused: ${describeReason(item.reason)}.`,
-						item.reason.type === "budget_exhausted"
-							? `Raise it with: npx wallis resume ${item.runId} --budget ${item.reason.kind === "compute_minutes" ? "computeMinutes" : item.reason.kind}=<new limit>`
+						item.reason.type === "budget_reached"
+							? `Raise it with: npx wallis resume ${item.runId} --budget ${item.reason.kind === "compute_minutes" ? "computeMinutes" : item.reason.kind}=<new limit>, or cancel it`
 							: item.reason.type === "executor_unavailable"
 								? `Fix the executor or rebind the alias, then: npx wallis resume ${item.runId} --model ${item.reason.alias}=<provider/model:thinking>`
 								: `Continue it with: npx wallis resume ${item.runId}`,
+					].join("\n");
+				case "node_failed":
+					return [
+						`Run ${item.runId}: node ${item.node} failed and the workflow did not handle it: ${truncate(JSON.stringify(item.reason), RESULT_CAP)}`,
+						`Other branches go on. Restart it (completed work is kept): npx wallis restart ${item.runId} '${item.node}' [note] [--model alias=provider/model] [--turns n]`,
+						`Or accept the failure, which then propagates: npx wallis cancel ${item.runId} --node '${item.node}'`,
 					].join("\n");
 				case "finished":
 					return `Run ${item.runId} finished, ${describeOutcome(item.outcome)}.`;
@@ -178,27 +213,20 @@ export async function waitForAttention(dir: string, options: { timeoutMs?: numbe
 }
 
 /**
- * Copies a prefix of a run's log into a new run. `at` is a count of events
- * or a node id; a node id keeps the events up to and including that node's
- * request, so the fork issues it again. The original is untouched.
+ * Copies a run into a new one: its whole journal (a cache) and blobs, so
+ * the fork re-executes the body and every unchanged call hits. Only the
+ * events that ended the source are left out. The cache is per run and its
+ * forks; it is never shared implicitly with other runs.
  */
-export function forkRun(source: string, target: string, at: number | string): RunPaths {
+export function forkRun(source: string, target: string): RunPaths {
 	const from = runPaths(source);
 	const to = runPaths(target);
 	if (existsSync(to.log)) throw new Error(`run ${to.id} already exists`);
-	const events = new EventLog(from.log).read();
-	let count: number;
-	if (typeof at === "number") count = at;
-	else {
-		const index = events.findIndex((e: Event) => e.type === "requested" && e.id === at);
-		if (index < 0) throw new Error(`run ${from.id} has no node ${at}`);
-		count = index + 1;
-	}
-	if (count < 1 || count > events.length) throw new Error(`fork point ${at} is outside the log (1..${events.length})`);
+	const events = new EventLog(from.log).read().filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested");
 	mkdirSync(to.dir, { recursive: true });
-	writeFileSync(to.log, events.slice(0, count).map((e) => `${JSON.stringify(e)}\n`).join(""));
+	writeFileSync(to.log, events.map((e) => `${JSON.stringify(e)}\n`).join(""));
 	const meta = readMeta(from);
-	if (meta) writeMeta(to, { ...meta, run_id: to.id, created: new Date().toISOString(), forked_from: { run_id: from.id, at: count } });
+	if (meta) writeMeta(to, { ...meta, run_id: to.id, created: new Date().toISOString(), forked_from: { run_id: from.id, at: events.length } });
 	shareBlobs(from.dir, to.dir);
 	return to;
 }
@@ -300,9 +328,25 @@ export function renderTree(v: RunView): string {
 	const lines = [runLine(v)];
 	for (const node of v.run.nodes) {
 		const depth = (node.id.match(/[.>]/g) ?? []).length;
-		const status = node.type === "node_idle" ? `idle: ${truncate(node.question, 80)}` : node.type === "node_done" ? `done (${node.outcome.type})` : "running";
 		const inbox = node.inbox.length > 0 ? `  inbox: ${node.inbox.map((m) => `${m.kind}@${m.step}`).join(",")}` : "";
-		lines.push(`${"  ".repeat(depth + 1)}${node.id}  ${node.agent}  ${node.model}  ${status}${node.steerable ? "" : "  (not steerable)"}${inbox}`);
+		const indent = "  ".repeat(depth + 1);
+		switch (node.type) {
+			case "command_running":
+			case "command_done":
+				lines.push(`${indent}${node.id}  ${node.command}  command  ${node.type === "command_done" ? `done (${node.outcome.type})` : "running"}${inbox}`);
+				break;
+			default: {
+				const status =
+					node.type === "node_idle"
+						? node.cause.type === "question"
+							? `idle: ${truncate(node.cause.message, 80)}`
+							: `idle: turn limit ${node.cause.used}/${node.cause.limit}`
+						: node.type === "node_done"
+							? `done (${node.outcome.type})`
+							: "running";
+				lines.push(`${indent}${node.id}  ${node.agent}  ${node.model}  ${status}${node.steerable ? "" : "  (not steerable)"}${inbox}`);
+			}
+		}
 	}
 	for (const o of v.run.observations) {
 		const depth = (o.at.match(/[.>]/g) ?? []).length;

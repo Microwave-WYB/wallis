@@ -22,14 +22,18 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
-import type { ArtifactRef, Json, Refusal } from "../sdk/index.ts";
+import type { ArtifactRef, CommandFailure, Json, Refusal } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
-import { ArtifactError, discardNode, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
+import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
+import type { CommandRunner } from "./commands.ts";
+import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
+import { canonical } from "./render.ts";
+import { checkContainment, type McpSpawn } from "./tools.ts";
 import { bundleWorkflow } from "./bundle.ts";
 import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode } from "./capability.ts";
 import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
-import type { Executor, NodeSession, NodeSpec, ScriptRunner, TranscriptEntry } from "./executor.ts";
+import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
 import { type Mount, MountError, mountDigest, resolveMounts } from "./mounts.ts";
@@ -44,7 +48,19 @@ export interface SessionOptions {
 	/** Path to workflow.ts. Defaults to the one recorded for the run. */
 	readonly workflow?: string;
 	readonly executor: Executor;
-	readonly scripts?: ScriptRunner;
+	/** Runs command calls. Without one, every command call fails as `unrunnable`. */
+	readonly commands?: CommandRunner;
+	/**
+	 * `auto` (default): bwrap sandboxes when bwrap works here; `require`:
+	 * refuse without bwrap; `off`: no sandbox preflight and no bwrap (tests
+	 * with fake commands; agents' `bash` reports it, MCP servers run unconfined
+	 * and the MCP containment preflight is skipped).
+	 */
+	readonly confine?: "auto" | "require" | "off";
+	/** New runs: call-time binary paths (`--bin name=path`), beating the profile and the PATH. */
+	readonly bins?: Readonly<Record<string, string>>;
+	/** New runs: the caller's PATH, where unresolved binaries are found. Default: this process's PATH. */
+	readonly callerPath?: string;
 	/** Recorded in the run's meta, so later sessions can recreate the executor. */
 	readonly executorModule?: string | null;
 	/** New runs only. */
@@ -65,7 +81,7 @@ export interface SessionOptions {
 	/** Who the session's own interventions (answers, cancel, unpause) come from. Default: the human. */
 	readonly by?: string;
 	/** Answers to idle nodes, sent once the body has replayed. */
-	readonly sends?: readonly { readonly node: string; readonly text: string }[];
+	readonly sends?: readonly { readonly node: string; readonly text: string; readonly turns?: number }[];
 	readonly cancel?: boolean;
 	/** Resume: lift a pause (`resume_requested`). */
 	readonly unpause?: boolean;
@@ -160,6 +176,22 @@ export class Session {
 	#decl!: Declarations;
 	#local!: LocalProfile;
 	#mounts: Record<string, Mount> = {};
+	#boxes: Sandboxes | null = null;
+	/** Per sandbox: its identity (declaration, binaries, mount content), part of command node digests. */
+	#sandboxDigests: Record<string, string> = {};
+	/** Per node name: the digest of its definition, the first part of its journal key. */
+	readonly #nodeDigests = new Map<string, string>();
+	/** Occurrences of each (node, input) in this execution of the body. */
+	#occurrences = new Map<string, number>();
+	#code = "";
+	#input: Json = null;
+	#seed = 0;
+	/** Set when the code changed since the last session: hits so far, until the first new call. */
+	#codeChange: { hits: number; reported: boolean } | null = null;
+	/** A restarted held node: the body runs again, in a fresh VM, against the journal. */
+	#restarting = false;
+	/** Aborts a command call in flight (restart, cancel). */
+	readonly #commandAborts = new Map<string, AbortController>();
 	#resumed = false;
 	#settled = false;
 	#timer: ReturnType<typeof setInterval> | null = null;
@@ -195,10 +227,10 @@ export class Session {
 	}
 
 	/** Answers an idle node: its dialogue continues with the message. */
-	answer(node: IdleNode, text: string, messageId = newMessageId()): Refusal | null {
+	answer(node: IdleNode, text: string, messageId = newMessageId(), turns = 0): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		this.#seen.add(messageId);
-		const refusal = this.#feed({ type: "sent", node: node.node.id, text, message_id: messageId, by: node.owned.by })[0] ?? null;
+		const refusal = this.#feed({ type: "sent", node: node.node.id, text, message_id: messageId, by: node.owned.by, turns })[0] ?? null;
 		this.#settle();
 		return refusal;
 	}
@@ -229,27 +261,32 @@ export class Session {
 	}
 
 	/** Discards a node's progress and reissues its call with the original input and the note. Logged. */
-	restart(node: LiveNode, note?: string): Refusal | null {
+	restart(node: LiveNode, note?: string, turns = 0): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
-		// The old session and dirs go first: the reissued call creates fresh ones.
+		const held = this.#core.snapshot().held === id;
+		// The old session (or process) and dirs go first: the reissued call creates fresh ones.
 		this.#nodes.get(id)?.session.interrupt?.();
+		this.#commandAborts.get(id)?.abort();
 		this.#closeNode(id);
 		discardNode(this.paths.dir, id);
 		this.#transcriptLog(id)({ kind: "note", text: `restarted${note === undefined ? "" : `: ${note}`}` });
-		const refusal = this.#feed({ type: "restarted", node: id, note: note ?? null, by: node.owned.by })[0] ?? null;
+		const refusal = this.#feed({ type: "restarted", node: id, note: note ?? null, by: node.owned.by, turns })[0] ?? null;
+		// A held failure: the body had stopped on it, so it runs again.
+		if (refusal === null && held) void this.#restartBody();
 		this.#pump();
 		this.#settle();
 		return refusal;
 	}
 
-	/** Fails one node as an agent failure; the body handles it. */
+	/** Fails one node (an agent or a command) as a typed failure; the body handles it. */
 	cancelNode(node: LiveNode): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
 		const refusal = this.#feed({ type: "node_cancelled", node: id, by: node.owned.by })[0];
 		if (refusal) return refusal;
 		this.#nodes.get(id)?.session.interrupt?.();
+		this.#commandAborts.get(id)?.abort();
 		this.#closeNode(id);
 		discardNode(this.paths.dir, id);
 		this.#pump();
@@ -295,11 +332,8 @@ export class Session {
 		const by = o.by ?? HUMAN;
 		const prior = this.#log.read();
 		this.#resumed = prior.length > 0;
-		this.#sandbox = await Sandbox.create(code, {
-			send: (json) => this.#requests.push(JSON.parse(json) as Event),
-			done: (json) => this.#requests.push({ type: "body_finished", output: JSON.parse(json) as Json }),
-			fail: (json) => this.#requests.push({ type: "body_failed", reason: JSON.parse(json) }),
-		});
+		this.#code = code;
+		this.#sandbox = await this.#newSandbox();
 		const decl = this.#sandbox.declare();
 		this.#decl = decl;
 		this.#local = o.local ?? loadProfile(this.#root);
@@ -312,14 +346,17 @@ export class Session {
 		const inputs: Record<string, string> = Object.fromEntries(decl.pin.files.map((f) => [f, digestFile(resolve(this.#root, f))]));
 		// Mounts are read in place, never copied: their content digest is pinned.
 		for (const [name, mount] of Object.entries(this.#mounts)) inputs[`mount.${name}`] = mountDigest(mount.dir);
+		this.#prepareSandboxes(prior.length === 0, inputs);
 
 		let input: Json;
 		let seed: number;
 		if (prior.length === 0) {
 			this.#preflight();
+			await this.#containment();
 			seed = o.seed ?? 0;
 			const pin: Pin = {
 				workflow_digest: this.#digest,
+				prior_digests: [],
 				models: resolveModels(decl.core.name, decl.models, { callTime: o.models, profile: o.profile ?? this.#local.models }),
 				seed,
 				inputs,
@@ -336,7 +373,13 @@ export class Session {
 			for (const e of prior) if (e.type === "sent" || e.type === "steered") this.#seen.add(e.message_id);
 			seed = o.seed ?? first.pin.seed;
 			input = first.input;
-			must(ResumableRun.check(this.#core, { workflow_digest: this.#digest, models: first.pin.models, seed, inputs, semantics: SEMANTICS }), refused);
+			must(ResumableRun.check(this.#core, { workflow_digest: this.#digest, prior_digests: [], models: first.pin.models, seed, inputs, semantics: SEMANTICS }), refused);
+			// Changed code is allowed: logged, and the body re-executes against the journal.
+			const recorded = this.#core.snapshot().code[0];
+			if (recorded !== undefined && recorded !== this.#digest && this.#core.snapshot().status.type !== "finished") {
+				this.#feed({ type: "code_changed", from: recorded, to: this.#digest });
+				this.#codeChange = { hits: 0, reported: false };
+			}
 			if (this.#core.snapshot().status.type === "finished") return this.#complete();
 			const snap = this.#core.snapshot();
 			if (snap.executor !== o.executor.id) this.#feed({ type: "executor_changed", name: o.executor.id });
@@ -351,6 +394,8 @@ export class Session {
 		if (o.cancel) this.#refuseOn([this.cancel(must(this.owned(by), refused))].filter((r) => r !== null));
 		if (this.#settled) return;
 
+		this.#input = input;
+		this.#seed = seed;
 		this.#sandbox.start(input, seed);
 		this.#pump();
 		for (const [kind, limit] of Object.entries(o.budget ?? {})) {
@@ -360,7 +405,7 @@ export class Session {
 		if (o.unpause && !this.#settled) this.#refuseOn([this.unpause(must(this.owned(by), refused))].filter((r) => r !== null));
 		for (const s of o.sends ?? []) {
 			const owned = must(this.owned(by), refused);
-			const refusal = this.answer(must(IdleNode.check(owned, s.node), refused), s.text);
+			const refusal = this.answer(must(IdleNode.check(owned, s.node), refused), s.text, undefined, s.turns ?? 0);
 			if (refusal) throw new RunRefused(refusal);
 		}
 		this.#drainInbox();
@@ -370,6 +415,72 @@ export class Session {
 		if (!this.#settled && poll !== null) {
 			this.#timer = setInterval(() => this.#later(() => this.#drainInbox()), poll);
 		}
+	}
+
+	/**
+	 * Binaries (resolved for a new run, from run metadata on resume), then
+	 * each sandbox's checks and setup unless confinement is off. Typed
+	 * refusals: requires_missing, requires_broken, setup_failed, unknown_bin.
+	 */
+	#prepareSandboxes(fresh: boolean, inputs: Readonly<Record<string, string>>): void {
+		const o = this.#options;
+		const decls = this.#decl.sandboxes;
+		const meta = readMeta(this.paths)!;
+		try {
+			const bins = fresh || !meta.bins
+				? resolveBins(this.#decl.core.name, decls, { callTime: o.bins, profile: this.#local.bins, path: o.callerPath ?? process.env.PATH })
+				: Object.fromEntries(Object.entries(meta.bins).map(([n, b]) => [n, b.path]));
+			const confine = o.confine ?? "auto";
+			const can = confine !== "off" && bwrapAvailable();
+			if (confine === "require" && !can) throw new Error("bubblewrap is required but cannot create a sandbox here");
+			const mounts = Object.fromEntries(Object.entries(this.#mounts).map(([n, m]) => [n, m.dir]));
+			const digests = Object.fromEntries(Object.keys(mounts).map((n) => [n, inputs[`mount.${n}`] ?? ""]));
+			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, digests)]));
+			this.#boxes = can ? new Sandboxes({ decls, bins, mounts, mountDigests: digests }) : null;
+			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
+			for (const note of this.#boxes?.notes ?? []) process.stderr.write(`wallis: ${note}\n`);
+			writeMeta(this.paths, {
+				...meta,
+				bins: Object.fromEntries(Object.entries(bins).map(([n, path]) => [n, versions[n] === undefined ? { path } : { path, version: versions[n]! }])),
+				base: meta.base ?? baseIdentity(),
+				confined: this.#boxes !== null,
+			});
+		} catch (error) {
+			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
+			throw error;
+		}
+	}
+
+	/** How an MCP server of this workflow starts: in its overlay sandbox (unconfined only with confine off). */
+	#mcpSpawn(): McpSpawn | undefined {
+		const boxes = this.#boxes;
+		if (!boxes) return undefined;
+		return (server, argv, env) => {
+			const box = this.#decl.mcpServers[server]?.sandbox;
+			if (!box) throw new Error(`MCP server ${server} has no sandbox in the workflow's mcp overlay`);
+			const scratch = join(this.paths.dir, "work", `mcp-${nodeDirName(server)}`);
+			mkdirSync(scratch, { recursive: true });
+			return boxes.spawn(box, argv, { scratch, inputs: null }, { env });
+		};
+	}
+
+	/** Preflight of every allowlisted MCP tool's annotations: no writes outside unless the overlay allows them. */
+	async #containment(): Promise<void> {
+		// Confinement off is for tests and development: no MCP servers are started in preflight.
+		if ((this.#options.confine ?? "auto") === "off") return;
+		const agents = Object.fromEntries(Object.entries(this.#decl.agents).filter(([, a]) => Object.keys(a.mcp).length > 0));
+		if (Object.keys(agents).length === 0) return;
+		const allow = Object.fromEntries(Object.entries(this.#decl.mcpServers).map(([s, o]) => [s, o.allow_writes]));
+		const servers = (this.#decl.mcp as { mcpServers?: Json } | null)?.mcpServers ?? null;
+		const bad = await checkContainment(agents, allow, servers, process.env, this.#mcpSpawn());
+		if (bad) throw new RunRefused({ type: "tool_writes_outside", ...bad });
+	}
+
+	#agentSandbox(name: string | null, dirs: NodeDirs): AgentSandbox {
+		if (name === null) return { type: "none" };
+		const boxes = this.#boxes;
+		if (!boxes) return { type: "unavailable", name, reason: "confinement is off or bubblewrap cannot create a sandbox here" };
+		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs }) };
 	}
 
 	#mountDirs(names: readonly string[]): Record<string, string> {
@@ -420,7 +531,7 @@ export class Session {
 				return this.unpause(owned);
 			case "answer": {
 				const node = IdleNode.check(owned, entry.node);
-				return node instanceof IdleNode ? this.answer(node, entry.text, entry.id) : node;
+				return node instanceof IdleNode ? this.answer(node, entry.text, entry.id, entry.turns ?? 0) : node;
 			}
 			case "steer":
 			case "interrupt": {
@@ -432,7 +543,7 @@ export class Session {
 			case "cancel_node": {
 				const node = LiveNode.check(owned, entry.node);
 				if (!(node instanceof LiveNode)) return node;
-				return entry.type === "restart" ? this.restart(node, entry.note) : this.cancelNode(node);
+				return entry.type === "restart" ? this.restart(node, entry.note, entry.turns ?? 0) : this.cancelNode(node);
 			}
 		}
 	}
@@ -453,7 +564,9 @@ export class Session {
 	/** Steps one event; returns the refusals of the event itself. */
 	#feed(event: Event): Refusal[] {
 		const refusals: Refusal[] = [];
-		for (const effect of this.#core.step(event)) {
+		const effects = this.#core.step(event);
+		this.#noteCodeChange(event, effects);
+		for (const effect of effects) {
 			if (effect.type === "refuse" && effect.id === null) refusals.push(effect.refusal);
 			else this.#handle(effect, event);
 		}
@@ -464,10 +577,11 @@ export class Session {
 		while (!this.#settled && (this.#deliveries.length > 0 || this.#requests.length > 0)) {
 			const delivery = this.#deliveries.shift();
 			if (delivery) {
-				this.#sandbox!.deliver(delivery[0], delivery[1] as unknown as Json);
+				// A result for an earlier execution of the body is in the journal; the current one hits it.
+				if (!this.#sandbox!.deliver(delivery[0], delivery[1] as unknown as Json)) this.#transcriptLog(delivery[0])({ kind: "note", text: "result journaled; no current request waited for it" });
 				continue;
 			}
-			const event = this.#requests.shift()!;
+			let event = this.#requests.shift()!;
 			if (event.type === "requested") {
 				const invalid = this.#invalidRequest(event.request);
 				if (invalid) {
@@ -475,6 +589,7 @@ export class Session {
 					this.#deliveries.push([event.id, invalid]);
 					continue;
 				}
+				event = this.#keyed(event);
 			}
 			const refusals = this.#feed(event);
 			// A request the core refuses as an event is a path divergence: the body took another path.
@@ -482,17 +597,83 @@ export class Session {
 		}
 	}
 
+	/**
+	 * The journal key of a request: its node's definition digest, and its
+	 * occurrence among calls with the same node and input in this execution
+	 * of the body (issue order, which is synchronous and deterministic).
+	 */
+	#keyed(event: Extract<Event, { type: "requested" }>): Event {
+		const r = event.request as { type: string; agent?: string; command?: string; input?: Json };
+		const name = r.type === "call" ? `agent:${r.agent}` : `command:${r.command}`;
+		let digest = this.#nodeDigests.get(name);
+		if (digest === undefined) {
+			const definition =
+				r.type === "call"
+					? { kind: "agent", ...this.#decl.agents[r.agent!], sandbox: this.#decl.agents[r.agent!]?.sandbox ? this.#decl.sandboxes[this.#decl.agents[r.agent!]!.sandbox!] : null }
+					: { kind: "command", ...this.#decl.commands[r.command!], env: this.#sandboxDigests[this.#decl.commands[r.command!]?.sandbox ?? ""] ?? null };
+			digest = createHash("sha256").update(canonical(JSON.parse(JSON.stringify(definition)) as Json)).digest("hex");
+			this.#nodeDigests.set(name, digest);
+		}
+		const key = `${digest}\n${canonical(r.input ?? null)}`;
+		const occurrence = this.#occurrences.get(key) ?? 0;
+		this.#occurrences.set(key, occurrence + 1);
+		return { ...event, node_digest: digest, occurrence };
+	}
+
+	/** After a code change: count hits, and say where the first new call is. */
+	#noteCodeChange(event: Event, effects: readonly Effect[]): void {
+		const c = this.#codeChange;
+		if (!c || c.reported || event.type !== "requested") return;
+		const issued = effects.find((e) => e.type === "call_agent" || e.type === "run_command");
+		if (!issued) {
+			if (!effects.some((e) => e.type === "checkpoint")) c.hits++;
+			return;
+		}
+		c.reported = true;
+		const node = issued.type === "call_agent" ? issued.agent : issued.command;
+		process.stderr.write(`wallis: code changed; ${c.hits} calls reused, first new call: ${node} at ${event.id}\n`);
+	}
+
+	/** Runs the body again in a fresh VM: completed calls hit the journal, the restarted node's call waits for its new result. */
+	async #restartBody(): Promise<void> {
+		this.#restarting = true;
+		try {
+			// The new VM is built first; the old one stays usable (parse, deliveries) until the swap.
+			const next = await this.#newSandbox();
+			this.#later(() => {
+				const old = this.#sandbox;
+				this.#sandbox = next;
+				old?.dispose();
+				this.#requests.length = 0;
+				this.#deliveries.length = 0;
+				this.#occurrences = new Map();
+				this.#restarting = false;
+				this.#sandbox.start(this.#input, this.#seed);
+			});
+		} catch (error) {
+			this.#abort(error);
+		}
+	}
+
+	#newSandbox(): Promise<Sandbox> {
+		return Sandbox.create(this.#code, {
+			send: (json) => this.#requests.push(JSON.parse(json) as Event),
+			done: (json) => this.#requests.push({ type: "body_finished", output: JSON.parse(json) as Json }),
+			fail: (json) => this.#requests.push({ type: "body_failed", reason: JSON.parse(json) }),
+		});
+	}
+
 	#invalidRequest(request: Json): Reply | null {
-		const r = request as { type: string; agent?: string; input?: Json; script?: string; args?: Json };
+		const r = request as { type: string; agent?: string; input?: Json; command?: string };
 		const fail = (subject: string, errors: string[]): Reply | null => (errors.length > 0 ? { type: "schema", subject, errors } : null);
 		switch (r.type) {
 			case "call": {
 				const agent = this.#decl.agents[r.agent!];
 				return agent ? fail(`input of agent ${r.agent}`, schemaErrors(agent.input, r.input)) : null;
 			}
-			case "script": {
-				const script = this.#decl.scripts[r.script!];
-				return script ? fail(`args of script ${r.script}`, schemaErrors(script.input, r.args)) : null;
+			case "command": {
+				const command = this.#decl.commands[r.command!];
+				return command ? fail(`input of command ${r.command}`, schemaErrors(command.input, r.input)) : null;
 			}
 			default:
 				return null;
@@ -519,8 +700,8 @@ export class Session {
 			case "call_agent":
 				this.#callAgent(effect);
 				return;
-			case "run_script":
-				this.#runScript(effect);
+			case "run_command":
+				this.#runCommand(effect);
 				return;
 			case "deliver":
 				this.#deliveries.push([effect.id, { type: "deliver", value: effect.value }]);
@@ -541,7 +722,7 @@ export class Session {
 	 * A producer's output, parsed: JSON, drafts stored as artifacts, every ref
 	 * verified against the store, then the schema. Errors are a string.
 	 */
-	#parseOutput(output: unknown, schema: unknown, scratch: string | null): { ok: true; value: Json } | { ok: false; error: string } {
+	#parseOutput(output: unknown, schema: unknown, scratch: string | null): { ok: true; value: Json } | { ok: false; error: string; missing?: string } {
 		const json = toJson(output);
 		if (!json.ok) return { ok: false, error: `output is not JSON: ${json.errors.join("; ")}` };
 		let value: Json;
@@ -549,7 +730,7 @@ export class Session {
 			value = resolveDrafts(json.value, this.paths.dir, scratch);
 			verifyRefs(value, this.paths.dir);
 		} catch (error) {
-			if (error instanceof ArtifactError) return { ok: false, error: error.message };
+			if (error instanceof ArtifactError) return error.missing === undefined ? { ok: false, error: error.message } : { ok: false, error: error.message, missing: error.missing };
 			throw error;
 		}
 		const errors = schemaErrors(schema, value);
@@ -586,7 +767,8 @@ export class Session {
 
 		let workspace: NodeDirs;
 		try {
-			workspace = prepareNode(this.paths.dir, id, declaration.sandbox, effect.input, this.#mountDirs(declaration.mounts));
+			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
+			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts));
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -613,14 +795,18 @@ export class Session {
 			input: effect.input,
 			note: effect.note,
 			contextTokens,
-			maxTurns: effect.max_turns,
+			turn: effect.turn,
+			turnLimit: effect.turn_limit,
+			checkpoint: join(workspace.root, "session.json"),
 			digest: effect.digest,
 			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
 			outputSchema: declaration.output as unknown as Json,
 			workspace,
+			sandbox: this.#agentSandbox(declaration.sandbox, workspace),
 			exportArtifact: (path, media, name) =>
 				resolveDrafts(name === undefined ? { artifact: path, media } : { artifact: path, media, name }, this.paths.dir, workspace.scratch) as unknown as ArtifactRef,
 			mcp: this.#mcpFor(declaration),
+			mcpSpawn: this.#mcpSpawn(),
 			log,
 		};
 		const done = () => {
@@ -646,7 +832,7 @@ export class Session {
 		};
 		if (message !== undefined) log({ kind: "user", text: message });
 		session()
-			.then((s) => s.turn(message))
+			.then((s) => s.turn(message, effect.turn_limit))
 			.then(
 				(turn) =>
 					this.#later(() => {
@@ -664,14 +850,12 @@ export class Session {
 						log({ kind: "turn", result: turn.type, usage });
 						if (turn.type === "ended") {
 							this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
-							const parked = this.#afterInterrupt.get(id);
-							if (parked !== undefined) {
-								this.#afterInterrupt.delete(id);
-								const owned = this.owned(parked.by);
-								const node = owned instanceof OwnedRun ? IdleNode.check(owned, id) : owned;
-								const refusal = node instanceof IdleNode ? this.answer(node, parked.text) : node;
-								if (refusal) log({ kind: "note", text: `the message after the interrupt was refused: ${JSON.stringify(refusal)}` });
-							}
+							this.#afterIdle(id, log);
+							return;
+						}
+						if (turn.type === "turn_limit") {
+							this.#feed({ type: "turn_limit_reached", ...base, used: turn.used, limit: turn.limit, usage });
+							this.#afterIdle(id, log);
 							return;
 						}
 						if (turn.type === "agent_error") {
@@ -693,41 +877,77 @@ export class Session {
 			);
 	}
 
-	#runScript(effect: Extract<Effect, { type: "run_script" }>): void {
-		const runner = this.#options.scripts;
+	/**
+	 * A command call: its argv from the command's pure `run` (in the workflow
+	 * VM, on the mounted input), the process in its sandbox, then its pure
+	 * `parse`; files it names must exist in its scratch dir; the output is
+	 * checked against the schema. Every failure is a typed `CommandFailure`.
+	 */
+	/** A message parked by an interrupt is delivered once the aborted turn has ended. */
+	#afterIdle(id: string, log: (entry: TranscriptEntry) => void): void {
+		const parked = this.#afterInterrupt.get(id);
+		if (parked === undefined) return;
+		this.#afterInterrupt.delete(id);
+		const owned = this.owned(parked.by);
+		const node = owned instanceof OwnedRun ? IdleNode.check(owned, id) : owned;
+		const refusal = node instanceof IdleNode ? this.answer(node, parked.text) : node;
+		if (refusal) log({ kind: "note", text: `the message after the interrupt was refused: ${JSON.stringify(refusal)}` });
+	}
+
+	#runCommand(effect: Extract<Effect, { type: "run_command" }>): void {
 		const id = effect.id;
-		const failed = (error: string) => queueMicrotask(() => this.#later(() => this.#feed({ type: "script_failed", id, error, minutes: 0 })));
-		if (!runner) return failed("no script runner");
-		const declaration = this.#decl.scripts[effect.script];
+		const declaration = this.#decl.commands[effect.command]!;
+		const generation = (this.#generation.get(id) ?? 0) + 1;
+		this.#generation.set(id, generation);
+		const current = () => this.#generation.get(id) === generation;
+		const failed = (failure: CommandFailure, minutes = 0) => this.#feed({ type: "command_failed", id, failure, minutes });
+		const later = (step: () => void) => queueMicrotask(() => this.#later(step));
+		const runner = this.#options.commands;
+		if (!runner) return later(() => failed({ type: "unrunnable", error: "no command runner" }));
 		let workspace: NodeDirs;
 		try {
-			workspace = prepareNode(this.paths.dir, id, declaration?.sandbox ?? "workspace", effect.args, this.#mountDirs(declaration?.mounts ?? []));
+			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(this.#decl.sandboxes[declaration.sandbox]!.mounts));
 		} catch (error) {
-			return failed(errorText(error));
+			return later(() => failed({ type: "unrunnable", error: errorText(error) }));
 		}
-		const done = () => discardNode(this.paths.dir, id);
+		const input = mountedInput(effect.input, LAYOUT.inputs);
+		const argv = this.#sandbox!.argv(effect.command, input);
+		if (!argv.ok) return later(() => failed({ type: "unrunnable", error: `run: ${argv.error}` }));
+		this.#commandAborts.get(id)?.abort();
+		const abort = new AbortController();
+		this.#commandAborts.set(id, abort);
+		const env: Record<string, string> = effect.compute_minutes === null ? {} : { WALLIS_COMPUTE_MINUTES: String(effect.compute_minutes) };
+		const spawn = this.#boxes?.spawn(declaration.sandbox, argv.argv, { scratch: workspace.scratch, inputs: workspace.inputs }, { gpu: (declaration.resources.gpu ?? 0) > 0, env }) ?? null;
+		const log = this.#transcriptLog(id);
+		log({ kind: "note", text: `argv: ${JSON.stringify(argv.argv)}` });
+		const done = () => {
+			if (this.#commandAborts.get(id) === abort) this.#commandAborts.delete(id);
+			discardNode(this.paths.dir, id);
+		};
 		runner
-			.run({
-				id,
-				script: effect.script,
-				args: effect.args,
-				computeMinutes: effect.compute_minutes,
-				digest: effect.digest,
-				outputSchema: (declaration?.output ?? {}) as Json,
-				workspace,
-				resources: declaration?.resources ?? {},
-			})
+			.run({ id, command: effect.command, input, argv: argv.argv, spawn, computeMinutes: effect.compute_minutes, resources: declaration.resources, workspace, signal: abort.signal })
 			.then(
-				(result) =>
+				(r) =>
 					this.#later(() => {
-						const parsed = this.#parseOutput(result.output, declaration?.output ?? {}, workspace.scratch);
-						if (parsed.ok) this.#feed({ type: "script_returned", id, output: parsed.value, minutes: result.minutes });
-						else this.#feed({ type: "script_failed", id, error: parsed.error, minutes: result.minutes });
+						if (!current()) return log({ kind: "note", text: "discarded the result of a command that was restarted or cancelled" });
+						log({ kind: "turn", result: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}` });
+						if (r.timedOut) failed({ type: "timed_out", minutes: r.minutes }, r.minutes);
+						else if (r.exit !== 0) failed({ type: "exit_code", code: r.exit, stderr_head: r.stderr.trim().slice(-500) }, r.minutes);
+						else {
+							const parsed = this.#sandbox!.parse(effect.command, { exit: r.exit, stdout: r.stdout, stderr: r.stderr });
+							if (!parsed.ok) failed({ type: "output_mismatch", errors: [`parse: ${parsed.error}`] }, r.minutes);
+							else {
+								const out = this.#parseOutput(parsed.output, declaration.output, workspace.scratch);
+								if (out.ok) this.#feed({ type: "command_returned", id, output: out.value, minutes: r.minutes });
+								else failed(out.missing === undefined ? { type: "output_mismatch", errors: [out.error] } : { type: "missing_file", name: out.missing }, r.minutes);
+							}
+						}
 						done();
 					}),
 				(error: unknown) =>
 					this.#later(() => {
-						this.#feed({ type: "script_failed", id, error: errorText(error), minutes: 0 });
+						if (!current()) return;
+						failed({ type: "unrunnable", error: errorText(error) });
 						done();
 					}),
 			);
@@ -735,7 +955,7 @@ export class Session {
 
 	/** Ends the session once nothing is queued and the run no longer runs. */
 	#settle(): void {
-		if (this.#settled || this.#requests.length > 0 || this.#deliveries.length > 0) return;
+		if (this.#settled || this.#restarting || this.#requests.length > 0 || this.#deliveries.length > 0) return;
 		const status = this.#core.snapshot().status;
 		if (status.type === "running") return;
 		if (status.type === "idle") {

@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { Executor, NodeSession, NodeSpec, TurnResult } from "../src/host/executor.ts";
-import { appendInbox, EventLog, IdleNode, LiveNode, OwnedRun, runPaths, runWorkflow, type Session, startSession, SteerableNode } from "../src/host/index.ts";
+import { appendInbox, EventLog, FakeCommands, IdleNode, LiveNode, OwnedRun, runPaths, runWorkflow, type Session, startSession, SteerableNode } from "../src/host/index.ts";
 import { refusedEntry } from "../src/host/store.ts";
 import { inspectRun, nodeTranscript, renderTree, runLog } from "../src/host/query.ts";
 import { tmp } from "./util.ts";
@@ -153,7 +153,7 @@ test("a non-steerable node accepts only cancel and a restart without a note", as
 	const session = await startSession({ workflow: fanout, dir, executor, input: null, inboxPollMs: null });
 	await session.result;
 	const view = inspectRun(dir);
-	const judge = view.run.nodes.find((n) => n.agent === "judge")!;
+	const judge = view.run.nodes.find((n) => "agent" in n && n.agent === "judge")!;
 	assert.equal(judge.type, "node_idle");
 	assert.equal(judge.steerable, false);
 	const o = OwnedRun.check(view.run, "human");
@@ -169,12 +169,13 @@ test("a non-steerable node accepts only cancel and a restart without a note", as
 	const paths = runPaths(dir);
 	appendInbox(paths, { id: "r1", type: "restart", node: judge.id, note: "a hint", by: "human" });
 	appendInbox(paths, { id: "r2", type: "restart", node: judge.id, by: "human" });
-	const done = await runWorkflow({ workflow: fanout, dir, executor, inboxPollMs: null });
+	const commands = new FakeCommands({ train: { stdout: JSON.stringify({ budget: null }) } });
+	const done = await runWorkflow({ workflow: fanout, dir, executor, commands, confine: "off", inboxPollMs: null });
 	assert.deepEqual(refusedEntry(paths, "r1"), { type: "not_steerable", node: judge.id });
 	assert.equal(refusedEntry(paths, "r2"), null);
-	assert.notEqual(done.status.type, "idle");
+	assert.equal(done.outcome?.type, "done", JSON.stringify(done.status));
 	const log = new EventLog(join(dir, "log.jsonl")).read();
-	assert.deepEqual(log.filter((e) => e.type === "restarted"), [{ type: "restarted", node: judge.id, note: null, by: "human" }]);
+	assert.deepEqual(log.filter((e) => e.type === "restarted"), [{ type: "restarted", node: judge.id, note: null, by: "human", turns: 0 }]);
 });
 
 test("pause issues no new calls (Idle(PausedByUser)); resume continues", async () => {
@@ -186,7 +187,7 @@ test("pause issues no new calls (Idle(PausedByUser)); resume continues", async (
 	gated.open.get("#0")!({ type: "submitted", output: { outline: ["a"], note: "n" } });
 	const paused = await session.result;
 	assert.deepEqual(paused.status, { type: "idle", reason: { type: "paused_by_user" } });
-	assert.deepEqual(paused.run.nodes.map((n) => n.agent), ["planner"], "the writer was not issued");
+	assert.deepEqual(paused.run.nodes.map((n) => ("agent" in n ? n.agent : n.command)), ["planner"], "the writer was not issued");
 	const done = await runWorkflow({ ...base(dir, new Gated()), unpause: true });
 	assert.equal(done.outcome?.type, "done");
 });

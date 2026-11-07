@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { EventLog, FakeExecutor, FakeScripts, resolveModels, RunRefused, runWorkflow } from "../src/host/index.ts";
+import { EventLog, FakeCommands, FakeExecutor, resolveModels, RunRefused, runWorkflow } from "../src/host/index.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const twoNode = resolve(here, "../examples/two-node/workflow.ts");
 const fanout = resolve(here, "fixtures/fanout/workflow.ts");
 const tmp = () => mkdtempSync(join(tmpdir(), "wallis-host-"));
-const quiet = { inboxPollMs: null } as const;
+const quiet = { inboxPollMs: null, confine: "off" } as const;
 
 const twoNodeResponses = {
 	planner: { output: { outline: ["a"], note: "n" } },
@@ -81,12 +81,12 @@ test("resume refuses a changed pinned input file", async () => {
 	await assert.rejects(runWorkflow(opts), (e: unknown) => e instanceof RunRefused && e.refusal.type === "pin_mismatch" && e.refusal.field === "inputs.advice.md");
 });
 
-test("parallel branches, a sub-workflow, an explicit merge call, typed scripts, observations; a spent compute budget pauses until raised", async () => {
+test("parallel branches, a nested workflow, an explicit merge call, commands, observations; a reached compute budget holds new calls until raised", async () => {
 	const dir = join(tmp(), "run");
 	const executor = fanoutExecutor();
-	const scripts = new FakeScripts({ train: (call) => ({ output: { budget: call.computeMinutes }, minutes: 5 }) });
-	const first = await runWorkflow({ ...quiet, workflow: fanout, dir, executor, scripts, input: null });
-	assert.deepEqual(first.status, { type: "idle", reason: { type: "budget_exhausted", kind: "compute_minutes", spent: 5, limit: 5 } });
+	const scripts = new FakeCommands({ train: (call) => ({ stdout: JSON.stringify({ budget: call.computeMinutes }), minutes: 5 }) });
+	const first = await runWorkflow({ ...quiet, workflow: fanout, dir, executor, commands: scripts, input: null });
+	assert.deepEqual(first.status, { type: "idle", reason: { type: "budget_reached", kind: "compute_minutes", spent: 5, limit: 5 } });
 	assert.equal(scripts.calls.length, 1);
 
 	const ids = executor.calls.map((c) => c.id);
@@ -105,7 +105,7 @@ test("parallel branches, a sub-workflow, an explicit merge call, typed scripts, 
 	// Raise the budget: the paused script runs, nothing completed runs again,
 	// and the body's local variables are rebuilt by the replay.
 	const executor2 = fanoutExecutor();
-	const r = await runWorkflow({ ...quiet, workflow: fanout, dir, executor: executor2, scripts, budget: { compute_minutes: 20 } });
+	const r = await runWorkflow({ ...quiet, workflow: fanout, dir, executor: executor2, commands: scripts, budget: { compute_minutes: 20 } });
 	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
 	assert.equal(executor2.calls.length, 0);
 	assert.equal(scripts.calls.length, 2);
@@ -121,19 +121,20 @@ test("parallel branches, a sub-workflow, an explicit merge call, typed scripts, 
 	assert.equal(log.filter((e) => e.type === "observed").length, 3, "replayed observations are not logged again");
 });
 
-test("a spent USD budget pauses before the next call; a raise continues it", async () => {
+test("a reached turn budget admits no new call; calls in flight finish (a small overshoot); a raise continues", async () => {
 	const dir = join(tmp(), "run");
-	const workflow = variant(twoNode, (t) => t.replace('name: "two-node",', 'name: "two-node",\n\tbudget: { usd: 1 },'));
-	const responses = { ...twoNodeResponses, planner: { submit: { outline: ["a"], note: "n" }, usage: { usd: 5, tokens: 1, turns: 1 } } };
-	const executor = new FakeExecutor(responses);
-	const paused = await runWorkflow({ ...quiet, workflow, dir, executor, input: { topic: "x" } });
-	assert.deepEqual(paused.status, { type: "idle", reason: { type: "budget_exhausted", kind: "usd", spent: 5, limit: 1 } });
-	assert.equal(paused.outcome, null);
-	assert.equal(executor.calls.length, 1);
-	const again = new FakeExecutor(responses);
-	const r = await runWorkflow({ ...quiet, workflow, dir, executor: again, budget: { usd: 10 } });
-	assert.equal(r.outcome?.type, "done");
-	assert.deepEqual(again.calls.map((c) => c.agent), ["writer"]);
+	const workflow = variant(fanout, (t) => t.replace("budget: { turns: 100, computeMinutes: 5 },", "budget: { turns: 1, computeMinutes: 5 },"));
+	const executor = fanoutExecutor();
+	const scripts = new FakeCommands({ train: { stdout: JSON.stringify({ budget: null }), minutes: 1 } });
+	const paused = await runWorkflow({ ...quiet, workflow, dir, executor, commands: scripts, input: null });
+	// Both parallel scouts were in flight: both finished, overshooting by one turn; the judge was held.
+	assert.deepEqual(paused.status, { type: "idle", reason: { type: "budget_reached", kind: "turns", spent: 2, limit: 1 } });
+	assert.deepEqual(executor.calls.map((c) => c.agent), ["scout", "scout"]);
+	assert.ok(paused.run.spent.usd > 0, "USD is recorded, never budgeted");
+	const again = fanoutExecutor();
+	const r = await runWorkflow({ ...quiet, workflow, dir, executor: again, commands: scripts, budget: { turns: 50 } });
+	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
+	assert.equal(again.calls[0]!.agent, "judge");
 });
 
 test("model aliases resolve call-time > workflow profile > global profile > workflow > default", () => {

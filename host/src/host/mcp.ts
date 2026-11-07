@@ -11,7 +11,7 @@ import { toJson } from "../sdk/validate.ts";
 import { BadId, type NodeId, parseNodeId, parseRunId, type RunId } from "./capability.ts";
 import { mayControl, NotOwner } from "./owner.ts";
 import { declarationsOf } from "./sandbox.ts";
-import { attention, claimable, describe, listRunViews, nodeTranscript, pending, renderTree, runLine, runLog, type RunView, waitForAttention } from "./query.ts";
+import { attention, CONTINUE, claimable, describe, listRunViews, nodeTranscript, pending, renderTree, runLine, runLog, type RunView, waitForAttention } from "./query.ts";
 import { type Runs, SendRefused } from "./runs.ts";
 import { RunRefused } from "./session.ts";
 import { runPaths, runsDir } from "./store.ts";
@@ -92,13 +92,14 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 				seed: z.number().int().optional(),
 				models: z.record(z.string(), z.string()).optional().describe("Model alias remaps, alias -> provider/model:thinking"),
 				mounts: z.record(z.string(), z.string()).optional().describe("Mount remaps, name -> host dir (read-only)"),
+				bins: z.record(z.string(), z.string()).optional().describe("Paths of required binaries, name -> absolute path"),
 			},
 		},
-		async ({ workflow, input, seed, models, mounts }) => {
+		async ({ workflow, input, seed, models, mounts, bins }) => {
 			try {
 				const parsed = toJson(input ?? null);
 				if (!parsed.ok) return reply(`Bad input: ${parsed.errors.join("; ")}`, { error: "bad_input" }, true);
-				const session = await runs.start({ workflow, input: parsed.value, seed, models, mounts });
+				const session = await runs.start({ workflow, input: parsed.value, seed, models, mounts, bins });
 				const view = runs.view(parseRunId(session.paths.id));
 				return reply(
 					`${summary(view)}\n\nTo be notified when it needs attention, run in the background: npx wallis wait ${view.runId}`,
@@ -113,13 +114,14 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 	server.registerTool(
 		"send",
 		{
-			description: "Answer a node that is waiting for a reply (an agent that ended its turn with a question). Non-steerable agents take no answers.",
-			inputSchema: { run_id: z.string(), node_id: z.string(), text: z.string() },
+			description:
+				"Answer a node that is waiting for a reply (an agent that ended its turn with a question), or grant a node at its turn limit more turns (`turns`, optionally with text). Non-steerable agents take no answers.",
+			inputSchema: { run_id: z.string(), node_id: z.string(), text: z.string().optional(), turns: z.number().int().positive().optional() },
 		},
-		async ({ run_id, node_id, text }) => {
+		async ({ run_id, node_id, text, turns }) => {
 			try {
 				const { run, node } = ids(run_id, node_id);
-				await runs.answer(run, node, text);
+				await runs.answer(run, node, text ?? CONTINUE, turns ?? 0);
 				const view = runs.view(run);
 				return reply(summary(view), data(view));
 			} catch (error) {
@@ -133,7 +135,7 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 		const agent = z.enum(steerable as [string, ...string[]]).describe("The node's agent; only steerable agents are listed");
 		const matches = (run: RunId, node: NodeId, name: string) => {
 			const found = runs.view(run).run.nodes.find((n) => n.id === node);
-			if (found && found.agent !== name) throw new Error(`node ${node} runs agent ${found.agent}, not ${name}`);
+			if (found && ("command" in found || found.agent !== name)) throw new Error(`node ${node} runs ${"command" in found ? `command ${found.command}` : `agent ${found.agent}`}, not agent ${name}`);
 		};
 		server.registerTool(
 			"steer",
@@ -174,13 +176,14 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 	server.registerTool(
 		"restart",
 		{
-			description: "Discard a node's progress and reissue its call with the original input plus an operator note (no note for non-steerable agents). Logged.",
-			inputSchema: { run_id: z.string(), node_id: z.string(), note: z.string().optional() },
+			description:
+				"Discard a node's progress and reissue its call with the original input plus an operator note (no note for non-steerable agents or commands); `turns` sets its turn allowance. A failed node the run is held on is restarted the same way, and the workflow then continues. Logged.",
+			inputSchema: { run_id: z.string(), node_id: z.string(), note: z.string().optional(), turns: z.number().int().positive().optional() },
 		},
-		async ({ run_id, node_id, note }) => {
+		async ({ run_id, node_id, note, turns }) => {
 			try {
 				const { run, node } = ids(run_id, node_id);
-				await runs.restart(run, node, note);
+				await runs.restart(run, node, note, turns ?? 0);
 				return reply(summary(runs.view(run)));
 			} catch (error) {
 				return failure(error);

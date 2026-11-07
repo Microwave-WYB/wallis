@@ -1,6 +1,7 @@
 // Runs a bundled workflow in QuickJS: no fs, no network, a virtual clock,
 // UTC, and Math.random seeded from the pin. The guest talks to the host
-// only through the three functions installed here.
+// only through the three functions installed here; the host calls into it
+// to start, deliver, and evaluate a command's pure `run` and `parse`.
 
 import { readFileSync } from "node:fs";
 import { QuickJS } from "quickjs-wasi";
@@ -69,8 +70,32 @@ export class Sandbox {
 		this.#call("__wallis_start", [JSON.stringify(input), seed]);
 	}
 
-	deliver(id: string, reply: Json): void {
-		this.#call("__wallis_deliver", [id, JSON.stringify(reply)]);
+	/** A command's `run`, evaluated in the workflow VM: pure, synchronous. */
+	argv(command: string, input: Json): { ok: true; argv: string[] } | { ok: false; error: string } {
+		return JSON.parse(this.#invoke("__wallis_argv", [command, JSON.stringify(input)])) as never;
+	}
+
+	/** A command's `parse`, evaluated in the workflow VM: pure, synchronous. */
+	parse(command: string, result: { exit: number; stdout: string; stderr: string }): { ok: true; output: unknown } | { ok: false; error: string } {
+		return JSON.parse(this.#invoke("__wallis_parse", [command, JSON.stringify(result)])) as never;
+	}
+
+	#invoke(name: string, args: string[]): string {
+		const vm = this.#vm;
+		using fn = vm.global.getProp(name);
+		const handles = args.map((a) => vm.newString(a));
+		try {
+			return vm.callFunction(fn, vm.undefined, ...handles).consume((h) => h.toString());
+		} finally {
+			for (const h of handles) h.dispose();
+		}
+	}
+
+	/** False when no request of the body waits for `id`. */
+	deliver(id: string, reply: Json): boolean {
+		const taken = this.#invoke("__wallis_deliver", [id, JSON.stringify(reply)]) === "true";
+		this.#vm.executePendingJobs();
+		return taken;
 	}
 
 	#call(name: string, args: (string | number)[]): void {

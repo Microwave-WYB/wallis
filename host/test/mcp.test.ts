@@ -8,6 +8,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/host/mcp.ts";
+import { bwrapAvailable, readMeta, runPaths } from "../src/host/index.ts";
+import { join } from "node:path";
 import { loadExecutor, Runs } from "../src/host/runs.ts";
 import { cli, fakeExecutor, project } from "./util.ts";
 
@@ -55,7 +57,7 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 		const before = await call("get_run", { run_id: runId });
 		assert.deepEqual(before.data.status, { type: "idle", reason: null });
 		assert.equal(before.data.nodes[0].type, "node_idle");
-		assert.equal(before.data.nodes[0].question, "Who is the audience: experts or newcomers?");
+		assert.deepEqual(before.data.nodes[0].cause, { type: "question", message: "Who is the audience: experts or newcomers?" });
 
 		const refused = await call("send", { run_id: runId, node_id: "#1", text: "hi" });
 		assert.equal(refused.isError, true);
@@ -108,16 +110,17 @@ test("MCP over stdio: wallis serve lists tools and runs a workflow", async () =>
 	}
 });
 
-test("MCP: without a script runner from the executor module, scripts run as processes (as in the CLI)", async () => {
+test("MCP: without a command runner from the executor module, commands run as sandboxed processes (as in the CLI)", { skip: !bwrapAvailable() && "bubblewrap unavailable" }, async () => {
 	const root = project();
 	const { call, close } = await connect(root);
 	try {
 		const started = await call("run", { workflow: "fanout", input: null });
 		const done = await call("wait", { run_id: started.data.run_id, timeout_s: 20 });
-		assert.match(done.text, /finished, failed/);
-		const status = await call("get_run", { run_id: started.data.run_id });
-		assert.equal(status.data.status.outcome.reason.type, "script_crashed");
-		assert.match(status.data.status.outcome.reason.error, /no script train in/, "ProcessScripts looked for the script file");
+		// The fanout's train command really ran (sh in bwrap) and printed its JSON.
+		assert.match(done.text, /finished, done: .*"trained":\{"budget":null\}/);
+		const meta = readMeta(runPaths(join(root, ".wallis", "runs", started.data.run_id)))!;
+		assert.equal(meta.confined, true);
+		assert.ok(meta.bins!.sh!.path.startsWith("/"));
 	} finally {
 		await close();
 	}

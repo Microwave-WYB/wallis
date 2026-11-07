@@ -1,4 +1,4 @@
-// Schema checks at the boundary: typed script outputs (A), agent outputs
+// Schema checks at the boundary: typed command outputs (A), agent outputs
 // parsed before anything is logged (B), and the model fixing its own output
 // inside its loop (C).
 
@@ -6,42 +6,43 @@ import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { EventLog, type Executor, FakeExecutor, FakeScripts, runWorkflow, type Turn } from "../src/host/index.ts";
+import { type Conversation, conversation, EventLog, type Executor, FakeCommands, FakeExecutor, runWorkflow, type Turn } from "../src/host/index.ts";
 import { tmp } from "./util.ts";
 
 const workflow = resolve(fileURLToPath(new URL(".", import.meta.url)), "fixtures/boundary/workflow.ts");
 
-async function run(mode: string, options: { tagger?: Turn; strict?: Turn; reporter?: Turn; score?: unknown } = {}) {
+async function run(mode: string, options: { tagger?: Turn; strict?: Turn | Conversation; reporter?: Turn; score?: unknown } = {}) {
 	const dir = join(tmp(), "run");
 	const executor = new FakeExecutor({
 		tagger: options.tagger ?? { submit: { tags: ["ok"] } },
 		strict: options.strict ?? { submit: { answer: 1 } },
 		reporter: options.reporter ?? { submit: { report: { digest: `sha256:${"0".repeat(64)}`, name: "r.md", media: "text/markdown" } } },
 	});
-	const scripts = new FakeScripts({ measure: { output: { score: options.score ?? 0.5 } as never, minutes: 1 } });
-	const result = await runWorkflow({ workflow, dir, executor, scripts, input: { mode }, inboxPollMs: null });
-	return { result, executor, scripts, dir, log: new EventLog(join(dir, "log.jsonl")).read(), value: (result.outcome as { value?: unknown }).value };
+	const commands = new FakeCommands({ measure: { stdout: JSON.stringify({ score: options.score ?? 0.5 }), minutes: 1 } });
+	const result = await runWorkflow({ workflow, dir, executor, commands, confine: "off", input: { mode }, inboxPollMs: null });
+	return { result, executor, commands, dir, log: new EventLog(join(dir, "log.jsonl")).read(), value: (result.outcome as { value?: unknown } | null)?.value };
 }
 
-// --- A. Typed scripts ---
+// --- A. Typed commands ---
 
-test("a script's output is checked against its schema before it is logged", async () => {
-	const ok = await run("script");
+test("a command's output is checked against its schema before it is logged, typed", async () => {
+	const ok = await run("command");
 	assert.deepEqual(ok.value, { score: 0.5 });
-	assert.deepEqual(ok.scripts.calls[0]!.outputSchema, { type: "object", required: ["score"], properties: { score: { type: "number" } } });
+	assert.deepEqual(ok.commands.calls[0]!.argv, ["sh", "-c", "cat"]);
+	assert.deepEqual(ok.commands.calls[0]!.input, { n: 1 });
 
-	const bad = await run("script", { score: "high" });
-	assert.equal((bad.value as { error: string }).error, "ScriptFailed");
-	assert.match((bad.value as { message: string }).message, /output does not match its schema/);
-	const failed = bad.log.find((e) => e.type === "script_failed");
-	assert.ok(failed, "logged as a script failure");
-	assert.ok(!bad.log.some((e) => e.type === "script_returned"), "the bad output is never logged as a result");
+	const bad = await run("command", { score: "high" });
+	assert.equal((bad.value as { error: string }).error, "CommandFailed");
+	assert.equal((bad.value as { failure: string }).failure, "output_mismatch");
+	const failed = bad.log.find((e) => e.type === "command_failed");
+	assert.ok(failed, "logged as a command failure");
+	assert.ok(!bad.log.some((e) => e.type === "command_returned"), "the bad output is never logged as a result");
 });
 
-test("script args are checked in the sandbox: a typed error and nothing logged", async () => {
-	const r = await run("script_bad_args");
-	assert.deepEqual(r.value, { error: "SchemaError", subject: "args of script measure" });
-	assert.equal(r.scripts.calls.length, 0);
+test("a command's input is checked in the sandbox: a typed error and nothing logged", async () => {
+	const r = await run("command_bad_input");
+	assert.deepEqual(r.value, { error: "SchemaError", subject: "input of command measure" });
+	assert.equal(r.commands.calls.length, 0);
 	assert.ok(!r.log.some((e) => e.type === "requested"));
 });
 
@@ -51,7 +52,7 @@ test("an agent output that does not match its schema fails the call; nothing is 
 	// An executor that skips its own submit_result check: the host parses the output anyway.
 	const dir = join(tmp(), "run");
 	const executor: Executor = { id: "lax", start: () => ({ turn: async () => ({ type: "submitted", output: { tags: ["much too long"] } }), handle: () => null, close: () => {} }) };
-	const result = await runWorkflow({ workflow, dir, executor, input: { mode: "agent" }, inboxPollMs: null });
+	const result = await runWorkflow({ workflow, dir, executor, confine: "off", input: { mode: "agent" }, inboxPollMs: null });
 	const r = { value: (result.outcome as { value?: unknown }).value, log: new EventLog(join(dir, "log.jsonl")).read() };
 	assert.equal((r.value as { error: string }).error, "AgentFailed");
 	assert.match((r.value as { message: string }).message, /output does not match its schema/);
@@ -84,16 +85,32 @@ test("an invalid submit_result goes back to the model; the node completes on a v
 	const again = await run("submit", { strict });
 	assert.deepEqual(again.log, r.log);
 	const executor = new FakeExecutor({});
-	const resumed = await runWorkflow({ workflow, dir: r.dir, executor, inboxPollMs: null });
+	const resumed = await runWorkflow({ workflow, dir: r.dir, executor, confine: "off", inboxPollMs: null });
 	assert.equal(resumed.snapshot, r.result.snapshot);
 	assert.equal(executor.calls.length, 0);
 });
 
-test("never submitting a valid result, or running out of turns, is an agent failure", async () => {
+test("never submitting a valid result is an agent failure", async () => {
 	const gaveUp = await run("submit", { strict: { submits: [{ answer: 0 }, { answer: -1 }] } });
 	assert.deepEqual(gaveUp.value, { error: "AgentFailed", agent: "strict", failure: "gave_up", message: "gave up: no submit_result passed validation" });
-	const turns = await run("submit", { strict: { submits: [{ answer: 0 }, { answer: 0 }, { answer: 0 }, { answer: 0 }, { answer: 5 }] } });
-	assert.deepEqual(turns.value, { error: "AgentFailed", agent: "strict", failure: "gave_up", message: "maxTurns exceeded (4)" });
-	const node = turns.result.run.nodes[0]!;
-	assert.deepEqual(node.type === "node_done" && node.outcome, { type: "node_failed", failure: { type: "gave_up", error: "maxTurns exceeded (4)" } });
+});
+
+test("reaching maxTurns idles the node (turn_limit); more turns continue it; replay is identical", async () => {
+	const strict = conversation({ submits: [{ answer: 0 }, { answer: 0 }, { answer: 0 }, { answer: 0 }, { answer: 5 }] }, { submit: { answer: 5 } });
+	const first = await run("submit", { strict });
+	assert.deepEqual(first.result.status, { type: "idle", reason: null });
+	const node = first.result.run.nodes[0]!;
+	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "turn_limit", used: 4, limit: 4 });
+	assert.ok(first.log.some((e) => e.type === "turn_limit_reached"));
+	// An answer without turns is refused; with turns it continues the same node.
+	await assert.rejects(runWorkflow({ workflow, dir: first.dir, executor: new FakeExecutor({ strict }), confine: "off", sends: [{ node: "#0", text: "go on" }], inboxPollMs: null }), /no_turns_left/);
+	const executor = new FakeExecutor({ strict });
+	const done = await runWorkflow({ workflow, dir: first.dir, executor, confine: "off", sends: [{ node: "#0", text: "Continue.", turns: 3 }], inboxPollMs: null });
+	assert.deepEqual(done.outcome, { type: "done", value: { answer: 5 } });
+	assert.deepEqual(executor.calls.map((c) => [c.turn, c.turnLimit]), [[4, 7]]);
+	// A resume replays from the journal: the same snapshot, nothing called.
+	const again = new FakeExecutor({});
+	const replayed = await runWorkflow({ workflow, dir: first.dir, executor: again, confine: "off", inboxPollMs: null });
+	assert.equal(replayed.snapshot, done.snapshot);
+	assert.equal(again.calls.length, 0);
 });
