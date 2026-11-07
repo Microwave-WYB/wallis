@@ -138,9 +138,11 @@ async function run<O extends TSchema>(spec: AgentSpec<O>, input: unknown, onDeta
 		turns++;
 		save();
 		if (spec.onTurn) {
-			const u = (last as { usage?: { input?: number; output?: number; cacheRead?: number } } | undefined)?.usage;
+			// turn_end can fire after the tool results: take the usage of the newest assistant reply.
+			const reply = [...agent.state.messages].reverse().find((m) => m.role === "assistant");
+			const u = (reply as { usage?: { input?: number; output?: number; cacheRead?: number } } | undefined)?.usage;
 			const usage: Usage = { input: u?.input ?? 0, output: u?.output ?? 0, cacheRead: u?.cacheRead ?? 0 };
-			spec.onTurn({ turn: turns, text: textOf(last), usage });
+			spec.onTurn({ turn: turns, text: textOf(reply), usage });
 		}
 		if (turns >= limit && !result) agent.abort();
 	});
