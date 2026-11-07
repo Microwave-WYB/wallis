@@ -410,6 +410,15 @@ pub type Event {
   CancelRequested
   /// Ownership: who may wait on, answer and steer the run.
   Claimed(owner: String)
+  /// A message to a running node, delivered at its next step boundary.
+  Steered(node: String, text: String, message_id: String)
+  /// The running node's current generation or tool was aborted.
+  Interrupted(node: String)
+  /// Issue no new calls until `ResumeRequested`.
+  PauseRequested
+  ResumeRequested
+  /// Fails one node as an agent failure, for the body to handle.
+  NodeCancelled(node: String)
   BodyFinished(output: Value)
   BodyFailed(reason: FailReason)
 }
@@ -521,6 +530,31 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("type", json.string("claimed")),
         #("owner", json.string(owner)),
       ])
+    Steered(node:, text:, message_id:) ->
+      json.object([
+        #("type", json.string("steered")),
+        #("node", json.string(node)),
+        #("text", json.string(text)),
+        #("message_id", json.string(message_id)),
+      ])
+    Interrupted(node:) ->
+      json.object([
+        #("type", json.string("interrupted")),
+        #("node", json.string(node)),
+      ])
+    PauseRequested ->
+      json.object([
+        #("type", json.string("pause_requested")),
+      ])
+    ResumeRequested ->
+      json.object([
+        #("type", json.string("resume_requested")),
+      ])
+    NodeCancelled(node:) ->
+      json.object([
+        #("type", json.string("node_cancelled")),
+        #("node", json.string(node)),
+      ])
     BodyFinished(output:) ->
       json.object([
         #("type", json.string("body_finished")),
@@ -618,6 +652,22 @@ pub fn event_decoder() -> decode.Decoder(Event) {
     "claimed" -> {
       use owner <- decode.field("owner", decode.string)
       decode.success(Claimed(owner:))
+    }
+    "steered" -> {
+      use node <- decode.field("node", decode.string)
+      use text <- decode.field("text", decode.string)
+      use message_id <- decode.field("message_id", decode.string)
+      decode.success(Steered(node:, text:, message_id:))
+    }
+    "interrupted" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(Interrupted(node:))
+    }
+    "pause_requested" -> decode.success(PauseRequested)
+    "resume_requested" -> decode.success(ResumeRequested)
+    "node_cancelled" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(NodeCancelled(node:))
     }
     "body_finished" -> {
       use output <- decode.field("output", json_value.decoder())
@@ -958,6 +1008,7 @@ pub type Refusal {
   ReducerRejected(field: String, message: String)
   NeedsUnmet(agent: String, need: String)
   NotIdle(node: String)
+  NodeNotRunning(node: String)
   UnknownAlias(alias: String)
   JournalMissing(request: String)
   InvalidDeclaration(message: String)
@@ -1023,6 +1074,11 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
     NotIdle(node:) ->
       json.object([
         #("type", json.string("not_idle")),
+        #("node", json.string(node)),
+      ])
+    NodeNotRunning(node:) ->
+      json.object([
+        #("type", json.string("node_not_running")),
         #("node", json.string(node)),
       ])
     UnknownAlias(alias:) ->
@@ -1108,6 +1164,10 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
     "not_idle" -> {
       use node <- decode.field("node", decode.string)
       decode.success(NotIdle(node:))
+    }
+    "node_not_running" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(NodeNotRunning(node:))
     }
     "unknown_alias" -> {
       use alias <- decode.field("alias", decode.string)
@@ -1274,6 +1334,7 @@ pub fn run_status_decoder() -> decode.Decoder(RunStatus) {
 pub type IdleReason {
   BudgetExhausted(kind: BudgetKind, spent: Float, limit: Float)
   ExecutorUnavailable(alias: String, error: String)
+  PausedByUser
 }
 
 pub fn idle_reason_to_json(idle_reason: IdleReason) -> json.Json {
@@ -1290,6 +1351,10 @@ pub fn idle_reason_to_json(idle_reason: IdleReason) -> json.Json {
         #("type", json.string("executor_unavailable")),
         #("alias", json.string(alias)),
         #("error", json.string(error)),
+      ])
+    PausedByUser ->
+      json.object([
+        #("type", json.string("paused_by_user")),
       ])
   }
 }
@@ -1308,7 +1373,8 @@ pub fn idle_reason_decoder() -> decode.Decoder(IdleReason) {
       use error <- decode.field("error", decode.string)
       decode.success(ExecutorUnavailable(alias:, error:))
     }
-    _ -> decode.failure(ExecutorUnavailable(alias: "", error: ""), "IdleReason")
+    "paused_by_user" -> decode.success(PausedByUser)
+    _ -> decode.failure(PausedByUser, "IdleReason")
   }
 }
 

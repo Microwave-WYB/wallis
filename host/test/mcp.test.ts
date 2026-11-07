@@ -32,7 +32,7 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 	try {
 		assert.match(client.getInstructions() ?? "", /npx wallis wait <run_id>/);
 		const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-		assert.deepEqual(tools, ["cancel", "get_run", "run", "send", "wait"]);
+		assert.deepEqual(tools, ["cancel", "get_run", "interrupt", "list_runs", "node_transcript", "pause", "resume", "run", "run_log", "run_tree", "send", "wait"]);
 		assert.match((await client.listTools()).tools.find((t) => t.name === "run")!.description!, /ask, two-node/);
 
 		const started = await call("run", { workflow: "ask", input: { topic: "folds" }, seed: 3 });
@@ -61,6 +61,17 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 		assert.deepEqual(after.data.nodes.map((n: { agent: string; status: { type: string } }) => [n.agent, n.status.type]), [["scout", "node_done"], ["writer", "node_done"]]);
 		assert.match(after.text, /Nothing else is pending/);
 
+		// Monitoring for the owner: runs, tree, log and transcript, capped with cursors.
+		assert.match((await call("list_runs", {})).text, new RegExp(`${runId}  ask  finished`));
+		assert.match((await call("run_tree", { run_id: runId })).text, /#0  scout  fake\/default  done \(submitted\)\n {2}#1  writer/);
+		const log1 = await call("run_log", { run_id: runId, limit: 3 });
+		assert.equal(log1.data.items.length, 3);
+		assert.equal(log1.data.next, 3);
+		const log2 = await call("run_log", { run_id: runId, since: log1.data.next });
+		assert.equal(log2.data.items[0].seq, 3);
+		const transcript = await call("node_transcript", { run_id: runId, node_id: "#0" });
+		assert.match(transcript.text, /"kind":"user","text":"newcomers"/);
+
 		// wait returns "still running" at its cap; cancel ends an idle run.
 		const second = await call("run", { workflow: "ask", input: { topic: "x" } });
 		const cancelled = await call("cancel", { run_id: second.data.run_id });
@@ -76,7 +87,7 @@ test("MCP over stdio: wallis serve lists tools and runs a workflow", async () =>
 	const client = new Client({ name: "test", version: "0.0.0" });
 	await client.connect(transport);
 	try {
-		assert.equal((await client.listTools()).tools.length, 5);
+		assert.equal((await client.listTools()).tools.length, 12);
 		const r = (await client.callTool({ name: "run", arguments: { workflow: "two-node", input: { topic: "x" } } })) as Result;
 		const runId = JSON.parse(r.content[1]!.text).run_id;
 		const w = (await client.callTool({ name: "wait", arguments: { run_id: runId, timeout_s: 10 } })) as Result;

@@ -1,10 +1,10 @@
 // Reading runs without driving them: status from a refold of the log, the
 // derived `stopped`, what needs attention, and agent-readable summaries.
 
-import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
-import { blobPath, refsIn, shareBlobs } from "./artifacts.ts";
+import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
 import { Core, type Event, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
@@ -101,6 +101,8 @@ function describeReason(reason: IdleReason): string {
 			return `the ${reason.kind} budget is spent (${reason.spent} of ${reason.limit})`;
 		case "executor_unavailable":
 			return `the executor cannot serve model alias ${reason.alias}: ${reason.error}`;
+		case "paused_by_user":
+			return "its owner paused it";
 	}
 }
 
@@ -141,7 +143,9 @@ export function describe(items: readonly Attention[]): string {
 						`Run ${item.runId} is paused: ${describeReason(item.reason)}.`,
 						item.reason.type === "budget_exhausted"
 							? `Raise it with: npx wallis resume ${item.runId} --budget ${item.reason.kind === "compute_minutes" ? "computeMinutes" : item.reason.kind}=<new limit>`
-							: `Fix the executor or rebind the alias, then: npx wallis resume ${item.runId} --model ${item.reason.alias}=<provider/model:thinking>`,
+							: item.reason.type === "executor_unavailable"
+								? `Fix the executor or rebind the alias, then: npx wallis resume ${item.runId} --model ${item.reason.alias}=<provider/model:thinking>`
+								: `Continue it with: npx wallis resume ${item.runId}`,
 					].join("\n");
 				case "finished":
 					return `Run ${item.runId} finished, ${describeOutcome(item.outcome)}.`;
@@ -266,4 +270,76 @@ export async function waitForOwn(root: string, caller: Owner, options: { timeout
 		if (options.timeoutMs !== undefined && Date.now() - start >= options.timeoutMs) return null;
 		await new Promise((r) => setTimeout(r, options.pollMs ?? 200));
 	}
+}
+
+// --- Monitoring ------------------------------------------------------------------
+
+/** Every run under `root`, oldest first. */
+export function listRunViews(root: string): RunView[] {
+	return listRuns(root).map((p) => inspectRun(p.dir));
+}
+
+/** One line per run, for `wallis ls` and `list_runs`. */
+export function runLine(v: RunView): string {
+	const status = v.run.status?.type ?? "unknown";
+	const reason = v.run.status?.type === "idle" && v.run.status.reason ? ` (${v.run.status.reason.type})` : "";
+	const outcome = v.run.status?.type === "finished" ? ` (${v.run.status.outcome.type})` : "";
+	return `${v.runId}  ${v.workflow ?? "?"}  ${status}${reason}${outcome}${v.stopped ? ", stopped" : ""}  owner=${v.owner ?? "none"}${v.owner && !v.ownerAlive ? " (gone)" : ""}`;
+}
+
+/**
+ * The run's nodes as a tree: request ids encode branches (`#2.a#0`) and
+ * sub-workflows (`#3>retry#0`), so depth is the number of nested segments.
+ */
+export function renderTree(v: RunView): string {
+	const lines = [runLine(v)];
+	for (const node of v.run.nodes) {
+		const depth = (node.id.match(/[.>]/g) ?? []).length;
+		const status =
+			node.status.type === "node_idle"
+				? `idle: ${truncate(node.status.last_message, 80)}`
+				: node.status.type === "node_done"
+					? `done (${node.status.outcome.type})`
+					: "running";
+		lines.push(`${"  ".repeat(depth + 1)}${node.id}  ${node.agent}  ${node.model}  ${status}`);
+	}
+	return lines.join("\n");
+}
+
+export const PAGE_CAP = 200;
+const ENTRY_CAP = 2000;
+
+export interface Page<T> {
+	readonly items: T[];
+	/** Pass back as `since` for the next page; equal to the total when there is no more. */
+	readonly next: number;
+	readonly total: number;
+}
+
+function page<T>(all: readonly T[], since: number | undefined, limit: number | undefined): Page<T> {
+	const from = Math.max(0, since ?? 0);
+	const n = Math.min(PAGE_CAP, Math.max(1, limit ?? 50));
+	const items = all.slice(from, from + n);
+	return { items, next: from + items.length, total: all.length };
+}
+
+/** The run's event log from `since` (an event index), capped. */
+export function runLog(dir: string, since?: number, limit?: number): Page<{ seq: number; event: string }> {
+	const events = new EventLog(runPaths(dir).log).read();
+	return page(
+		events.map((e, i) => ({ seq: i, event: truncate(JSON.stringify(e), ENTRY_CAP) })),
+		since,
+		limit,
+	);
+}
+
+/** A node's observational transcript (messages, tool calls and results), capped. */
+export function nodeTranscript(dir: string, node: string, since?: number, limit?: number): Page<{ seq: number; entry: string }> {
+	const file = join(runPaths(dir).dir, "nodes", `${nodeDirName(node)}.jsonl`);
+	const lines = existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
+	return page(
+		lines.map((l, i) => ({ seq: i, entry: truncate(l, ENTRY_CAP) })),
+		since,
+		limit,
+	);
 }

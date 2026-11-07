@@ -392,6 +392,7 @@ export type Refusal =
 	| { readonly type: "reducer_rejected"; readonly field: string; readonly message: string }
 	| { readonly type: "needs_unmet"; readonly agent: string; readonly need: string }
 	| { readonly type: "not_idle"; readonly node: string }
+	| { readonly type: "node_not_running"; readonly node: string }
 	| { readonly type: "unknown_alias"; readonly alias: string }
 	| { readonly type: "journal_missing"; readonly request: string }
 	| { readonly type: "invalid_declaration"; readonly message: string }

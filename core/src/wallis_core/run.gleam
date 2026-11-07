@@ -53,6 +53,12 @@ type Lifecycle {
   Ended(Outcome)
 }
 
+/// Whether new calls and scripts are issued: `Holding` after a pause.
+type Admission {
+  Admitting
+  Holding
+}
+
 type Run {
   Run(
     lifecycle: Lifecycle,
@@ -63,6 +69,7 @@ type Run {
     budget: types.Budget,
     executor: Option(String),
     owner: Option(String),
+    admission: Admission,
     state: Dict(String, Value),
     requests: Dict(String, Record),
     journal: Dict(String, Entry),
@@ -158,6 +165,7 @@ fn start(
           budget: workflow.budget,
           executor: None,
           owner: None,
+          admission: Admitting,
           state:,
           requests: dict.new(),
           journal: dict.new(),
@@ -284,6 +292,27 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
     RetryUnavailable -> retry_unavailable(run)
     CancelRequested -> finish(run, Cancelled)
     types.Claimed(owner:) -> #(Run(..run, owner: Some(owner)), [Checkpoint])
+    types.Steered(node:, text:, ..) -> steer(run, node, text)
+    types.Interrupted(node:) ->
+      case dict.get(run.requests, node) {
+        Ok(Record(progress: AwaitingAgent(..), ..)) -> #(run, [Checkpoint])
+        _ -> #(run, [Refuse(None, types.NodeNotRunning(node))])
+      }
+    // A pause or resume that changes nothing is not logged.
+    types.PauseRequested ->
+      case run.admission {
+        Holding -> #(run, [])
+        Admitting -> #(Run(..run, admission: Holding), [Checkpoint])
+      }
+    types.ResumeRequested ->
+      case run.admission {
+        Admitting -> #(run, [])
+        Holding -> {
+          let #(run, effects) = unblock(Run(..run, admission: Admitting))
+          #(run, [Checkpoint, ..effects])
+        }
+      }
+    types.NodeCancelled(node:) -> cancel_node(run, node)
     BodyFinished(output:) -> finish(run, Done(output))
     BodyFailed(reason:) -> finish(run, Failed(reason))
     Started(..) | Resumed(..) -> #(run, [])
@@ -392,7 +421,7 @@ fn live_request(
           )
         Ok(agent) -> {
           let kind = AgentKind(name, input)
-          case budget_check(run) {
+          case admit(run) {
             Error(reason) -> #(
               record(run, id, Record(d, branch, kind, Blocked(reason))),
               [],
@@ -422,7 +451,10 @@ fn live_request(
       }
     Script(script:, args:) -> {
       let kind = ScriptKind(script, args)
-      case list.contains(run.workflow.scripts, script), compute_check(run) {
+      case
+        list.contains(run.workflow.scripts, script),
+        result.try(admission(run), fn(_) { compute_check(run) })
+      {
         False, _ ->
           settle(
             run,
@@ -521,6 +553,18 @@ fn script_effect(
     }),
     digest: d,
   )
+}
+
+fn admission(run: Run) -> Result(Nil, IdleReason) {
+  case run.admission {
+    Admitting -> Ok(Nil)
+    Holding -> Error(types.PausedByUser)
+  }
+}
+
+/// A pause, then the budget: what holds a new agent call back.
+fn admit(run: Run) -> Result(Nil, IdleReason) {
+  result.try(admission(run), fn(_) { budget_check(run) })
 }
 
 /// Checked before every agent call. An exhausted budget pauses the call.
@@ -804,6 +848,46 @@ fn sent(run: Run, node: String, text: String) -> #(Run, List(Effect)) {
   }
 }
 
+/// A message to a running node joins its conversation; the executor
+/// delivers it at the next step boundary. Only the node's eventual output is
+/// journaled, so replay stays deterministic.
+fn steer(run: Run, node: String, text: String) -> #(Run, List(Effect)) {
+  case dict.get(run.requests, node) {
+    Ok(Record(progress: AwaitingAgent(conversation: c), ..) as rec) -> {
+      let c =
+        Conversation(
+          ..c,
+          transcript: list.append(c.transcript, [Message(User, text)]),
+        )
+      #(record(run, node, Record(..rec, progress: AwaitingAgent(c))), [
+        Checkpoint,
+      ])
+    }
+    _ -> #(run, [Refuse(None, types.NodeNotRunning(node))])
+  }
+}
+
+/// Fails one node as an agent failure; the body gets a typed error.
+fn cancel_node(run: Run, node: String) -> #(Run, List(Effect)) {
+  case dict.get(run.requests, node) {
+    Ok(Record(kind: AgentKind(agent:, ..), progress:, ..)) ->
+      case progress {
+        AwaitingAgent(..) | AgentWaiting(..) | Unavailable(..) | Blocked(..) -> {
+          let #(run, effects) =
+            settle_recorded(
+              run,
+              node,
+              None,
+              Errored(AgentGaveUp(agent, "cancelled by the owner")),
+            )
+          #(run, [Checkpoint, ..effects])
+        }
+        _ -> #(run, [Refuse(None, types.NodeNotRunning(node))])
+      }
+    _ -> #(run, [Refuse(None, types.NodeNotRunning(node))])
+  }
+}
+
 fn rebind(run: Run, alias: String, to: String) -> #(Run, List(Effect)) {
   case dict.has_key(run.models, alias) {
     False -> #(run, [Refuse(None, UnknownAlias(alias))])
@@ -826,43 +910,46 @@ fn raise_budget(
     Turns -> types.Budget(..b, turns: Some(float.round(limit)))
     ComputeMinutes -> types.Budget(..b, compute_minutes: Some(limit))
   }
-  let run = Run(..run, budget:)
-  let #(run, effects) =
-    run.requests
-    |> dict.to_list
-    |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
-    |> list.fold(#(run, []), fn(acc, entry) {
-      let #(run, effects) = acc
-      let id = entry.0
-      case entry.1 {
-        Record(kind: AgentKind(agent:, input:), progress: Blocked(_), ..) as rec ->
-          case budget_check(run), find_agent(run.workflow, agent) {
-            Ok(Nil), Ok(a) -> {
-              let c = snapshot_view(run, a)
-              case call_effect(run, id, agent, input, rec.digest, c) {
-                Ok(call) -> #(
-                  record(run, id, Record(..rec, progress: AwaitingAgent(c))),
-                  list.append(effects, [call]),
-                )
-                Error(_) -> acc
-              }
-            }
-            _, _ -> acc
-          }
-        Record(kind: ScriptKind(script:, args:), progress: Blocked(_), ..) as rec ->
-          case compute_check(run) {
-            Ok(Nil) -> #(
-              record(run, id, Record(..rec, progress: AwaitingScript)),
-              list.append(effects, [
-                script_effect(run, id, script, args, rec.digest),
-              ]),
-            )
-            Error(_) -> acc
-          }
-        _ -> acc
-      }
-    })
+  let #(run, effects) = unblock(Run(..run, budget:))
   #(run, [Checkpoint, ..effects])
+}
+
+/// Issues every blocked request that the pause and the budget now admit.
+fn unblock(run: Run) -> #(Run, List(Effect)) {
+  run.requests
+  |> dict.to_list
+  |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
+  |> list.fold(#(run, []), fn(acc, entry) {
+    let #(run, effects) = acc
+    let id = entry.0
+    case entry.1 {
+      Record(kind: AgentKind(agent:, input:), progress: Blocked(_), ..) as rec ->
+        case admit(run), find_agent(run.workflow, agent) {
+          Ok(Nil), Ok(a) -> {
+            let c = snapshot_view(run, a)
+            case call_effect(run, id, agent, input, rec.digest, c) {
+              Ok(call) -> #(
+                record(run, id, Record(..rec, progress: AwaitingAgent(c))),
+                list.append(effects, [call]),
+              )
+              Error(_) -> acc
+            }
+          }
+          _, _ -> acc
+        }
+      Record(kind: ScriptKind(script:, args:), progress: Blocked(_), ..) as rec ->
+        case result.try(admission(run), fn(_) { compute_check(run) }) {
+          Ok(Nil) -> #(
+            record(run, id, Record(..rec, progress: AwaitingScript)),
+            list.append(effects, [
+              script_effect(run, id, script, args, rec.digest),
+            ]),
+          )
+          Error(_) -> acc
+        }
+      _ -> acc
+    }
+  })
 }
 
 fn script_settled(
@@ -1037,6 +1124,8 @@ pub fn status(run: RunState) -> Option(RunStatus) {
         })
       case running, reason, waiting {
         True, _, _ -> Some(Running)
+        False, _, _ if r.admission == Holding ->
+          Some(Idle(Some(types.PausedByUser)))
         False, Ok(reason), _ -> Some(Idle(Some(reason)))
         False, Error(Nil), True -> Some(Idle(None))
         False, Error(Nil), False -> Some(Running)

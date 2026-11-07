@@ -227,6 +227,44 @@ Prototype choices:
 - A fork is claimed by whoever forked it.
 - Truncation: questions at 1200 characters, result summaries at 600.
 
+## Monitoring and steering (decided, round 3)
+
+- **Per-node transcripts** live in `.wallis/runs/<id>/nodes/<node>.jsonl`:
+  messages, tool calls (direct and nested) and results. They are
+  observational only and never affect replay.
+- **CLI:** `wallis ls`, `wallis tree <run>`, `wallis log <run> [--follow]`,
+  `wallis show <run> <node>`.
+- **MCP tools for the owner:** `list_runs`, `run_tree`,
+  `node_transcript(run, node, since?, limit?)` and `run_log(run, since?)`,
+  all capped with cursors. Also `interrupt`, `pause`, `resume`, and
+  `cancel` with an optional `node_id`.
+- **`send` to a running node** steers it. The message reaches the node at
+  its next step boundary (after a codemode script ends) and is logged as
+  `Steered`.
+- **`interrupt(run, node, text?)`** aborts the current generation or tool,
+  then delivers the message. `Interrupted` is logged; the message follows
+  as an ordinary `Sent` once the turn has ended.
+- **`pause` and `resume`:** pause issues no new calls, and the run goes
+  `Idle(PausedByUser)` once in-flight work ends; resume continues.
+- **`cancel --node`** fails one node as an agent failure for the body.
+- Steering changes only the node's eventual output, which is journaled, so
+  workflow replay stays deterministic.
+
+Prototype choices:
+
+- `Steered` appends a user message to the node's conversation in the core.
+  A node reissued after a crash therefore carries the steer, and resumes
+  with it as its next message.
+- Pause is an admission state in the core (`Admitting | Holding`). A held
+  request is `Blocked(PausedByUser)`, and `ResumeRequested` issues it like a
+  budget raise. A pause or resume that changes nothing is not logged.
+  `wallis resume` (and MCP `resume`) also lifts a pause.
+- Steer, interrupt, pause and cancel go through the run's inbox to the live
+  driver. Without a driver, pause and cancel-node are applied under the lock;
+  interrupt then has nothing to abort and is refused.
+- Pages: at most 200 entries (default 50), each truncated to 2000
+  characters; the cursor is the next entry index.
+
 ## Recovery (decided)
 
 - Result-defining changes are refused on resume: workflow digest, pinned

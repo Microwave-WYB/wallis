@@ -55,6 +55,8 @@ export interface SessionOptions {
 	/** Messages to idle nodes, sent once the body has replayed. */
 	readonly sends?: readonly { readonly node: string; readonly text: string }[];
 	readonly cancel?: boolean;
+	/** Resume: lift a pause (`resume_requested`). */
+	readonly unpause?: boolean;
 	/** New runs: the owner, logged as `claimed` right after `started`. */
 	readonly owner?: string;
 	/** How often to read the inbox, in ms; `null` to not poll. */
@@ -143,6 +145,8 @@ export class Session {
 	readonly #requests: Event[] = [];
 	readonly #deliveries: [string, Reply][] = [];
 	readonly #seen = new Set<string>();
+	/** Messages to send to a node once its interrupted turn ends. */
+	readonly #afterInterrupt = new Map<string, string>();
 	#core = new Core();
 	#sandbox: Sandbox | null = null;
 	#decl!: Declarations;
@@ -175,13 +179,61 @@ export class Session {
 		return this.#core.snapshot();
 	}
 
-	/** Sends a message to an idle node. Returns the refusal if the core refused it. */
+	/**
+	 * Sends a message to a node: an idle node continues with it; a running
+	 * node is steered (the message reaches it at its next step boundary,
+	 * logged as `steered`). Returns the refusal if the core refused it.
+	 */
 	send(node: string, text: string, messageId = newMessageId()): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		this.#seen.add(messageId);
-		const refusals = this.#feed({ type: "sent", node, text, message_id: messageId });
+		const running = this.#core.snapshot().nodes.find((n) => n.id === node)?.status.type === "node_running";
+		const refusals = running
+			? this.#feed({ type: "steered", node, text, message_id: messageId })
+			: this.#feed({ type: "sent", node, text, message_id: messageId });
+		if (running && refusals.length === 0) {
+			this.#transcriptLog(node)({ kind: "user", text: `[steer] ${text}` });
+			this.steerNode(node, text);
+		}
 		this.#settle();
 		return refusals[0] ?? null;
+	}
+
+	/** Aborts a running node's current generation or tool; `text`, if given, is sent once it stops. */
+	interrupt(node: string, text?: string): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const refusals = this.#feed({ type: "interrupted", node });
+		if (refusals.length > 0) return refusals[0]!;
+		if (text !== undefined) this.#afterInterrupt.set(node, text);
+		this.interruptNode(node);
+		return null;
+	}
+
+	/** Issues no new calls; in-flight ones finish. The run goes Idle(PausedByUser). */
+	pause(): void {
+		if (this.#settled) return;
+		this.#feed({ type: "pause_requested" });
+		this.#settle();
+	}
+
+	unpause(): void {
+		if (this.#settled) return;
+		this.#feed({ type: "resume_requested" });
+		this.#pump();
+		this.#settle();
+	}
+
+	/** Fails one node as an agent failure; the body handles it. */
+	cancelNode(node: string): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const refusals = this.#feed({ type: "node_cancelled", node });
+		if (refusals.length > 0) return refusals[0]!;
+		this.interruptNode(node);
+		this.#closeNode(node);
+		discardNode(this.paths.dir, node);
+		this.#pump();
+		this.#settle();
+		return null;
 	}
 
 	cancel(): void {
@@ -260,6 +312,7 @@ export class Session {
 			this.#feed({ type: "budget_raised", kind: kind as BudgetKind, limit: limit! });
 		}
 		this.#feed({ type: "retry_unavailable" });
+		if (o.unpause) this.unpause();
 		for (const s of o.sends ?? []) {
 			const refusal = this.send(s.node, s.text);
 			if (refusal) throw new RunRefused(refusal);
@@ -322,6 +375,10 @@ export class Session {
 			appendFileSync(this.#doneInbox(), `${entry.id}\n`);
 			if (entry.type === "cancel") this.cancel();
 			else if (entry.type === "claim") this.#feed({ type: "claimed", owner: entry.owner });
+			else if (entry.type === "pause") this.pause();
+			else if (entry.type === "resume") this.unpause();
+			else if (entry.type === "interrupt") this.interrupt(entry.node, entry.text);
+			else if (entry.type === "cancel_node") this.cancelNode(entry.node);
 			else {
 				const refusal = this.send(entry.node, entry.text, entry.id);
 				if (refusal) process.stderr.write(`wallis: message ${entry.id} to ${entry.node} refused: ${JSON.stringify(refusal)}\n`);
@@ -539,6 +596,11 @@ export class Session {
 						log({ kind: "turn", result: turn.type, usage });
 						if (turn.type === "ended") {
 							this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
+							const parked = this.#afterInterrupt.get(effect.id);
+							if (parked !== undefined) {
+								this.#afterInterrupt.delete(effect.id);
+								this.send(effect.id, parked);
+							}
 							return;
 						}
 						if (turn.type === "agent_error") {

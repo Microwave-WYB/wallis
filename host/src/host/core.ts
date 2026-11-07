@@ -30,6 +30,11 @@ export type Event =
 	| { type: "retry_unavailable" }
 	| { type: "cancel_requested" }
 	| { type: "claimed"; owner: string }
+	| { type: "steered"; node: string; text: string; message_id: string }
+	| { type: "interrupted"; node: string }
+	| { type: "pause_requested" }
+	| { type: "resume_requested" }
+	| { type: "node_cancelled"; node: string }
 	| { type: "body_finished"; output: Json }
 	| { type: "body_failed"; reason: FailReason };
 
@@ -39,7 +44,8 @@ export type Outcome = { type: "done"; value: Json } | { type: "failed"; reason: 
 
 export type IdleReason =
 	| { type: "budget_exhausted"; kind: BudgetKind; spent: number; limit: number }
-	| { type: "executor_unavailable"; alias: string; error: string };
+	| { type: "executor_unavailable"; alias: string; error: string }
+	| { type: "paused_by_user" };
 
 export type RunStatus = { type: "running" } | { type: "idle"; reason: IdleReason | null } | { type: "finished"; outcome: Outcome };
 

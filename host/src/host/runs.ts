@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import type { Json, Refusal } from "../sdk/index.ts";
 import type { BudgetKind } from "./core.ts";
 import type { Executor, ScriptRunner } from "./executor.ts";
-import { inspectRun, type RunView } from "./query.ts";
+import { applyControl, inspectRun, type RunView } from "./query.ts";
 import { type Session, type SessionOptions, startSession } from "./session.ts";
 import { mayControl, NotOwner, type Owner, serverOwner } from "./owner.ts";
 import { newRunId, runPaths, runsDir } from "./store.ts";
@@ -62,6 +62,7 @@ export interface ResumeRun {
 	readonly budget?: Readonly<Partial<Record<BudgetKind, number>>>;
 	readonly sends?: readonly { readonly node: string; readonly text: string }[];
 	readonly cancel?: boolean;
+	readonly unpause?: boolean;
 }
 
 /** The runs this process drives, one session at a time per run. */
@@ -116,9 +117,41 @@ export class Runs {
 				if (refusal) throw new SendRefused(refusal);
 			}
 			if (request.cancel) live.cancel();
+			if (request.unpause) live.unpause();
 			return live;
 		}
 		return this.#track(await startSession({ ...this.#options(resolveRunDir(this.root, runId)), ...request }));
+	}
+
+	/** Aborts a running node of a live run; `text` is sent once it stops. */
+	interrupt(runId: string, node: string, text?: string): void {
+		this.control(runId);
+		const live = this.#live.get(runId);
+		if (!live || live.settled) throw new SendRefused({ type: "node_not_running", node });
+		const refusal = live.interrupt(node, text);
+		if (refusal) throw new SendRefused(refusal);
+	}
+
+	async pause(runId: string): Promise<void> {
+		this.control(runId);
+		const live = this.#live.get(runId);
+		if (live && !live.settled) return live.pause();
+		const refusal = applyControl(resolveRunDir(this.root, runId), { type: "pause_requested" });
+		if (refusal) throw new SendRefused(refusal);
+	}
+
+	async unpause(runId: string): Promise<void> {
+		this.control(runId);
+		const live = this.#live.get(runId);
+		if (live && !live.settled) return live.unpause();
+		await this.resume(runId, { unpause: true });
+	}
+
+	async cancelNode(runId: string, node: string): Promise<void> {
+		this.control(runId);
+		const live = this.#live.get(runId);
+		const refusal = live && !live.settled ? live.cancelNode(node) : applyControl(resolveRunDir(this.root, runId), { type: "node_cancelled", node });
+		if (refusal) throw new SendRefused(refusal);
 	}
 
 	view(runId: string): RunView {

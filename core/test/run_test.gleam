@@ -647,3 +647,71 @@ pub fn claim_is_logged_and_works_on_finished_runs_test() {
     replay_from(s, [types.BodyFinished(JNull), types.Claimed("harness:b")])
   assert snapshot_get(s, "owner") == JString("harness:b")
 }
+
+// --- Steering ---
+
+pub fn steering_a_running_node_is_logged_and_joins_its_conversation_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.Steered("#0", "focus on recall", "m1"),
+  ]
+  let #(s, effects, log) = replay(events)
+  assert effects == [Checkpoint]
+  assert list.length(log) == 3
+  // A reissue after a kill carries the steering message.
+  let #(s2, _) = run.step(s, Resumed(pin()))
+  let assert #(
+    _,
+    [CallAgent(transcript: [Message(User, "focus on recall")], ..)],
+  ) = run.step(s2, call("#0", "worker", JNull))
+  // Only the eventual output is journaled.
+  let done = list.append(events, [returned("#0", summary("recall first"))])
+  assert state_of(done, "runs") == JArray([JString("recall first")])
+  // Steering a node that is not running is refused.
+  assert last(list.append(done, [types.Steered("#0", "late", "m2")]))
+    == [Refuse(None, types.NodeNotRunning("#0"))]
+}
+
+pub fn interrupt_is_logged_for_a_running_node_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.Interrupted("#0"),
+  ]
+  let #(_, effects, log) = replay(events)
+  assert effects == [Checkpoint]
+  assert list.length(log) == 3
+  assert last([started(basic()), types.Interrupted("#9")])
+    == [Refuse(None, types.NodeNotRunning("#9"))]
+}
+
+pub fn pause_holds_new_calls_until_resume_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.PauseRequested,
+    returned("#0", summary("s0")),
+    call("#1", "worker", JNull),
+  ]
+  // The in-flight call finished; the new one is held.
+  assert last(events) == []
+  assert status_after(events) == Some(Idle(Some(types.PausedByUser)))
+  let resumed = list.append(events, [types.ResumeRequested])
+  let assert [CallAgent(id: "#1", ..)] = last(resumed)
+  assert status_after(resumed) == Some(Running)
+}
+
+pub fn cancelling_a_node_fails_it_for_the_body_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.NodeCancelled("#0"),
+  ]
+  assert last(events)
+    == [Fail("#0", AgentGaveUp("worker", "cancelled by the owner"))]
+  // A late result is ignored.
+  assert last(list.append(events, [returned("#0", summary("late"))])) == []
+  assert last([started(basic()), types.NodeCancelled("#0")])
+    == [Refuse(None, types.NodeNotRunning("#0"))]
+}

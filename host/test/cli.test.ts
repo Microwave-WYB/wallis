@@ -53,6 +53,12 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	assert.match(waited.stdout, /finished, done/);
 	assert.equal(status(root, id).status.type, "finished");
 	assert.equal(wallis(root, ["pending"]).stdout, "");
+	// Monitoring.
+	assert.match(wallis(root, ["ls"]).stdout, new RegExp(`${id}  ask  finished \\(done\\)`));
+	assert.match(wallis(root, ["tree", id]).stdout, /#0  scout/);
+	assert.match(wallis(root, ["log", id, "--since", "1", "--limit", "1"]).stdout, /^1\t\{"type":"executor_changed"/);
+	assert.match(wallis(root, ["log", id, "--follow"]).stdout, /"type":"body_finished"/);
+	assert.match(wallis(root, ["show", id, "#0"]).stdout, /"kind":"user","text":"newcomers"/);
 
 	const log = logOf(root, id);
 	const sentEvents = log.filter((e) => e.type === "sent");

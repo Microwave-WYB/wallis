@@ -139,7 +139,11 @@ function releaseLock(paths: RunPaths, pid: number): void {
 export type InboxEntry =
 	| { readonly id: string; readonly type: "send"; readonly node: string; readonly text: string }
 	| { readonly id: string; readonly type: "cancel" }
-	| { readonly id: string; readonly type: "claim"; readonly owner: string };
+	| { readonly id: string; readonly type: "claim"; readonly owner: string }
+	| { readonly id: string; readonly type: "interrupt"; readonly node: string; readonly text?: string }
+	| { readonly id: string; readonly type: "pause" }
+	| { readonly id: string; readonly type: "resume" }
+	| { readonly id: string; readonly type: "cancel_node"; readonly node: string };
 
 export function newMessageId(): string {
 	return `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;

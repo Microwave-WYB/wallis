@@ -49,6 +49,8 @@ wallis resume <run> [--model alias=provider/model:thinking] [--budget usd=60]
 wallis fork <run> --at <events|node> [--model ...]
 wallis cancel <run> | wallis status <run> [--json]
 wallis export <run> <artifact> <dir>   # copy an artifact out of a run
+wallis ls | tree <run> | log <run> [--follow] | show <run> <node>   # monitoring
+wallis interrupt <run> <node> [text] | pause <run> | cancel <run> --node <node>   # steering
 wallis serve --executor <module>   # stdio MCP server: run, send, get_run, cancel, wait
 ```
 

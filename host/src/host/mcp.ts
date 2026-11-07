@@ -8,7 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Json } from "../sdk/index.ts";
 import { mayControl, NotOwner } from "./owner.ts";
-import { attention, claimable, describe, pending, type RunView, waitForAttention } from "./query.ts";
+import { attention, claimable, describe, listRunViews, nodeTranscript, pending, renderTree, runLine, runLog, type RunView, waitForAttention } from "./query.ts";
 import { type Runs, SendRefused } from "./runs.ts";
 import { RunRefused } from "./session.ts";
 import { runPaths, runsDir } from "./store.ts";
@@ -83,7 +83,7 @@ export function createMcpServer(runs: Runs): McpServer {
 	server.registerTool(
 		"send",
 		{
-			description: "Reply to a node that is waiting for a message (an agent that ended its turn with a question).",
+			description: "Reply to a node that is waiting for a message (an agent that ended its turn with a question), or steer a running node: the message reaches it at its next step boundary.",
 			inputSchema: { run_id: z.string(), node_id: z.string(), text: z.string() },
 		},
 		async ({ run_id, node_id, text }) => {
@@ -112,12 +112,111 @@ export function createMcpServer(runs: Runs): McpServer {
 
 	server.registerTool(
 		"cancel",
-		{ description: "Cancel a run. Completed work stays in its log.", inputSchema: { run_id: z.string() } },
-		async ({ run_id }) => {
+		{
+			description: "Cancel a run (completed work stays in its log), or with node_id fail just that node as an agent failure for the workflow to handle.",
+			inputSchema: { run_id: z.string(), node_id: z.string().optional() },
+		},
+		async ({ run_id, node_id }) => {
 			try {
-				await runs.resume(run_id, { cancel: true });
+				if (node_id) await runs.cancelNode(run_id, node_id);
+				else await runs.resume(run_id, { cancel: true });
 				const view = runs.view(run_id);
 				return reply(summary(view), data(view));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	const paged = (text: string, page: { items: unknown[]; next: number; total: number }) =>
+		reply(`${text}\n${page.items.length} of ${page.total}; next cursor: ${page.next}${page.next < page.total ? " (more)" : ""}`, JSON.parse(JSON.stringify(page)));
+
+	server.registerTool(
+		"list_runs",
+		{ description: "Every run in this project: status, owner, stopped.", inputSchema: {} },
+		async () => {
+			const views = listRunViews(runs.root);
+			return reply(views.map(runLine).join("\n") || "No runs.", views.map((v) => ({ run_id: v.runId, workflow: v.workflow, status: v.run.status, stopped: v.stopped, owner: v.owner })) as never);
+		},
+	);
+
+	server.registerTool(
+		"run_tree",
+		{ description: "A run's nodes as a tree (branches and sub-workflows), with agent, model and status.", inputSchema: { run_id: z.string() } },
+		async ({ run_id }) => {
+			try {
+				return reply(renderTree(runs.view(run_id)));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
+		"node_transcript",
+		{
+			description: "A node's transcript (messages, tool calls, results). Capped; pass the returned cursor as since for more.",
+			inputSchema: { run_id: z.string(), node_id: z.string(), since: z.number().int().min(0).optional(), limit: z.number().int().positive().optional() },
+		},
+		async ({ run_id, node_id, since, limit }) => {
+			try {
+				const page = nodeTranscript(runPaths(join(runsDir(runs.root), run_id)).dir, node_id, since, limit);
+				return paged(page.items.map((e) => `${e.seq}\t${e.entry}`).join("\n"), page);
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
+		"run_log",
+		{
+			description: "A run's event log. Capped; pass the returned cursor as since for more.",
+			inputSchema: { run_id: z.string(), since: z.number().int().min(0).optional(), limit: z.number().int().positive().optional() },
+		},
+		async ({ run_id, since, limit }) => {
+			try {
+				const page = runLog(runPaths(join(runsDir(runs.root), run_id)).dir, since, limit);
+				return paged(page.items.map((e) => `${e.seq}\t${e.event}`).join("\n"), page);
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
+		"interrupt",
+		{ description: "Abort a running node's current generation or tool, then deliver text (if given) to it.", inputSchema: { run_id: z.string(), node_id: z.string(), text: z.string().optional() } },
+		async ({ run_id, node_id, text }) => {
+			try {
+				runs.interrupt(run_id, node_id, text);
+				return reply(summary(runs.view(run_id)));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
+		"pause",
+		{ description: "Pause a run: no new calls are issued; it goes idle (paused_by_user) once in-flight work ends.", inputSchema: { run_id: z.string() } },
+		async ({ run_id }) => {
+			try {
+				await runs.pause(run_id);
+				return reply(summary(runs.view(run_id)));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
+		"resume",
+		{ description: "Resume a paused or stopped run.", inputSchema: { run_id: z.string() } },
+		async ({ run_id }) => {
+			try {
+				await runs.unpause(run_id);
+				return reply(summary(runs.view(run_id)));
 			} catch (error) {
 				return failure(error);
 			}

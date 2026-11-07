@@ -10,6 +10,8 @@
 //   wallis wait <run> [--timeout seconds] [--json]
 //   wallis pending [--json]
 //   wallis claim <run>
+//   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> <node>
+//   wallis interrupt <run> <node> [text] | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
 //   wallis fork <run> --at <events|node> [--model a=m]... [--detach]
 //   wallis export <run> <artifact> <dir>
@@ -23,7 +25,23 @@ import { parseArgs } from "node:util";
 import type { Json } from "../sdk/index.ts";
 import type { BudgetKind } from "../host/core.ts";
 import { EventLog } from "../host/log.ts";
-import { applyControl, attention, claimable, describe, exportArtifact, forkRun, inspectRun, pending, waitForAttention, waitForOwn } from "../host/query.ts";
+import {
+	applyControl,
+	attention,
+	claimable,
+	describe,
+	exportArtifact,
+	forkRun,
+	inspectRun,
+	listRunViews,
+	nodeTranscript,
+	pending,
+	renderTree,
+	runLine,
+	runLog,
+	waitForAttention,
+	waitForOwn,
+} from "../host/query.ts";
 import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { ProcessScripts } from "../host/scripts.ts";
@@ -47,6 +65,11 @@ const { values, positionals } = parseArgs({
 		json: { type: "boolean" },
 		timeout: { type: "string" },
 		at: { type: "string" },
+		since: { type: "string" },
+		limit: { type: "string" },
+		follow: { type: "boolean" },
+		node: { type: "string" },
+		unpause: { type: "boolean" },
 	},
 });
 
@@ -165,9 +188,10 @@ async function main(): Promise<number> {
 		case "drive": {
 			const dir = command === "drive" ? resolve(args[0]!) : resolveRun(root, args[0] ?? "");
 			if (command === "resume") control(dir);
-			const options = { models: pairs(values.model), budget: budgets(values.budget) };
+			// `resume` also lifts a pause.
+			const options = { models: pairs(values.model), budget: budgets(values.budget), unpause: command === "resume" || values.unpause === true };
 			if (values.detach) {
-				detach(dir, [...(values.model ?? []).flatMap((m) => ["--model", m]), ...(values.budget ?? []).flatMap((b) => ["--budget", b])]);
+				detach(dir, [...(values.model ?? []).flatMap((m) => ["--model", m]), ...(values.budget ?? []).flatMap((b) => ["--budget", b]), "--unpause"]);
 				out(`Resuming run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 				return 0;
 			}
@@ -181,7 +205,8 @@ async function main(): Promise<number> {
 			control(dir);
 			const view = inspectRun(dir);
 			const target = view.run.nodes.find((n) => n.id === node);
-			if (!target || target.status.type !== "node_idle") {
+			// An idle node continues with the message; a running node is steered.
+			if (!target || target.status.type === "node_done") {
 				out(`Refused: ${JSON.stringify({ type: "not_idle", node })}`);
 				return 1;
 			}
@@ -192,6 +217,16 @@ async function main(): Promise<number> {
 		case "cancel": {
 			const dir = resolveRun(root, args[0] ?? "");
 			control(dir);
+			if (values.node) {
+				// One node: an agent failure for the body to handle.
+				if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "cancel_node", node: values.node });
+				else {
+					const refusal = applyControl(dir, { type: "node_cancelled", node: values.node });
+					if (refusal) throw new RunRefused(refusal);
+				}
+				out(`Cancelled node ${values.node} of run ${runPaths(dir).id}.`);
+				return 0;
+			}
 			if (inspectRun(dir).run.status?.type === "finished") {
 				report(dir);
 				return 0;
@@ -238,6 +273,57 @@ async function main(): Promise<number> {
 			if (orphans.length > 0) {
 				out(`${orphans.length} run(s) have no live owner and can be claimed: ${orphans.map((v) => `npx wallis claim ${v.runId}`).join("; ")}`);
 			}
+			return 0;
+		}
+		case "ls": {
+			const views = listRunViews(root);
+			if (values.json) out(JSON.stringify(views.map((v) => ({ run_id: v.runId, workflow: v.workflow, status: v.run.status, stopped: v.stopped, owner: v.owner }))));
+			else out(views.map(runLine).join("\n"));
+			return 0;
+		}
+		case "tree":
+			out(renderTree(inspectRun(resolveRun(root, args[0] ?? ""))));
+			return 0;
+		case "log": {
+			const dir = resolveRun(root, args[0] ?? "");
+			let since = values.since ? Number(values.since) : 0;
+			for (;;) {
+				const page = runLog(dir, since, values.limit ? Number(values.limit) : 200);
+				for (const e of page.items) out(`${e.seq}\t${e.event}`);
+				since = page.next;
+				if (!values.follow) return 0;
+				if (page.next >= page.total) {
+					const view = inspectRun(dir);
+					if (view.run.status?.type === "finished" || view.stopped) return 0;
+					await new Promise((r) => setTimeout(r, 300));
+				}
+			}
+		}
+		case "show": {
+			const [run, node] = args;
+			const dir = resolveRun(root, run ?? "");
+			const page = nodeTranscript(dir, node ?? "", values.since ? Number(values.since) : 0, values.limit ? Number(values.limit) : 200);
+			for (const e of page.items) out(`${e.seq}\t${e.entry}`);
+			return 0;
+		}
+		case "interrupt": {
+			const [run, node, ...words] = args;
+			const dir = resolveRun(root, run ?? "");
+			control(dir);
+			if (lockHolder(runPaths(dir)) === null) throw new Error(`run ${runPaths(dir).id} is not being driven: nothing to interrupt`);
+			await deliver(dir, words.length > 0 ? { id: newMessageId(), type: "interrupt", node: node!, text: words.join(" ") } : { id: newMessageId(), type: "interrupt", node: node! });
+			out(`Interrupted ${node} of run ${runPaths(dir).id}.`);
+			return 0;
+		}
+		case "pause": {
+			const dir = resolveRun(root, args[0] ?? "");
+			control(dir);
+			if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "pause" });
+			else {
+				const refusal = applyControl(dir, { type: "pause_requested" });
+				if (refusal) throw new RunRefused(refusal);
+			}
+			out(`Paused run ${runPaths(dir).id}: no new calls until npx wallis resume ${runPaths(dir).id}.`);
 			return 0;
 		}
 		case "claim": {
