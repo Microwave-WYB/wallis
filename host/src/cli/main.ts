@@ -17,7 +17,7 @@
 //   wallis export <run> <artifact> <dir>
 //   wallis serve [--executor module]
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,9 +44,11 @@ import {
 } from "../host/query.ts";
 import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
+import { loadProfile } from "../host/profile.ts";
 import { ProcessScripts } from "../host/scripts.ts";
+import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
-import { acquireLock, appendInbox, lockHolder, newMessageId, newRunId, readMeta, runPaths, runsDir, writeMeta } from "../host/store.ts";
+import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, runPaths, runsDir, writeMeta } from "../host/store.ts";
 
 const self = fileURLToPath(import.meta.url);
 /** pi, with pi-ai's built-in providers. */
@@ -115,10 +117,45 @@ function report(dir: string): void {
 	out(items.length > 0 ? describe(items) : `Run ${view.runId}: ${view.run.status?.type}${view.stopped ? ", stopped" : ""}.`);
 }
 
-/** Starts a detached driver for the run; the lock names it before it starts. */
+/** `WALLIS_HOST`: `systemd`, `plain`, or (default) systemd when `systemd-run --user` works. */
+function hostMode(): "systemd" | "plain" {
+	const mode = process.env.WALLIS_HOST;
+	if (mode === "plain" || mode === "systemd") return mode;
+	return systemdAvailable() ? "systemd" : "plain";
+}
+
+/** The environment a detached host needs: wallis settings, paths, provider credentials. */
+function hostEnv(): string[] {
+	return Object.entries(process.env)
+		.filter(([k, v]) => v !== undefined && /^(WALLIS_.*|PATH|HOME|LANG|XDG_.*|.*_API_KEY|.*_TOKEN|.*_BASE_URL)$/.test(k))
+		.map(([k, v]) => `--setenv=${k}=${v}`);
+}
+
+/**
+ * Starts a detached host for the run: a systemd user unit
+ * (`wallis-run-<id>`, restarted on failure) when available, else a plain
+ * detached process whose lock is written before it starts. Hosts exit when
+ * the run is idle or finished.
+ */
 function detach(dir: string, extra: string[] = []): void {
-	const child = spawn(process.execPath, [self, "drive", dir, "--root", root, ...extra], { detached: true, stdio: "ignore" });
-	acquireLock(runPaths(dir), child.pid);
+	const paths = runPaths(dir);
+	const argv = [self, "drive", dir, "--root", root, ...extra];
+	const logged = new EventLog(paths.log).read().length;
+	if (hostMode() === "systemd") {
+		const r = spawnSync(
+			"systemd-run",
+			["--user", "--quiet", "--collect", `--unit=wallis-run-${paths.id}`, "-p", "Restart=on-failure", `--working-directory=${root}`, ...hostEnv(), "--", process.execPath, ...argv],
+			{ stdio: "ignore" },
+		);
+		if (r.status === 0) {
+			// The unit takes the lock itself; wait for it so a following `wait` does not see a stopped run.
+			const deadline = Date.now() + 10_000;
+			while (Date.now() < deadline && lockHolder(paths) === null && new EventLog(paths.log).read().length === logged) spawnSync("sleep", ["0.05"]);
+			return;
+		}
+	}
+	const child = spawn(process.execPath, argv, { detached: true, stdio: "ignore" });
+	acquireLock(paths, child.pid);
 	child.unref();
 }
 
@@ -128,13 +165,14 @@ async function drive(dir: string, options: Partial<SessionOptions>): Promise<voi
 	const module = values.executor ? resolve(values.executor) : (meta?.executor ?? process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
 	if (meta && module !== meta.executor) writeMeta(paths, { ...meta, executor: module });
 	const kit = await loadExecutor(module);
+	const local = loadProfile(meta?.root ?? root);
 	const start = meta?.start ?? {};
 	const fresh = new EventLog(paths.log).read().length === 0;
 	const workflow = meta?.workflow;
 	const session = await startSession({
 		dir,
-		executor: kit.executor,
-		scripts: kit.scripts ?? (workflow ? new ProcessScripts({ workflowDir: dirname(workflow) }) : undefined),
+		executor: limitProviders(kit.executor, local.providers ?? {}),
+		scripts: kit.scripts ?? (workflow ? new ProcessScripts({ workflowDir: dirname(workflow), slots: new MachineSlots(local.slots) }) : undefined),
 		executorModule: module,
 		root: meta?.root ?? root,
 		...(fresh ? start : {}),
@@ -155,8 +193,13 @@ async function deliver(dir: string, entry: Parameters<typeof appendInbox>[1]): P
 		(existsSync(`${paths.inbox}.done`) && readFileSync(`${paths.inbox}.done`, "utf8").split("\n").includes(entry.id)) ||
 		new EventLog(paths.log).read().some((e) => e.type === "sent" && e.message_id === entry.id);
 	const deadline = Date.now() + 15_000;
+	let started = 0;
 	while (Date.now() < deadline && !taken()) {
-		if (lockHolder(paths) === null) detach(dir);
+		// One host per handoff; another only if that one has come and gone without taking it.
+		if (lockHolder(paths) === null && Date.now() - started > 3000) {
+			detach(dir);
+			started = Date.now();
+		}
 		await new Promise((r) => setTimeout(r, 100));
 	}
 }
@@ -365,7 +408,9 @@ async function main(): Promise<number> {
 			const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
 			const { createMcpServer } = await import("../host/mcp.ts");
 			const module = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
-			const server = createMcpServer(new Runs(root, await loadExecutor(module), module));
+			const kit = await loadExecutor(module);
+			const local = loadProfile(root);
+			const server = createMcpServer(new Runs(root, { executor: limitProviders(kit.executor, local.providers ?? {}), scripts: kit.scripts }, module));
 			await server.connect(new StdioServerTransport());
 			return new Promise<number>(() => {});
 		}
@@ -378,6 +423,8 @@ async function main(): Promise<number> {
 main().then(
 	(code) => process.exit(code),
 	(error: unknown) => {
+		// A host that finds its run already driven has nothing to do.
+		if (error instanceof RunLocked && command === "drive") process.exit(0);
 		if (error instanceof RunRefused) out(`Refused: ${JSON.stringify(error.refusal)}`);
 		else if (error instanceof NotOwner) process.stderr.write(`wallis: ${error.message}\n`);
 		else process.stderr.write(`wallis: ${error instanceof Error ? error.message : String(error)}\n`);

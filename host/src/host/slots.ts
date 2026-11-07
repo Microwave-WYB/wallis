@@ -89,3 +89,48 @@ export function scoped(command: string, argv: string[], memoryGb: number | undef
 	if (!memoryGb || !systemdAvailable()) return [command, argv];
 	return ["systemd-run", ["--user", "--scope", "--quiet", "--collect", "-p", `MemoryMax=${memoryGb}G`, "--", command, ...argv]];
 }
+
+// --- Per-provider LLM concurrency ---------------------------------------------------
+
+/**
+ * Wraps an executor so each turn holds one of the provider's slots (from the
+ * local profile's `providers`, e.g. `{ "openai": 4 }`), machine-wide.
+ * Providers without a limit are not throttled.
+ */
+export function limitProviders<E extends import("./executor.ts").Executor>(executor: E, limits: Readonly<Record<string, number>>): E {
+	if (Object.keys(limits).length === 0) return executor;
+	const provider = (model: string) => model.slice(0, Math.max(0, model.indexOf("/")));
+	return {
+		...executor,
+		id: executor.id,
+		capabilities: executor.capabilities,
+		start: async (spec) => {
+			const inner = await executor.start(spec);
+			let model = spec.model;
+			const throttled = async <T>(run: () => Promise<T>): Promise<T> => {
+				const limit = limits[provider(model)];
+				if (!limit) return run();
+				const release = await acquire(`provider-${provider(model)}`, 1, limit);
+				try {
+					return await run();
+				} finally {
+					release();
+				}
+			};
+			return {
+				...inner,
+				turn: (message) => throttled(() => inner.turn(message)),
+				rebind: inner.rebind
+					? (next) => {
+							model = next;
+							inner.rebind!(next);
+						}
+					: undefined,
+				steer: inner.steer?.bind(inner),
+				interrupt: inner.interrupt?.bind(inner),
+				handle: () => inner.handle(),
+				close: () => inner.close(),
+			};
+		},
+	};
+}

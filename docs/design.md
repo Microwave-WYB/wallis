@@ -265,6 +265,39 @@ Prototype choices:
 - Pages: at most 200 entries (default 50), each truncated to 2000
   characters; the cursor is the next entry index.
 
+## Many runs on one machine (decided, round 3)
+
+- **Resource slots.** Scripts declare `resources: { gpu?, memoryGb? }`. They
+  take machine-wide flock slots, like `~/.local/bin/build-guard`, and run in
+  `systemd-run --user --scope -p MemoryMax=...`.
+- **Concurrency limits.** The local profile sets per-provider limits on LLM
+  calls (`providers`), also through flock.
+- **Run hosts** start detached via
+  `systemd-run --user --unit wallis-run-<id> -p Restart=on-failure` when
+  available, with a plain detached fallback. Hosts exit when the run is
+  idle or finished.
+
+Prototype choices:
+
+- Slots are lock files in `$XDG_RUNTIME_DIR/wallis/slots/<kind>/slot<i>`,
+  held by `flock -n` in a child process for as long as the work runs.
+- Kinds: `gpu` (one file per GPU) and `memory` (one file per GB, from the
+  profile's `slots`). A script needing more than the machine has is refused.
+  Waiting slots poll every 500 ms.
+- Provider limits wrap the executor: each `turn()` holds one
+  `provider-<name>` slot. The provider is the model string up to the first
+  `/`, and follows rebinds.
+- `WALLIS_HOST=systemd|plain` overrides host detection. Tests use `plain`,
+  so a SIGKILL test is not restarted by systemd.
+- A systemd host gets the caller's `WALLIS_*`, `PATH`, `HOME`, `LANG`,
+  `XDG_*`, `*_API_KEY`, `*_TOKEN` and `*_BASE_URL` variables.
+- A host that finds its run already driven exits 0 (nothing to do), so
+  systemd does not restart it. `send`/`cancel` start at most one host per
+  handoff.
+- Script memory scopes use `systemd-run --user --scope` only when the script
+  declares `memoryGb` and systemd works. The scope wraps bwrap, which keeps
+  its clean environment inside.
+
 ## Recovery (decided)
 
 - Result-defining changes are refused on resume: workflow digest, pinned

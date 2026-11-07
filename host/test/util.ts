@@ -25,7 +25,8 @@ export function project(): string {
 }
 
 export function wallis(root: string, args: string[], env: Record<string, string> = {}) {
-	return spawnSync(process.execPath, [cli, ...args, "--root", root], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 60_000 });
+	// Plain detached hosts by default: SIGKILL tests must not be restarted by systemd.
+	return spawnSync(process.execPath, [cli, ...args, "--root", root], { encoding: "utf8", env: { ...process.env, WALLIS_HOST: "plain", ...env }, timeout: 60_000 });
 }
 
 export function onlyRun(root: string): string {
