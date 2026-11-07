@@ -99,8 +99,8 @@ pub fn apply(
             [write],
           )
       }
-      let top =
-        pool
+      let rank = fn(entries) {
+        entries
         |> list.sort(fn(a, b) {
           let by_score = case score(a, by), score(b, by), order {
             Scored(x), Scored(y), Ascending -> compare_floats(x, y)
@@ -112,9 +112,20 @@ pub fn apply(
           order.break_tie(by_score, value.compare(a, b))
         })
         |> list.take(k)
-      case latest, list.any(top, value.equal(_, write)) {
-        KeepLatest, False -> Ok(JArray(list.append(top, [write])))
-        _, _ -> Ok(JArray(top))
+      }
+      case latest {
+        TopOnly -> Ok(JArray(rank(pool)))
+        // The latest write plus the top k of the others (SIDERIUS
+        // cap_knowledge_cache: current model plus the best remaining).
+        KeepLatest ->
+          Ok(
+            JArray(
+              list.append(
+                rank(list.filter(pool, fn(i) { !value.equal(i, write) })),
+                [write],
+              ),
+            ),
+          )
       }
     }
     AppendByKey(key:) ->

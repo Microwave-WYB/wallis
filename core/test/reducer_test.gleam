@@ -95,6 +95,14 @@ pub fn top_k_plus_latest_test() {
       model("d", 0.2),
     ])
     == JArray([model("a", 0.9), model("b", 0.8), model("d", 0.2)])
+  // The current model never takes a top slot from the others.
+  assert fold(r, [
+      model("a", 0.9),
+      model("b", 0.8),
+      model("c", 0.7),
+      model("d", 0.95),
+    ])
+    == JArray([model("a", 0.9), model("b", 0.8), model("d", 0.95)])
   // A re-run of a model replaces its entry.
   assert fold(r, [model("a", 0.9), model("a", 0.3)])
     == JArray([model("a", 0.3)])

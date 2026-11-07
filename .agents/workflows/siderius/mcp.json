@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "arxiv": {
+      "command": "uvx",
+      "args": ["arxiv-mcp-server==0.3.1"]
+    },
+    "semantic_scholar": {
+      "command": "uvx",
+      "args": ["semantic-scholar-mcp==0.2.0"],
+      "env": { "S2_API_KEY": "${S2_API_KEY}" }
+    }
+  }
+}
