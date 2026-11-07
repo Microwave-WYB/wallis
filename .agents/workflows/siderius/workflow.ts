@@ -13,12 +13,11 @@ import {
 	defineAgent,
 	defineMcp,
 	defineModels,
+	defineScript,
 	defineState,
 	defineTool,
 	freeze,
-	type Json,
 	llmMerge,
-	Refused,
 	type Static,
 	subWorkflow,
 	sum,
@@ -36,6 +35,7 @@ import implementPrompt from "./implement.md" with { type: "text" };
 import interpretPrompt from "./interpret.md" with { type: "text" };
 import literaturePrompt from "./literature-review.md" with { type: "text" };
 import proposePrompt from "./propose.md" with { type: "text" };
+import stopCheckPrompt from "./stop-check.md" with { type: "text" };
 import tunePlannerPrompt from "./tune-planner.md" with { type: "text" };
 import tuneReflectorPrompt from "./tune-reflector.md" with { type: "text" };
 import validatePrompt from "./validate.md" with { type: "text" };
@@ -141,6 +141,75 @@ const Proposal = Type.Object({
 
 const Config = Type.Record(Type.String(), Type.Union([Type.Number(), Type.String(), Type.Boolean()]));
 
+// --- Scripts: the task package's domain code, with typed args and outputs ------
+
+const Scope = Type.Union([Type.Literal("trial"), Type.Literal("formal")]);
+const HealthCheck = Type.Object({ check_name: Type.String(), metrics: Type.Record(Type.String(), Type.Number()) });
+const Direction = Type.Union([Type.Literal("higher_is_better"), Type.Literal("lower_is_better")]);
+
+const trainScript = defineScript({
+	name: "train",
+	description: "Train one candidate config on the trial or formal scope (training_skill).",
+	input: Type.Object({
+		config: Config,
+		scope: Scope,
+		max_epochs: Type.Integer(),
+		time_budget_minutes: Type.Number(),
+		seed: Type.Integer(),
+		data_scope: Type.String(),
+	}),
+	output: Type.Object({
+		status: Type.Union([Type.Literal("ok"), Type.Literal("oom"), Type.Literal("gate_refused"), Type.Literal("infrastructure_abort")]),
+		checkpoint: Type.Union([Type.String(), Type.Null()]),
+		minutes: Type.Number(),
+	}),
+});
+
+const evaluateScript = defineScript({
+	name: "evaluate",
+	description: "Score a checkpoint on the trial or formal evaluation portion (inference_skill, evaluate_metric).",
+	input: Type.Object({ checkpoint: Type.String(), scope: Scope }),
+	output: Type.Object({ scoreable: Type.Boolean(), score: Score, metric_id: Type.String() }),
+});
+
+const healthScript = defineScript({
+	name: "health",
+	description: "Run the scientific Health gates of the effective Health config (round_health.py).",
+	input: Type.Object({ checkpoint: Type.String(), health_config: Type.String(), model_type: Type.String() }),
+	output: Type.Object({ valid: Type.Boolean(), policy: Type.Union([Type.Literal("blocking"), Type.Literal("recording")]), failed_checks: Type.Array(HealthCheck) }),
+});
+
+const fingerprintScript = defineScript({
+	name: "fingerprint",
+	description: "Turn failed Health checks into collapse fingerprints.",
+	input: Type.Object({ failed_checks: Type.Array(HealthCheck), model_type: Type.String(), iteration: Type.Integer() }),
+	output: Type.Object({ entries: Type.Array(CollapseEntry) }),
+});
+
+const metricOrderScript = defineScript({
+	name: "metric_order",
+	description: "Reconcile the run's MetricSpec and report its direction (MetricOrder).",
+	input: Type.Object({ data_scope: Type.String() }),
+	output: Type.Object({ metric_id: Type.String(), direction: Direction }),
+});
+
+const validateScript = defineScript({
+	name: "validate",
+	description: "Deterministic validator checks 1-7 and 9.",
+	input: Type.Object({ model_file_path: Type.String(), probe_seed: Type.Integer() }),
+	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), checks: Type.Record(Type.String(), Type.Boolean()) }),
+});
+
+const SkillInput = Type.Object({ skill: Type.String(), args: Type.Record(Type.String(), Type.String()) });
+const SkillOutput = Type.Object({ result_ref: Type.String(), summary: Type.String() });
+
+const runSkillScript = defineScript({
+	name: "run_skill",
+	description: "Serve the data-analysis tool run_skill: one authorized analysis skill under the access policy.",
+	input: SkillInput,
+	output: SkillOutput,
+});
+
 // --- Merge agent (declared before state: llmMerge names it) --------------------
 
 const consolidator = defineAgent(
@@ -209,9 +278,9 @@ const proposerView = view(state, {
 const runSkill = defineTool({
 	name: "run_skill",
 	description: "Run one authorized analysis skill inside the declared data scope.",
-	input: Type.Object({ skill: Type.String(), args: Type.Record(Type.String(), Type.String()) }),
-	output: Type.Object({ result_ref: Type.String(), summary: Type.String() }),
-	script: "run_skill",
+	input: SkillInput,
+	output: SkillOutput,
+	script: runSkillScript.name,
 });
 
 // --- Agents: SIDERIUS nodes ----------------------------------------------------
@@ -313,7 +382,7 @@ const validator = defineAgent(env, {
 	name: "validate",
 	model: "validate",
 	prompt: validatePrompt,
-	input: Type.Object({ model_file_path: Type.String(), deterministic_report: Type.Unknown() }),
+	input: Type.Object({ model_file_path: Type.String(), deterministic_report: validateScript.output }),
 	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), error_signatures: Type.Array(ErrorSignature) }),
 	sandbox: "read-only",
 	maxTurns: 4,
@@ -335,6 +404,21 @@ const tunePlanner = defineAgent(env, {
 	output: Type.Object({ config: Config, rationale: Type.String() }),
 	view: view(state, { fields: ["knowledge_cache"], maxChars: 6000, maxItems: 5 }),
 	maxTurns: 2,
+	needs: { structuredOutput: true },
+});
+
+/**
+ * JudgeStop with `on_met: "request_input"`: presents the judge's
+ * recommendation, ends its turn with the question (its node goes idle), and
+ * submits the operator's decision once they reply.
+ */
+const stopCheck = defineAgent(env, {
+	name: "stop_check",
+	model: "judge",
+	prompt: stopCheckPrompt,
+	input: Type.Object({ iteration: Type.Integer(), criterion: Type.String(), recommendation: Type.String() }),
+	output: Type.Object({ decision: Type.Union([Type.Literal("stop"), Type.Literal("continue")]), note: Type.String() }),
+	maxTurns: 4,
 	needs: { structuredOutput: true },
 });
 
@@ -363,7 +447,12 @@ const Input = Type.Object({
 		literatureMaxRounds: Type.Integer({ minimum: 1 }),
 	}),
 	/** Authored-loop stops (definition/models.py). Zero or empty turns them off. */
-	stops: Type.Object({ noImprovementBodies: Type.Integer({ minimum: 0 }), judgeCriterion: Type.String({ maxLength: 2000 }) }),
+	stops: Type.Object({
+		noImprovementBodies: Type.Integer({ minimum: 0 }),
+		judgeCriterion: Type.String({ maxLength: 2000 }),
+		/** JudgeStop `on_met`: stop at once, or ask the operator through the stop-check node. */
+		judgeOnMet: Type.Union([Type.Literal("stop"), Type.Literal("request_input")]),
+	}),
 	maxProposalAttempts: Type.Integer({ minimum: 1 }),
 	maxImplAttempts: Type.Integer({ minimum: 1 }),
 	tuning: Type.Object({
@@ -381,7 +470,7 @@ const Input = Type.Object({
 });
 
 type Input = Static<typeof Input>;
-type Direction = "higher_is_better" | "lower_is_better";
+type Direction = Static<typeof Direction>;
 
 const files = {
 	dataScope: "siderius/data_scope.json",
@@ -391,8 +480,6 @@ const files = {
 
 // --- Helpers -----------------------------------------------------------------------
 
-const asRecord = (v: Json): Record<string, Json> => (v !== null && typeof v === "object" && !Array.isArray(v) ? v : {});
-const asNumber = (v: Json | undefined): number | null => (typeof v === "number" ? v : null);
 const tag = (iteration: number) => `iter-${String(iteration).padStart(3, "0")}`;
 
 /** probe_seed_context(run_seed, iteration, attempt): deterministic per-attempt seeds. */
@@ -438,7 +525,7 @@ const implementAndValidate = subWorkflow({
 				previous_validation_failure: feedback,
 				probe_seed: probeSeed(input.seed, input.iteration, attempt),
 			});
-			const report = await ctx.script("validate", { model_file_path: impl.model_file_path, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
+			const report = await ctx.script(validateScript, { model_file_path: impl.model_file_path, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
 			const review = await ctx.call(validator, { model_file_path: impl.model_file_path, deterministic_report: report });
 			signatures.push(...review.error_signatures);
 			if (review.passed) {
@@ -458,7 +545,7 @@ const TuneInput = Type.Object({
 	baseline_config: Config,
 	iteration: Type.Integer(),
 	seed: Type.Integer(),
-	direction: Type.Union([Type.Literal("higher_is_better"), Type.Literal("lower_is_better")]),
+	direction: Direction,
 	max_rounds: Type.Integer(),
 	max_fail_rounds: Type.Integer(),
 	attempts_trial: Type.Integer(),
@@ -476,7 +563,7 @@ const TuneOutput = Type.Object({
 	best_valid_formal_score: Score,
 	termination_reason: Type.String(),
 	physical_rejections: Type.Array(Type.String()),
-	failed_checks: Type.Array(Type.Unknown()),
+	failed_checks: Type.Array(HealthCheck),
 });
 
 const tune = subWorkflow({
@@ -492,7 +579,7 @@ const tune = subWorkflow({
 		let failRounds = 0;
 		const notes: string[] = [];
 		const rejections = [...input.previous_rejections];
-		const failedChecks: unknown[] = [];
+		const failedChecks: Static<typeof HealthCheck>[] = [];
 
 		for (let round = 1; round <= input.max_rounds; round++) {
 			// force_formal_round: the last round is Formal (formal_round_strategy full_clone).
@@ -508,19 +595,18 @@ const tune = subWorkflow({
 			const config: Static<typeof Config> = isTrial ? plan.config : { ...(bestTrialConfig ?? plan.config), ...plan.config };
 
 			// Gate refusals and OOM count as attempts, not rounds.
-			let scored: { score: number; checkpoint: Json } | null = null;
+			let scored: { score: number; checkpoint: string } | null = null;
 			const attempts = isTrial ? input.attempts_trial : input.attempts_formal;
+			const scope = isTrial ? "trial" : "formal";
 			for (let attempt = 1; attempt <= attempts && scored === null; attempt++) {
-				const trained = asRecord(
-					await ctx.script("train", {
-						config,
-						scope: isTrial ? "trial" : "formal",
-						max_epochs: isTrial ? input.trial_max_epochs : input.formal_max_epochs,
-						time_budget_minutes: isTrial ? input.trial_minutes : input.formal_minutes,
-						seed: probeSeed(input.seed, input.iteration * 100 + round, attempt),
-						data_scope: files.dataScope,
-					}),
-				);
+				const trained = await ctx.script(trainScript, {
+					config,
+					scope,
+					max_epochs: isTrial ? input.trial_max_epochs : input.formal_max_epochs,
+					time_budget_minutes: isTrial ? input.trial_minutes : input.formal_minutes,
+					seed: probeSeed(input.seed, input.iteration * 100 + round, attempt),
+					data_scope: files.dataScope,
+				});
 				if (trained.status === "infrastructure_abort") {
 					return {
 						best_score: bestScore,
@@ -531,10 +617,9 @@ const tune = subWorkflow({
 						failed_checks: failedChecks,
 					};
 				}
-				if (trained.status !== "ok") continue;
-				const evaluated = asRecord(await ctx.script("evaluate", { checkpoint: trained.checkpoint ?? null, scope: isTrial ? "trial" : "formal" }));
-				const score = asNumber(evaluated.score);
-				if (evaluated.scoreable === true && score !== null) scored = { score, checkpoint: trained.checkpoint ?? null };
+				if (trained.status !== "ok" || trained.checkpoint === null) continue;
+				const evaluated = await ctx.script(evaluateScript, { checkpoint: trained.checkpoint, scope });
+				if (evaluated.scoreable && evaluated.score !== null) scored = { score: evaluated.score, checkpoint: trained.checkpoint };
 			}
 
 			if (scored === null) {
@@ -545,8 +630,8 @@ const tune = subWorkflow({
 			failRounds = 0;
 
 			// Health: scientific gates on every scored round.
-			const health = asRecord(await ctx.script("health", { checkpoint: scored.checkpoint, health_config: files.healthConfig, model_type: input.model_type }));
-			if (Array.isArray(health.failed_checks)) failedChecks.push(...health.failed_checks);
+			const health = await ctx.script(healthScript, { checkpoint: scored.checkpoint, health_config: files.healthConfig, model_type: input.model_type });
+			failedChecks.push(...health.failed_checks);
 			if (better(input.direction, scored.score, bestScore)) bestScore = scored.score;
 			if (isTrial && better(input.direction, scored.score, bestTrialScore)) {
 				bestTrialScore = scored.score;
@@ -554,7 +639,7 @@ const tune = subWorkflow({
 			}
 			if (!isTrial) {
 				if (better(input.direction, scored.score, bestFormal)) bestFormal = scored.score;
-				if (health.valid === true && better(input.direction, scored.score, bestValidFormal)) bestValidFormal = scored.score;
+				if (health.valid && better(input.direction, scored.score, bestValidFormal)) bestValidFormal = scored.score;
 			}
 
 			const reflection = await ctx.call(tuneReflector, { round, is_trial: isTrial, result: { score: scored.score, health } });
@@ -581,17 +666,18 @@ type StopReason =
 	| "iterations_exhausted"
 	| "no_improvement"
 	| "judge_stop"
-	| "budget_exhausted";
+	| "operator_stop";
 
 export default workflow({
 	name: "siderius",
 	models,
 	state,
 	mcp,
-	agents: [interpreter, dataAnalyst, literature, evidenceJudge, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
-	scripts: ["train", "evaluate", "health", "fingerprint", "metric_order", "validate", "run_skill"],
-	// LLM spend is new in wallis (SIDERIUS only logs tokens); compute minutes
-	// reach every script as its remaining budget.
+	agents: [interpreter, dataAnalyst, literature, evidenceJudge, stopCheck, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
+	scripts: [trainScript, evaluateScript, healthScript, fingerprintScript, metricOrderScript, validateScript, runSkillScript],
+	// LLM spend is new in wallis (SIDERIUS only logs tokens). A spent budget
+	// pauses the run, which `wallis resume --budget usd=...` continues;
+	// compute minutes reach every script as its remaining budget.
 	budget: { usd: 40, turns: 3000, computeMinutes: 24 * 60 },
 	// run_invariants.py: resolved_data_scope, health_config_sha256 and
 	// advice_sha256. The seed, workflow digest and resolved alias table are
@@ -604,8 +690,7 @@ export default workflow({
 		incumbent: Type.Union([Incumbent, Type.Null()]),
 	}),
 	run: async (ctx, input: Input) => {
-		const order = asRecord(await ctx.script("metric_order", { data_scope: files.dataScope }));
-		const direction: Direction = order.direction === "lower_is_better" ? "lower_is_better" : "higher_is_better";
+		const { direction } = await ctx.script(metricOrderScript, { data_scope: files.dataScope });
 		const sign = direction === "higher_is_better" ? 1 : -1;
 
 		let stop: StopReason = "iterations_exhausted";
@@ -615,158 +700,156 @@ export default workflow({
 
 		const incumbent = async () => (await ctx.read(view(state, { fields: ["incumbent"], maxChars: 1000, maxItems: 1 }))).data.incumbent[0] ?? null;
 
-		try {
-			for (let iteration = 0; iteration < input.maxIterations; iteration++) {
-				// 1. Target check against the Health-valid formal incumbent.
-				const best = await incumbent();
-				if (input.targetScore !== null && best !== null && atLeast(direction, best.score, input.targetScore)) {
-					stop = "target_reached";
-					break;
-				}
-				iterations++;
+		for (let iteration = 0; iteration < input.maxIterations; iteration++) {
+			// 1. Target check against the Health-valid formal incumbent.
+			const best = await incumbent();
+			if (input.targetScore !== null && best !== null && atLeast(direction, best.score, input.targetScore)) {
+				stop = "target_reached";
+				break;
+			}
+			iterations++;
 
-				// 2. Interpretation of the previous iteration (cold start on the first).
-				const interpretation = await ctx.call(interpreter, { iteration, cold_start: iteration === 0, metric_direction: direction });
+			// 2. Interpretation of the previous iteration (cold start on the first).
+			const interpretation = await ctx.call(interpreter, { iteration, cold_start: iteration === 0, metric_direction: direction });
 
-				// 3. Optional evidence stage, then the judge over a capped projection.
-				let evidenceBrief = "";
-				if (input.evidence.dataAnalysis || input.evidence.literature) {
-					const at = tag(iteration);
-					const bottlenecks = interpretation.key_findings.filter((f) => f.kind === "bottleneck").map((f) => f.statement);
-					const analysis = () => ({ at, analysis_brief: interpretation.analysis_brief, resource_minutes: 30 });
-					const lit = () => ({ at, bottlenecks, max_rounds: input.evidence.literatureMaxRounds });
-					if (input.evidence.order === "parallel") {
-						await ctx.parallel({
-							analysis: async (c) => (input.evidence.dataAnalysis ? c.call(dataAnalyst, analysis()) : null),
-							literature: async (c) => (input.evidence.literature ? c.call(literature, lit()) : null),
-						});
-					} else {
-						const first = input.evidence.order === "analysis_then_literature" ? "analysis" : "literature";
-						for (const node of first === "analysis" ? ["analysis", "literature"] : ["literature", "analysis"]) {
-							if (node === "analysis" && input.evidence.dataAnalysis) await ctx.call(dataAnalyst, analysis());
-							if (node === "literature" && input.evidence.literature) await ctx.call(literature, lit());
-						}
+			// 3. Optional evidence stage, then the judge over a capped projection.
+			let evidenceBrief = "";
+			if (input.evidence.dataAnalysis || input.evidence.literature) {
+				const at = tag(iteration);
+				const bottlenecks = interpretation.key_findings.filter((f) => f.kind === "bottleneck").map((f) => f.statement);
+				const analysis = () => ({ at, analysis_brief: interpretation.analysis_brief, resource_minutes: 30 });
+				const lit = () => ({ at, bottlenecks, max_rounds: input.evidence.literatureMaxRounds });
+				if (input.evidence.order === "parallel") {
+					await ctx.parallel({
+						analysis: async (c) => (input.evidence.dataAnalysis ? c.call(dataAnalyst, analysis()) : null),
+						literature: async (c) => (input.evidence.literature ? c.call(literature, lit()) : null),
+					});
+				} else {
+					const first = input.evidence.order === "analysis_then_literature" ? "analysis" : "literature";
+					for (const node of first === "analysis" ? ["analysis", "literature"] : ["literature", "analysis"]) {
+						if (node === "analysis" && input.evidence.dataAnalysis) await ctx.call(dataAnalyst, analysis());
+						if (node === "literature" && input.evidence.literature) await ctx.call(literature, lit());
 					}
-					const verdict = await ctx.call(evidenceJudge, { iteration, stop_criterion: input.stops.judgeCriterion });
-					evidenceBrief = verdict.brief;
-					if (input.stops.judgeCriterion !== "" && iteration > 0 && verdict.stop.recommend) {
+				}
+				const verdict = await ctx.call(evidenceJudge, { iteration, stop_criterion: input.stops.judgeCriterion });
+				evidenceBrief = verdict.brief;
+				if (input.stops.judgeCriterion !== "" && iteration > 0 && verdict.stop.recommend) {
+					if (input.stops.judgeOnMet === "stop") {
 						stop = "judge_stop";
 						break;
 					}
-				}
-
-				// 4. Propose, then implement with a bounded validate/retry sub-workflow.
-				const failures = [...lastRejections];
-				let candidate: { proposal: Static<typeof Proposal>; modelFile: string } | null = null;
-				for (let attempt = 1; attempt <= input.maxProposalAttempts && candidate === null; attempt++) {
-					try {
-						const proposal = await ctx.call(proposer, {
-							iteration,
-							task: input.task,
-							evidence_brief: evidenceBrief,
-							previous_failures: failures,
-							vram_budget_gb: input.tuning.vramBudgetGb,
-						});
-						const impl = await ctx.sub(implementAndValidate, {
-							proposal,
-							previous_failure: null,
-							max_attempts: input.maxImplAttempts,
-							seed: ctx.seed,
-							iteration,
-						});
-						if (impl.error_signatures.length > 0) await ctx.emit("error_signatures", impl.error_signatures);
-						if (impl.passed && impl.model_file_path !== null) candidate = { proposal, modelFile: impl.model_file_path };
-						else failures.push(impl.last_error ?? "validation failed");
-					} catch (error) {
-						if (!(error instanceof AgentFailed)) throw error;
-						failures.push(`proposal attempt failed: ${error.message}`);
+					// request_input: the stop-check node asks the operator and waits for the reply.
+					const decision = await ctx.call(stopCheck, { iteration, criterion: input.stops.judgeCriterion, recommendation: verdict.stop.reason });
+					if (decision.decision === "stop") {
+						stop = "operator_stop";
+						break;
 					}
 				}
+			}
 
-				if (candidate === null) {
-					// Like SIDERIUS, a failed iteration still uses an iteration slot.
-					await ctx.emit("runs", {
+			// 4. Propose, then implement with a bounded validate/retry sub-workflow.
+			const failures = [...lastRejections];
+			let candidate: { proposal: Static<typeof Proposal>; modelFile: string } | null = null;
+			for (let attempt = 1; attempt <= input.maxProposalAttempts && candidate === null; attempt++) {
+				try {
+					const proposal = await ctx.call(proposer, {
 						iteration,
-						model_type: "",
-						status: "no_candidate",
-						best_score: null,
-						best_valid_formal_score: null,
-						termination_reason: failures.at(-1) ?? "no candidate",
-						take_home: interpretation.take_home,
+						task: input.task,
+						evidence_brief: evidenceBrief,
+						previous_failures: failures,
+						vram_budget_gb: input.tuning.vramBudgetGb,
 					});
-					continue;
-				}
-
-				// 5. Tuning: Trial rounds, then the forced Formal round, Health per round.
-				const tuned = await ctx.sub(tune, {
-					model_type: candidate.proposal.model_type,
-					model_file_path: candidate.modelFile,
-					baseline_config: candidate.proposal.baseline_config,
-					iteration,
-					seed: ctx.seed,
-					direction,
-					max_rounds: input.tuning.maxRounds,
-					max_fail_rounds: input.tuning.maxFailRounds,
-					attempts_trial: input.tuning.attemptsPerTrialRound,
-					attempts_formal: input.tuning.attemptsPerFormalRound,
-					trial_minutes: input.tuning.trialMinutes,
-					formal_minutes: input.tuning.formalMinutes,
-					trial_max_epochs: input.tuning.trialMaxEpochs,
-					formal_max_epochs: input.tuning.formalMaxEpochs,
-					previous_rejections: lastRejections,
-				});
-				lastRejections = tuned.physical_rejections.slice(-10);
-
-				if (tuned.termination_reason === "infrastructure_abort") {
-					// Evidence is kept, but the iteration is not folded into history.
-					stop = "infrastructure_abort";
-					break;
-				}
-
-				// 6. Health feedback: collapse fingerprints per model.
-				const fingerprints = asRecord(
-					await ctx.script("fingerprint", { failed_checks: tuned.failed_checks as Json, model_type: candidate.proposal.model_type, iteration }),
-				);
-				for (const entry of Array.isArray(fingerprints.entries) ? fingerprints.entries : []) {
-					await ctx.emit("collapse_history", entry as Static<typeof CollapseEntry>);
-				}
-
-				// 7. Fold the iteration into the carried history (advance_completed_history).
-				const valid = tuned.best_valid_formal_score;
-				await ctx.emit("runs", {
-					iteration,
-					model_type: candidate.proposal.model_type,
-					status: "tuned",
-					best_score: tuned.best_score,
-					best_valid_formal_score: valid,
-					termination_reason: tuned.termination_reason,
-					take_home: interpretation.take_home,
-				});
-				await ctx.emit("knowledge_cache", {
-					model_type: candidate.proposal.model_type,
-					description: candidate.proposal.model_description,
-					iteration,
-					rank_score: valid === null ? null : sign * valid,
-					stats: { best_score: tuned.best_score, best_formal_score: tuned.best_formal_score, best_valid_formal_score: valid },
-				});
-				const before = best === null ? null : best.score;
-				if (valid !== null && better(direction, valid, before)) {
-					await ctx.emit("incumbent", { rank_score: sign * valid, score: valid, model_type: candidate.proposal.model_type, iteration });
-					bodiesWithoutImprovement = 0;
-				} else {
-					bodiesWithoutImprovement++;
-				}
-
-				// 8. Authored-loop stop: no strict incumbent improvement for N bodies.
-				if (input.stops.noImprovementBodies > 0 && bodiesWithoutImprovement >= input.stops.noImprovementBodies) {
-					stop = "no_improvement";
-					break;
+					const impl = await ctx.sub(implementAndValidate, {
+						proposal,
+						previous_failure: null,
+						max_attempts: input.maxImplAttempts,
+						seed: ctx.seed,
+						iteration,
+					});
+					if (impl.error_signatures.length > 0) await ctx.emit("error_signatures", impl.error_signatures);
+					if (impl.passed && impl.model_file_path !== null) candidate = { proposal, modelFile: impl.model_file_path };
+					else failures.push(impl.last_error ?? "validation failed");
+				} catch (error) {
+					if (!(error instanceof AgentFailed)) throw error;
+					failures.push(`proposal attempt failed: ${error.message}`);
 				}
 			}
-		} catch (error) {
-			// The core refuses a call once the LLM budget is spent.
-			if (!(error instanceof Refused && error.message.startsWith("budget exhausted"))) throw error;
-			stop = "budget_exhausted";
+
+			if (candidate === null) {
+				// Like SIDERIUS, a failed iteration still uses an iteration slot.
+				await ctx.emit("runs", {
+					iteration,
+					model_type: "",
+					status: "no_candidate",
+					best_score: null,
+					best_valid_formal_score: null,
+					termination_reason: failures.at(-1) ?? "no candidate",
+					take_home: interpretation.take_home,
+				});
+				continue;
+			}
+
+			// 5. Tuning: Trial rounds, then the forced Formal round, Health per round.
+			const tuned = await ctx.sub(tune, {
+				model_type: candidate.proposal.model_type,
+				model_file_path: candidate.modelFile,
+				baseline_config: candidate.proposal.baseline_config,
+				iteration,
+				seed: ctx.seed,
+				direction,
+				max_rounds: input.tuning.maxRounds,
+				max_fail_rounds: input.tuning.maxFailRounds,
+				attempts_trial: input.tuning.attemptsPerTrialRound,
+				attempts_formal: input.tuning.attemptsPerFormalRound,
+				trial_minutes: input.tuning.trialMinutes,
+				formal_minutes: input.tuning.formalMinutes,
+				trial_max_epochs: input.tuning.trialMaxEpochs,
+				formal_max_epochs: input.tuning.formalMaxEpochs,
+				previous_rejections: lastRejections,
+			});
+			lastRejections = tuned.physical_rejections.slice(-10);
+
+			if (tuned.termination_reason === "infrastructure_abort") {
+				// Evidence is kept, but the iteration is not folded into history.
+				stop = "infrastructure_abort";
+				break;
+			}
+
+			// 6. Health feedback: collapse fingerprints per model.
+			const fingerprints = await ctx.script(fingerprintScript, { failed_checks: tuned.failed_checks, model_type: candidate.proposal.model_type, iteration });
+			for (const entry of fingerprints.entries) await ctx.emit("collapse_history", entry);
+
+			// 7. Fold the iteration into the carried history (advance_completed_history).
+			const valid = tuned.best_valid_formal_score;
+			await ctx.emit("runs", {
+				iteration,
+				model_type: candidate.proposal.model_type,
+				status: "tuned",
+				best_score: tuned.best_score,
+				best_valid_formal_score: valid,
+				termination_reason: tuned.termination_reason,
+				take_home: interpretation.take_home,
+			});
+			await ctx.emit("knowledge_cache", {
+				model_type: candidate.proposal.model_type,
+				description: candidate.proposal.model_description,
+				iteration,
+				rank_score: valid === null ? null : sign * valid,
+				stats: { best_score: tuned.best_score, best_formal_score: tuned.best_formal_score, best_valid_formal_score: valid },
+			});
+			const before = best === null ? null : best.score;
+			if (valid !== null && better(direction, valid, before)) {
+				await ctx.emit("incumbent", { rank_score: sign * valid, score: valid, model_type: candidate.proposal.model_type, iteration });
+				bodiesWithoutImprovement = 0;
+			} else {
+				bodiesWithoutImprovement++;
+			}
+
+			// 8. Authored-loop stop: no strict incumbent improvement for N bodies.
+			if (input.stops.noImprovementBodies > 0 && bodiesWithoutImprovement >= input.stops.noImprovementBodies) {
+				stop = "no_improvement";
+				break;
+			}
 		}
 
 		// The target can be reached by the last iteration.

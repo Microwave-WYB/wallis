@@ -17,7 +17,7 @@ the SIDERIUS code, the code's behavior is noted here.
 | Interpretation after Health | Interpretation runs at the start of each iteration and covers the previous iteration's results. | Same as SIDERIUS: it runs first in each iteration. The last iteration's results are not interpreted. |
 | Knowledge cache: top 5 by metric plus the current model | 5 entries in total: the current model plus the top 4 others. | `topK({ k: 4, keepLatest: true })`, 5 in total. |
 | Collapse history never pruned | Pruned: 3-iteration window, at most 8 entries per model, empty models dropped. | Never pruned, as the brief asks. Views window it per model. |
-| LLM USD budget | Not tracked or enforced; token use is only logged. | Added: `budget.usd` and `budget.turns`. |
+| LLM USD budget | Not tracked or enforced; token use is only logged. | Added: `budget.usd` and `budget.turns`. A spent budget pauses the run (`Idle(BudgetExhausted)`); `wallis resume <run> --budget usd=…` continues it. |
 
 ## Concept to construct
 
@@ -29,7 +29,8 @@ the SIDERIUS code, the code's behavior is noted here.
 | `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with `defineTool(run_skill)` (served by `scripts/run_skill.py`) and `sandbox: "read-only"`. It writes `evidence`. |
 | `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review` with `mcp: { arxiv: [...], semantic_scholar: "*" }` over `mcp.json`. `S2_API_KEY` is a `${VAR}` secret reference. |
 | Judge strategies, projection caps (`judge-strategies-contract.md`) | Agent `evidence_judge`. View `judgeProjection`: `maxChars 4000`, `maxItems 24`, `omit ["confidence", "candidate_id"]`, with omitted counts. |
-| `JudgeStop` (authored loops) | `stops.judgeCriterion` plus `verdict.stop.recommend` |
+| `JudgeStop` (authored loops), `on_met: "stop"` | `stops.judgeCriterion` plus `verdict.stop.recommend`, with `stops.judgeOnMet: "stop"` |
+| `JudgeStop` `on_met: "request_input"` (pause and ask the operator) | `stops.judgeOnMet: "request_input"`: agent `stop_check` presents the recommendation and ends its turn with the question. Its node goes `Idle(question)`, and the operator's `send` continues the same conversation; it then submits `stop` or `continue`. |
 | `NoImprovementStop` | `stops.noImprovementBodies` |
 | `MLModelProposalAgent` (route `propose`), `max_proposal_attempts = 3` | Agent `propose` in a loop of `input.maxProposalAttempts`. `previous_failures` collects validation errors and physical rejections. |
 | `MLModelImplementor` and `MLCodeValidatorAgent`, `max_impl_attempts = 3` | `subWorkflow(implement_validate)`: agent `implement` (`sandbox: "workspace"`), then script `validate` (checks 1–7 and 9), then agent `validate` (check 8, the LLM review). The loop is bounded and feeds failures back. |
@@ -55,7 +56,8 @@ the SIDERIUS code, the code's behavior is noted here.
 | `token_usage.jsonl` | Per-call `usage` in `agent_returned` events of the wallis log |
 | Trial/formal time budgets, compute | `budget.computeMinutes`. Every `RunScript` carries the remaining minutes. |
 | Chain-mode resume (`restore_prior_state`, per-iteration subprocess) | wallis resume: refold the log, check the pin, replay the body. Completed calls and scripts are answered from the journal. |
-| `workflow_stop_reason`: `infrastructure_abort` > `target_reached` > `iterations_exhausted` | `StopReason`, plus `no_improvement`, `judge_stop` and `budget_exhausted` |
+| `workflow_stop_reason`: `infrastructure_abort` > `target_reached` > `iterations_exhausted` | `StopReason`, plus `no_improvement`, `judge_stop` and `operator_stop`. A spent budget is a pause, not a stop. |
+| Script outputs (`train`, `evaluate`, Health, fingerprints, metric order, validator, skills) | `defineScript` with TypeBox input and output schemas. Args and outputs are checked in the sandbox and in the host; a mismatch is a typed `ScriptFailed`. |
 
 ## Not expressed, or approximated
 
@@ -67,11 +69,12 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
    exact `Fraction` weighted mean), debate, judge-merge and primary-advisors.
    Not expressed: `MAX_SCORED_ITEMS_PER_CALL`, `MAX_JUDGE_PROMPT_CHARS`, and
    the launch-time `max_judge_calls` check against per-iteration bounds.
-2. **JudgeStop semantics.** SIDERIUS consults the judge only after every
+2. **JudgeStop timing.** SIDERIUS consults the judge only after every
    deterministic stop condition said continue, and never at the final
    boundary. Here it is checked mid-iteration, after the evidence stage.
-   `on_met: "request_input"` (pause and ask the operator) and `on_failure`
-   have no wallis equivalent: there is no human-input effect.
+   `on_met: "request_input"` is expressed (the `stop_check` node asks the
+   operator), but there is no `on_failure` policy: a judge that fails is an
+   agent failure in the body.
 3. **Interpretation.** SIDERIUS picks active models (top-K 3, last-N 2,
    |Δscore| ≥ 0.05), makes one LLM call per active model plus a synthesis
    call, and copies stable models. Here it is one call.
