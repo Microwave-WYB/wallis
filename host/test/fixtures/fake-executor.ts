@@ -6,7 +6,7 @@
 //   WALLIS_FAKE_UNAVAILABLE_MODEL=m  calls on model m fail as executor errors
 
 import { appendFileSync } from "node:fs";
-import { type AgentCall, conversation, ExecutorUnavailable, FakeExecutor } from "../../src/host/index.ts";
+import { type AgentCall, conversation, FakeExecutor, type NodeSpec } from "../../src/host/index.ts";
 
 export const responses = {
 	planner: { submit: { outline: ["why", "how", "so what"], note: "outline has three points" } },
@@ -20,7 +20,7 @@ export const responses = {
 export default function create() {
 	const replies = (call: AgentCall) => call.transcript.filter((m) => m.role === "user").length;
 	const fake = new FakeExecutor(responses, {
-		name: "fake",
+		id: "fake",
 		onCall: (call) => {
 			const log = process.env.WALLIS_FAKE_EXEC_LOG;
 			if (log) appendFileSync(log, `${JSON.stringify({ id: call.id, agent: call.agent, model: call.model, replies: replies(call) })}\n`);
@@ -32,13 +32,25 @@ export default function create() {
 		},
 	});
 	const executor = {
-		name: fake.name,
-		call: async (call: AgentCall) => {
-			if (call.model === process.env.WALLIS_FAKE_UNAVAILABLE_MODEL) {
-				appendFileSync(process.env.WALLIS_FAKE_EXEC_LOG ?? "/dev/null", `${JSON.stringify({ id: call.id, agent: call.agent, model: call.model, unavailable: true })}\n`);
-				throw new ExecutorUnavailable("HTTP 412 account suspended");
-			}
-			return fake.call(call);
+		id: fake.id,
+		capabilities: fake.capabilities,
+		start: (spec: NodeSpec) => {
+			const inner = fake.start(spec);
+			let model = spec.model;
+			return {
+				...inner,
+				rebind: (next: string) => {
+					model = next;
+					inner.rebind!(next);
+				},
+				turn: async (message?: string) => {
+					if (model === process.env.WALLIS_FAKE_UNAVAILABLE_MODEL) {
+						appendFileSync(process.env.WALLIS_FAKE_EXEC_LOG ?? "/dev/null", `${JSON.stringify({ id: spec.id, agent: spec.agent, model, unavailable: true })}\n`);
+						return { type: "executor_error" as const, error: "HTTP 412 account suspended" };
+					}
+					return inner.turn(message);
+				},
+			};
 		},
 	};
 	return { executor };

@@ -14,16 +14,16 @@
 // 5. log budget raises, a retry of calls the executor could not serve,
 //    sends and cancels.
 
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { ArtifactRef, Json, Refusal } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors } from "../sdk/validate.ts";
-import { ArtifactError, discardNode, manifestDigest, type NodeDirs, prepareNode, resolveDrafts } from "./artifacts.ts";
+import { ArtifactError, discardNode, manifestDigest, type NodeDirs, nodeDirName, prepareNode, resolveDrafts } from "./artifacts.ts";
 import { bundleWorkflow } from "./bundle.ts";
 import { Core, type BudgetKind, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
-import { type AgentCall, AgentFailure, type Executor, type ScriptRunner } from "./executor.ts";
+import type { Executor, NodeSession, NodeSpec, ScriptRunner, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
@@ -227,7 +227,7 @@ export class Session {
 			};
 			input = o.input ?? null;
 			this.#refuseOn(this.#feed({ type: "started", workflow: decl.core as unknown as Json, pin, input }));
-			if (o.executor.name) this.#feed({ type: "executor_changed", name: o.executor.name });
+			this.#feed({ type: "executor_changed", name: o.executor.id });
 		} else {
 			const first = prior[0]!;
 			if (first.type !== "started") throw new Error(`log ${this.paths.log} does not begin with a started event`);
@@ -239,7 +239,7 @@ export class Session {
 			this.#refuseOn(this.#feed({ type: "resumed", pin }));
 			if (this.#settled) return;
 			const snap = this.#core.snapshot();
-			if (o.executor.name && snap.executor !== o.executor.name) this.#feed({ type: "executor_changed", name: o.executor.name });
+			if (snap.executor !== o.executor.id) this.#feed({ type: "executor_changed", name: o.executor.id });
 			for (const [alias, to] of Object.entries(o.models ?? {})) {
 				const from = snap.models[alias];
 				if (from === undefined) this.#refuseOn([{ type: "unknown_alias", alias }]);
@@ -434,10 +434,46 @@ export class Session {
 		return null;
 	}
 
+	/** The node's open executor session, kept while the node is idle. */
+	readonly #nodes = new Map<string, { session: NodeSession; model: string }>();
+
+	#transcriptLog(id: string): (entry: TranscriptEntry) => void {
+		const file = join(this.paths.dir, "nodes", `${nodeDirName(id)}.jsonl`);
+		return (entry) => {
+			mkdirSync(join(this.paths.dir, "nodes"), { recursive: true });
+			appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+		};
+	}
+
+	#closeNode(id: string): void {
+		const open = this.#nodes.get(id);
+		this.#nodes.delete(id);
+		if (open) void Promise.resolve(open.session.close()).catch(() => {});
+	}
+
+	/** Steers a running node: the message reaches it at its next step boundary. */
+	steerNode(id: string, text: string): boolean {
+		const open = this.#nodes.get(id);
+		if (!open?.session.steer) return false;
+		open.session.steer(text);
+		return true;
+	}
+
+	/** Aborts a running node's current generation or tool. */
+	interruptNode(id: string): boolean {
+		const open = this.#nodes.get(id);
+		if (!open?.session.interrupt) return false;
+		open.session.interrupt();
+		return true;
+	}
+
 	#callAgent(effect: Extract<Effect, { type: "call_agent" }>): void {
 		const declaration = this.#decl.agents[effect.agent]!;
 		const workspace = this.#dirs(effect.id, declaration.sandbox, effect.input, declaration.data);
-		const call: AgentCall = {
+		const last = effect.transcript.at(-1);
+		const message = last?.role === "user" ? last.text : undefined;
+		const log = this.#transcriptLog(effect.id);
+		const spec: NodeSpec = {
 			id: effect.id,
 			agent: effect.agent,
 			declaration,
@@ -447,47 +483,80 @@ export class Session {
 			input: effect.input,
 			maxTurns: effect.max_turns,
 			digest: effect.digest,
-			transcript: effect.transcript,
+			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
 			outputSchema: declaration.output as unknown as Json,
 			workspace,
 			exportArtifact: (path, media, name) =>
 				resolveDrafts(name === undefined ? { artifact: path, media } : { artifact: path, media, name }, this.paths.dir, workspace.scratch) as unknown as ArtifactRef,
+			log,
 		};
 		const base = { id: effect.id, model: effect.model };
-		const done = () => discardNode(this.paths.dir, effect.id);
-		this.#options.executor.call(call).then(
-			(turn) =>
-				this.#later(() => {
-					const usage = turn.usage ?? NO_USAGE;
-					if (turn.type === "idle") {
-						this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
-						return;
-					}
-					let output: Json;
-					let emits: { field: string; value: Json }[];
-					try {
-						output = resolveDrafts(turn.output, this.paths.dir, call.workspace.scratch);
-						emits = (turn.emits ?? []).map((e) => ({ field: e.field, value: resolveDrafts(e.value, this.paths.dir, call.workspace.scratch) }));
-					} catch (error) {
-						if (!(error instanceof ArtifactError)) throw error;
-						this.#feed({ type: "agent_failed", ...base, error: error.message, usage });
+		const done = () => {
+			this.#closeNode(effect.id);
+			discardNode(this.paths.dir, effect.id);
+		};
+		const session = async (): Promise<NodeSession> => {
+			const open = this.#nodes.get(effect.id);
+			// A continued node keeps its session; a new model is a rebind, or a restart.
+			if (open && message !== undefined) {
+				if (open.model === effect.model) return open.session;
+				if (open.session.rebind) {
+					open.session.rebind(effect.model);
+					open.model = effect.model;
+					log({ kind: "note", text: `rebound to ${effect.model}` });
+					return open.session;
+				}
+			}
+			this.#closeNode(effect.id);
+			const started = await this.#options.executor.start(spec);
+			this.#nodes.set(effect.id, { session: started, model: effect.model });
+			return started;
+		};
+		if (message !== undefined) log({ kind: "user", text: message });
+		session()
+			.then((s) => s.turn(message))
+			.then(
+				(turn) =>
+					this.#later(() => {
+						if (turn.type === "executor_error") {
+							this.#closeNode(effect.id);
+							log({ kind: "turn", result: `executor_error: ${turn.error}` });
+							this.#feed({ type: "executor_failed", id: effect.id, error: turn.error });
+							return;
+						}
+						const usage = turn.usage ?? NO_USAGE;
+						log({ kind: "turn", result: turn.type, usage });
+						if (turn.type === "ended") {
+							this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
+							return;
+						}
+						if (turn.type === "agent_error") {
+							this.#feed({ type: "agent_failed", ...base, error: turn.error, usage });
+							done();
+							return;
+						}
+						let output: Json;
+						let emits: { field: string; value: Json }[];
+						try {
+							output = resolveDrafts(turn.output, this.paths.dir, workspace.scratch);
+							emits = (turn.emits ?? []).map((e) => ({ field: e.field, value: resolveDrafts(e.value, this.paths.dir, workspace.scratch) }));
+						} catch (error) {
+							if (!(error instanceof ArtifactError)) throw error;
+							this.#feed({ type: "agent_failed", ...base, error: error.message, usage });
+							done();
+							return;
+						}
+						const invalid = this.#resultErrors(effect, output, emits);
+						if (invalid) this.#feed({ type: "agent_failed", ...base, error: invalid, usage });
+						else this.#feed({ type: "agent_returned", ...base, output, emits, usage });
 						done();
-						return;
-					}
-					const invalid = this.#resultErrors(effect, output, emits);
-					if (invalid) this.#feed({ type: "agent_failed", ...base, error: invalid, usage });
-					else this.#feed({ type: "agent_returned", ...base, output, emits, usage });
-					done();
-				}),
-			(error: unknown) =>
-				this.#later(() => {
-					if (error instanceof AgentFailure) {
-						this.#feed({ type: "agent_failed", ...base, error: error.message, usage: error.usage ?? NO_USAGE });
-						done();
-					}
-					else this.#feed({ type: "executor_failed", id: effect.id, error: errorText(error) });
-				}),
-		);
+					}),
+				(error: unknown) =>
+					this.#later(() => {
+						this.#closeNode(effect.id);
+						this.#feed({ type: "executor_failed", id: effect.id, error: errorText(error) });
+					}),
+			);
 	}
 
 	#runScript(effect: Extract<Effect, { type: "run_script" }>): void {
@@ -588,6 +657,7 @@ export class Session {
 
 	#cleanup(): void {
 		if (this.#timer) clearInterval(this.#timer);
+		for (const id of [...this.#nodes.keys()]) this.#closeNode(id);
 		this.#sandbox?.dispose();
 		this.#sandbox = null;
 		this.#release();

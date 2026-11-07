@@ -39,11 +39,11 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 		assert.equal(started.isError, false, started.text);
 		const runId = started.data.run_id as string;
 		assert.match(started.text, new RegExp(`run in the background: npx wallis wait ${runId}`));
-		// Every result appends what is pending: here, the question.
-		assert.match(started.text, /Pending in this project:[\s\S]*Who is the audience/);
-
 		const asked = await call("wait", { run_id: runId, timeout_s: 10 });
 		assert.match(asked.text, /waiting for a reply/);
+		// Every result appends what is pending: here, the question.
+		const status = await call("get_run", { run_id: runId });
+		assert.match(status.text, /Pending in this project:[\s\S]*Who is the audience/);
 		const before = await call("get_run", { run_id: runId });
 		assert.deepEqual(before.data.status, { type: "idle", reason: null });
 		assert.deepEqual(before.data.nodes[0].status, { type: "node_idle", last_message: "Who is the audience: experts or newcomers?" });
