@@ -3,7 +3,7 @@
 //
 //   {
 //     "models":    { "global": { alias: model }, "workflows": { name: { alias: model } } },
-//     "data":      { "name": "/path/to/dataset" },
+//     "mounts":    { "global": { name: dir }, "workflows": { name: { mount: dir } } },
 //     "providers": { "openai": 4 },        // concurrent LLM calls per provider
 //     "slots":     { "gpu": 1, "memoryGb": 48 }   // machine-wide script resources
 //   }
@@ -12,10 +12,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Profile } from "./models.ts";
+import type { MountProfile } from "./mounts.ts";
 
 export interface LocalProfile {
 	readonly models?: Profile;
-	readonly data?: Readonly<Record<string, string>>;
+	readonly mounts?: MountProfile;
 	readonly providers?: Readonly<Record<string, number>>;
 	readonly slots?: { readonly gpu?: number; readonly memoryGb?: number };
 }
@@ -32,7 +33,10 @@ export function loadProfile(root: string, home = process.env.WALLIS_HOME ?? join
 			global: { ...global.models?.global, ...local.models?.global },
 			workflows: { ...global.models?.workflows, ...local.models?.workflows },
 		},
-		data: { ...global.data, ...local.data },
+		mounts: {
+			global: { ...global.mounts?.global, ...local.mounts?.global },
+			workflows: { ...global.mounts?.workflows, ...local.mounts?.workflows },
+		},
 		providers: { ...global.providers, ...local.providers },
 		slots: { ...global.slots, ...local.slots },
 	};

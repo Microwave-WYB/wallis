@@ -1,30 +1,30 @@
 // The wallis tool layer: every tool an agent can call, built per node and
 // handed to an executor. It enforces the agent's allowlist, logs every call
 // to the node's transcript, counts calls against the node's tool budget,
-// and injects secrets only into MCP server processes.
+// caps every result that enters the model's context, and injects secrets
+// only into MCP server processes.
 //
-// Built-in tools: submit_result (validated; errors go back to the model),
-// state_read (capped, against the call's snapshot), emit (declared emit
-// fields only), export_artifact and fs/exec tools confined to the node's
-// dirs (by sandbox level), declared defineTools (served by scripts) and the
-// allowlisted tools of upstream MCP servers.
+// Every agent gets `codemode` and `submit_result`, plus its declared tools
+// (fs tools by sandbox level, `defineTool`s, allowlisted MCP tools), which
+// are callable directly and from codemode. Codemode runs in QuickJS with no
+// fs or network, so it adds no capability to a `sandbox: "none"` agent.
+// Inside codemode the full input is the `input` variable.
 //
-// codemode (default on for agents that have tools beyond submit_result and
-// state_read): the model gets `codemode` and `submit_result`; a codemode
-// script can call the agent's allowlisted tools, including submit_result
-// and state_read, and every nested call goes through the same allowlist,
-// logging and budget.
+// Context protection: a direct tool result or a codemode output longer than
+// the cap is cut, and its full text is spilled to the node's spill dir with
+// an explicit marker; the next script pages it with `read_spill`. Nothing
+// is dropped silently.
 
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { CodemodeSandbox, type CodemodeTool, renderDeclarations, toCodemodeIdentifier } from "@earendil-works/pi-codemode";
 import { McpClient, StdioTransport, StreamableHttpTransport, toLlmContent } from "@earendil-works/pi-mcp";
 import type { Json } from "../sdk/index.ts";
-import type { Write } from "./core.ts";
 import { type NodeSpec, type ScriptRunner, validateSubmission } from "./executor.ts";
 import { bwrapArgs, bwrapAvailable } from "./scripts.ts";
+import { parseWith } from "../sdk/validate.ts";
 
 /** A tool as wallis runs it, before it is adapted to an executor. */
 export interface WallisTool {
@@ -47,25 +47,31 @@ export interface ToolLayerOptions {
 	readonly secrets?: Readonly<Record<string, string | undefined>>;
 	/** Tool calls one node may make, nested calls included. Default: 10 per allowed turn. */
 	readonly maxCalls?: number;
+	/** Characters of one tool result or codemode output that enter the context. */
+	readonly resultCap?: number;
 }
 
-const STATE_READ_CAP = 20_000;
+/** Prototype choice: 16k characters (about 5k tokens at 3 chars per token). */
+export const RESULT_CAP = 16_000;
+/** A submitted result over this many characters of JSON goes back to the model as a validation error. */
+export const OUTPUT_CAP = 100_000;
 const FILE_CAP = 100_000;
+const SPILL_PAGE = 8_000;
 
 export class NodeTools {
 	readonly spec: NodeSpec;
 	submitted: Json | undefined = undefined;
-	readonly emits: Write[] = [];
 	calls = 0;
 	readonly #tools = new Map<string, WallisTool>();
 	readonly #maxCalls: number;
+	readonly #cap: number;
 	readonly #clients: McpClient[] = [];
-	readonly codemode: boolean;
+	#spills = 0;
 
-	constructor(spec: NodeSpec, maxCalls: number) {
+	constructor(spec: NodeSpec, maxCalls: number, cap: number) {
 		this.spec = spec;
 		this.#maxCalls = maxCalls;
-		this.codemode = (spec.declaration as { codemode?: boolean }).codemode !== false;
+		this.#cap = cap;
 	}
 
 	add(tool: WallisTool): void {
@@ -98,11 +104,24 @@ export class NodeTools {
 		return outcome;
 	}
 
-	/** The tools the model is offered, as pi `AgentTool`s. */
+	/**
+	 * Cuts text that would enter the context at the cap. The full text goes
+	 * to the spill dir, and the marker says how to page it.
+	 */
+	cap(text: string): string {
+		if (text.length <= this.#cap) return text;
+		const name = `${++this.#spills}.txt`;
+		mkdirSync(this.spec.workspace.spill, { recursive: true });
+		writeFileSync(join(this.spec.workspace.spill, name), text);
+		this.spec.log({ kind: "note", text: `spilled ${text.length} chars to spill/${name}` });
+		const page = `await tools.read_spill({ name: ${JSON.stringify(name)}, offset: ${this.#cap} })`;
+		return `${text.slice(0, this.#cap)}\n[output truncated at ${this.#cap} of ${text.length} chars; the full text is spill ${JSON.stringify(name)}. Page it from the next script: ${page}]`;
+	}
+
+	/** The tools the model is offered, as pi `AgentTool`s: every tool, plus codemode. */
 	agentTools(): AgentTool[] {
-		const direct = this.codemode && this.#hasCapabilityTools() ? ["submit_result", "codemode"] : this.names;
-		if (direct.includes("codemode") && !this.#tools.has("codemode")) this.add(this.#codemodeTool());
-		return direct.map((name) => {
+		if (!this.#tools.has("codemode")) this.add(this.#codemodeTool());
+		return this.names.map((name) => {
 			const tool = this.#tools.get(name)!;
 			return {
 				name: tool.name,
@@ -111,14 +130,10 @@ export class NodeTools {
 				parameters: tool.parameters as object,
 				execute: async (_id: string, params: unknown, signal?: AbortSignal) => {
 					const r = await this.invoke(tool.name, params as Json, false, signal);
-					return { content: [{ type: "text" as const, text: r.text }], details: undefined, isError: r.isError === true, terminate: this.submitted !== undefined };
+					return { content: [{ type: "text" as const, text: this.cap(r.text) }], details: undefined, isError: r.isError === true, terminate: this.submitted !== undefined };
 				},
 			};
 		});
-	}
-
-	#hasCapabilityTools(): boolean {
-		return this.names.some((n) => n !== "submit_result" && n !== "state_read" && n !== "codemode");
 	}
 
 	#codemodeTool(): WallisTool {
@@ -141,6 +156,8 @@ export class NodeTools {
 			name: "codemode",
 			description: [
 				"Run a JavaScript async function body that calls this agent's tools as `await tools.<name>(args)` and returns a value.",
+				"Your full input is the variable `input`; folded fields of the prompt are complete there.",
+				`Output longer than ${this.#cap} characters is cut; its full text is spilled and paged with tools.read_spill.`,
 				`Tool names: ${nestedTools.map((t) => `${t.name} -> tools.${toCodemodeIdentifier(t.name)}`).join(", ")}.`,
 				renderDeclarations({ tools: nestedTools }),
 			].join("\n\n"),
@@ -148,7 +165,8 @@ export class NodeTools {
 			run: async (args, signal) => {
 				const sandbox = new CodemodeSandbox({ tools: nestedTools });
 				try {
-					const result = await sandbox.execute(String((args as { code?: unknown }).code ?? ""), { signal });
+					const code = `const input = load("input");\n${String((args as { code?: unknown }).code ?? "")}`;
+					const result = await sandbox.execute(code, { signal, store: { input: this.spec.input } });
 					const parts = result.output.map((o) => (o.type === "text" ? o.text : "[image]"));
 					if (result.ok) {
 						if (result.value !== undefined) parts.push(JSON.stringify(result.value));
@@ -185,7 +203,7 @@ function resolveSecrets(env: Readonly<Record<string, string>> | undefined, secre
 }
 
 export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions = {}): Promise<NodeTools> {
-	const tools = new NodeTools(spec, options.maxCalls ?? Math.max(16, spec.maxTurns * 10));
+	const tools = new NodeTools(spec, options.maxCalls ?? Math.max(16, spec.maxTurns * 10), options.resultCap ?? RESULT_CAP);
 	const ws = spec.workspace;
 
 	tools.add({
@@ -193,7 +211,8 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 		description: "Submit your final result. It must match the result schema; on a mismatch you get the errors and may resubmit.",
 		parameters: spec.outputSchema,
 		run: async (args) => {
-			const errors = validateSubmission(spec, args);
+			const size = JSON.stringify(args).length;
+			const errors = size > OUTPUT_CAP ? [`/ result is ${size} chars; the cap is ${OUTPUT_CAP}`] : validateSubmission(spec, args);
 			if (errors.length > 0) return { text: `submit_result does not match the result schema:\n${errors.join("\n")}`, isError: true };
 			tools.submitted = args;
 			return { text: "submitted", value: null };
@@ -201,42 +220,35 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 	});
 
 	tools.add({
-		name: "state_read",
-		description: "Read your snapshot of the run state (the view taken when this call started), capped.",
-		parameters: { type: "object", properties: { max_chars: { type: "integer", minimum: 1 } } },
+		name: "read_spill",
+		description: "Read a page of output that was cut at the context cap and spilled (the marker names it).",
+		parameters: {
+			type: "object",
+			required: ["name"],
+			properties: { name: { type: "string" }, offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } },
+		},
 		run: async (args) => {
-			const max = Math.min(STATE_READ_CAP, Number((args as { max_chars?: number }).max_chars ?? STATE_READ_CAP));
-			return { text: spec.view.slice(0, max) || "(empty view)", value: spec.view.slice(0, max) };
+			const { name, offset, limit } = args as { name: string; offset?: number; limit?: number };
+			const path = resolve(ws.spill, name);
+			if (!within([ws.spill], path)) return { text: `${name} is not a spill of this node`, isError: true };
+			const text = readFileSync(path, "utf8");
+			const from = offset ?? 0;
+			const page = text.slice(from, from + Math.min(limit ?? SPILL_PAGE, SPILL_PAGE));
+			return { text: page, value: { text: page, next: from + page.length, total: text.length } };
 		},
 	});
 
-	const emitFields = Object.entries(spec.declaration.writes)
-		.filter(([, source]) => typeof source !== "string")
-		.map(([field]) => field);
-	if (emitFields.length > 0) {
-		tools.add({
-			name: "emit",
-			description: `Write a value to a state field when this call ends. Fields: ${emitFields.join(", ")}.`,
-			parameters: { type: "object", required: ["field", "value"], properties: { field: { enum: emitFields }, value: {} } },
-			run: async (args) => {
-				const { field, value } = args as { field: string; value: Json };
-				if (!emitFields.includes(field)) return { text: `field ${field} may not be written`, isError: true };
-				tools.emits.push({ field, value });
-				return { text: `buffered a write to ${field}` };
-			},
-		});
-	}
-
 	if (ws.level !== "none") {
-		const readable = [ws.inputs, ...Object.values(ws.data), ...(ws.scratch ? [ws.scratch] : [])];
+		const readable = [ws.inputs, ...Object.values(ws.mounts), ...(ws.scratch ? [ws.scratch] : [])];
 		const inside = (path: string, roots: readonly string[]) => {
 			const abs = resolve(ws.scratch ?? ws.inputs, path);
 			if (!within(roots, abs)) throw new Error(`${path} is outside this node's dirs`);
 			return abs;
 		};
+		const mounts = Object.entries(ws.mounts).map(([n, d]) => `${n}: ${d}`).join(", ") || "none";
 		tools.add({
 			name: "read_file",
-			description: `Read a text file from your input artifacts (${ws.inputs}), data dirs${ws.scratch ? " or scratch dir" : ""}.`,
+			description: `Read a text file from your input artifacts (${ws.inputs}), mounts (${mounts})${ws.scratch ? " or scratch dir" : ""}.`,
 			parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
 			run: async (args) => {
 				const content = readFileSync(inside(String((args as { path: string }).path), readable), "utf8");
@@ -245,7 +257,7 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 		});
 		tools.add({
 			name: "list_dir",
-			description: "List a directory among your input artifacts, data dirs or scratch dir.",
+			description: "List a directory among your input artifacts, mounts or scratch dir.",
 			parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
 			run: async (args) => {
 				const dir = inside(String((args as { path: string }).path), readable);
@@ -282,7 +294,7 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 		if (bwrapAvailable()) {
 			tools.add({
 				name: "exec",
-				description: "Run a shell command confined to your dirs (scratch writable, inputs and data read-only, no network). 60 s limit.",
+				description: "Run a shell command confined to your dirs (scratch writable, inputs and mounts read-only, no network). 60 s limit.",
 				parameters: { type: "object", required: ["command"], properties: { command: { type: "string" } } },
 				run: async (args) => {
 					const r = spawnSync("bwrap", [...bwrapArgs(ws, []), "--setenv", "PATH", "/usr/bin:/bin", "--", "/bin/sh", "-c", String((args as { command: string }).command)], {
@@ -313,7 +325,9 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 					workspace: { ...spec.workspace, scratch: null, level: "read-only" },
 					resources: {},
 				});
-				return { text: text(r.output), value: r.output };
+				const parsed = parseWith(tool.output, r.output);
+				if (!parsed.ok) return { text: `tool ${tool.name} returned an output that does not match its schema: ${parsed.errors.join("; ")}`, isError: true };
+				return { text: text(parsed.value), value: parsed.value };
 			},
 		});
 	}

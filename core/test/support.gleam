@@ -4,45 +4,32 @@ import gleam/dict
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import wallis_core/reducer
 import wallis_core/run.{type RunState}
 import wallis_core/types.{
-  type Agent, type Effect, type Event, type Field, type Reducer, type ViewSpec,
-  type Workflow, Agent, Budget, Call, Checkpoint, Commit, Field, Pin, Requested,
-  Started, Usage, ViewSpec, Workflow, Write, WriteMap,
+  type Agent, type Effect, type Event, type Workflow, Agent, Budget, Call,
+  Checkpoint, Pin, Requested, Started, Usage, Workflow,
 }
 import wallis_core/value.{type Value, JArray, JNull}
 
-pub fn field(name: String, r: Reducer) -> Field {
-  Field(name, r, reducer.default_initial(r))
+/// Interventions in tests come from the human, who controls every run.
+pub const human = "human"
+
+pub fn agent(name: String) -> Agent {
+  Agent(name:, model: "default", max_turns: 8, steerable: True)
 }
 
-pub fn view(fields: List(String)) -> ViewSpec {
-  ViewSpec(fields:, max_chars: 100_000, max_items: 100, chunk: 1, omit: [])
-}
-
-pub fn agent(
-  name: String,
-  view: ViewSpec,
-  writes: List(#(String, Option(String))),
-) -> Agent {
-  Agent(
-    name:,
-    model: "default",
-    view:,
-    writes: list.map(writes, fn(w) { WriteMap(w.0, w.1) }),
-    max_turns: 8,
-  )
-}
-
-pub fn workflow(fields: List(Field), agents: List(Agent)) -> Workflow {
+pub fn workflow(agents: List(Agent)) -> Workflow {
   Workflow(
     name: "test",
-    fields:,
     agents:,
     scripts: ["train"],
     budget: Budget(usd: None, tokens: None, turns: None, compute_minutes: None),
   )
+}
+
+/// A steerable `worker` and a non-steerable `judge`.
+pub fn basic() -> Workflow {
+  workflow([agent("worker"), Agent(..agent("judge"), steerable: False)])
 }
 
 pub fn pin() -> types.Pin {
@@ -60,34 +47,15 @@ pub fn started(wf: Workflow) -> Event {
 }
 
 pub fn call(id: String, agent: String, input: Value) -> Event {
-  Requested(id:, branch: None, request: Call(agent:, input:))
-}
-
-pub fn branch_call(
-  id: String,
-  branch: String,
-  agent: String,
-  input: Value,
-) -> Event {
-  Requested(id:, branch: Some(branch), request: Call(agent:, input:))
-}
-
-pub fn commit(id: String, writes: List(#(String, Value))) -> Event {
-  Requested(
-    id:,
-    branch: None,
-    request: Commit(list.map(writes, fn(w) { Write(w.0, w.1) })),
-  )
+  Requested(id:, request: Call(agent:, input:))
 }
 
 pub fn returned(id: String, output: Value) -> Event {
-  types.AgentReturned(
-    id:,
-    output:,
-    emits: [],
-    usage: usage(),
-    model: "fake/model",
-  )
+  types.AgentReturned(id:, output:, usage: usage(), model: "fake/model")
+}
+
+pub fn idle(id: String, message: String) -> Event {
+  types.AgentIdle(id, message, usage(), "fake/model")
 }
 
 pub fn usage() -> types.Usage {
@@ -121,11 +89,6 @@ pub fn last(events: List(Event)) -> List(Effect) {
   list.filter(effects, fn(e) { e != Checkpoint })
 }
 
-pub fn state_of(events: List(Event), name: String) -> Value {
-  let #(state, _, _) = replay(events)
-  snapshot_get(state, "state." <> name)
-}
-
 /// A dotted path into the run's JSON snapshot.
 pub fn snapshot_get(state: RunState, path: String) -> Value {
   let assert Ok(snap) = value.parse(json.to_string(run.snapshot(state)))
@@ -138,6 +101,11 @@ pub fn snapshot_get(state: RunState, path: String) -> Value {
 pub fn status_after(events: List(Event)) -> Option(types.RunStatus) {
   let #(state, _, _) = replay(events)
   run.status(state)
+}
+
+pub fn nodes_after(events: List(Event)) -> List(types.Node) {
+  let #(state, _, _) = replay(events)
+  run.nodes(state)
 }
 
 /// The i-th node of the run's snapshot.

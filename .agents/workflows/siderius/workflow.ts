@@ -4,31 +4,26 @@
 // accounting. The task package (models, training, Health gates) stays
 // domain code behind scripts/. See MAPPING.md for what maps where and what
 // is approximated.
+//
+// The body is a pure program over journaled calls. The carried history
+// (knowledge cache, findings archive, collapse history, prediction memory,
+// error signatures, incumbent) is the body's local variables, rebuilt by
+// replay on resume. Agents never read it: the body builds each agent's
+// input from it, and marks the parts that can grow `Foldable`.
 
 import {
 	AgentFailed,
 	Artifact,
-	append,
-	countByKey,
 	defineAgent,
 	defineMcp,
 	defineModels,
+	defineMounts,
 	defineScript,
-	defineState,
 	defineTool,
-	freeze,
-	lastN,
-	perKey,
-	replace,
-	topK,
-	topKBy,
-	union,
-	dedupeBy,
+	Foldable,
 	type Static,
 	subWorkflow,
-	sum,
 	Type,
-	view,
 	workflow,
 } from "wallis";
 import mcpConfig from "./mcp.json" with { type: "json" };
@@ -146,20 +141,29 @@ const S = Type.Script(
 
 const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheEntry, CollapseEntry, Evidence, Incumbent, Proposal, Scope, Direction, HealthCheck, SkillInput, SkillOutput } = S;
 
-// --- Artifacts and data ------------------------------------------------------------
+// --- Artifacts and mounts ----------------------------------------------------------
 //
 // Files handed downstream are artifacts: the implementor exports the model
 // plugin, train mounts it and returns the checkpoint, evaluate and Health
-// mount the checkpoint. The dataset is mounted read-only from the local
-// profile (`data.siderius_data`); its manifest digest is pinned.
+// mount the checkpoint. Two read-only mounts, both supplied by the caller or
+// the local profile: `data` (the dataset) and `config` (data_scope.json,
+// health_config.yaml, advice.md: run_invariants.py's locked files). Their
+// content digests are pinned.
 
 const ModelPlugin = Artifact("text/x-python");
 const Checkpoint = Artifact("application/x-checkpoint");
-const DATA = "siderius_data";
+const mounts = defineMounts({ data: "", config: "" });
+
+/** Files in the `config` mount, by name. */
+const files = {
+	dataScope: "data_scope.json",
+	healthConfig: "health_config.yaml",
+	advice: "advice.md",
+};
 
 // --- Scripts: the task package's domain code, with typed args and outputs ------
 
-const trainScript = defineScript({
+const trainScript = defineScript({ mounts }, {
 	name: "train",
 	description: "Train one candidate config on the trial or formal scope (training_skill).",
 	input: Type.Script({ ModelPlugin, Config, Scope, Int }, `{
@@ -170,25 +174,25 @@ const trainScript = defineScript({
 		status: "ok" | "oom" | "gate_refused" | "infrastructure_abort",
 		checkpoint: Checkpoint | null, minutes: number
 	}`),
-	data: [DATA],
+	mounts: ["data", "config"],
 	resources: { gpu: 1, memoryGb: 32 },
 });
 
-const evaluateScript = defineScript({
+const evaluateScript = defineScript({ mounts }, {
 	name: "evaluate",
 	description: "Score a checkpoint on the trial or formal evaluation portion (inference_skill, evaluate_metric).",
 	input: Type.Script({ Checkpoint, Scope }, `{ checkpoint: Checkpoint, scope: Scope }`),
 	output: Type.Script({ Score }, `{ scoreable: boolean, score: Score, metric_id: string }`),
-	data: [DATA],
+	mounts: ["data"],
 	resources: { gpu: 1, memoryGb: 16 },
 });
 
-const healthScript = defineScript({
+const healthScript = defineScript({ mounts }, {
 	name: "health",
 	description: "Run the scientific Health gates of the effective Health config (round_health.py).",
 	input: Type.Script({ Checkpoint }, `{ checkpoint: Checkpoint, health_config: string, model_type: string }`),
 	output: Type.Script({ HealthCheck }, `{ valid: boolean, policy: "blocking" | "recording", failed_checks: HealthCheck[] }`),
-	data: [DATA],
+	mounts: ["data", "config"],
 });
 
 const fingerprintScript = defineScript({
@@ -198,11 +202,12 @@ const fingerprintScript = defineScript({
 	output: Type.Script({ CollapseEntry }, `{ entries: CollapseEntry[] }`),
 });
 
-const metricOrderScript = defineScript({
+const metricOrderScript = defineScript({ mounts }, {
 	name: "metric_order",
 	description: "Reconcile the run's MetricSpec and report its direction (MetricOrder).",
 	input: Type.Script(`{ data_scope: string }`),
 	output: Type.Script({ Direction }, `{ metric_id: string, direction: Direction }`),
+	mounts: ["config"],
 });
 
 const validateScript = defineScript({
@@ -235,56 +240,52 @@ const consolidator = defineAgent(
 			max: Type.Integer(),
 		}),
 		output: Type.Object({ items: Type.Array(Finding), archived: Type.Array(Finding) }),
-		maxTurns: 1,
+		// Codemode is always offered and costs a turn: 2 is the minimum.
+		maxTurns: 2,
 		needs: { structuredOutput: true },
 	},
 );
 
-// --- State: SIDERIUS ChainState and its folds ---------------------------------
+// --- Projections the body builds for agent inputs ---------------------------
+//
+// SIDERIUS's carried history lives in the body (see the loop). These are the
+// shapes agents receive; the large ones are Foldable, so the prompt shows a
+// skeleton when they outgrow maxChars and the full value is `input` in
+// codemode.
 
-const state = defineState({
-	// recent_tune_outputs / latest_new_summary: one summary per iteration.
-	runs: append(RunSummary),
-	// Per-model records; body code caps them (cap_knowledge_cache: the current
-	// model plus the top 4 others) and consolidates their findings.
-	knowledge_cache: replace(Type.Array(CacheEntry), []),
-	// Findings dropped by consolidation or rank-pruning (cache_archive_*.json).
-	findings_archive: append(Finding),
-	// collapse_fingerprint_history keyed by model_type; body code prunes it
-	// (3-iteration window, at most 8 entries per model).
-	collapse_history: replace(Type.Record(Type.String(), Type.Array(CollapseEntry)), {}),
-	// PredictionMemory: legacy v1 pool frozen, v2 outcome counts, v2 gain.
-	prediction_v1: freeze(Type.Record(Type.String(), Type.Integer())),
-	prediction_v2: countByKey(),
-	info_gain_v2: sum(),
-	prediction_version: freeze(Type.Integer(), 2),
-	// Evidence for the judge projection.
-	evidence: union(Evidence),
-	// chain_formal_incumbent_reference.
-	incumbent: topK({ k: 1, by: "rank_score", order: "descending" }, Incumbent),
-});
-
-// --- Views ---------------------------------------------------------------------
+type Evidence = Static<typeof Evidence>;
+type Incumbent = Static<typeof Incumbent>;
+type RunSummary = Static<typeof RunSummary>;
 
 /** judge-strategies-contract.md: 4000 chars, 24 entries, no confidence or ids. */
-const judgeProjection = view(state, {
-	fields: ["evidence"],
-	maxChars: 4000,
-	maxItems: 24,
-	chunk: 8,
-	omit: ["confidence", "candidate_id"],
+const JUDGE_MAX_CHARS = 4000;
+const JUDGE_MAX_ITEMS = 24;
+
+const JudgedEvidence = Type.Object({ at: Type.String(), source: Type.String(), content: Type.String(), source_ref: Type.String() });
+
+/**
+ * The judge's evidence projection, built in code: the newest 24 entries,
+ * without self-reported confidence, then the oldest dropped until the JSON
+ * fits 4000 characters. `omitted` counts every entry left out.
+ */
+function judgeProjection(evidence: readonly Evidence[]): { items: Static<typeof JudgedEvidence>[]; omitted: number } {
+	let items = evidence.slice(-JUDGE_MAX_ITEMS).map(({ at, source, content, source_ref }) => ({ at, source, content, source_ref }));
+	while (items.length > 0 && JSON.stringify(items).length > JUDGE_MAX_CHARS) items = items.slice(1);
+	return { items, omitted: evidence.length - items.length };
+}
+
+/** What the interpreter and proposer read: the carried history, foldable. */
+const History = Type.Object({
+	runs: Foldable(Type.Array(RunSummary), { maxChars: 6000 }),
+	knowledge_cache: Foldable(Type.Array(CacheEntry), { maxChars: 12_000 }),
+	collapse_history: Foldable(Type.Record(Type.String(), Type.Array(CollapseEntry)), { maxChars: 4000 }),
 });
 
-const interpreterView = view(state, {
-	fields: ["prediction_version", "prediction_v1", "runs", "collapse_history", "knowledge_cache", "prediction_v2", "info_gain_v2"],
-	maxChars: 24_000,
-	maxItems: 12,
-});
-
-const proposerView = view(state, {
-	fields: ["runs", "collapse_history", "knowledge_cache"],
-	maxChars: 16_000,
-	maxItems: 8,
+const PredictionMemory = Type.Object({
+	version: Type.Integer(),
+	v1: Type.Union([Type.Record(Type.String(), Type.Integer()), Type.Null()]),
+	v2: Type.Record(Type.String(), Type.Integer()),
+	info_gain_v2: Type.Number(),
 });
 
 // --- Tools ---------------------------------------------------------------------
@@ -299,21 +300,28 @@ const runSkill = defineTool({
 
 // --- Agents: SIDERIUS nodes ----------------------------------------------------
 
-const env = { models, state, mcp };
+const env = { models, mcp, mounts };
 
 const interpreter = defineAgent(env, {
 	name: "interpret",
 	model: "interpret",
 	prompt: interpretPrompt,
-	input: Type.Object({ iteration: Type.Integer(), cold_start: Type.Boolean(), metric_direction: Type.String() }),
+	input: Type.Object({
+		iteration: Type.Integer(),
+		cold_start: Type.Boolean(),
+		metric_direction: Type.String(),
+		history: History,
+		prediction_memory: PredictionMemory,
+	}),
 	output: Type.Object({
 		take_home: Type.String(),
 		key_findings: Type.Array(Finding),
 		legacy_prediction_pool: Type.Record(Type.String(), Type.Integer()),
 		analysis_brief: Type.String(),
 	}),
-	view: interpreterView,
-	writes: { prediction_v1: "legacy_prediction_pool" },
+	// advice.md is read from the config mount.
+	sandbox: "read-only",
+	mounts: ["config"],
 	maxTurns: 4,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -322,13 +330,11 @@ const dataAnalyst = defineAgent(env, {
 	name: "data_analysis",
 	model: "analysis",
 	prompt: dataAnalysisPrompt,
-	input: Type.Object({ at: Type.String(), analysis_brief: Type.String(), resource_minutes: Type.Number() }),
+	input: Type.Object({ at: Type.String(), analysis_brief: Type.String(), resource_minutes: Type.Number(), recent_runs: Type.Array(RunSummary) }),
 	output: Type.Object({ evidence: Type.Array(Evidence) }),
-	view: view(state, { fields: ["runs"], maxChars: 4000, maxItems: 4 }),
-	writes: { evidence: "evidence" },
 	tools: [runSkill],
 	sandbox: "read-only",
-	data: [DATA],
+	mounts: ["data"],
 	maxTurns: 24,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -337,10 +343,13 @@ const literature = defineAgent(env, {
 	name: "literature_review",
 	model: "literature",
 	prompt: literaturePrompt,
-	input: Type.Object({ at: Type.String(), bottlenecks: Type.Array(Type.String()), max_rounds: Type.Integer() }),
+	input: Type.Object({
+		at: Type.String(),
+		bottlenecks: Type.Array(Type.String()),
+		max_rounds: Type.Integer(),
+		knowledge_cache: Foldable(Type.Array(CacheEntry), { maxChars: 6000 }),
+	}),
 	output: Type.Object({ evidence: Type.Array(Evidence), search_rounds_used: Type.Integer() }),
-	view: view(state, { fields: ["knowledge_cache"], maxChars: 6000, maxItems: 5 }),
-	writes: { evidence: "evidence" },
 	mcp: { arxiv: ["search_papers", "download_paper", "read_paper"], semantic_scholar: "*" },
 	sandbox: "none",
 	maxTurns: 32,
@@ -351,10 +360,17 @@ const evidenceJudge = defineAgent(env, {
 	name: "evidence_judge",
 	model: "judge",
 	prompt: evidenceJudgePrompt,
-	input: Type.Object({ iteration: Type.Integer(), stop_criterion: Type.String() }),
+	input: Type.Object({
+		iteration: Type.Integer(),
+		stop_criterion: Type.String(),
+		evidence: Type.Array(JudgedEvidence, { maxItems: JUDGE_MAX_ITEMS }),
+		omitted: Type.Integer(),
+	}),
 	output: Type.Object({ brief: Type.String(), kept: Type.Array(Type.String()), stop: Type.Object({ recommend: Type.Boolean(), reason: Type.String() }) }),
-	view: judgeProjection,
-	maxTurns: 1,
+	// The judge is not steered: no answers, steering or interrupts; only cancel and a restart without a note.
+	steerable: false,
+	// Codemode is always offered and costs a turn: 2 is the minimum.
+	maxTurns: 2,
 	needs: { structuredOutput: true },
 });
 
@@ -368,9 +384,11 @@ const proposer = defineAgent(env, {
 		evidence_brief: Type.String(),
 		previous_failures: Type.Array(Type.String()),
 		vram_budget_gb: Type.Number(),
+		history: History,
 	}),
 	output: Proposal,
-	view: proposerView,
+	sandbox: "read-only",
+	mounts: ["config"],
 	maxTurns: 6,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -409,9 +427,9 @@ const tunePlanner = defineAgent(env, {
 		best_trial_config: Type.Union([Config, Type.Null()]),
 		notes: Type.Array(Type.String()),
 		physical_rejections: Type.Array(Type.String()),
+		knowledge_cache: Foldable(Type.Array(CacheEntry), { maxChars: 6000 }),
 	}),
 	output: Type.Object({ config: Config, rationale: Type.String() }),
-	view: view(state, { fields: ["knowledge_cache"], maxChars: 6000, maxItems: 5 }),
 	maxTurns: 2,
 	needs: { structuredOutput: true },
 });
@@ -481,12 +499,6 @@ const Input = Type.Object({
 type Input = Static<typeof Input>;
 type Direction = Static<typeof Direction>;
 
-const files = {
-	dataScope: "siderius/data_scope.json",
-	healthConfig: "siderius/health_config.yaml",
-	advice: "siderius/advice.md",
-};
-
 // --- Helpers -----------------------------------------------------------------------
 
 const tag = (iteration: number) => `iter-${String(iteration).padStart(3, "0")}`;
@@ -525,32 +537,50 @@ function rankPrune(items: readonly Finding[]): { kept: Finding[]; archived: Find
 
 /** _dedupe_error_signatures: one per (failure_class, top_user_frame, error_type); union evidence, keep the longer frames, the first message wins. */
 function mergeSignatures(existing: readonly ErrorSignature[], incoming: readonly ErrorSignature[]): ErrorSignature[] {
-	return dedupeBy(
-		[...existing, ...incoming],
-		(e) => JSON.stringify([e.failure_class, e.top_user_frame, e.error_type]),
-		(kept, next) => ({
-			...kept,
-			evidence_iters: [...new Set([...kept.evidence_iters, ...next.evidence_iters])].sort((a, b) => a - b),
-			last_frames: next.last_frames.length > kept.last_frames.length ? next.last_frames : kept.last_frames,
-		}),
-	);
+	const kept = new Map<string, ErrorSignature>();
+	for (const e of [...existing, ...incoming]) {
+		const key = JSON.stringify([e.failure_class, e.top_user_frame, e.error_type]);
+		const prior = kept.get(key);
+		kept.set(
+			key,
+			prior === undefined
+				? e
+				: {
+						...prior,
+						evidence_iters: [...new Set([...prior.evidence_iters, ...e.evidence_iters])].sort((a, b) => a - b),
+						last_frames: e.last_frames.length > prior.last_frames.length ? e.last_frames : prior.last_frames,
+					},
+		);
+	}
+	return [...kept.values()];
 }
 
 /** Collapse history: drop entries outside the window, then keep the 8 most recent per model; empty models disappear. */
 function pruneCollapse(history: Record<string, CollapseEntry[]>, fresh: readonly CollapseEntry[], iteration: number): Record<string, CollapseEntry[]> {
-	const all = [...Object.values(history).flat(), ...fresh].filter((e) => e.iteration > iteration - COLLAPSE_WINDOW);
-	return perKey(all, (e) => e.model_type, (entries) =>
-		lastN(
-			[...entries].sort((a, b) => a.iteration - b.iteration || a.count - b.count || a.signature.localeCompare(b.signature)),
-			COLLAPSE_PER_MODEL,
-		),
-	);
+	const out: Record<string, CollapseEntry[]> = {};
+	for (const e of [...Object.values(history).flat(), ...fresh]) {
+		if (e.iteration <= iteration - COLLAPSE_WINDOW) continue;
+		(out[e.model_type] ??= []).push(e);
+	}
+	for (const [model, entries] of Object.entries(out)) {
+		out[model] = entries.sort((a, b) => a.iteration - b.iteration || a.count - b.count || a.signature.localeCompare(b.signature)).slice(-COLLAPSE_PER_MODEL);
+	}
+	return out;
 }
 
-/** cap_knowledge_cache: the current model plus the top 4 others by rank score; scoreless entries rank last. */
+/**
+ * cap_knowledge_cache: the current model plus the top 4 others by rank
+ * score; ties keep insertion order and scoreless entries rank last, as
+ * MetricOrder.rank does.
+ */
 function capCache(cache: readonly CacheEntry[], current: CacheEntry): CacheEntry[] {
-	const others = cache.filter((e) => e.model_type !== current.model_type);
-	return [...topKBy(others, 4, (e) => e.rank_score, "descending"), current];
+	const others = cache
+		.filter((e) => e.model_type !== current.model_type)
+		.map((e, i) => ({ e, i }))
+		.sort((a, b) => (a.e.rank_score === null ? (b.e.rank_score === null ? a.i - b.i : 1) : b.e.rank_score === null ? -1 : b.e.rank_score - a.e.rank_score || a.i - b.i))
+		.slice(0, 4)
+		.map(({ e }) => e);
+	return [...others, current];
 }
 
 /**
@@ -627,6 +657,7 @@ const TuneInput = Type.Object({
 	trial_max_epochs: Type.Integer(),
 	formal_max_epochs: Type.Integer(),
 	previous_rejections: Type.Array(Type.String()),
+	knowledge_cache: Type.Array(CacheEntry),
 });
 
 const TuneOutput = Type.Object({
@@ -663,6 +694,7 @@ const tune = subWorkflow({
 				best_trial_config: bestTrialConfig,
 				notes,
 				physical_rejections: rejections,
+				knowledge_cache: input.knowledge_cache,
 			});
 			const config: Static<typeof Config> = isTrial ? plan.config : { ...(bestTrialConfig ?? plan.config), ...plan.config };
 
@@ -744,8 +776,8 @@ type StopReason =
 export default workflow({
 	name: "siderius",
 	models,
-	state,
 	mcp,
+	mounts,
 	agents: [interpreter, dataAnalyst, literature, evidenceJudge, stopCheck, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
 	scripts: [trainScript, evaluateScript, healthScript, fingerprintScript, metricOrderScript, validateScript, runSkillScript],
 	// LLM spend is new in wallis (SIDERIUS only logs tokens). A spent budget
@@ -753,49 +785,79 @@ export default workflow({
 	// compute minutes reach every script as its remaining budget.
 	budget: { usd: 40, turns: 3000, computeMinutes: 24 * 60 },
 	// run_invariants.py: resolved_data_scope, health_config_sha256 and
-	// advice_sha256. The seed, workflow digest and resolved alias table are
+	// advice_sha256 are the `config` mount's content digest, pinned with the
+	// `data` mount's. The seed, workflow digest and resolved alias table are
 	// always pinned.
-	pin: { files: [files.dataScope, files.healthConfig, files.advice] },
 	input: Input,
 	output: Type.Object({
 		stop_reason: Type.String(),
 		iterations: Type.Integer(),
 		incumbent: Type.Union([Incumbent, Type.Null()]),
+		/** The carried history at the end of the run. */
+		carried: Type.Object({
+			runs: Type.Array(RunSummary),
+			knowledge_cache: Type.Array(CacheEntry),
+			findings_archive: Type.Array(Finding),
+			collapse_history: Type.Record(Type.String(), Type.Array(CollapseEntry)),
+			prediction: PredictionMemory,
+		}),
 	}),
 	run: async (ctx, input: Input) => {
 		const { direction } = await ctx.script(metricOrderScript, { data_scope: files.dataScope });
 		const sign = direction === "higher_is_better" ? 1 : -1;
 
+		// --- Run memory: SIDERIUS ChainState, as local variables -------------
+		// recent_tune_outputs / latest_new_summary: one summary per iteration.
+		const runs: RunSummary[] = [];
+		// Per-model records (cap_knowledge_cache: the current model plus the top 4 others).
+		let knowledgeCache: CacheEntry[] = [];
+		// Findings dropped by consolidation or rank-pruning (cache_archive_*.json).
+		const findingsArchive: Finding[] = [];
+		// collapse_fingerprint_history keyed by model_type (3-iteration window, at most 8 per model).
+		let collapseHistory: Record<string, CollapseEntry[]> = {};
+		// PredictionMemory: the legacy v1 pool (first one wins), v2 outcome counts and gain.
+		let predictionV1: Record<string, number> | null = null;
+		const predictionV2: Record<string, number> = {};
+		let infoGainV2 = 0;
+		// Evidence for the judge projection, oldest first.
+		const evidence: Evidence[] = [];
+		// chain_formal_incumbent_reference.
+		let incumbent: Incumbent | null = null;
+
 		let stop: StopReason = "iterations_exhausted";
 		let iterations = 0;
 		let lastRejections: string[] = [];
 		let bodiesWithoutImprovement = 0;
-
-		// Unbounded reads for the body's own folds (not an agent view).
-		const whole = view(state, { fields: ["knowledge_cache", "collapse_history"], maxChars: 10_000_000, maxItems: 10_000 });
-		const readCache = async () => (await ctx.read(whole)).data.knowledge_cache ?? [];
-		const incumbent = async () => (await ctx.read(view(state, { fields: ["incumbent"], maxChars: 1000, maxItems: 1 }))).data.incumbent[0] ?? null;
+		const history = () => ({ runs, knowledge_cache: knowledgeCache, collapse_history: collapseHistory });
 
 		for (let iteration = 0; iteration < input.maxIterations; iteration++) {
 			// 1. Target check against the Health-valid formal incumbent.
-			const best = await incumbent();
-			if (input.targetScore !== null && best !== null && atLeast(direction, best.score, input.targetScore)) {
+			if (input.targetScore !== null && incumbent !== null && atLeast(direction, incumbent.score, input.targetScore)) {
 				stop = "target_reached";
 				break;
 			}
 			iterations++;
+			ctx.observe("iteration", iteration);
 
 			// 2. Interpretation of the previous iteration (cold start on the first).
-			const interpretation = await ctx.call(interpreter, { iteration, cold_start: iteration === 0, metric_direction: direction });
+			const interpretation: Static<typeof interpreter.output> = await ctx.call(interpreter, {
+				iteration,
+				cold_start: iteration === 0,
+				metric_direction: direction,
+				history: history(),
+				prediction_memory: { version: 2, v1: predictionV1, v2: predictionV2, info_gain_v2: infoGainV2 },
+			});
+			predictionV1 ??= interpretation.legacy_prediction_pool;
 
 			// 2b. Consolidate the findings into each model's own cache entry
 			// (cache_consolidator: at most one call per list, on a cache hit).
-			let cache = await readCache();
-			for (const [modelType, found] of Object.entries(perKey(interpretation.key_findings, (f) => f.model_type))) {
-				const entry = cache.find((e) => e.model_type === modelType);
+			const byModel = new Map<string, Finding[]>();
+			for (const f of interpretation.key_findings) byModel.set(f.model_type, [...(byModel.get(f.model_type) ?? []), f]);
+			for (const [modelType, found] of byModel) {
+				const entry = knowledgeCache.find((e) => e.model_type === modelType);
 				if (!entry) {
 					// A cache miss: nothing to consolidate into.
-					for (const f of found) await ctx.emit("findings_archive", f);
+					findingsArchive.push(...found);
 					continue;
 				}
 				const updated: CacheEntry = { ...entry };
@@ -806,39 +868,41 @@ export default workflow({
 					const merged = await ctx.call(consolidator, { model_type: modelType, kind, current: entry[list], incoming, max: MAX_SURVIVORS });
 					const pruned = rankPrune(merged.items);
 					updated[list] = pruned.kept;
-					for (const f of [...merged.archived, ...pruned.archived]) await ctx.emit("findings_archive", f);
+					findingsArchive.push(...merged.archived, ...pruned.archived);
 				}
-				cache = cache.map((e) => (e.model_type === modelType ? updated : e));
+				knowledgeCache = knowledgeCache.map((e) => (e.model_type === modelType ? updated : e));
 			}
-			await ctx.emit("knowledge_cache", cache);
 
-			// 3. Optional evidence stage, then the judge over a capped projection.
+			// 3. Optional evidence stage, then the judge over its capped projection.
 			let evidenceBrief = "";
 			if (input.evidence.dataAnalysis || input.evidence.literature) {
 				const at = tag(iteration);
 				const bottlenecks = interpretation.key_findings.filter((f) => f.kind === "bottleneck").map((f) => f.statement);
-				const analysis = () => ({ at, analysis_brief: interpretation.analysis_brief, resource_minutes: 30 });
-				const lit = () => ({ at, bottlenecks, max_rounds: input.evidence.literatureMaxRounds });
+				const analysis = () => ({ at, analysis_brief: interpretation.analysis_brief, resource_minutes: 30, recent_runs: runs.slice(-4) });
+				const lit = () => ({ at, bottlenecks, max_rounds: input.evidence.literatureMaxRounds, knowledge_cache: knowledgeCache });
+				const found: Evidence[] = [];
 				if (input.evidence.order === "parallel") {
-					await ctx.parallel({
+					const r = await ctx.parallel({
 						analysis: async (c) => (input.evidence.dataAnalysis ? c.call(dataAnalyst, analysis()) : null),
 						literature: async (c) => (input.evidence.literature ? c.call(literature, lit()) : null),
 					});
+					found.push(...(r.analysis?.evidence ?? []), ...(r.literature?.evidence ?? []));
 				} else {
-					const first = input.evidence.order === "analysis_then_literature" ? "analysis" : "literature";
-					for (const node of first === "analysis" ? ["analysis", "literature"] : ["literature", "analysis"]) {
-						if (node === "analysis" && input.evidence.dataAnalysis) await ctx.call(dataAnalyst, analysis());
-						if (node === "literature" && input.evidence.literature) await ctx.call(literature, lit());
+					for (const node of input.evidence.order === "analysis_then_literature" ? ["analysis", "literature"] : ["literature", "analysis"]) {
+						if (node === "analysis" && input.evidence.dataAnalysis) found.push(...(await ctx.call(dataAnalyst, analysis())).evidence);
+						if (node === "literature" && input.evidence.literature) found.push(...(await ctx.call(literature, lit())).evidence);
 					}
 				}
-				const verdict = await ctx.call(evidenceJudge, { iteration, stop_criterion: input.stops.judgeCriterion });
+				evidence.push(...found);
+				const projection = judgeProjection(evidence);
+				const verdict = await ctx.call(evidenceJudge, { iteration, stop_criterion: input.stops.judgeCriterion, evidence: projection.items, omitted: projection.omitted });
 				evidenceBrief = verdict.brief;
 				if (input.stops.judgeCriterion !== "" && iteration > 0 && verdict.stop.recommend) {
 					if (input.stops.judgeOnMet === "stop") {
 						stop = "judge_stop";
 						break;
 					}
-					// request_input: the stop-check node asks the operator and waits for the reply.
+					// request_input: the stop-check node asks the operator and waits for the answer.
 					const decision = await ctx.call(stopCheck, { iteration, criterion: input.stops.judgeCriterion, recommendation: verdict.stop.reason });
 					if (decision.decision === "stop") {
 						stop = "operator_stop";
@@ -859,6 +923,7 @@ export default workflow({
 						evidence_brief: evidenceBrief,
 						previous_failures: failures,
 						vram_budget_gb: input.tuning.vramBudgetGb,
+						history: history(),
 					});
 					const impl = await ctx.sub(implementAndValidate, {
 						proposal,
@@ -878,7 +943,7 @@ export default workflow({
 
 			if (candidate === null) {
 				// Like SIDERIUS, a failed iteration still uses an iteration slot.
-				await ctx.emit("runs", {
+				runs.push({
 					iteration,
 					model_type: "",
 					status: "no_candidate",
@@ -907,6 +972,7 @@ export default workflow({
 				trial_max_epochs: input.tuning.trialMaxEpochs,
 				formal_max_epochs: input.tuning.formalMaxEpochs,
 				previous_rejections: lastRejections,
+				knowledge_cache: knowledgeCache,
 			});
 			lastRejections = tuned.physical_rejections.slice(-10);
 
@@ -918,12 +984,11 @@ export default workflow({
 
 			// 6. Health feedback: collapse fingerprints per model.
 			const fingerprints = await ctx.script(fingerprintScript, { failed_checks: tuned.failed_checks, model_type: candidate.proposal.model_type, iteration });
-			const history = (await ctx.read(whole)).data.collapse_history ?? {};
-			await ctx.emit("collapse_history", pruneCollapse(history, fingerprints.entries, iteration));
+			collapseHistory = pruneCollapse(collapseHistory, fingerprints.entries, iteration);
 
 			// 7. Fold the iteration into the carried history (advance_completed_history).
 			const valid = tuned.best_valid_formal_score;
-			await ctx.emit("runs", {
+			runs.push({
 				iteration,
 				model_type: candidate.proposal.model_type,
 				status: "tuned",
@@ -933,9 +998,8 @@ export default workflow({
 				take_home: interpretation.take_home,
 			});
 			const modelType = candidate.proposal.model_type;
-			const cached = await readCache();
-			const prior = cached.find((e) => e.model_type === modelType);
-			const entry: CacheEntry = {
+			const prior = knowledgeCache.find((e) => e.model_type === modelType);
+			knowledgeCache = capCache(knowledgeCache, {
 				model_type: modelType,
 				description: candidate.proposal.model_description,
 				iteration,
@@ -944,18 +1008,18 @@ export default workflow({
 				key_findings: prior?.key_findings ?? [],
 				bottlenecks: prior?.bottlenecks ?? [],
 				error_signatures: mergeSignatures(prior?.error_signatures ?? [], signatures),
-			};
-			await ctx.emit("knowledge_cache", capCache(cached, entry));
+			});
 
 			// PredictionMemory v2: the deterministic rule, against the incumbent before this iteration.
-			const before = best === null ? null : best.score;
+			const before = incumbent === null ? null : incumbent.score;
 			const prediction = evaluatePrediction(direction, valid, before);
 			if (prediction.outcome !== "unevaluated") {
-				await ctx.emit("prediction_v2", prediction.outcome);
-				await ctx.emit("info_gain_v2", prediction.gain);
+				predictionV2[prediction.outcome] = (predictionV2[prediction.outcome] ?? 0) + 1;
+				infoGainV2 += prediction.gain;
 			}
 			if (valid !== null && better(direction, valid, before)) {
-				await ctx.emit("incumbent", { rank_score: sign * valid, score: valid, model_type: candidate.proposal.model_type, iteration });
+				incumbent = { rank_score: sign * valid, score: valid, model_type: modelType, iteration };
+				ctx.observe("incumbent", incumbent);
 				bodiesWithoutImprovement = 0;
 			} else {
 				bodiesWithoutImprovement++;
@@ -969,10 +1033,14 @@ export default workflow({
 		}
 
 		// The target can be reached by the last iteration.
-		const final = await incumbent();
-		if (stop === "iterations_exhausted" && input.targetScore !== null && final !== null && atLeast(direction, final.score, input.targetScore)) {
+		if (stop === "iterations_exhausted" && input.targetScore !== null && incumbent !== null && atLeast(direction, incumbent.score, input.targetScore)) {
 			stop = "target_reached";
 		}
-		return { stop_reason: stop, iterations, incumbent: final };
+		return {
+			stop_reason: stop,
+			iterations,
+			incumbent,
+			carried: { runs, knowledge_cache: knowledgeCache, findings_archive: findingsArchive, collapse_history: collapseHistory, prediction: { version: 2, v1: predictionV1, v2: predictionV2, info_gain_v2: infoGainV2 } },
+		};
 	},
 });

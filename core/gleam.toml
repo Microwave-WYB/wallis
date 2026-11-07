@@ -1,6 +1,6 @@
 name = "wallis_core"
 version = "0.1.0"
-description = "Pure core of wallis: run state, events, effects, views and reducers"
+description = "Pure core of wallis: journal, replay, budget, pin, status and interventions"
 target = "javascript"
 
 [javascript]

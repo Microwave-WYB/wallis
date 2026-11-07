@@ -1,7 +1,7 @@
 //// The pure core of wallis.
 ////
-//// The core owns every decision about a run (views, reducers, pin, budget,
-//// journal hits) and performs no I/O. The host feeds it events and executes
+//// The core owns every decision about a run (journal, replay matching,
+//// budget, pin, status, ownership and interventions) and performs no I/O. The host feeds it events and executes
 //// the effects it returns. See docs/design.md at the repository root.
 ////
 //// The host holds `RunState` as an opaque handle; events, effects and state
@@ -40,7 +40,7 @@ pub fn step_json(state: RunState, event: String) -> #(RunState, String) {
   )
 }
 
-/// JSON of the run: status, nodes, state, spend, budget and models.
+/// JSON of the run: status, nodes, observations, spend, budget and models.
 pub fn snapshot_json(state: RunState) -> String {
   json.to_string(run.snapshot(state))
 }

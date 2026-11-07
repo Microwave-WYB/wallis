@@ -9,7 +9,7 @@
 // as artifacts are discarded. No directory is shared between nodes.
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json, SandboxLevel } from "../sdk/index.ts";
 
@@ -82,6 +82,13 @@ export function resolveDrafts(value: Json, runDir: string, scratch: string | nul
 	return value;
 }
 
+/** Every artifact ref in a value must name a blob in the run's store. */
+export function verifyRefs(value: Json, runDir: string): void {
+	for (const ref of refsIn(value)) {
+		if (!existsSync(blobPath(runDir, ref.digest))) throw new ArtifactError(`artifact ${ref.name} (${ref.digest}) is not in the run's store`);
+	}
+}
+
 /** Hardlinks a blob to `target` (same filesystem) or copies it. */
 export function linkOrCopy(source: string, target: string): void {
 	try {
@@ -100,8 +107,10 @@ export interface NodeDirs {
 	/** `<inputs>/<sha256 hex>/<name>` for every artifact in the node's input. */
 	readonly inputs: string;
 	readonly scratch: string | null;
-	/** Data dirs by name, mounted read-only. */
-	readonly data: Readonly<Record<string, string>>;
+	/** Mounts by name, read-only. */
+	readonly mounts: Readonly<Record<string, string>>;
+	/** Host-owned: where capped tool and codemode output spills. Not a tool-visible dir. */
+	readonly spill: string;
 }
 
 export function nodeDirName(id: string): string {
@@ -114,15 +123,15 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
 }
 
 /** Creates (or reuses, for a continued node) a node's dirs and mounts its input artifacts. */
-export function prepareNode(runDir: string, id: string, level: SandboxLevel, input: Json, data: Readonly<Record<string, string>>): NodeDirs {
+export function prepareNode(runDir: string, id: string, level: SandboxLevel, input: Json, mounts: Readonly<Record<string, string>>): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
-	const dirs: NodeDirs = { level, root, inputs: join(root, "inputs"), scratch: level === "workspace" ? join(root, "scratch") : null, data };
+	const dirs: NodeDirs = { level, root, inputs: join(root, "inputs"), scratch: level === "workspace" ? join(root, "scratch") : null, mounts, spill: join(root, "spill") };
+	verifyRefs(input, runDir);
 	if (level === "none") return dirs;
 	mkdirSync(dirs.inputs, { recursive: true });
 	if (dirs.scratch) mkdirSync(dirs.scratch, { recursive: true });
 	for (const ref of refsIn(input)) {
 		const blob = blobPath(runDir, ref.digest);
-		if (!existsSync(blob)) throw new ArtifactError(`input artifact ${ref.name} (${ref.digest}) is not in the run's store`);
 		const target = inputPath(dirs, ref);
 		if (existsSync(target)) continue;
 		mkdirSync(join(target, ".."), { recursive: true });
@@ -145,27 +154,4 @@ export function shareBlobs(fromRunDir: string, toRunDir: string): void {
 		const target = join(blobsDir(toRunDir), file);
 		if (!existsSync(target)) linkOrCopy(join(from, file), target);
 	}
-}
-
-// --- Datasets ----------------------------------------------------------------------
-
-/**
- * A dataset dir's manifest digest: sha256 over the sorted relative paths,
- * sizes and modification times of its files. Datasets are mounted, never
- * copied, so this is what the pin records.
- */
-export function manifestDigest(dir: string): string {
-	const lines: string[] = [];
-	const walk = (d: string) => {
-		for (const entry of readdirSync(d, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
-			const path = join(d, entry.name);
-			if (entry.isDirectory()) walk(path);
-			else if (entry.isFile()) {
-				const st = statSync(path, { bigint: true });
-				lines.push(`${relative(dir, path)}\t${st.size}\t${st.mtimeNs}`);
-			}
-		}
-	};
-	walk(dir);
-	return `manifest:sha256:${createHash("sha256").update(lines.join("\n")).digest("hex")}`;
 }

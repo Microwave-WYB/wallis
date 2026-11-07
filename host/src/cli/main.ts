@@ -2,15 +2,17 @@
 // The wallis CLI. Runs live under `.wallis/runs/` of the project (the
 // working directory, or --root).
 //
-//   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--executor module] [--detach]
+//   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--mount name=dir]... [--executor module] [--detach]
 //   wallis resume <run> [--model a=m]... [--budget kind=limit]... [--executor module] [--detach]
-//   wallis send <run> <node> <text>
+//   wallis send <run> <node> <text>          answer an idle node
+//   wallis steer <run> <node> <text>         a running node of a steerable agent, at its next step
+//   wallis restart <run> <node> [note]       discard the node's progress, reissue with the note
 //   wallis cancel <run>
 //   wallis status <run> [--json]
 //   wallis wait <run> [--timeout seconds] [--json]
 //   wallis pending [--json]
 //   wallis claim <run>
-//   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> <node>
+//   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> [<node>]
 //   wallis interrupt <run> <node> [text] | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
 //   wallis fork <run> --at <events|node> [--model a=m]... [--detach]
@@ -33,6 +35,7 @@ import {
 	exportArtifact,
 	forkRun,
 	inspectRun,
+	latestObservations,
 	listRunViews,
 	nodeTranscript,
 	pending,
@@ -42,6 +45,8 @@ import {
 	waitForAttention,
 	waitForOwn,
 } from "../host/query.ts";
+import { IdleNode, LiveNode, must, OwnedRun, parseNodeId, parseRunId, SteerableNode } from "../host/capability.ts";
+import type { Refusal } from "../sdk/index.ts";
 import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { loadProfile } from "../host/profile.ts";
@@ -61,6 +66,7 @@ const { values, positionals } = parseArgs({
 		input: { type: "string" },
 		seed: { type: "string" },
 		model: { type: "string", multiple: true },
+		mount: { type: "string", multiple: true },
 		budget: { type: "string", multiple: true },
 		executor: { type: "string" },
 		detach: { type: "boolean" },
@@ -79,9 +85,19 @@ const root = resolve(values.root ?? process.cwd());
 const caller = callerIdentity();
 
 /** Commands that change or answer a run work only on the caller's own runs. */
-function control(dir: string): void {
+function control(dir: string): OwnedRun {
 	const view = inspectRun(dir);
-	if (!mayControl(caller, view.owner)) throw new NotOwner(view.runId, view.owner, caller);
+	const owned = OwnedRun.check(view.run, caller);
+	if (!(owned instanceof OwnedRun)) throw new NotOwner(view.runId, view.owner, caller);
+	return owned;
+}
+
+
+const refused = (refusal: Refusal) => new RunRefused(refusal);
+
+/** The run dir and node id named on the command line, parsed. */
+function target(run: string | undefined, node: string | undefined): { dir: string; node: string } {
+	return { dir: resolveRun(root, parseRunId(run)), node: parseNodeId(node) };
 }
 const [command, ...args] = positionals;
 
@@ -112,9 +128,14 @@ function out(text: string): void {
 
 function report(dir: string): void {
 	const view = inspectRun(dir);
-	if (values.json) return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, spent: view.run.spent }));
+	const observed = latestObservations(view);
+	if (values.json) {
+		return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed, spent: view.run.spent }));
+	}
 	const items = attention(view);
 	out(items.length > 0 ? describe(items) : `Run ${view.runId}: ${view.run.status?.type}${view.stopped ? ", stopped" : ""}.`);
+	const labels = Object.entries(observed);
+	if (labels.length > 0) out(`Observed: ${labels.map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 200)}`).join("; ")}`);
 }
 
 /** `WALLIS_HOST`: `systemd`, `plain`, or (default) systemd when `systemd-run --user` works. */
@@ -175,6 +196,7 @@ async function drive(dir: string, options: Partial<SessionOptions>): Promise<voi
 		scripts: kit.scripts ?? (workflow ? new ProcessScripts({ workflowDir: dirname(workflow), slots: new MachineSlots(local.slots) }) : undefined),
 		executorModule: module,
 		root: meta?.root ?? root,
+		by: caller,
 		...(fresh ? start : {}),
 		...options,
 	});
@@ -214,6 +236,7 @@ async function main(): Promise<number> {
 				input: values.input ? (JSON.parse(values.input) as Json) : null,
 				seed: values.seed ? Number(values.seed) : undefined,
 				models: pairs(values.model),
+				mounts: pairs(values.mount),
 				owner: caller,
 			};
 			const executor = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? null);
@@ -243,38 +266,60 @@ async function main(): Promise<number> {
 			return 0;
 		}
 		case "send": {
-			const [run, node, ...words] = args;
-			const dir = resolveRun(root, run ?? "");
-			control(dir);
-			const view = inspectRun(dir);
-			const target = view.run.nodes.find((n) => n.id === node);
-			// An idle node continues with the message; a running node is steered.
-			if (!target || target.status.type === "node_done") {
-				out(`Refused: ${JSON.stringify({ type: "not_idle", node })}`);
-				return 1;
-			}
-			await deliver(dir, { id: newMessageId(), type: "send", node: node!, text: words.join(" ") });
-			out(`Sent to ${node} of run ${view.runId}. To be notified: npx wallis wait ${view.runId}`);
+			const [run, id, ...words] = args;
+			const { dir, node } = target(run, id);
+			// Checked here and again by the driver when it applies the answer.
+			must(IdleNode.check(control(dir), node), refused);
+			await deliver(dir, { id: newMessageId(), type: "answer", node, text: words.join(" "), by: caller });
+			out(`Sent to ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
+			return 0;
+		}
+		case "steer":
+		case "interrupt": {
+			const [run, id, ...words] = args;
+			const { dir, node } = target(run, id);
+			must(SteerableNode.check(control(dir), node), refused);
+			if (lockHolder(runPaths(dir)) === null) throw new RunRefused({ type: "node_not_running", node });
+			const text = words.join(" ");
+			await deliver(
+				dir,
+				command === "steer"
+					? { id: newMessageId(), type: "steer", node, text, by: caller }
+					: words.length > 0
+						? { id: newMessageId(), type: "interrupt", node, text, by: caller }
+						: { id: newMessageId(), type: "interrupt", node, by: caller },
+			);
+			out(`${command === "steer" ? "Steered" : "Interrupted"} ${node} of run ${runPaths(dir).id}.`);
+			return 0;
+		}
+		case "restart": {
+			const [run, id, ...words] = args;
+			const { dir, node } = target(run, id);
+			must(LiveNode.check(control(dir), node), refused);
+			await deliver(dir, words.length > 0 ? { id: newMessageId(), type: "restart", node, note: words.join(" "), by: caller } : { id: newMessageId(), type: "restart", node, by: caller });
+			out(`Restarted ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
 		case "cancel": {
-			const dir = resolveRun(root, args[0] ?? "");
-			control(dir);
+			const dir = resolveRun(root, parseRunId(args[0]));
+			const owned = control(dir);
 			if (values.node) {
 				// One node: an agent failure for the body to handle.
-				if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "cancel_node", node: values.node });
+				const node = parseNodeId(values.node);
+				must(LiveNode.check(owned, node), refused);
+				if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "cancel_node", node, by: caller });
 				else {
-					const refusal = applyControl(dir, { type: "node_cancelled", node: values.node });
+					const refusal = applyControl(dir, { type: "node_cancelled", node, by: caller });
 					if (refusal) throw new RunRefused(refusal);
 				}
-				out(`Cancelled node ${values.node} of run ${runPaths(dir).id}.`);
+				out(`Cancelled node ${node} of run ${runPaths(dir).id}.`);
 				return 0;
 			}
 			if (inspectRun(dir).run.status?.type === "finished") {
 				report(dir);
 				return 0;
 			}
-			await deliver(dir, { id: newMessageId(), type: "cancel" });
+			await deliver(dir, { id: newMessageId(), type: "cancel", by: caller });
 			const deadline = Date.now() + 10_000;
 			while (Date.now() < deadline && inspectRun(dir).run.status?.type !== "finished") await new Promise((r) => setTimeout(r, 100));
 			report(dir);
@@ -344,26 +389,22 @@ async function main(): Promise<number> {
 		}
 		case "show": {
 			const [run, node] = args;
-			const dir = resolveRun(root, run ?? "");
-			const page = nodeTranscript(dir, node ?? "", values.since ? Number(values.since) : 0, values.limit ? Number(values.limit) : 200);
+			const dir = resolveRun(root, parseRunId(run));
+			if (node === undefined) {
+				// The run's observations, in order.
+				for (const o of inspectRun(dir).run.observations) out(`${o.at}\t${o.label}\t${JSON.stringify(o.value)}`);
+				return 0;
+			}
+			const page = nodeTranscript(dir, parseNodeId(node), values.since ? Number(values.since) : 0, values.limit ? Number(values.limit) : 200);
 			for (const e of page.items) out(`${e.seq}\t${e.entry}`);
-			return 0;
-		}
-		case "interrupt": {
-			const [run, node, ...words] = args;
-			const dir = resolveRun(root, run ?? "");
-			control(dir);
-			if (lockHolder(runPaths(dir)) === null) throw new Error(`run ${runPaths(dir).id} is not being driven: nothing to interrupt`);
-			await deliver(dir, words.length > 0 ? { id: newMessageId(), type: "interrupt", node: node!, text: words.join(" ") } : { id: newMessageId(), type: "interrupt", node: node! });
-			out(`Interrupted ${node} of run ${runPaths(dir).id}.`);
 			return 0;
 		}
 		case "pause": {
 			const dir = resolveRun(root, args[0] ?? "");
 			control(dir);
-			if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "pause" });
+			if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "pause", by: caller });
 			else {
-				const refusal = applyControl(dir, { type: "pause_requested" });
+				const refusal = applyControl(dir, { type: "pause_requested", by: caller });
 				if (refusal) throw new RunRefused(refusal);
 			}
 			out(`Paused run ${runPaths(dir).id}: no new calls until npx wallis resume ${runPaths(dir).id}.`);
@@ -410,12 +451,12 @@ async function main(): Promise<number> {
 			const module = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
 			const kit = await loadExecutor(module);
 			const local = loadProfile(root);
-			const server = createMcpServer(new Runs(root, { executor: limitProviders(kit.executor, local.providers ?? {}), scripts: kit.scripts }, module));
+			const server = await createMcpServer(new Runs(root, { executor: limitProviders(kit.executor, local.providers ?? {}), scripts: kit.scripts }, module));
 			await server.connect(new StdioServerTransport());
 			return new Promise<number>(() => {});
 		}
 		default:
-			process.stderr.write(`usage: wallis run|resume|send|cancel|status|wait|pending|fork|serve ...\n`);
+			process.stderr.write(`usage: wallis run|resume|send|steer|interrupt|restart|cancel|pause|claim|status|wait|pending|ls|tree|log|show|fork|export|serve ...\n`);
 			return 64;
 	}
 }

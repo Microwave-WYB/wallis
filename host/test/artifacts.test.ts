@@ -1,4 +1,4 @@
-// Artifacts, per-node dirs, mounted datasets and the bwrap script sandbox.
+// Artifacts, per-node dirs, mounts and the bwrap script sandbox.
 
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -13,6 +13,8 @@ import { tmp } from "./util.ts";
 const here = fileURLToPath(new URL(".", import.meta.url));
 const workflow = resolve(here, "fixtures/artifacts/workflow.ts");
 const hasBwrap = bwrapAvailable();
+// Mount file hashes go to a throwaway cache.
+process.env.XDG_CACHE_HOME = tmp("wallis-cache-");
 if (!hasBwrap) process.stderr.write("artifacts.test: bubblewrap cannot create a sandbox here; confinement assertions are skipped\n");
 
 function setup() {
@@ -31,6 +33,8 @@ function writer() {
 			// The checkpoint is mounted read-only; the report is written to scratch and exported.
 			const ref = call.input as { checkpoint: { digest: string; name: string } };
 			const ckpt = readFileSync(join(call.workspace.inputs, ref.checkpoint.digest.slice(7), ref.checkpoint.name), "utf8");
+			// A mount with a relative default resolves against the workflow dir.
+			assert.equal(call.workspace.mounts.fixtures, resolve(workflow, "..", "scripts"));
 			writeFileSync(join(call.workspace.scratch!, "report.md"), `# Report\n${ckpt}\n`);
 			return { submit: { report: call.exportArtifact("report.md", "text/markdown") } };
 		},
@@ -39,7 +43,7 @@ function writer() {
 
 async function run(s: ReturnType<typeof setup>) {
 	const scripts = new ProcessScripts({ workflowDir: resolve(workflow, ".."), confine: hasBwrap ? "require" : "off" });
-	return runWorkflow({ workflow, dir: s.dir, root: s.root, executor: writer(), scripts, input: { outside: s.outside }, local: { data: { corpus: s.corpus } }, inboxPollMs: null });
+	return runWorkflow({ workflow, dir: s.dir, root: s.root, executor: writer(), scripts, input: { outside: s.outside }, mounts: { corpus: s.corpus }, local: {}, inboxPollMs: null });
 }
 
 test("artifacts flow downstream by ref; the store is content-addressed; node dirs are discarded", async () => {
@@ -58,9 +62,10 @@ test("artifacts flow downstream by ref; the store is content-addressed; node dir
 	assert.doesNotMatch(log, /"artifact":/);
 	assert.doesNotMatch(log, /not-exported/);
 	assert.deepEqual(existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [], []);
-	// The dataset's manifest digest is pinned.
+	// Each mount's content digest is pinned.
 	const started = new EventLog(join(s.dir, "log.jsonl")).read()[0] as { pin: { inputs: Record<string, string> } };
-	assert.match(started.pin.inputs["data.corpus"]!, /^manifest:sha256:[0-9a-f]{64}$/);
+	assert.match(started.pin.inputs["mount.corpus"]!, /^mount:sha256:[0-9a-f]{64}$/);
+	assert.match(started.pin.inputs["mount.fixtures"]!, /^mount:sha256:[0-9a-f]{64}$/);
 
 	// export copies an artifact out; fork shares blobs.
 	const target = tmp();
@@ -80,11 +85,26 @@ test("scripts run confined: read-only inputs, a private scratch dir, nothing els
 	assert.ok(!existsSync(`${s.outside}.copy`));
 });
 
-test("a changed dataset is a result-defining change: resume refuses it", async () => {
+test("a changed mount is a result-defining change: resume refuses it", async () => {
 	const s = setup();
 	await run(s);
 	writeFileSync(join(s.corpus, "words.txt"), "a different corpus");
-	await assert.rejects(run(s), (e: unknown) => e instanceof RunRefused && e.refusal.type === "pin_mismatch" && e.refusal.field === "inputs.data.corpus");
+	await assert.rejects(run(s), (e: unknown) => e instanceof RunRefused && e.refusal.type === "pin_mismatch" && e.refusal.field === "inputs.mount.corpus");
+});
+
+test("a mount without a value is a preflight refusal; file hashes are cached by path, mtime and size", async () => {
+	const s = setup();
+	const scripts = new ProcessScripts({ workflowDir: resolve(workflow, ".."), confine: "off" });
+	await assert.rejects(
+		runWorkflow({ workflow, dir: s.dir, root: s.root, executor: writer(), scripts, input: { outside: s.outside }, local: {}, inboxPollMs: null }),
+		(e: unknown) => e instanceof RunRefused && JSON.stringify(e.refusal) === JSON.stringify({ type: "mount_unset", mount: "corpus" }),
+	);
+	assert.ok(!existsSync(join(s.dir, "log.jsonl")), "nothing is logged");
+	// The local profile supplies it, per workflow.
+	const r = await runWorkflow({ workflow, dir: s.dir, root: s.root, executor: writer(), scripts, input: { outside: s.outside }, local: { mounts: { workflows: { artifacts: { corpus: s.corpus } } } }, inboxPollMs: null });
+	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
+	const cache = JSON.parse(readFileSync(join(process.env.XDG_CACHE_HOME!, "wallis", "file-hashes.json"), "utf8")) as Record<string, string>;
+	assert.ok(Object.keys(cache).some((k) => k.startsWith(join(s.corpus, "words.txt"))));
 });
 
 test("an idle node keeps its scratch dir; a done node's dir is deleted", async () => {
@@ -102,10 +122,10 @@ test("an idle node keeps its scratch dir; a done node's dir is deleted", async (
 				return { submit: { report: call.exportArtifact("report.md", "text/markdown") } };
 			},
 		});
-	const opts = { workflow, dir: s.dir, root: s.root, scripts, local: { data: { corpus: s.corpus } }, inboxPollMs: null } as const;
+	const opts = { workflow, dir: s.dir, root: s.root, scripts, mounts: { corpus: s.corpus }, local: {}, inboxPollMs: null } as const;
 	const idle = await runWorkflow({ ...opts, executor: executor(), input: { outside: s.outside } });
 	const node = idle.run.nodes.find((n) => n.agent === "writer")!;
-	assert.equal(node.status.type, "node_idle");
+	assert.equal(node.type, "node_idle");
 	const scratch = join(s.dir, "work", node.id.replace(/[^A-Za-z0-9._-]/g, "_"), "scratch");
 	assert.equal(readFileSync(join(scratch, "draft.md"), "utf8"), "draft");
 	const done = await runWorkflow({ ...opts, executor: executor(), sends: [{ node: node.id, text: "yes" }] });

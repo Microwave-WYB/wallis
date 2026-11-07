@@ -5,36 +5,38 @@
 // core/src/wallis_core/types.gleam.
 
 import * as gleam from "../../../core/build/dev/javascript/wallis_core/wallis_core.mjs";
-import type { FailReason, Json, Refusal } from "../sdk/index.ts";
+import type { AgentFailure, FailReason, Json, Refusal } from "../sdk/index.ts";
 
-export type { FailReason, Refusal };
+export type { AgentFailure, FailReason, Refusal };
 export type Usage = { usd: number; tokens: number; turns: number };
-export type Write = { field: string; value: Json };
 export type Message = { role: "user" | "assistant"; text: string };
 export type BudgetKind = "usd" | "tokens" | "turns" | "compute_minutes";
 
 export type Event =
 	| { type: "started"; workflow: Json; pin: Pin; input: Json }
 	| { type: "resumed"; pin: Pin }
-	| { type: "requested"; id: string; branch: string | null; request: Json }
-	| { type: "agent_returned"; id: string; output: Json; emits: Write[]; usage: Usage; model: string }
+	| { type: "requested"; id: string; request: Json }
+	| { type: "agent_returned"; id: string; output: Json; usage: Usage; model: string }
 	| { type: "agent_idle"; id: string; message: string; usage: Usage; model: string }
-	| { type: "agent_failed"; id: string; error: string; usage: Usage; model: string }
+	| { type: "agent_failed"; id: string; failure: AgentFailure; usage: Usage; model: string }
 	| { type: "executor_failed"; id: string; error: string }
+	| { type: "input_rejected"; id: string; field: string | null; chars: number; limit: number }
 	| { type: "script_returned"; id: string; output: Json; minutes: number }
 	| { type: "script_failed"; id: string; error: string; minutes: number }
-	| { type: "sent"; node: string; text: string; message_id: string }
+	| { type: "observed"; at: string; label: string; value: Json }
+	| { type: "sent"; node: string; text: string; message_id: string; by: string }
+	| { type: "steered"; node: string; text: string; message_id: string; by: string }
+	| { type: "interrupted"; node: string; by: string }
+	| { type: "restarted"; node: string; note: string | null; by: string }
+	| { type: "node_cancelled"; node: string; by: string }
 	| { type: "alias_rebound"; alias: string; from: string; to: string }
 	| { type: "budget_raised"; kind: BudgetKind; limit: number }
 	| { type: "executor_changed"; name: string }
 	| { type: "retry_unavailable" }
-	| { type: "cancel_requested" }
+	| { type: "cancel_requested"; by: string }
+	| { type: "pause_requested"; by: string }
+	| { type: "resume_requested"; by: string }
 	| { type: "claimed"; owner: string }
-	| { type: "steered"; node: string; text: string; message_id: string }
-	| { type: "interrupted"; node: string }
-	| { type: "pause_requested" }
-	| { type: "resume_requested" }
-	| { type: "node_cancelled"; node: string }
 	| { type: "body_finished"; output: Json }
 	| { type: "body_failed"; reason: FailReason };
 
@@ -49,17 +51,25 @@ export type IdleReason =
 
 export type RunStatus = { type: "running" } | { type: "idle"; reason: IdleReason | null } | { type: "finished"; outcome: Outcome };
 
-export type NodeStatus =
-	| { type: "node_running" }
-	| { type: "node_idle"; last_message: string }
-	| { type: "node_done"; outcome: { type: "submitted" } | { type: "gave_up"; error: string } };
+export type InboxMessage = { kind: "answer" | "steer" | "interrupt" | "restart"; text: string; step: number };
 
-export type Node = { id: string; agent: string; model: string; status: NodeStatus };
+/** `steerable` is a literal in each member, so `node.steerable` narrows. */
+type NodeBase = { id: string; agent: string; model: string; inbox: InboxMessage[] } & ({ steerable: true } | { steerable: false });
+
+export type RunningNode = NodeBase & { type: "node_running" };
+export type IdleNodeState = NodeBase & { type: "node_idle"; question: string };
+export type DoneNode = NodeBase & { type: "node_done"; outcome: { type: "submitted" } | { type: "node_failed"; failure: AgentFailure } };
+/** What cancel and restart reach. */
+export type LiveNodeState = RunningNode | IdleNodeState;
+/** One agent call and its dialogue; each variant carries only what is meaningful in that state. */
+export type Node = RunningNode | IdleNodeState | DoneNode;
+
+export type Observation = { at: string; label: string; value: Json };
 
 export type Snapshot = {
 	status: RunStatus;
 	nodes: Node[];
-	state: Record<string, Json>;
+	observations: Observation[];
 	spent: { usd: number; tokens: number; turns: number; compute_minutes: number };
 	budget: { usd: number | null; tokens: number | null; turns: number | null; compute_minutes: number | null };
 	models: Record<string, string>;
@@ -67,20 +77,21 @@ export type Snapshot = {
 	owner: string | null;
 };
 
+export type CallAgentEffect = {
+	type: "call_agent";
+	id: string;
+	agent: string;
+	model: string;
+	input: Json;
+	max_turns: number;
+	digest: string;
+	transcript: Message[];
+	note: string | null;
+};
+
 export type Effect =
 	| { type: "checkpoint" }
-	| {
-			type: "call_agent";
-			id: string;
-			agent: string;
-			model: string;
-			view: string;
-			omitted: Record<string, number>;
-			input: Json;
-			max_turns: number;
-			digest: string;
-			transcript: Message[];
-	  }
+	| CallAgentEffect
 	| { type: "run_script"; id: string; script: string; args: Json; compute_minutes: number | null; digest: string }
 	| { type: "deliver"; id: string; value: Json }
 	| { type: "fail"; id: string; reason: FailReason }
@@ -98,7 +109,7 @@ export class Core {
 		return JSON.parse(effects) as Effect[];
 	}
 
-	/** JSON of status, nodes, state, spend, budget and models. */
+	/** JSON of status, nodes, observations, spend, budget and models. */
 	snapshotText(): string {
 		return gleam.snapshot_json(this.#state);
 	}

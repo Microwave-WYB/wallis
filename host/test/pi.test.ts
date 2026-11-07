@@ -15,7 +15,7 @@ import { tmp } from "./util.ts";
 const here = fileURLToPath(new URL(".", import.meta.url));
 
 function faux() {
-	const provider = fauxProvider({ models: [{ id: "faux-1" }, { id: "faux-2" }] });
+	const provider = fauxProvider({ models: [{ id: "faux-1" }, { id: "faux-2" }, { id: "faux-small", contextWindow: 2000 }] });
 	const models = createModels();
 	models.setProvider(provider.provider);
 	return { provider, executor: new PiExecutor({ models }) };
@@ -28,16 +28,31 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 	return {
 		id: "#0",
 		agent: "answerer",
-		declaration: { model: "default", prompt: "Answer.", input: {}, output: {}, writes: {}, mcp: {}, tools: [], skills: [], needs: {}, sandbox: "none", data: [], codemode: true, max_turns: 6 } as never,
+		declaration: {
+			model: "default",
+			prompt: "Answer.",
+			input: {},
+			output: {},
+			mcp: {},
+			tools: [],
+			skills: [],
+			needs: {},
+			sandbox: "none",
+			mounts: [],
+			steerable: true,
+			compaction: true,
+			max_turns: 6,
+		},
 		model: "faux/faux-1",
-		view: '<field name="note">\n"hello"\n</field>',
-		omitted: {},
+		prompt: 'Input:\n{ "question": "how many?" }',
 		input: { question: "how many?" },
+		note: null,
+		contextTokens: undefined,
 		maxTurns: 6,
 		digest: "d",
 		transcript: [],
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
-		workspace: { level: "none", root: "/nonexistent", inputs: "/nonexistent", scratch: null, data: {} },
+		workspace: { level: "none", root: "/nonexistent", inputs: "/nonexistent", scratch: null, mounts: {}, spill: join(tmp(), "spill") },
 		exportArtifact: () => {
 			throw new Error("no scratch");
 		},
@@ -113,7 +128,8 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	const dir = join(tmp(), "run");
 	const opts = { workflow: ask, dir, executor, models: { default: "faux/faux-1" }, inboxPollMs: null } as const;
 	const first = await runWorkflow({ ...opts, input: { topic: "folds" } });
-	assert.deepEqual(first.run.nodes[0]!.status, { type: "node_idle", last_message: "Who is the audience?" });
+	const node = first.run.nodes[0]!;
+	assert.equal(node.type === "node_idle" && node.question, "Who is the audience?");
 	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0", text: "newcomers" }] });
 	assert.equal(done.outcome?.type, "done", JSON.stringify(done.status));
 	// The rebuilt session carried the conversation so far.
@@ -125,25 +141,81 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	assert.match(transcript, /"kind":"tool_call","tool":"submit_result"/);
 });
 
-test("pi codemode: an agent with tools gets codemode; its script calls state_read and submit_result through the tool layer", async () => {
+test("pi codemode: every agent gets codemode; its script reads the full input (folded in the prompt) and submits through the tool layer", async () => {
 	const { provider, executor } = faux();
+	const prompts: string[] = [];
 	provider.setResponses([
-		() => {
-			return call("codemode", {
-				code: "const view = await tools.state_read({}); await tools.submit_result({ summary: view.includes('state note') ? 'saw the note' : 'missed' }); return 'done';",
-			});
+		(ctx) => {
+			prompts.push(JSON.stringify(ctx.messages));
+			return call("codemode", { code: "await tools.submit_result({ summary: `${input.topic}: ${input.notes.length} notes, last ${input.notes.at(-1)}` }); return 'done';" });
 		},
 	]);
 	const dir = join(tmp(), "run");
-	const r = await runWorkflow({ workflow: resolve(here, "fixtures/pi/workflow.ts"), dir, executor, input: { topic: "x" }, inboxPollMs: null });
-	assert.deepEqual(r.outcome, { type: "done", value: { summary: "saw the note" } });
+	const notes = Array.from({ length: 30 }, (_, i) => `note number ${i}`);
+	const r = await runWorkflow({ workflow: resolve(here, "fixtures/pi/workflow.ts"), dir, executor, input: { topic: "x", notes }, inboxPollMs: null });
+	assert.deepEqual(r.outcome, { type: "done", value: { summary: "x: 30 notes, last note number 29" } });
+	// The prompt shows a skeleton of the folded field, and says so.
+	assert.match(prompts[0]!, /folded.*array.*items.*30/);
+	assert.match(prompts[0]!, /Folded fields.*\/notes/);
+	assert.doesNotMatch(prompts[0]!, /note number 29/);
 	const transcript = readFileSync(join(dir, "nodes", "_0.jsonl"), "utf8")
 		.trim()
 		.split("\n")
 		.map((l) => JSON.parse(l));
 	const calls = transcript.filter((e) => e.kind === "tool_call").map((e) => [e.tool, e.nested]);
-	assert.deepEqual(calls, [["codemode", false], ["state_read", true], ["submit_result", true]]);
-	assert.ok(!existsSync(join(dir, "work")) || !existsSync(join(dir, "work", "_0")), "the node's dir is gone");
+	assert.deepEqual(calls, [["codemode", false], ["submit_result", true]]);
+	assert.ok(!existsSync(join(dir, "work", "_0")), "the node's dir is gone");
+});
+
+test("pi: a dialogue over the window is compacted (logged); with compaction off it fails as context_exhausted", async () => {
+	const long = "x".repeat(6000);
+	const run = async (compaction: boolean) => {
+		const { provider, executor } = faux();
+		const seen: string[] = [];
+		provider.setResponses([
+			call("read_spill", { name: "none" }),
+			fauxAssistantMessage(long),
+			() => {
+				seen.push("summary request");
+				return fauxAssistantMessage("Earlier: the agent tried a spill read and talked at length.");
+			},
+			(ctx) => {
+				seen.push(JSON.stringify(ctx.messages).length < 5000 ? "compacted" : "full");
+				return call("submit_result", { answer: 3 });
+			},
+		]);
+		const s = spec({ model: "faux/faux-small", declaration: { ...spec().declaration, compaction } });
+		const session = await executor.start(s);
+		const first = await session.turn();
+		const second = first.type === "ended" ? await session.turn("go on") : first;
+		await session.close();
+		return { first, second, seen, notes: s.entries.filter((e) => e.kind === "note").map((e) => (e as { text: string }).text) };
+	};
+	const on = await run(true);
+	assert.equal(on.first.type, "ended");
+	assert.equal(on.second.type, "submitted", JSON.stringify(on.second));
+	assert.deepEqual(on.seen, ["summary request", "compacted"]);
+	assert.ok(on.notes.some((n) => /^compacted \d+ messages/.test(n)));
+	const off = await run(false);
+	assert.deepEqual(off.second.type === "agent_error" && off.second.failure, { type: "context_exhausted" });
+	assert.ok(off.notes.some((n) => n.startsWith("context exhausted")));
+});
+
+test("the tool layer caps results: the overflow is spilled with a marker and paged by read_spill", async () => {
+	const s = spec();
+	const tools = await buildNodeTools(s, { resultCap: 100 });
+	tools.add({ name: "big", description: "returns a lot", parameters: { type: "object" }, run: async () => ({ text: "y".repeat(250) }) });
+	const direct = tools.agentTools().find((t) => t.name === "big")!;
+	const out = await direct.execute("1", {}, undefined as never, undefined as never);
+	const text = (out.content[0] as { text: string }).text;
+	assert.match(text, /^y{100}\n\[output truncated at 100 of 250 chars; the full text is spill "1.txt"\. Page it from the next script: await tools.read_spill\(\{ name: "1.txt", offset: 100 \}\)\]$/);
+	const page = await tools.invoke("read_spill", { name: "1.txt", offset: 100 }, true);
+	assert.deepEqual(page.value, { text: "y".repeat(150), next: 250, total: 250 });
+	assert.ok(s.entries.some((e) => e.kind === "note" && /spilled 250 chars/.test((e as { text: string }).text)));
+	// A submitted result over the output cap goes back as a validation error.
+	const huge = await tools.invoke("submit_result", { answer: 1, pad: "z".repeat(200_000) }, false);
+	assert.equal(huge.isError, true);
+	assert.match(huge.text, /the cap is 100000/);
 });
 
 test("pi: a provider error is an executor error: the run pauses, a resume reissues the call", async () => {
@@ -151,25 +223,25 @@ test("pi: a provider error is an executor error: the run pauses, a resume reissu
 	provider.setResponses([fauxAssistantMessage([fauxText("")], { stopReason: "error", errorMessage: "HTTP 412 account suspended" })]);
 	const dir = join(tmp(), "run");
 	const workflow = resolve(here, "fixtures/pi/workflow.ts");
-	const paused = await runWorkflow({ workflow, dir, executor, input: { topic: "x" }, inboxPollMs: null });
+	const paused = await runWorkflow({ workflow, dir, executor, input: { topic: "x", notes: [] }, inboxPollMs: null });
 	assert.deepEqual(paused.status, { type: "idle", reason: { type: "executor_unavailable", alias: "default", error: "HTTP 412 account suspended" } });
 	provider.setResponses([call("submit_result", { summary: "fine now" })]);
 	const resumed = await runWorkflow({ workflow, dir, executor, inboxPollMs: null });
 	assert.deepEqual(resumed.outcome, { type: "done", value: { summary: "fine now" } });
 });
 
-test("the tool layer: codemode wraps an agent's tools; disallowed names are refused and logged", async () => {
+test("the tool layer: every tool is offered directly and through codemode; disallowed names are refused and logged", async () => {
 	const dir = tmp();
-	const s = spec({ workspace: { level: "read-only", root: dir, inputs: dir, scratch: null, data: {} } });
+	const s = spec({ workspace: { level: "read-only", root: dir, inputs: dir, scratch: null, mounts: {}, spill: join(dir, "spill") } });
 	const tools = await buildNodeTools(s);
-	assert.deepEqual(tools.agentTools().map((t) => t.name), ["submit_result", "codemode"]);
-	assert.deepEqual(tools.names.sort(), ["codemode", "list_dir", "read_file", "state_read", "submit_result"]);
+	assert.deepEqual(tools.agentTools().map((t) => t.name).sort(), ["codemode", "list_dir", "read_file", "read_spill", "submit_result"]);
 	const refused = await tools.invoke("exec", { command: "id" }, true);
 	assert.equal(refused.isError, true);
 	assert.match(refused.text, /not allowed/);
 	assert.ok(s.entries.some((e) => e.kind === "tool_call" && e.tool === "exec"));
-	const off = await buildNodeTools(spec({ declaration: { ...(spec().declaration as object), codemode: false } as never, workspace: { level: "read-only", root: dir, inputs: dir, scratch: null, data: {} } }));
-	assert.deepEqual(off.agentTools().map((t) => t.name).sort(), ["list_dir", "read_file", "state_read", "submit_result"]);
+	// A sandbox "none" agent gets codemode too, and no fs tools.
+	const none = await buildNodeTools(spec());
+	assert.deepEqual(none.agentTools().map((t) => t.name).sort(), ["codemode", "read_spill", "submit_result"]);
 });
 
 test("upstream MCP through pi-mcp: only allowlisted tools, secrets only in the server process", async () => {

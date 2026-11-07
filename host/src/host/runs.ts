@@ -2,15 +2,19 @@
 // from modules, and the sessions this process drives.
 
 import { existsSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Json, Refusal } from "../sdk/index.ts";
 import type { BudgetKind } from "./core.ts";
 import type { Executor, ScriptRunner } from "./executor.ts";
+import { IdleNode, LiveNode, must, type NodeId, OwnedRun, type RunId, SteerableNode } from "./capability.ts";
+import { NotOwner, type Owner, serverOwner } from "./owner.ts";
+import { loadProfile } from "./profile.ts";
 import { applyControl, inspectRun, type RunView } from "./query.ts";
+import { ProcessScripts } from "./scripts.ts";
 import { type Session, type SessionOptions, startSession } from "./session.ts";
-import { mayControl, NotOwner, type Owner, serverOwner } from "./owner.ts";
-import { newRunId, runPaths, runsDir } from "./store.ts";
+import { MachineSlots } from "./slots.ts";
+import { appendInbox, type InboxEntry, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir } from "./store.ts";
 
 export interface ExecutorKit {
 	readonly executor: Executor;
@@ -55,6 +59,7 @@ export interface StartRun {
 	readonly input?: Json;
 	readonly seed?: number;
 	readonly models?: Readonly<Record<string, string>>;
+	readonly mounts?: Readonly<Record<string, string>>;
 }
 
 export interface ResumeRun {
@@ -65,7 +70,12 @@ export interface ResumeRun {
 	readonly unpause?: boolean;
 }
 
-/** The runs this process drives, one session at a time per run. */
+
+/**
+ * The runs this process drives, one session at a time per run. Ids from
+ * outside are parsed (`RunId`, `NodeId`) and every intervention goes
+ * through its capability check.
+ */
 export class Runs {
 	readonly root: string;
 	readonly #kit: ExecutorKit;
@@ -82,9 +92,11 @@ export class Runs {
 	}
 
 	/** Changing or answering a run needs ownership; reading does not. */
-	control(runId: string): void {
+	control(runId: RunId): OwnedRun {
 		const view = this.view(runId);
-		if (!mayControl(this.owner, view.owner)) throw new NotOwner(runId, view.owner, this.owner);
+		const owned = OwnedRun.check(view.run, this.owner);
+		if (!(owned instanceof OwnedRun)) throw new NotOwner(runId, view.owner, this.owner);
+		return owned;
 	}
 
 	#track(session: Session): Session {
@@ -95,8 +107,10 @@ export class Runs {
 		return session;
 	}
 
-	#options(dir: string): Pick<SessionOptions, "dir" | "executor" | "scripts" | "executorModule" | "root"> {
-		return { dir, executor: this.#kit.executor, scripts: this.#kit.scripts, executorModule: this.#executorModule, root: this.root };
+	/** Without a script runner from the executor module: domain scripts as bwrap processes with machine-wide slots, as the CLI does. */
+	#options(dir: string, workflow: string): Pick<SessionOptions, "dir" | "executor" | "scripts" | "executorModule" | "root" | "by"> {
+		const scripts = this.#kit.scripts ?? new ProcessScripts({ workflowDir: dirname(workflow), slots: new MachineSlots(loadProfile(this.root).slots) });
+		return { dir, executor: this.#kit.executor, scripts, executorModule: this.#executorModule, root: this.root, by: this.owner };
 	}
 
 	async start(request: StartRun): Promise<Session> {
@@ -104,66 +118,129 @@ export class Runs {
 		const name = workflow.split("/").at(-2) ?? "run";
 		const dir = join(runsDir(this.root), newRunId(name));
 		return this.#track(
-			await startSession({ ...this.#options(dir), workflow, input: request.input ?? null, seed: request.seed, models: request.models, owner: this.owner }),
+			await startSession({
+				...this.#options(dir, workflow),
+				workflow,
+				input: request.input ?? null,
+				seed: request.seed,
+				models: request.models,
+				mounts: request.mounts,
+				owner: this.owner,
+			}),
 		);
 	}
 
-	async resume(runId: string, request: ResumeRun = {}): Promise<Session> {
+	/** The live session of a run, resuming it if no session drives it. */
+	async #session(runId: RunId, request: ResumeRun = {}): Promise<Session> {
+		const live = this.#live.get(runId);
+		if (live && !live.settled) return live;
+		const dir = resolveRunDir(this.root, runId);
+		const meta = readMeta(runPaths(dir));
+		if (!meta) throw new Error(`run ${runId} has no meta.json`);
+		return this.#track(await startSession({ ...this.#options(dir, meta.workflow), ...request }));
+	}
+
+	async resume(runId: RunId, request: ResumeRun = {}): Promise<Session> {
 		this.control(runId);
 		const live = this.#live.get(runId);
 		if (live && !live.settled) {
+			const owned = must(live.owned(this.owner), refused);
 			for (const s of request.sends ?? []) {
-				const refusal = live.send(s.node, s.text);
+				const refusal = live.answer(must(IdleNode.check(owned, s.node), refused), s.text);
 				if (refusal) throw new SendRefused(refusal);
 			}
-			if (request.cancel) live.cancel();
-			if (request.unpause) live.unpause();
+			if (request.cancel) live.cancel(owned);
+			if (request.unpause) live.unpause(owned);
 			return live;
 		}
-		return this.#track(await startSession({ ...this.#options(resolveRunDir(this.root, runId)), ...request }));
+		return this.#session(runId, request);
 	}
 
-	/** Aborts a running node of a live run; `text` is sent once it stops. */
-	interrupt(runId: string, node: string, text?: string): void {
+	/** Answers an idle node. */
+	async answer(runId: RunId, node: NodeId, text: string): Promise<void> {
+		await this.resume(runId, { sends: [{ node, text }] });
+	}
+
+	/** Steers a running node of a live run. */
+	steer(runId: RunId, node: NodeId, text: string): void {
+		const live = this.#running(runId, node);
+		const refusal = live.steer(must(SteerableNode.check(must(live.owned(this.owner), refused), node), refused), text);
+		if (refusal) throw new SendRefused(refusal);
+	}
+
+	/** Aborts a running node's current step; `text` is delivered once it stops. */
+	interrupt(runId: RunId, node: NodeId, text?: string): void {
+		const live = this.#running(runId, node);
+		const refusal = live.interrupt(must(SteerableNode.check(must(live.owned(this.owner), refused), node), refused), text);
+		if (refusal) throw new SendRefused(refusal);
+	}
+
+	#running(runId: RunId, node: NodeId): Session {
 		this.control(runId);
 		const live = this.#live.get(runId);
 		if (!live || live.settled) throw new SendRefused({ type: "node_not_running", node });
-		const refusal = live.interrupt(node, text);
+		return live;
+	}
+
+	/** Discards a node's progress and reissues its call with the note. */
+	async restart(runId: RunId, node: NodeId, note?: string): Promise<void> {
+		const owned = this.control(runId);
+		must(LiveNode.check(owned, node), refused);
+		const live = this.#live.get(runId);
+		const entry: InboxEntry = note === undefined ? { id: newMessageId(), type: "restart", node, by: this.owner } : { id: newMessageId(), type: "restart", node, note, by: this.owner };
+		if (live && !live.settled) {
+			const refusal = live.restart(must(LiveNode.check(must(live.owned(this.owner), refused), node), refused), note);
+			if (refusal) throw new SendRefused(refusal);
+		} else await this.#viaInbox(runId, entry);
+	}
+
+	async cancelNode(runId: RunId, node: NodeId): Promise<void> {
+		const owned = this.control(runId);
+		must(LiveNode.check(owned, node), refused);
+		const live = this.#live.get(runId);
+		if (live && !live.settled) {
+			const refusal = live.cancelNode(must(LiveNode.check(must(live.owned(this.owner), refused), node), refused));
+			if (refusal) throw new SendRefused(refusal);
+		} else await this.#viaInbox(runId, { id: newMessageId(), type: "cancel_node", node, by: this.owner });
+	}
+
+	/** A run no session drives takes the intervention from its inbox when a session boots; a refusal is reported back. */
+	async #viaInbox(runId: RunId, entry: InboxEntry): Promise<void> {
+		const paths = runPaths(resolveRunDir(this.root, runId));
+		appendInbox(paths, entry);
+		await this.#session(runId);
+		const refusal = refusedEntry(paths, entry.id);
 		if (refusal) throw new SendRefused(refusal);
 	}
 
-	async pause(runId: string): Promise<void> {
-		this.control(runId);
+	async pause(runId: RunId): Promise<void> {
+		const owned = this.control(runId);
 		const live = this.#live.get(runId);
-		if (live && !live.settled) return live.pause();
-		const refusal = applyControl(resolveRunDir(this.root, runId), { type: "pause_requested" });
+		const refusal =
+			live && !live.settled ? live.pause(must(live.owned(this.owner), refused)) : applyControl(resolveRunDir(this.root, runId), { type: "pause_requested", by: owned.by });
 		if (refusal) throw new SendRefused(refusal);
 	}
 
-	async unpause(runId: string): Promise<void> {
-		this.control(runId);
-		const live = this.#live.get(runId);
-		if (live && !live.settled) return live.unpause();
+	async unpause(runId: RunId): Promise<void> {
 		await this.resume(runId, { unpause: true });
 	}
 
-	async cancelNode(runId: string, node: string): Promise<void> {
-		this.control(runId);
-		const live = this.#live.get(runId);
-		const refusal = live && !live.settled ? live.cancelNode(node) : applyControl(resolveRunDir(this.root, runId), { type: "node_cancelled", node });
-		if (refusal) throw new SendRefused(refusal);
+	async cancel(runId: RunId): Promise<void> {
+		await this.resume(runId, { cancel: true });
 	}
 
-	view(runId: string): RunView {
+	view(runId: RunId): RunView {
 		return inspectRun(resolveRunDir(this.root, runId));
 	}
 
-	live(runId: string): Session | undefined {
+	live(runId: RunId): Session | undefined {
 		return this.#live.get(runId);
 	}
 }
 
-function resolveRunDir(root: string, runId: string): string {
+const refused = (refusal: Refusal) => new SendRefused(refusal);
+
+function resolveRunDir(root: string, runId: RunId): string {
 	return runPaths(join(runsDir(root), runId)).dir;
 }
 

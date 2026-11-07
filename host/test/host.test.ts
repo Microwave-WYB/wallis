@@ -81,7 +81,7 @@ test("resume refuses a changed pinned input file", async () => {
 	await assert.rejects(runWorkflow(opts), (e: unknown) => e instanceof RunRefused && e.refusal.type === "pin_mismatch" && e.refusal.field === "inputs.advice.md");
 });
 
-test("parallel branches, a sub-workflow, an explicit merge call, typed scripts; a spent compute budget pauses until raised", async () => {
+test("parallel branches, a sub-workflow, an explicit merge call, typed scripts, observations; a spent compute budget pauses until raised", async () => {
 	const dir = join(tmp(), "run");
 	const executor = fanoutExecutor();
 	const scripts = new FakeScripts({ train: (call) => ({ output: { budget: call.computeMinutes }, minutes: 5 }) });
@@ -90,14 +90,20 @@ test("parallel branches, a sub-workflow, an explicit merge call, typed scripts; 
 	assert.equal(scripts.calls.length, 1);
 
 	const ids = executor.calls.map((c) => c.id);
-	assert.deepEqual(ids, ["#0.a#0", "#0.b#0", "#1", "#3", "#6>retry#0", "#6>retry#1"]);
+	assert.deepEqual(ids, ["#0.a#0", "#0.b#0", "#1", "#2", "#3>retry#0", "#3>retry#1"]);
+	// Agents get what they need in their input: the judge sees both branches' errors.
 	const judge = executor.calls.find((c) => c.agent === "judge")!;
-	assert.match(judge.view, /E-a/);
-	assert.match(judge.view, /E-b/);
-	assert.doesNotMatch(judge.view, /confidence/);
-	assert.doesNotMatch(executor.calls[1]!.view, /E-a/, "each branch saw the state as of its own request");
+	assert.deepEqual(judge.input, { errors: ["E-a", "E-b"] });
+	assert.match(judge.prompt, /E-a/);
+	assert.deepEqual(executor.calls[1]!.input, { area: "b", known: [] }, "each branch got the memory as of its call");
+	// Observations are logged with their position; they never shift request ids.
+	assert.deepEqual(
+		first.run.observations.map((o) => [o.at, o.label]),
+		[["~0", "errors"], ["#3>retry~0", "attempt"], ["#3>retry~1", "attempt"]],
+	);
 
-	// Raise the budget: the paused script runs, nothing completed runs again.
+	// Raise the budget: the paused script runs, nothing completed runs again,
+	// and the body's local variables are rebuilt by the replay.
 	const executor2 = fanoutExecutor();
 	const r = await runWorkflow({ ...quiet, workflow: fanout, dir, executor: executor2, scripts, budget: { compute_minutes: 20 } });
 	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
@@ -107,26 +113,12 @@ test("parallel branches, a sub-workflow, an explicit merge call, typed scripts; 
 	assert.deepEqual(out.tries, { attempts: 2 });
 	assert.deepEqual(out.trained, { budget: 5 });
 	assert.deepEqual(out.again, { budget: 15 });
+	assert.deepEqual(out.errors, ["E-a", "E-b"]);
 	assert.deepEqual(out.findings, [{ content: "f1+f3", confidence: 0.9 }, { content: "f2", confidence: 0.2 }]);
 	assert.deepEqual(out.archive, [{ content: "f1", confidence: 0.9 }]);
-	assert.deepEqual(r.run.state.errors, ["E-a", "E-b"]);
 	const log = new EventLog(join(dir, "log.jsonl")).read();
 	assert.deepEqual(log.filter((e) => e.type === "budget_raised"), [{ type: "budget_raised", kind: "compute_minutes", limit: 20 }]);
-});
-
-test("a non-commutative write in a parallel branch is refused into the body, typed", async () => {
-	const workflow = variant(fanout, (t) =>
-		t
-			.replace('writes: { errors: "errors" }', 'writes: { log: "errors" }')
-			.replace('log: append(Type.String()),', "log: append(Type.Array(Type.String())),")
-			.replace(
-				/run: async \(ctx\) => \{[\s\S]*\n\t\},\n\}\);\n$/,
-				'run: async (ctx) => {\n\t\ttry { await ctx.parallel({ a: (c) => c.call(scout, { area: "a" }) }); return "accepted"; } catch (e) { return (e as Refused).refusal; }\n\t},\n});\n',
-			)
-			.replace("import { append,", "import { type Refused, append,"),
-	);
-	const r = await runWorkflow({ ...quiet, workflow, dir: join(tmp(), "run"), executor: fanoutExecutor(), input: null });
-	assert.deepEqual(r.outcome, { type: "done", value: { type: "non_commutative_write_in_branch", field: "log", branch: "#0.a" } });
+	assert.equal(log.filter((e) => e.type === "observed").length, 3, "replayed observations are not logged again");
 });
 
 test("a spent USD budget pauses before the next call; a raise continues it", async () => {

@@ -5,7 +5,7 @@
 //   log.jsonl    the append-only event log (the run is a fold over it)
 //   meta.json    workflow path, project root, executor module
 //   lock         the pid of the host process driving the run
-//   inbox.jsonl  messages and cancels for a run another process drives
+//   inbox.jsonl  interventions for a run another process drives (.done: taken, .refused: refused)
 //
 // The lock makes `stopped` derivable: a run that is not finished and has no
 // live lock holder is stopped, and resumable. That is computed at query
@@ -14,7 +14,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import type { Json } from "../sdk/index.ts";
+import type { Json, Refusal } from "../sdk/index.ts";
 
 export interface RunPaths {
 	readonly dir: string;
@@ -67,7 +67,13 @@ export interface RunMeta {
 	readonly created: string;
 	readonly forked_from?: { readonly run_id: string; readonly at: number };
 	/** Parameters for the first session of a run started detached. */
-	readonly start?: { readonly input?: Json; readonly seed?: number; readonly models?: Readonly<Record<string, string>>; readonly owner?: string };
+	readonly start?: {
+		readonly input?: Json;
+		readonly seed?: number;
+		readonly models?: Readonly<Record<string, string>>;
+		readonly mounts?: Readonly<Record<string, string>>;
+		readonly owner?: string;
+	};
 }
 
 export function readMeta(paths: RunPaths): RunMeta | null {
@@ -136,14 +142,17 @@ function releaseLock(paths: RunPaths, pid: number): void {
 
 // --- Inbox ---------------------------------------------------------------------
 
+/** An intervention from another process. Each carries `by`, checked when the driver applies it. */
 export type InboxEntry =
-	| { readonly id: string; readonly type: "send"; readonly node: string; readonly text: string }
-	| { readonly id: string; readonly type: "cancel" }
-	| { readonly id: string; readonly type: "claim"; readonly owner: string }
-	| { readonly id: string; readonly type: "interrupt"; readonly node: string; readonly text?: string }
-	| { readonly id: string; readonly type: "pause" }
-	| { readonly id: string; readonly type: "resume" }
-	| { readonly id: string; readonly type: "cancel_node"; readonly node: string };
+	| { readonly id: string; readonly type: "answer"; readonly node: string; readonly text: string; readonly by: string }
+	| { readonly id: string; readonly type: "steer"; readonly node: string; readonly text: string; readonly by: string }
+	| { readonly id: string; readonly type: "interrupt"; readonly node: string; readonly text?: string; readonly by: string }
+	| { readonly id: string; readonly type: "restart"; readonly node: string; readonly note?: string; readonly by: string }
+	| { readonly id: string; readonly type: "cancel_node"; readonly node: string; readonly by: string }
+	| { readonly id: string; readonly type: "cancel"; readonly by: string }
+	| { readonly id: string; readonly type: "pause"; readonly by: string }
+	| { readonly id: string; readonly type: "resume"; readonly by: string }
+	| { readonly id: string; readonly type: "claim"; readonly owner: string };
 
 export function newMessageId(): string {
 	return `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
@@ -161,4 +170,16 @@ export function readInbox(paths: RunPaths): InboxEntry[] {
 		.slice(0, -1)
 		.filter((l) => l.length > 0)
 		.map((l) => JSON.parse(l) as InboxEntry);
+}
+
+/** The refusal the driver recorded for an inbox entry, if it refused it. */
+export function refusedEntry(paths: RunPaths, id: string): Refusal | null {
+	const file = `${paths.inbox}.refused`;
+	if (!existsSync(file)) return null;
+	for (const line of readFileSync(file, "utf8").split("\n")) {
+		if (!line) continue;
+		const entry = JSON.parse(line) as { id: string; refusal: Refusal };
+		if (entry.id === id) return entry.refusal;
+	}
+	return null;
 }

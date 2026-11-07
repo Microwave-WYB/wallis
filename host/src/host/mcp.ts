@@ -7,7 +7,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Json } from "../sdk/index.ts";
+import { toJson } from "../sdk/validate.ts";
+import { BadId, type NodeId, parseNodeId, parseRunId, type RunId } from "./capability.ts";
 import { mayControl, NotOwner } from "./owner.ts";
+import { declarationsOf } from "./sandbox.ts";
 import { attention, claimable, describe, listRunViews, nodeTranscript, pending, renderTree, runLine, runLog, type RunView, waitForAttention } from "./query.ts";
 import { type Runs, SendRefused } from "./runs.ts";
 import { RunRefused } from "./session.ts";
@@ -22,7 +25,8 @@ const INSTRUCTIONS = `wallis runs declarative agent workflows committed under .a
 - Start one with the "run" tool. It returns a run id at once; the run continues in the background.
 - To be notified, run \`npx wallis wait <run_id>\` as a background shell command. It exits with an agent-readable summary when something needs attention: a node asks a question, the run pauses (budget, executor) or finishes.
 - A node that asks a question waits for a reply: answer it with "send" (run_id, node_id, text).
-- "get_run" shows status and nodes; "wait" long-polls (capped at ${WAIT_CAP_SECONDS}s); "cancel" ends a run.
+- A running node of a steerable agent can be steered ("steer", delivered at its next step) or interrupted ("interrupt"); "restart" discards a node's progress and reissues its call with an operator note.
+- "get_run" shows status, nodes and observations; "wait" long-polls (capped at ${WAIT_CAP_SECONDS}s); "cancel" ends a run.
 Every tool result ends with the items pending in this project.`;
 
 type Text = { content: { type: "text"; text: string }[]; isError?: boolean };
@@ -34,8 +38,18 @@ function summary(view: RunView): string {
 	return items.length > 0 ? `${head}\n\n${describe(items)}` : head;
 }
 
-export function createMcpServer(runs: Runs): McpServer {
+/** Agent names that may be steered, across the project's workflows. */
+async function steerableAgents(root: string): Promise<string[]> {
+	const names = new Set<string>();
+	for (const path of Object.values(workflowsIn(root))) {
+		for (const [name, agent] of Object.entries((await declarationsOf(path)).agents)) if (agent.steerable) names.add(name);
+	}
+	return [...names].sort();
+}
+
+export async function createMcpServer(runs: Runs): Promise<McpServer> {
 	const workflows = Object.keys(workflowsIn(runs.root));
+	const steerable = await steerableAgents(runs.root);
 	const server = new McpServer({ name: "wallis", version: "0.0.0" }, { instructions: INSTRUCTIONS });
 
 	const reply = (text: string, data?: Json, isError = false): Text => {
@@ -50,10 +64,23 @@ export function createMcpServer(runs: Runs): McpServer {
 	const failure = (error: unknown): Text => {
 		if (error instanceof RunRefused || error instanceof SendRefused) return reply(`Refused: ${JSON.stringify(error.refusal)}`, { refusal: error.refusal }, true);
 		if (error instanceof NotOwner) return reply(`Not yours: ${error.message}`, { error: "not_owner" }, true);
+		if (error instanceof BadId) return reply(`Bad id: ${error.message}`, { error: "bad_id" }, true);
 		return reply(`Error: ${error instanceof Error ? error.message : String(error)}`, undefined, true);
 	};
 	const data = (view: RunView): Json =>
-		JSON.parse(JSON.stringify({ run_id: view.runId, workflow: view.workflow, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, spent: view.run.spent }));
+		JSON.parse(
+			JSON.stringify({
+				run_id: view.runId,
+				workflow: view.workflow,
+				status: view.run.status,
+				stopped: view.stopped,
+				nodes: view.run.nodes,
+				observations: view.run.observations,
+				spent: view.run.spent,
+			}),
+		);
+	/** Ids from the caller are parsed before anything uses them. */
+	const ids = (run_id: unknown, node_id?: unknown): { run: RunId; node: NodeId } => ({ run: parseRunId(run_id), node: parseNodeId(node_id ?? "#0") });
 
 	server.registerTool(
 		"run",
@@ -64,12 +91,15 @@ export function createMcpServer(runs: Runs): McpServer {
 				input: z.any().optional().describe("Workflow input (JSON)"),
 				seed: z.number().int().optional(),
 				models: z.record(z.string(), z.string()).optional().describe("Model alias remaps, alias -> provider/model:thinking"),
+				mounts: z.record(z.string(), z.string()).optional().describe("Mount remaps, name -> host dir (read-only)"),
 			},
 		},
-		async ({ workflow, input, seed, models }) => {
+		async ({ workflow, input, seed, models, mounts }) => {
 			try {
-				const session = await runs.start({ workflow, input: (input ?? null) as Json, seed, models });
-				const view = runs.view(session.paths.id);
+				const parsed = toJson(input ?? null);
+				if (!parsed.ok) return reply(`Bad input: ${parsed.errors.join("; ")}`, { error: "bad_input" }, true);
+				const session = await runs.start({ workflow, input: parsed.value, seed, models, mounts });
+				const view = runs.view(parseRunId(session.paths.id));
 				return reply(
 					`${summary(view)}\n\nTo be notified when it needs attention, run in the background: npx wallis wait ${view.runId}`,
 					data(view),
@@ -83,14 +113,75 @@ export function createMcpServer(runs: Runs): McpServer {
 	server.registerTool(
 		"send",
 		{
-			description: "Reply to a node that is waiting for a message (an agent that ended its turn with a question), or steer a running node: the message reaches it at its next step boundary.",
+			description: "Answer a node that is waiting for a reply (an agent that ended its turn with a question). Non-steerable agents take no answers.",
 			inputSchema: { run_id: z.string(), node_id: z.string(), text: z.string() },
 		},
 		async ({ run_id, node_id, text }) => {
 			try {
-				await runs.resume(run_id, { sends: [{ node: node_id, text }] });
-				const view = runs.view(run_id);
+				const { run, node } = ids(run_id, node_id);
+				await runs.answer(run, node, text);
+				const view = runs.view(run);
 				return reply(summary(view), data(view));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	// Steering reaches only steerable agents; the schemas enumerate them.
+	if (steerable.length > 0) {
+		const agent = z.enum(steerable as [string, ...string[]]).describe("The node's agent; only steerable agents are listed");
+		const matches = (run: RunId, node: NodeId, name: string) => {
+			const found = runs.view(run).run.nodes.find((n) => n.id === node);
+			if (found && found.agent !== name) throw new Error(`node ${node} runs agent ${found.agent}, not ${name}`);
+		};
+		server.registerTool(
+			"steer",
+			{
+				description: "Send a message to a running node of a steerable agent; it arrives at the node's next step boundary, with progress kept.",
+				inputSchema: { run_id: z.string(), node_id: z.string(), agent, text: z.string() },
+			},
+			async ({ run_id, node_id, agent: name, text }) => {
+				try {
+					const { run, node } = ids(run_id, node_id);
+					matches(run, node, name);
+					runs.steer(run, node, text);
+					return reply(summary(runs.view(run)));
+				} catch (error) {
+					return failure(error);
+				}
+			},
+		);
+		server.registerTool(
+			"interrupt",
+			{
+				description: "Abort a running node's current step (steerable agents only), then deliver text, if given, to it. Progress is kept.",
+				inputSchema: { run_id: z.string(), node_id: z.string(), agent, text: z.string().optional() },
+			},
+			async ({ run_id, node_id, agent: name, text }) => {
+				try {
+					const { run, node } = ids(run_id, node_id);
+					matches(run, node, name);
+					runs.interrupt(run, node, text);
+					return reply(summary(runs.view(run)));
+				} catch (error) {
+					return failure(error);
+				}
+			},
+		);
+	}
+
+	server.registerTool(
+		"restart",
+		{
+			description: "Discard a node's progress and reissue its call with the original input plus an operator note (no note for non-steerable agents). Logged.",
+			inputSchema: { run_id: z.string(), node_id: z.string(), note: z.string().optional() },
+		},
+		async ({ run_id, node_id, note }) => {
+			try {
+				const { run, node } = ids(run_id, node_id);
+				await runs.restart(run, node, note);
+				return reply(summary(runs.view(run)));
 			} catch (error) {
 				return failure(error);
 			}
@@ -102,7 +193,7 @@ export function createMcpServer(runs: Runs): McpServer {
 		{ description: "Status, nodes and spend of a run.", inputSchema: { run_id: z.string() } },
 		async ({ run_id }) => {
 			try {
-				const view = runs.view(run_id);
+				const view = runs.view(parseRunId(run_id));
 				return reply(summary(view), data(view));
 			} catch (error) {
 				return failure(error);
@@ -118,9 +209,10 @@ export function createMcpServer(runs: Runs): McpServer {
 		},
 		async ({ run_id, node_id }) => {
 			try {
-				if (node_id) await runs.cancelNode(run_id, node_id);
-				else await runs.resume(run_id, { cancel: true });
-				const view = runs.view(run_id);
+				const run = parseRunId(run_id);
+				if (node_id) await runs.cancelNode(run, parseNodeId(node_id));
+				else await runs.cancel(run);
+				const view = runs.view(run);
 				return reply(summary(view), data(view));
 			} catch (error) {
 				return failure(error);
@@ -145,7 +237,7 @@ export function createMcpServer(runs: Runs): McpServer {
 		{ description: "A run's nodes as a tree (branches and sub-workflows), with agent, model and status.", inputSchema: { run_id: z.string() } },
 		async ({ run_id }) => {
 			try {
-				return reply(renderTree(runs.view(run_id)));
+				return reply(renderTree(runs.view(parseRunId(run_id))));
 			} catch (error) {
 				return failure(error);
 			}
@@ -160,7 +252,7 @@ export function createMcpServer(runs: Runs): McpServer {
 		},
 		async ({ run_id, node_id, since, limit }) => {
 			try {
-				const page = nodeTranscript(runPaths(join(runsDir(runs.root), run_id)).dir, node_id, since, limit);
+				const page = nodeTranscript(runPaths(join(runsDir(runs.root), parseRunId(run_id))).dir, parseNodeId(node_id), since, limit);
 				return paged(page.items.map((e) => `${e.seq}\t${e.entry}`).join("\n"), page);
 			} catch (error) {
 				return failure(error);
@@ -176,21 +268,8 @@ export function createMcpServer(runs: Runs): McpServer {
 		},
 		async ({ run_id, since, limit }) => {
 			try {
-				const page = runLog(runPaths(join(runsDir(runs.root), run_id)).dir, since, limit);
+				const page = runLog(runPaths(join(runsDir(runs.root), parseRunId(run_id))).dir, since, limit);
 				return paged(page.items.map((e) => `${e.seq}\t${e.event}`).join("\n"), page);
-			} catch (error) {
-				return failure(error);
-			}
-		},
-	);
-
-	server.registerTool(
-		"interrupt",
-		{ description: "Abort a running node's current generation or tool, then deliver text (if given) to it.", inputSchema: { run_id: z.string(), node_id: z.string(), text: z.string().optional() } },
-		async ({ run_id, node_id, text }) => {
-			try {
-				runs.interrupt(run_id, node_id, text);
-				return reply(summary(runs.view(run_id)));
 			} catch (error) {
 				return failure(error);
 			}
@@ -202,8 +281,9 @@ export function createMcpServer(runs: Runs): McpServer {
 		{ description: "Pause a run: no new calls are issued; it goes idle (paused_by_user) once in-flight work ends.", inputSchema: { run_id: z.string() } },
 		async ({ run_id }) => {
 			try {
-				await runs.pause(run_id);
-				return reply(summary(runs.view(run_id)));
+				const run = parseRunId(run_id);
+				await runs.pause(run);
+				return reply(summary(runs.view(run)));
 			} catch (error) {
 				return failure(error);
 			}
@@ -215,8 +295,9 @@ export function createMcpServer(runs: Runs): McpServer {
 		{ description: "Resume a paused or stopped run.", inputSchema: { run_id: z.string() } },
 		async ({ run_id }) => {
 			try {
-				await runs.unpause(run_id);
-				return reply(summary(runs.view(run_id)));
+				const run = parseRunId(run_id);
+				await runs.unpause(run);
+				return reply(summary(runs.view(run)));
 			} catch (error) {
 				return failure(error);
 			}
@@ -231,12 +312,13 @@ export function createMcpServer(runs: Runs): McpServer {
 		},
 		async ({ run_id, timeout_s }) => {
 			try {
-				runs.control(run_id);
-				const dir = runPaths(join(runsDir(runs.root), run_id)).dir;
+				const run = parseRunId(run_id);
+				runs.control(run);
+				const dir = runPaths(join(runsDir(runs.root), run)).dir;
 				const timeoutMs = Math.min(timeout_s ?? WAIT_CAP_SECONDS, WAIT_CAP_SECONDS) * 1000;
 				const items = await waitForAttention(dir, { timeoutMs });
-				const view = runs.view(run_id);
-				return reply(items ? describe(items) : `Run ${run_id} is still running.`, data(view));
+				const view = runs.view(run);
+				return reply(items ? describe(items) : `Run ${run} is still running.`, data(view));
 			} catch (error) {
 				return failure(error);
 			}

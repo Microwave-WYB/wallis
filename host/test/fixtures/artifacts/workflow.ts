@@ -1,10 +1,11 @@
 // Test fixture: artifacts handed between scripts and an agent, a mounted
 // dataset, and a probe of the script sandbox.
 
-import { Artifact, defineAgent, defineModels, defineScript, defineState, replace, Type, workflow } from "wallis";
+import { Artifact, defineAgent, defineModels, defineMounts, defineScript, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "fake/default" });
-const state = defineState({ last: replace(Type.String(), "") });
+/** The corpus has no default: the caller or the local profile supplies it. */
+const mounts = defineMounts({ corpus: "", fixtures: "./scripts" });
 
 const make = defineScript({
 	name: "make",
@@ -12,11 +13,11 @@ const make = defineScript({
 	output: Type.Object({ model: Artifact("text/plain") }),
 });
 
-const train = defineScript({
+const train = defineScript({ mounts }, {
 	name: "train",
 	input: Type.Object({ model: Artifact("text/plain") }),
 	output: Type.Object({ checkpoint: Artifact("application/octet-stream") }),
-	data: ["corpus"],
+	mounts: ["corpus"],
 	resources: { memoryGb: 1 },
 });
 
@@ -27,7 +28,7 @@ const probe = defineScript({
 });
 
 const writer = defineAgent(
-	{ models, state },
+	{ models, mounts },
 	{
 		name: "writer",
 		model: "default",
@@ -35,13 +36,14 @@ const writer = defineAgent(
 		input: Type.Object({ checkpoint: Artifact("application/octet-stream") }),
 		output: Type.Object({ report: Artifact("text/markdown") }),
 		sandbox: "workspace",
+		mounts: ["fixtures"],
 	},
 );
 
 export default workflow({
 	name: "artifacts",
 	models,
-	state,
+	mounts,
 	agents: [writer],
 	scripts: [make, train, probe],
 	input: Type.Object({ outside: Type.String() }),

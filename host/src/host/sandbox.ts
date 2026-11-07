@@ -89,3 +89,14 @@ export class Sandbox {
 		this.#vm.dispose();
 	}
 }
+
+/** A workflow's declarations, read by evaluating its bundle in the sandbox without starting it. */
+export async function declarationsOf(workflow: string): Promise<Declarations> {
+	const { bundleWorkflow } = await import("./bundle.ts");
+	const sandbox = await Sandbox.create((await bundleWorkflow(workflow)).code, { send: () => {}, done: () => {}, fail: () => {} });
+	try {
+		return sandbox.declare();
+	} finally {
+		sandbox.dispose();
+	}
+}

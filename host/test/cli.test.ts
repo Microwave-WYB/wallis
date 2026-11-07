@@ -63,7 +63,8 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	const log = logOf(root, id);
 	const sentEvents = log.filter((e) => e.type === "sent");
 	assert.equal(sentEvents.length, 1);
-	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0", text: "newcomers", message_id: "<id>" });
+	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0", text: "newcomers", message_id: "<id>", by: sentEvents[0]!.by });
+	assert.match(String(sentEvents[0]!.by), /^(human|harness:.+)$/, "the sender's identity is logged");
 	assert.ok(log.some((e) => e.type === "agent_idle" && e.message === "Who is the audience: experts or newcomers?"));
 	// The idle turn was not replayed: the reply continued the conversation.
 	assert.deepEqual(lines(execLog).map((e) => [e.agent, e.replies]), [["scout", 0], ["scout", 1], ["writer", 0]]);
@@ -136,7 +137,7 @@ test("an executor error pauses the run; a rebind and resume reissue the call", (
 	assert.equal(status(root, id).status.type, "finished");
 	assert.deepEqual(lines(execLog).map((e) => [e.agent, e.model]), [["planner", "fake/default"], ["writer", "bad/model"], ["writer", "bad/model"], ["writer", "good/model"]]);
 	const types = logOf(root, id).map((e) => e.type);
-	assert.deepEqual(types.slice(types.indexOf("executor_failed")), ["executor_failed", "retry_unavailable", "executor_failed", "alias_rebound", "retry_unavailable", "agent_returned", "requested", "body_finished"]);
+	assert.deepEqual(types.slice(types.indexOf("executor_failed")), ["executor_failed", "retry_unavailable", "executor_failed", "alias_rebound", "retry_unavailable", "agent_returned", "observed", "body_finished"]);
 });
 
 test("fork copies a log prefix into a new run; the original is untouched", () => {

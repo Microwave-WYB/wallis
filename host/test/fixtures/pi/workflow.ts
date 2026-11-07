@@ -1,20 +1,19 @@
-// Test fixture for the pi executor: an agent with filesystem tools, so it
-// works through codemode.
+// Test fixture for the pi executor: an agent with filesystem tools and a
+// foldable input, so it works through codemode and reads its full input
+// there.
 
-import { defineAgent, defineModels, defineState, replace, Type, workflow } from "wallis";
+import { defineAgent, defineModels, Foldable, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "faux/faux-1" });
-const state = defineState({ note: replace(Type.String(), "state note") });
 
 const reader = defineAgent(
-	{ models, state },
+	{ models },
 	{
 		name: "reader",
 		model: "default",
-		prompt: "Read your view and summarize it.",
-		input: Type.Object({ topic: Type.String() }),
+		prompt: "Read your input and summarize it.",
+		input: Type.Object({ topic: Type.String(), notes: Foldable(Type.Array(Type.String()), { maxChars: 40 }) }),
 		output: Type.Object({ summary: Type.String({ minLength: 1 }) }),
-		view: { fields: ["note"], maxChars: 1000, maxItems: 10 },
 		sandbox: "read-only",
 	},
 );
@@ -22,9 +21,8 @@ const reader = defineAgent(
 export default workflow({
 	name: "pi-fixture",
 	models,
-	state,
 	agents: [reader],
-	input: Type.Object({ topic: Type.String() }),
+	input: Type.Object({ topic: Type.String(), notes: Type.Array(Type.String()) }),
 	output: Type.Any(),
-	run: async (ctx, input) => ctx.call(reader, { topic: input.topic }),
+	run: async (ctx, input) => ctx.call(reader, input),
 });

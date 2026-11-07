@@ -2,33 +2,41 @@
 // lock, refolds the log, runs the body in the sandbox, steps the core with
 // every request and result, executes the core's effects and appends
 // checkpointed events to the log. It ends when the run is finished or idle
-// (nothing in flight: a node waits for a message, the budget is spent, or
-// the executor is unavailable). The next session resumes it.
+// (nothing in flight: a node waits for an answer, the run is paused, the
+// budget is spent, or the executor is unavailable). The next session
+// resumes it.
 //
 // Resuming:
 // 1. refold the log;
-// 2. check the pin (`resumed`; a refusal ends the session);
+// 2. check the pin (`ResumableRun`; a refusal ends the session);
 // 3. log the operational changes: executor, alias rebinds;
 // 4. replay the body; the core answers completed requests from its journal
 //    and reissues the ones that were in flight;
 // 5. log budget raises, a retry of calls the executor could not serve,
-//    sends and cancels.
+//    answers and cancels.
+//
+// Interventions take capabilities (`OwnedRun`, `IdleNode`, `SteerableNode`,
+// `LiveNode`), checked against the live core; the core checks them again
+// when it applies the event.
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ArtifactRef, Json, Refusal } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
-import { schemaErrors } from "../sdk/validate.ts";
-import { ArtifactError, discardNode, manifestDigest, type NodeDirs, nodeDirName, prepareNode, resolveDrafts } from "./artifacts.ts";
+import { schemaErrors, toJson } from "../sdk/validate.ts";
+import { ArtifactError, discardNode, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
 import { bundleWorkflow } from "./bundle.ts";
-import { Core, type BudgetKind, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
+import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode } from "./capability.ts";
+import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
 import type { Executor, NodeSession, NodeSpec, ScriptRunner, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
+import { type Mount, MountError, mountDigest, resolveMounts } from "./mounts.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
+import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
-import { acquireLock, newMessageId, readInbox, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
+import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
 
 export interface SessionOptions {
 	/** The run directory. A directory without a log starts a new run. */
@@ -47,12 +55,16 @@ export interface SessionOptions {
 	readonly root?: string;
 	/** New run: call-time alias remaps. Resume: rebinds, each logged as `alias_rebound`. */
 	readonly models?: Readonly<Record<string, string>>;
+	/** Call-time mount remaps (name -> dir). A changed mount digest is a pin mismatch on resume. */
+	readonly mounts?: Readonly<Record<string, string>>;
 	readonly profile?: Profile;
-	/** The local profile (data dirs, provider limits, slots). Defaults to the one on disk. */
+	/** The local profile (mounts, provider limits, slots). Defaults to the one on disk. */
 	readonly local?: LocalProfile;
 	/** Resume: raised limits, each logged as `budget_raised`. */
 	readonly budget?: Readonly<Partial<Record<BudgetKind, number>>>;
-	/** Messages to idle nodes, sent once the body has replayed. */
+	/** Who the session's own interventions (answers, cancel, unpause) come from. Default: the human. */
+	readonly by?: string;
+	/** Answers to idle nodes, sent once the body has replayed. */
 	readonly sends?: readonly { readonly node: string; readonly text: string }[];
 	readonly cancel?: boolean;
 	/** Resume: lift a pause (`resume_requested`). */
@@ -75,7 +87,7 @@ export interface RunResult {
 	readonly resumed: boolean;
 }
 
-/** The core refused the run as a whole (pin mismatch, path divergence, invalid declarations, unmet needs). */
+/** The core refused the run as a whole (pin mismatch, path divergence, invalid declarations, unmet needs, unset mounts). */
 export class RunRefused extends Error {
 	override readonly name = "RunRefused";
 	readonly refusal: Refusal;
@@ -91,14 +103,7 @@ function digestFile(path: string): string {
 	return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 }
 
-function getPath(value: Json, path: string): Json | undefined {
-	let v: Json | undefined = value;
-	for (const key of path.split(".")) {
-		if (v === null || typeof v !== "object" || Array.isArray(v)) return undefined;
-		v = v[key];
-	}
-	return v;
-}
+const refused = (refusal: Refusal) => new RunRefused(refusal);
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -120,7 +125,7 @@ export async function startSession(options: SessionOptions): Promise<Session> {
 			});
 		}
 		const bundle = await bundleWorkflow(workflow);
-		const session = new Session(paths, options, root, bundle.digest, release);
+		const session = new Session(paths, options, root, resolve(workflow), bundle.digest, release);
 		await session.boot(bundle.code);
 		return session;
 	} catch (error) {
@@ -139,28 +144,33 @@ export class Session {
 	readonly result: Promise<RunResult>;
 	readonly #options: SessionOptions;
 	readonly #root: string;
+	readonly #workflow: string;
 	readonly #digest: string;
 	readonly #release: () => void;
 	readonly #log: EventLog;
 	readonly #requests: Event[] = [];
 	readonly #deliveries: [string, Reply][] = [];
 	readonly #seen = new Set<string>();
-	/** Messages to send to a node once its interrupted turn ends. */
-	readonly #afterInterrupt = new Map<string, string>();
+	/** Answers to deliver once an interrupted turn has ended, with who sent them. */
+	readonly #afterInterrupt = new Map<string, { text: string; by: string }>();
+	/** Per node: the current executor turn. A result of an older turn (before a restart) is discarded. */
+	readonly #generation = new Map<string, number>();
 	#core = new Core();
 	#sandbox: Sandbox | null = null;
 	#decl!: Declarations;
 	#local!: LocalProfile;
+	#mounts: Record<string, Mount> = {};
 	#resumed = false;
 	#settled = false;
 	#timer: ReturnType<typeof setInterval> | null = null;
 	#done!: (result: RunResult) => void;
 	#fail!: (error: unknown) => void;
 
-	constructor(paths: RunPaths, options: SessionOptions, root: string, digest: string, release: () => void) {
+	constructor(paths: RunPaths, options: SessionOptions, root: string, workflow: string, digest: string, release: () => void) {
 		this.paths = paths;
 		this.#options = options;
 		this.#root = root;
+		this.#workflow = workflow;
 		this.#digest = digest;
 		this.#release = release;
 		this.#log = new EventLog(paths.log);
@@ -179,67 +189,95 @@ export class Session {
 		return this.#core.snapshot();
 	}
 
-	/**
-	 * Sends a message to a node: an idle node continues with it; a running
-	 * node is steered (the message reaches it at its next step boundary,
-	 * logged as `steered`). Returns the refusal if the core refused it.
-	 */
-	send(node: string, text: string, messageId = newMessageId()): Refusal | null {
-		if (this.#settled) return { type: "not_running" };
-		this.#seen.add(messageId);
-		const running = this.#core.snapshot().nodes.find((n) => n.id === node)?.status.type === "node_running";
-		const refusals = running
-			? this.#feed({ type: "steered", node, text, message_id: messageId })
-			: this.#feed({ type: "sent", node, text, message_id: messageId });
-		if (running && refusals.length === 0) {
-			this.#transcriptLog(node)({ kind: "user", text: `[steer] ${text}` });
-			this.steerNode(node, text);
-		}
-		this.#settle();
-		return refusals[0] ?? null;
+	/** The ownership check against the live run. */
+	owned(by: string): OwnedRun | Refusal {
+		return OwnedRun.check(this.#core.snapshot(), by);
 	}
 
-	/** Aborts a running node's current generation or tool; `text`, if given, is sent once it stops. */
-	interrupt(node: string, text?: string): Refusal | null {
+	/** Answers an idle node: its dialogue continues with the message. */
+	answer(node: IdleNode, text: string, messageId = newMessageId()): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
-		const refusals = this.#feed({ type: "interrupted", node });
-		if (refusals.length > 0) return refusals[0]!;
-		if (text !== undefined) this.#afterInterrupt.set(node, text);
-		this.interruptNode(node);
+		this.#seen.add(messageId);
+		const refusal = this.#feed({ type: "sent", node: node.node.id, text, message_id: messageId, by: node.owned.by })[0] ?? null;
+		this.#settle();
+		return refusal;
+	}
+
+	/** Steers a running node: the message reaches it at its next step boundary, with progress kept. */
+	steer(node: SteerableNode, text: string, messageId = newMessageId()): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		this.#seen.add(messageId);
+		const id = node.node.id;
+		const refusal = this.#feed({ type: "steered", node: id, text, message_id: messageId, by: node.owned.by })[0] ?? null;
+		if (refusal === null) {
+			this.#transcriptLog(id)({ kind: "user", text: `[steer] ${text}` });
+			this.#nodes.get(id)?.session.steer?.(text);
+		}
+		this.#settle();
+		return refusal;
+	}
+
+	/** Aborts a running node's current step; `text`, if given, is delivered once it stops. Progress is kept. */
+	interrupt(node: SteerableNode, text?: string): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const id = node.node.id;
+		const refusal = this.#feed({ type: "interrupted", node: id, by: node.owned.by })[0];
+		if (refusal) return refusal;
+		if (text !== undefined) this.#afterInterrupt.set(id, { text, by: node.owned.by });
+		this.#nodes.get(id)?.session.interrupt?.();
+		return null;
+	}
+
+	/** Discards a node's progress and reissues its call with the original input and the note. Logged. */
+	restart(node: LiveNode, note?: string): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const id = node.node.id;
+		// The old session and dirs go first: the reissued call creates fresh ones.
+		this.#nodes.get(id)?.session.interrupt?.();
+		this.#closeNode(id);
+		discardNode(this.paths.dir, id);
+		this.#transcriptLog(id)({ kind: "note", text: `restarted${note === undefined ? "" : `: ${note}`}` });
+		const refusal = this.#feed({ type: "restarted", node: id, note: note ?? null, by: node.owned.by })[0] ?? null;
+		this.#pump();
+		this.#settle();
+		return refusal;
+	}
+
+	/** Fails one node as an agent failure; the body handles it. */
+	cancelNode(node: LiveNode): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const id = node.node.id;
+		const refusal = this.#feed({ type: "node_cancelled", node: id, by: node.owned.by })[0];
+		if (refusal) return refusal;
+		this.#nodes.get(id)?.session.interrupt?.();
+		this.#closeNode(id);
+		discardNode(this.paths.dir, id);
+		this.#pump();
+		this.#settle();
 		return null;
 	}
 
 	/** Issues no new calls; in-flight ones finish. The run goes Idle(PausedByUser). */
-	pause(): void {
-		if (this.#settled) return;
-		this.#feed({ type: "pause_requested" });
-		this.#settle();
-	}
-
-	unpause(): void {
-		if (this.#settled) return;
-		this.#feed({ type: "resume_requested" });
-		this.#pump();
-		this.#settle();
-	}
-
-	/** Fails one node as an agent failure; the body handles it. */
-	cancelNode(node: string): Refusal | null {
+	pause(owned: OwnedRun): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
-		const refusals = this.#feed({ type: "node_cancelled", node });
-		if (refusals.length > 0) return refusals[0]!;
-		this.interruptNode(node);
-		this.#closeNode(node);
-		discardNode(this.paths.dir, node);
-		this.#pump();
+		const refusal = this.#feed({ type: "pause_requested", by: owned.by })[0] ?? null;
 		this.#settle();
-		return null;
+		return refusal;
 	}
 
-	cancel(): void {
-		if (this.#settled) return;
-		this.#feed({ type: "cancel_requested" });
+	unpause(owned: OwnedRun): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const refusal = this.#feed({ type: "resume_requested", by: owned.by })[0] ?? null;
+		this.#pump();
 		this.#settle();
+		return refusal;
+	}
+
+	cancel(owned: OwnedRun): Refusal | null {
+		if (this.#settled) return null;
+		const refusal = this.#feed({ type: "cancel_requested", by: owned.by })[0] ?? null;
+		this.#settle();
+		return refusal;
 	}
 
 	async boot(code: string): Promise<void> {
@@ -251,8 +289,10 @@ export class Session {
 		}
 	}
 
+
 	async #boot(code: string): Promise<void> {
 		const o = this.#options;
+		const by = o.by ?? HUMAN;
 		const prior = this.#log.read();
 		this.#resumed = prior.length > 0;
 		this.#sandbox = await Sandbox.create(code, {
@@ -263,9 +303,15 @@ export class Session {
 		const decl = this.#sandbox.declare();
 		this.#decl = decl;
 		this.#local = o.local ?? loadProfile(this.#root);
+		try {
+			this.#mounts = resolveMounts(decl.core.name, dirname(this.#workflow), decl.mounts, { root: this.#root, callTime: o.mounts, profile: this.#local.mounts });
+		} catch (error) {
+			if (error instanceof MountError) throw new RunRefused(error.refusal);
+			throw error;
+		}
 		const inputs: Record<string, string> = Object.fromEntries(decl.pin.files.map((f) => [f, digestFile(resolve(this.#root, f))]));
-		// Datasets are mounted, not copied: their manifest digest is pinned.
-		for (const name of this.#dataNames()) inputs[`data.${name}`] = manifestDigest(this.#dataPath(name));
+		// Mounts are read in place, never copied: their content digest is pinned.
+		for (const [name, mount] of Object.entries(this.#mounts)) inputs[`mount.${name}`] = mountDigest(mount.dir);
 
 		let input: Json;
 		let seed: number;
@@ -287,12 +333,11 @@ export class Session {
 			const first = prior[0]!;
 			if (first.type !== "started") throw new Error(`log ${this.paths.log} does not begin with a started event`);
 			this.#core = Core.refold(prior);
-			for (const e of prior) if (e.type === "sent") this.#seen.add(e.message_id);
+			for (const e of prior) if (e.type === "sent" || e.type === "steered") this.#seen.add(e.message_id);
 			seed = o.seed ?? first.pin.seed;
 			input = first.input;
-			const pin: Pin = { workflow_digest: this.#digest, models: first.pin.models, seed, inputs, semantics: SEMANTICS };
-			this.#refuseOn(this.#feed({ type: "resumed", pin }));
-			if (this.#settled) return;
+			must(ResumableRun.check(this.#core, { workflow_digest: this.#digest, models: first.pin.models, seed, inputs, semantics: SEMANTICS }), refused);
+			if (this.#core.snapshot().status.type === "finished") return this.#complete();
 			const snap = this.#core.snapshot();
 			if (snap.executor !== o.executor.id) this.#feed({ type: "executor_changed", name: o.executor.id });
 			for (const [alias, to] of Object.entries(o.models ?? {})) {
@@ -303,7 +348,7 @@ export class Session {
 		}
 		if (existsSync(this.#doneInbox())) for (const id of readFileSync(this.#doneInbox(), "utf8").split("\n")) if (id) this.#seen.add(id);
 
-		if (o.cancel) this.cancel();
+		if (o.cancel) this.#refuseOn([this.cancel(must(this.owned(by), refused))].filter((r) => r !== null));
 		if (this.#settled) return;
 
 		this.#sandbox.start(input, seed);
@@ -312,9 +357,10 @@ export class Session {
 			this.#feed({ type: "budget_raised", kind: kind as BudgetKind, limit: limit! });
 		}
 		this.#feed({ type: "retry_unavailable" });
-		if (o.unpause) this.unpause();
+		if (o.unpause && !this.#settled) this.#refuseOn([this.unpause(must(this.owned(by), refused))].filter((r) => r !== null));
 		for (const s of o.sends ?? []) {
-			const refusal = this.send(s.node, s.text);
+			const owned = must(this.owned(by), refused);
+			const refusal = this.answer(must(IdleNode.check(owned, s.node), refused), s.text);
 			if (refusal) throw new RunRefused(refusal);
 		}
 		this.#drainInbox();
@@ -326,19 +372,8 @@ export class Session {
 		}
 	}
 
-	#dataNames(): string[] {
-		const names = [...Object.values(this.#decl.agents).flatMap((a) => a.data), ...Object.values(this.#decl.scripts).flatMap((s) => s.data)];
-		return [...new Set(names)].sort();
-	}
-
-	#dataPath(name: string): string {
-		const path = this.#local.data?.[name];
-		if (!path) throw new Error(`data dir ${name} is not in the local profile (data.${name} in .wallis/profile.json)`);
-		return resolve(this.#root, path);
-	}
-
-	#dirs(id: string, level: NodeDirs["level"], input: Json, data: readonly string[]): NodeDirs {
-		return prepareNode(this.paths.dir, id, level, input, Object.fromEntries(data.map((n) => [n, this.#dataPath(n)])));
+	#mountDirs(names: readonly string[]): Record<string, string> {
+		return Object.fromEntries(names.map((n) => [n, this.#mounts[n]!.dir]));
 	}
 
 	#mcpFor(declaration: Declarations["agents"][string]): Json | null {
@@ -368,20 +403,49 @@ export class Session {
 		return `${this.paths.inbox}.done`;
 	}
 
+	/** Applies one inbox entry from another process, checking its capabilities against the live run. */
+	#applyEntry(entry: InboxEntry): Refusal | null {
+		if (entry.type === "claim") {
+			this.#feed({ type: "claimed", owner: entry.owner });
+			return null;
+		}
+		const owned = this.owned(entry.by);
+		if (!(owned instanceof OwnedRun)) return owned;
+		switch (entry.type) {
+			case "cancel":
+				return this.cancel(owned);
+			case "pause":
+				return this.pause(owned);
+			case "resume":
+				return this.unpause(owned);
+			case "answer": {
+				const node = IdleNode.check(owned, entry.node);
+				return node instanceof IdleNode ? this.answer(node, entry.text, entry.id) : node;
+			}
+			case "steer":
+			case "interrupt": {
+				const node = SteerableNode.check(owned, entry.node);
+				if (!(node instanceof SteerableNode)) return node;
+				return entry.type === "steer" ? this.steer(node, entry.text, entry.id) : this.interrupt(node, entry.text);
+			}
+			case "restart":
+			case "cancel_node": {
+				const node = LiveNode.check(owned, entry.node);
+				if (!(node instanceof LiveNode)) return node;
+				return entry.type === "restart" ? this.restart(node, entry.note) : this.cancelNode(node);
+			}
+		}
+	}
+
 	#drainInbox(): void {
 		for (const entry of readInbox(this.paths)) {
 			if (this.#settled || this.#seen.has(entry.id)) continue;
 			this.#seen.add(entry.id);
+			const refusal = this.#applyEntry(entry);
 			appendFileSync(this.#doneInbox(), `${entry.id}\n`);
-			if (entry.type === "cancel") this.cancel();
-			else if (entry.type === "claim") this.#feed({ type: "claimed", owner: entry.owner });
-			else if (entry.type === "pause") this.pause();
-			else if (entry.type === "resume") this.unpause();
-			else if (entry.type === "interrupt") this.interrupt(entry.node, entry.text);
-			else if (entry.type === "cancel_node") this.cancelNode(entry.node);
-			else {
-				const refusal = this.send(entry.node, entry.text, entry.id);
-				if (refusal) process.stderr.write(`wallis: message ${entry.id} to ${entry.node} refused: ${JSON.stringify(refusal)}\n`);
+			if (refusal) {
+				appendFileSync(`${this.paths.inbox}.refused`, `${JSON.stringify({ id: entry.id, refusal })}\n`);
+				process.stderr.write(`wallis: inbox entry ${entry.id} (${entry.type}) refused: ${JSON.stringify(refusal)}\n`);
 			}
 		}
 	}
@@ -419,7 +483,7 @@ export class Session {
 	}
 
 	#invalidRequest(request: Json): Reply | null {
-		const r = request as { type: string; agent?: string; input?: Json; script?: string; args?: Json; writes?: { field: string; value: Json }[] };
+		const r = request as { type: string; agent?: string; input?: Json; script?: string; args?: Json };
 		const fail = (subject: string, errors: string[]): Reply | null => (errors.length > 0 ? { type: "schema", subject, errors } : null);
 		switch (r.type) {
 			case "call": {
@@ -430,13 +494,6 @@ export class Session {
 				const script = this.#decl.scripts[r.script!];
 				return script ? fail(`args of script ${r.script}`, schemaErrors(script.input, r.args)) : null;
 			}
-			case "commit":
-				for (const w of r.writes ?? []) {
-					const schema = this.#decl.fields[w.field];
-					const reply = schema ? fail(`write to state field ${w.field}`, schemaErrors(schema, w.value)) : null;
-					if (reply) return reply;
-				}
-				return null;
 			default:
 				return null;
 		}
@@ -475,30 +532,28 @@ export class Session {
 				this.#deliveries.push([effect.id!, { type: "refuse", refusal: effect.refusal }]);
 				return;
 			case "finish":
-				this.#finish();
+				this.#complete();
 				return;
 		}
 	}
 
-	/** The output, emits and mapped writes, checked against their schemas before anything is logged. */
-	#resultErrors(effect: Extract<Effect, { type: "call_agent" }>, output: Json, emits: readonly { field: string; value: Json }[]): string | null {
-		const declaration = this.#decl.agents[effect.agent]!;
-		const errors = schemaErrors(declaration.output, output);
-		if (errors.length > 0) return `output does not match its schema: ${errors.join("; ")}`;
-		for (const e of emits) {
-			const schema = this.#decl.fields[e.field];
-			const bad = schema ? schemaErrors(schema, e.value) : [];
-			if (bad.length > 0) return `emit to state field ${e.field} does not match its schema: ${bad.join("; ")}`;
+	/**
+	 * A producer's output, parsed: JSON, drafts stored as artifacts, every ref
+	 * verified against the store, then the schema. Errors are a string.
+	 */
+	#parseOutput(output: unknown, schema: unknown, scratch: string | null): { ok: true; value: Json } | { ok: false; error: string } {
+		const json = toJson(output);
+		if (!json.ok) return { ok: false, error: `output is not JSON: ${json.errors.join("; ")}` };
+		let value: Json;
+		try {
+			value = resolveDrafts(json.value, this.paths.dir, scratch);
+			verifyRefs(value, this.paths.dir);
+		} catch (error) {
+			if (error instanceof ArtifactError) return { ok: false, error: error.message };
+			throw error;
 		}
-		for (const [field, source] of Object.entries(declaration.writes)) {
-			if (typeof source !== "string") continue;
-			const value = getPath(output, source);
-			const schema = this.#decl.fields[field];
-			if (value === undefined || value === null || !schema) continue;
-			const bad = schemaErrors(schema, value);
-			if (bad.length > 0) return `write to state field ${field} does not match its schema: ${bad.join("; ")}`;
-		}
-		return null;
+		const errors = schemaErrors(schema, value);
+		return errors.length > 0 ? { ok: false, error: `output does not match its schema: ${errors.join("; ")}` } : { ok: true, value };
 	}
 
 	/** The node's open executor session, kept while the node is idle. */
@@ -518,36 +573,46 @@ export class Session {
 		if (open) void Promise.resolve(open.session.close()).catch(() => {});
 	}
 
-	/** Steers a running node: the message reaches it at its next step boundary. */
-	steerNode(id: string, text: string): boolean {
-		const open = this.#nodes.get(id);
-		if (!open?.session.steer) return false;
-		open.session.steer(text);
-		return true;
-	}
-
-	/** Aborts a running node's current generation or tool. */
-	interruptNode(id: string): boolean {
-		const open = this.#nodes.get(id);
-		if (!open?.session.interrupt) return false;
-		open.session.interrupt();
-		return true;
-	}
-
-	#callAgent(effect: Extract<Effect, { type: "call_agent" }>): void {
+	#callAgent(effect: CallAgentEffect): void {
+		const id = effect.id;
 		const declaration = this.#decl.agents[effect.agent]!;
-		const workspace = this.#dirs(effect.id, declaration.sandbox, effect.input, declaration.data);
+		const generation = (this.#generation.get(id) ?? 0) + 1;
+		this.#generation.set(id, generation);
+		const current = () => this.#generation.get(id) === generation;
+		const log = this.#transcriptLog(id);
+		const base = { id, model: effect.model };
+		const failed = (error: string) =>
+			queueMicrotask(() => this.#later(() => this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error }, usage: NO_USAGE })));
+
+		let workspace: NodeDirs;
+		try {
+			workspace = prepareNode(this.paths.dir, id, declaration.sandbox, effect.input, this.#mountDirs(declaration.mounts));
+		} catch (error) {
+			if (!(error instanceof ArtifactError)) throw error;
+			return failed(error.message);
+		}
+		const rendered = renderInput(declaration.input, effect.input);
+		const contextTokens = this.#options.executor.contextWindow?.(effect.model);
+		if (effect.transcript.length === 0) {
+			// The window check, before the first request of the call.
+			const over = windowCheck(declaration.prompt.length + (effect.note?.length ?? 0), rendered, contextTokens);
+			if (over) {
+				log({ kind: "note", text: `input refused: ${over.chars} chars over the window's ${over.limit}` });
+				queueMicrotask(() => this.#later(() => this.#feed({ type: "input_rejected", id, ...over })));
+				return;
+			}
+		}
 		const last = effect.transcript.at(-1);
 		const message = last?.role === "user" ? last.text : undefined;
-		const log = this.#transcriptLog(effect.id);
 		const spec: NodeSpec = {
-			id: effect.id,
+			id,
 			agent: effect.agent,
 			declaration,
 			model: effect.model,
-			view: effect.view,
-			omitted: effect.omitted,
+			prompt: rendered.text,
 			input: effect.input,
+			note: effect.note,
+			contextTokens,
 			maxTurns: effect.max_turns,
 			digest: effect.digest,
 			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
@@ -558,13 +623,12 @@ export class Session {
 			mcp: this.#mcpFor(declaration),
 			log,
 		};
-		const base = { id: effect.id, model: effect.model };
 		const done = () => {
-			this.#closeNode(effect.id);
-			discardNode(this.paths.dir, effect.id);
+			this.#closeNode(id);
+			discardNode(this.paths.dir, id);
 		};
 		const session = async (): Promise<NodeSession> => {
-			const open = this.#nodes.get(effect.id);
+			const open = this.#nodes.get(id);
 			// A continued node keeps its session; a new model is a rebind, or a restart.
 			if (open && message !== undefined) {
 				if (open.model === effect.model) return open.session;
@@ -575,9 +639,9 @@ export class Session {
 					return open.session;
 				}
 			}
-			this.#closeNode(effect.id);
+			this.#closeNode(id);
 			const started = await this.#options.executor.start(spec);
-			this.#nodes.set(effect.id, { session: started, model: effect.model });
+			this.#nodes.set(id, { session: started, model: effect.model });
 			return started;
 		};
 		if (message !== undefined) log({ kind: "user", text: message });
@@ -586,48 +650,45 @@ export class Session {
 			.then(
 				(turn) =>
 					this.#later(() => {
+						if (!current()) {
+							log({ kind: "note", text: `discarded the ${turn.type} turn of a call that was restarted or cancelled` });
+							return;
+						}
 						if (turn.type === "executor_error") {
-							this.#closeNode(effect.id);
+							this.#closeNode(id);
 							log({ kind: "turn", result: `executor_error: ${turn.error}` });
-							this.#feed({ type: "executor_failed", id: effect.id, error: turn.error });
+							this.#feed({ type: "executor_failed", id, error: turn.error });
 							return;
 						}
 						const usage = turn.usage ?? NO_USAGE;
 						log({ kind: "turn", result: turn.type, usage });
 						if (turn.type === "ended") {
 							this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
-							const parked = this.#afterInterrupt.get(effect.id);
+							const parked = this.#afterInterrupt.get(id);
 							if (parked !== undefined) {
-								this.#afterInterrupt.delete(effect.id);
-								this.send(effect.id, parked);
+								this.#afterInterrupt.delete(id);
+								const owned = this.owned(parked.by);
+								const node = owned instanceof OwnedRun ? IdleNode.check(owned, id) : owned;
+								const refusal = node instanceof IdleNode ? this.answer(node, parked.text) : node;
+								if (refusal) log({ kind: "note", text: `the message after the interrupt was refused: ${JSON.stringify(refusal)}` });
 							}
 							return;
 						}
 						if (turn.type === "agent_error") {
-							this.#feed({ type: "agent_failed", ...base, error: turn.error, usage });
+							this.#feed({ type: "agent_failed", ...base, failure: turn.failure, usage });
 							done();
 							return;
 						}
-						let output: Json;
-						let emits: { field: string; value: Json }[];
-						try {
-							output = resolveDrafts(turn.output, this.paths.dir, workspace.scratch);
-							emits = (turn.emits ?? []).map((e) => ({ field: e.field, value: resolveDrafts(e.value, this.paths.dir, workspace.scratch) }));
-						} catch (error) {
-							if (!(error instanceof ArtifactError)) throw error;
-							this.#feed({ type: "agent_failed", ...base, error: error.message, usage });
-							done();
-							return;
-						}
-						const invalid = this.#resultErrors(effect, output, emits);
-						if (invalid) this.#feed({ type: "agent_failed", ...base, error: invalid, usage });
-						else this.#feed({ type: "agent_returned", ...base, output, emits, usage });
+						const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
+						if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage });
+						else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
 						done();
 					}),
 				(error: unknown) =>
 					this.#later(() => {
-						this.#closeNode(effect.id);
-						this.#feed({ type: "executor_failed", id: effect.id, error: errorText(error) });
+						if (!current()) return;
+						this.#closeNode(id);
+						this.#feed({ type: "executor_failed", id, error: errorText(error) });
 					}),
 			);
 	}
@@ -635,17 +696,14 @@ export class Session {
 	#runScript(effect: Extract<Effect, { type: "run_script" }>): void {
 		const runner = this.#options.scripts;
 		const id = effect.id;
-		if (!runner) {
-			queueMicrotask(() => this.#later(() => this.#feed({ type: "script_failed", id, error: "no script runner", minutes: 0 })));
-			return;
-		}
+		const failed = (error: string) => queueMicrotask(() => this.#later(() => this.#feed({ type: "script_failed", id, error, minutes: 0 })));
+		if (!runner) return failed("no script runner");
 		const declaration = this.#decl.scripts[effect.script];
 		let workspace: NodeDirs;
 		try {
-			workspace = this.#dirs(id, declaration?.sandbox ?? "workspace", effect.args, declaration?.data ?? []);
+			workspace = prepareNode(this.paths.dir, id, declaration?.sandbox ?? "workspace", effect.args, this.#mountDirs(declaration?.mounts ?? []));
 		} catch (error) {
-			queueMicrotask(() => this.#later(() => this.#feed({ type: "script_failed", id, error: errorText(error), minutes: 0 })));
-			return;
+			return failed(errorText(error));
 		}
 		const done = () => discardNode(this.paths.dir, id);
 		runner
@@ -662,21 +720,9 @@ export class Session {
 			.then(
 				(result) =>
 					this.#later(() => {
-						let output: Json;
-						try {
-							output = resolveDrafts(result.output, this.paths.dir, workspace.scratch);
-						} catch (error) {
-							if (!(error instanceof ArtifactError)) throw error;
-							this.#feed({ type: "script_failed", id, error: error.message, minutes: result.minutes });
-							done();
-							return;
-						}
-						const errors = declaration ? schemaErrors(declaration.output, output) : [];
-						if (errors.length > 0) {
-							this.#feed({ type: "script_failed", id, error: `output does not match its schema: ${errors.join("; ")}`, minutes: result.minutes });
-						} else {
-							this.#feed({ type: "script_returned", id, output, minutes: result.minutes });
-						}
+						const parsed = this.#parseOutput(result.output, declaration?.output ?? {}, workspace.scratch);
+						if (parsed.ok) this.#feed({ type: "script_returned", id, output: parsed.value, minutes: result.minutes });
+						else this.#feed({ type: "script_failed", id, error: parsed.error, minutes: result.minutes });
 						done();
 					}),
 				(error: unknown) =>
@@ -685,10 +731,6 @@ export class Session {
 						done();
 					}),
 			);
-	}
-
-	#finish(): void {
-		this.#complete();
 	}
 
 	/** Ends the session once nothing is queued and the run no longer runs. */

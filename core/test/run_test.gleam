@@ -3,45 +3,33 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import support.{
-  agent, branch_call, call, commit, field, last, pin, replay, replay_from,
-  returned, snapshot_get, started, state_of, status_after, view, workflow,
+  basic, call, human, idle, last, nodes_after, pin, replay, replay_from,
+  returned, snapshot_get, started, status_after,
 }
 import wallis_core/run
 import wallis_core/types.{
-  type Workflow, AgentGaveUp, AgentIdle, AliasRebound, Append, Assistant, Budget,
-  BudgetExhausted, BudgetRaised, CallAgent, CancelRequested, Cancelled,
-  Checkpoint, ComputeMinutes, Deliver, Descending, Done, ExecutorFailed,
-  ExecutorUnavailable, Fail, Finish, Finished, Idle, InvalidDeclaration, Message,
-  NonCommutativeWriteInBranch, NotIdle, NotRunning, PathDiverged, Pin,
-  PinMismatch, Refuse, Requested, Resumed, RetryUnavailable, RunScript, Running,
-  Script, Sent, Sum, Tokens, TopK, TopOnly, Union, UnknownAlias, Usage, Usd,
-  User, ViewSpec, Workflow, WriteNotAllowed,
+  AgentGaveUp, AliasRebound, Answer, Assistant, Budget, BudgetExhausted,
+  BudgetRaised, CallAgent, CancelRequested, Cancelled, CancelledByOwner,
+  Checkpoint, ComputeMinutes, ContextExhausted, Deliver, Done, ExecutorFailed,
+  ExecutorUnavailable, Fail, Finish, Finished, GaveUp, Idle, InboxMessage,
+  InputRejected, InputTooLarge, Interrupt, InvalidDeclaration, Message, NodeDone,
+  NodeFailed, NodeIdle, NodeNotRunning, NodeRunning, NotIdle, NotLive, NotOwner,
+  NotRunning, NotSteerable, PathDiverged, Pin, PinMismatch, Refuse, Requested,
+  Restart, Resumed, RetryUnavailable, RunScript, Running, Script, Sent, Steer,
+  Tokens, UnknownAlias, Usage, Usd, User, Workflow,
 }
 import wallis_core/value.{JArray, JInt, JNull, JString}
-
-fn basic() -> Workflow {
-  workflow(
-    [field("runs", Append), field("errors", Union), field("score", Sum)],
-    [
-      agent("worker", view(["runs"]), [
-        #("runs", Some("summary")),
-        #("errors", Some("errors")),
-        #("score", None),
-      ]),
-    ],
-  )
-}
 
 fn summary(s) {
   value.object([#("summary", JString(s))])
 }
 
 fn failed(id, error) {
-  types.AgentFailed(id, error, support.usage(), "fake/model")
+  types.AgentFailed(id, GaveUp(error), support.usage(), "fake/model")
 }
 
-fn idle(id, message) {
-  AgentIdle(id, message, support.usage(), "fake/model")
+fn sent(node, text) {
+  Sent(node, text, "m1", human)
 }
 
 // --- Start ---
@@ -50,134 +38,45 @@ pub fn start_checkpoints_and_rejects_unresolved_alias_test() {
   let #(_, effects, log) = replay([started(basic())])
   assert effects == [Checkpoint]
   assert list.length(log) == 1
-  let wf = basic()
   let bad =
-    Workflow(..wf, agents: [
-      types.Agent(..support.agent("x", view([]), []), model: "judge"),
-    ])
+    support.workflow([types.Agent(..support.agent("x"), model: "judge")])
   let no_default = types.Started(bad, Pin(..pin(), models: dict.new()), JNull)
   let assert [Refuse(None, InvalidDeclaration(reason))] = last([no_default])
   assert string.contains(reason, "judge")
 }
 
-pub fn start_rejects_view_of_unknown_field_test() {
-  let wf = workflow([], [agent("a", view(["ghost"]), [])])
-  let assert [Refuse(None, InvalidDeclaration(reason))] = last([started(wf)])
-  assert string.contains(reason, "ghost")
+pub fn start_rejects_duplicate_agents_test() {
+  let wf = support.workflow([support.agent("a"), support.agent("a")])
+  let assert [Refuse(None, InvalidDeclaration(_))] = last([started(wf)])
 }
 
-// --- Calls, writes, journal ---
+// --- Calls and the journal ---
 
-pub fn call_emits_call_agent_with_view_test() {
+pub fn call_emits_call_agent_with_its_input_test() {
   let assert [
     CallAgent(
       id: "#0",
       agent: "worker",
       model: "fake/model",
-      view:,
+      input: JInt(1),
       transcript: [],
+      note: None,
       ..,
     ),
   ] = last([started(basic()), call("#0", "worker", JInt(1))])
-  assert view == "<field name=\"runs\">\n</field>"
   assert status_after([started(basic()), call("#0", "worker", JInt(1))])
     == Some(Running)
 }
 
-pub fn writes_apply_at_call_end_test() {
+pub fn a_result_reaches_the_body_only_as_its_answer_test() {
   let events = [
     started(basic()),
     call("#0", "worker", JInt(1)),
-    returned(
-      "#0",
-      value.object([
-        #("summary", JString("s0")),
-        #("errors", JArray([JString("E1")])),
-      ]),
-    ),
+    returned("#0", summary("s0")),
   ]
-  let assert [Deliver("#0", _)] = last(events)
-  assert state_of(events, "runs") == JArray([JString("s0")])
-  assert state_of(events, "errors") == JArray([JString("E1")])
-}
-
-pub fn emit_to_undeclared_field_is_refused_atomically_test() {
-  let wf =
-    workflow([field("runs", Append), field("other", Append)], [
-      agent("worker", view([]), [#("runs", Some("summary"))]),
-    ])
-  let events = [
-    started(wf),
-    call("#0", "worker", JNull),
-    types.AgentReturned(
-      "#0",
-      summary("s"),
-      [types.Write("other", JInt(1))],
-      support.usage(),
-      "fake/model",
-    ),
-  ]
-  assert last(events)
-    == [Refuse(Some("#0"), WriteNotAllowed("worker", "other"))]
-  assert state_of(events, "runs") == JArray([])
-}
-
-pub fn emit_tool_writes_declared_field_test() {
-  let events = [
-    started(basic()),
-    call("#0", "worker", JNull),
-    types.AgentReturned(
-      "#0",
-      JNull,
-      [types.Write("score", JInt(4))],
-      support.usage(),
-      "fake/model",
-    ),
-  ]
-  assert state_of(events, "score") == JInt(4)
-}
-
-/// Snapshot isolation: a call sees the state as of its request, even when
-/// another call's writes land before it returns.
-pub fn calls_are_snapshot_isolated_test() {
-  let wf =
-    workflow([field("errors", Union)], [
-      agent("w", view(["errors"]), [#("errors", Some("errors"))]),
-    ])
-  let errs = fn(e) { value.object([#("errors", JArray([JString(e)]))]) }
-  let events = [
-    started(wf),
-    branch_call("#0.a#0", "a", "w", JNull),
-    branch_call("#0.b#0", "b", "w", JNull),
-    returned("#0.a#0", errs("A")),
-  ]
-  assert state_of(events, "errors") == JArray([JString("A")])
-  let assert [CallAgent(view:, ..)] = last(list.take(events, 3))
-  assert !string.contains(view, "\"A\"")
-  let assert [CallAgent(view:, ..)] =
-    last(list.append(events, [call("#1", "w", JNull)]))
-  assert string.contains(view, "\"A\"")
-}
-
-pub fn parallel_branch_refuses_non_commutative_write_test() {
-  let events = [
-    started(basic()),
-    branch_call("#0.a#0", "a", "worker", JNull),
-    returned("#0.a#0", summary("s")),
-  ]
-  assert last(events)
-    == [Refuse(Some("#0.a#0"), NonCommutativeWriteInBranch("runs", "a"))]
-  assert state_of(events, "runs") == JArray([])
-}
-
-pub fn parallel_branch_accepts_commutative_write_test() {
-  let events = [
-    started(basic()),
-    branch_call("#0.a#0", "a", "worker", JNull),
-    returned("#0.a#0", value.object([#("errors", JArray([JString("E")]))])),
-  ]
-  let assert [Deliver("#0.a#0", _)] = last(events)
-  assert state_of(events, "errors") == JArray([JString("E")])
+  assert last(events) == [Deliver("#0", summary("s0"))]
+  let #(s, _, _) = replay(events)
+  assert snapshot_get(s, "state") == JNull
 }
 
 pub fn agent_failure_is_journaled_and_typed_test() {
@@ -187,43 +86,42 @@ pub fn agent_failure_is_journaled_and_typed_test() {
     failed("#0", "maxTurns exceeded"),
   ]
   assert last(events)
-    == [Fail("#0", AgentGaveUp("worker", "maxTurns exceeded"))]
-  assert snapshot_get(replay(events).0, "nodes")
-    == JArray([
-      value.object([
-        #("id", JString("#0")),
-        #("agent", JString("worker")),
-        #("model", JString("fake/model")),
-        #(
-          "status",
-          value.object([
-            #("type", JString("node_done")),
-            #(
-              "outcome",
-              value.object([
-                #("type", JString("gave_up")),
-                #("error", JString("maxTurns exceeded")),
-              ]),
-            ),
-          ]),
-        ),
-      ]),
-    ])
+    == [Fail("#0", AgentGaveUp("worker", GaveUp("maxTurns exceeded")))]
+  assert nodes_after(events)
+    == [
+      NodeDone(
+        "#0",
+        "worker",
+        "fake/model",
+        True,
+        [],
+        NodeFailed(GaveUp("maxTurns exceeded")),
+      ),
+    ]
 }
 
-pub fn body_commit_and_read_test() {
+pub fn context_exhaustion_is_a_typed_agent_failure_test() {
   let events = [
     started(basic()),
-    commit("#0", [#("runs", JString("r")), #("score", JInt(2))]),
-    Requested(
-      "#1",
-      None,
-      types.Read(ViewSpec(["runs", "score"], 1000, 10, 1, [])),
-    ),
+    call("#0", "worker", JNull),
+    types.AgentFailed("#0", ContextExhausted, support.usage(), "fake/model"),
   ]
-  let assert [Deliver("#1", result)] = last(events)
-  assert value.get(result, "data.runs") == Some(JArray([JString("r")]))
-  assert value.get(result, "data.score") == Some(JInt(2))
+  assert last(events) == [Fail("#0", AgentGaveUp("worker", ContextExhausted))]
+}
+
+pub fn an_input_too_large_for_the_window_is_a_journaled_refusal_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    InputRejected("#0", Some("papers"), 900_000, 384_000),
+  ]
+  let refusal = InputTooLarge("worker", Some("papers"), 900_000, 384_000)
+  assert last(events) == [Refuse(Some("#0"), refusal)]
+  // Not a node: it never started a dialogue. A replay answers from the journal.
+  assert nodes_after(events) == []
+  let #(s, _, _) = replay(events)
+  let #(_, effects) = run.step(s, call("#0", "worker", JNull))
+  assert effects == [Refuse(Some("#0"), refusal)]
 }
 
 pub fn body_finish_test() {
@@ -237,17 +135,45 @@ pub fn body_failure_is_typed_test() {
     == [Finish(types.Failed(reason))]
 }
 
+// --- Observations: monitoring only ---
+
+pub fn observations_are_logged_once_and_never_diverge_test() {
+  let events = [
+    started(basic()),
+    types.Observed("#0~0", "incumbent", JInt(3)),
+    call("#0", "worker", JNull),
+  ]
+  let #(s, _, log) = replay(events)
+  assert list.length(log) == 3
+  assert snapshot_get(s, "observations")
+    == JArray([
+      value.object([
+        #("at", JString("#0~0")),
+        #("label", JString("incumbent")),
+        #("value", JInt(3)),
+      ]),
+    ])
+  // Replayed, even with another value: not logged again, nothing refused.
+  let #(s, _) = run.step(s, Resumed(pin()))
+  let #(_, effects) = run.step(s, types.Observed("#0~0", "incumbent", JInt(4)))
+  assert effects == []
+}
+
 // --- Cancel ---
 
 pub fn cancel_finishes_and_later_events_are_refused_test() {
-  let events = [started(basic()), call("#0", "worker", JNull), CancelRequested]
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    CancelRequested(human),
+  ]
   assert last(events) == [Finish(Cancelled)]
   assert status_after(events) == Some(Finished(Cancelled))
   assert last(list.append(events, [returned("#0", summary("late"))]))
     == [Refuse(None, NotRunning)]
 }
 
-// --- Questions: ending a turn without a result ---
+// --- Answering: ending a turn without a result ---
 
 fn asked() {
   [started(basic()), call("#0", "worker", JNull), idle("#0", "Which dataset?")]
@@ -256,48 +182,41 @@ fn asked() {
 pub fn agent_ending_turn_without_result_idles_its_node_test() {
   assert last(asked()) == []
   assert status_after(asked()) == Some(Idle(None))
-  assert support.node(replay(asked()).0, 0) |> value.get("status")
-    == Some(
-      value.object([
-        #("type", JString("node_idle")),
-        #("last_message", JString("Which dataset?")),
-      ]),
-    )
+  assert nodes_after(asked())
+    == [NodeIdle("#0", "worker", "fake/model", True, [], "Which dataset?")]
 }
 
-pub fn send_continues_the_same_conversation_test() {
-  let events = list.append(asked(), [Sent("#0", "the 2024 one", "m1")])
+pub fn an_answer_continues_the_same_dialogue_and_is_in_the_inbox_test() {
+  let events = list.append(asked(), [sent("#0", "the 2024 one")])
   let assert [CallAgent(id: "#0", transcript:, ..)] = last(events)
   assert transcript
     == [Message(Assistant, "Which dataset?"), Message(User, "the 2024 one")]
   assert status_after(events) == Some(Running)
   let done = list.append(events, [returned("#0", summary("s"))])
   let assert [Deliver("#0", _)] = last(done)
+  // The journal entry records which messages arrived, at which step.
+  let assert [NodeDone(inbox:, ..)] = nodes_after(done)
+  assert inbox == [InboxMessage(Answer, "the 2024 one", 1)]
 }
 
-pub fn send_to_a_node_that_is_not_idle_is_refused_test() {
-  let events = [
-    started(basic()),
-    call("#0", "worker", JNull),
-    Sent("#0", "hi", "m1"),
-  ]
+pub fn an_answer_to_a_node_that_is_not_idle_is_refused_test() {
+  let events = [started(basic()), call("#0", "worker", JNull), sent("#0", "hi")]
   assert last(events) == [Refuse(None, NotIdle("#0"))]
   let #(_, _, log) = replay(events)
   assert list.length(log) == 2
 }
 
-/// Killed after the send was logged: the replay reissues the continued
+/// Killed after the answer was logged: the replay reissues the continued
 /// call with the whole transcript, and the log ends equal.
-pub fn question_send_survives_a_kill_test() {
+pub fn an_answer_survives_a_kill_test() {
   let whole =
     list.append(asked(), [
-      Sent("#0", "the 2024 one", "m1"),
+      sent("#0", "the 2024 one"),
       returned("#0", summary("s")),
       types.BodyFinished(JNull),
     ])
   let #(expected, _, expected_log) = replay(whole)
-  let #(s, _, log) =
-    replay(list.append(asked(), [Sent("#0", "the 2024 one", "m1")]))
+  let #(s, _, log) = replay(list.append(asked(), [sent("#0", "the 2024 one")]))
   let #(s, effects) = run.step(s, Resumed(pin()))
   assert effects == []
   let #(s, effects) = run.step(s, call("#0", "worker", JNull))
@@ -313,6 +232,148 @@ pub fn replaying_an_idle_node_does_nothing_test() {
   let #(s, _, _) = replay(asked())
   let #(_, effects) = run.step(s, call("#0", "worker", JNull))
   assert effects == []
+}
+
+// --- Ownership: re-checked when an intervention is applied ---
+
+pub fn interventions_need_the_owner_or_the_human_test() {
+  let events = list.append(asked(), [types.Claimed("harness:a")])
+  assert last(list.append(events, [Sent("#0", "x", "m1", "harness:b")]))
+    == [Refuse(None, NotOwner("harness:b", Some("harness:a")))]
+  let assert [CallAgent(..)] =
+    last(list.append(events, [Sent("#0", "x", "m1", "harness:a")]))
+  let assert [CallAgent(..)] =
+    last(list.append(events, [Sent("#0", "x", "m1", human)]))
+  assert last(list.append(events, [types.PauseRequested("harness:b")]))
+    == [Refuse(None, NotOwner("harness:b", Some("harness:a")))]
+  // An unowned run is the human's only.
+  assert last([started(basic()), CancelRequested("harness:a")])
+    == [Refuse(None, NotOwner("harness:a", None))]
+}
+
+pub fn claim_is_logged_and_works_on_finished_runs_test() {
+  let events = [started(basic()), types.Claimed("harness:a")]
+  let #(s, effects, log) = replay(events)
+  assert effects == [Checkpoint]
+  assert list.length(log) == 2
+  assert snapshot_get(s, "owner") == JString("harness:a")
+  let #(s, _, _) =
+    replay_from(s, [types.BodyFinished(JNull), types.Claimed("harness:b")])
+  assert snapshot_get(s, "owner") == JString("harness:b")
+}
+
+// --- Steering, interrupt, restart, cancel ---
+
+pub fn steering_a_running_node_is_logged_and_joins_its_dialogue_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.Steered("#0", "focus on recall", "m1", human),
+  ]
+  let #(s, effects, log) = replay(events)
+  assert effects == [Checkpoint]
+  assert list.length(log) == 3
+  // A reissue after a kill carries the steering message.
+  let #(s2, _) = run.step(s, Resumed(pin()))
+  let assert #(
+    _,
+    [CallAgent(transcript: [Message(User, "focus on recall")], ..)],
+  ) = run.step(s2, call("#0", "worker", JNull))
+  let done = list.append(events, [returned("#0", summary("recall first"))])
+  let assert [Deliver("#0", _)] = last(done)
+  let assert [NodeDone(inbox: [InboxMessage(Steer, "focus on recall", 0)], ..)] =
+    nodes_after(done)
+  // Steering a node that is not running is refused.
+  assert last(list.append(done, [types.Steered("#0", "late", "m2", human)]))
+    == [Refuse(None, NodeNotRunning("#0"))]
+}
+
+pub fn a_non_steerable_node_refuses_steer_interrupt_and_answers_test() {
+  let running = [started(basic()), call("#0", "judge", JNull)]
+  assert last(list.append(running, [types.Steered("#0", "x", "m", human)]))
+    == [Refuse(None, NotSteerable("#0"))]
+  assert last(list.append(running, [types.Interrupted("#0", human)]))
+    == [Refuse(None, NotSteerable("#0"))]
+  let asking = list.append(running, [idle("#0", "?")])
+  assert last(list.append(asking, [sent("#0", "x")]))
+    == [Refuse(None, NotSteerable("#0"))]
+  assert nodes_after(running)
+    == [NodeRunning("#0", "judge", "fake/model", False, [])]
+  // It accepts cancel, and a restart without a note.
+  let assert [CallAgent(id: "#0", note: None, ..)] =
+    last(list.append(asking, [types.Restarted("#0", None, human)]))
+  assert last(list.append(asking, [types.Restarted("#0", Some("hint"), human)]))
+    == [Refuse(None, NotSteerable("#0"))]
+  let assert [Fail("#0", AgentGaveUp("judge", CancelledByOwner))] =
+    last(list.append(asking, [types.NodeCancelled("#0", human)]))
+}
+
+pub fn interrupt_is_logged_for_a_running_steerable_node_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.Interrupted("#0", human),
+  ]
+  let #(_, effects, log) = replay(events)
+  assert effects == [Checkpoint]
+  assert list.length(log) == 3
+  let assert [NodeRunning(inbox: [InboxMessage(Interrupt, "", 0)], ..)] =
+    nodes_after(events)
+  assert last([started(basic()), types.Interrupted("#9", human)])
+    == [Refuse(None, NodeNotRunning("#9"))]
+}
+
+pub fn restart_discards_progress_and_reissues_with_the_note_test() {
+  let events =
+    list.append(asked(), [
+      types.Restarted("#0", Some("use the 2024 data"), human),
+    ])
+  let assert [
+    CallAgent(id: "#0", input: JNull, transcript: [], note: Some(note), ..),
+  ] = last(events)
+  assert note == "use the 2024 data"
+  let #(s, _, log) = replay(events)
+  assert list.length(log) == 4
+  // Killed after the restart: the reissue carries the note, not the old dialogue.
+  let #(s, _) = run.step(s, Resumed(pin()))
+  let assert #(_, [CallAgent(transcript: [], note: Some(_), ..)]) =
+    run.step(s, call("#0", "worker", JNull))
+  let done = list.append(events, [returned("#0", summary("s"))])
+  let assert [
+    NodeDone(inbox: [InboxMessage(Restart, "use the 2024 data", 1)], ..),
+  ] = nodes_after(done)
+  // A done node has nothing to restart.
+  assert last(list.append(done, [types.Restarted("#0", None, human)]))
+    == [Refuse(None, NotLive("#0"))]
+}
+
+pub fn pause_holds_new_calls_until_resume_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.PauseRequested(human),
+    returned("#0", summary("s0")),
+    call("#1", "worker", JNull),
+  ]
+  // The in-flight call finished; the new one is held.
+  assert last(events) == []
+  assert status_after(events) == Some(Idle(Some(types.PausedByUser)))
+  let resumed = list.append(events, [types.ResumeRequested(human)])
+  let assert [CallAgent(id: "#1", ..)] = last(resumed)
+  assert status_after(resumed) == Some(Running)
+}
+
+pub fn cancelling_a_node_fails_it_for_the_body_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.NodeCancelled("#0", human),
+  ]
+  assert last(events) == [Fail("#0", AgentGaveUp("worker", CancelledByOwner))]
+  // A late result is ignored.
+  assert last(list.append(events, [returned("#0", summary("late"))])) == []
+  assert last([started(basic()), types.NodeCancelled("#0", human)])
+    == [Refuse(None, NotLive("#0"))]
 }
 
 // --- Budget: exhaustion pauses ---
@@ -361,7 +422,7 @@ pub fn budget_caps_turns_of_call_test() {
   let events = [
     started(wf),
     call("#0", "worker", JNull),
-    types.AgentReturned("#0", summary("s"), [], Usage(0.0, 0, 2), "fake/model"),
+    types.AgentReturned("#0", summary("s"), Usage(0.0, 0, 2), "fake/model"),
     call("#1", "worker", JNull),
   ]
   let assert [CallAgent(max_turns: 1, ..)] = last(events)
@@ -393,7 +454,7 @@ pub fn compute_minutes_pass_to_scripts_and_pause_test() {
       turns: None,
       compute_minutes: Some(10.0),
     ))
-  let script = fn(id) { Requested(id, None, Script("train", JNull)) }
+  let script = fn(id) { Requested(id, Script("train", JNull)) }
   let assert [RunScript(compute_minutes: Some(10.0), ..)] =
     last([started(wf), script("#0")])
   let events = [
@@ -440,7 +501,7 @@ pub fn idle_node_continues_with_the_new_model_test() {
   let events =
     list.append(asked(), [
       AliasRebound("default", "fake/model", "other/model"),
-      Sent("#0", "yes", "m1"),
+      sent("#0", "yes"),
     ])
   let assert [CallAgent(id: "#0", model: "other/model", ..)] = last(events)
 }
@@ -482,13 +543,7 @@ pub fn executor_error_pauses_and_retry_reissues_test() {
   let #(_, effects) =
     run.step(
       s,
-      types.AgentReturned(
-        "#0",
-        summary("s"),
-        [],
-        support.usage(),
-        "other/model",
-      ),
+      types.AgentReturned("#0", summary("s"), support.usage(), "other/model"),
     )
   let assert [Checkpoint, Deliver("#0", _)] = effects
 }
@@ -497,43 +552,6 @@ pub fn retry_without_unavailable_calls_logs_nothing_test() {
   let #(s, _, _) = replay([started(basic())])
   let #(_, effects) = run.step(s, RetryUnavailable)
   assert effects == []
-}
-
-pub fn top_k_in_parallel_branch_test() {
-  let wf =
-    workflow(
-      [
-        field(
-          "cache",
-          TopK(
-            k: 2,
-            by: "metric",
-            order: Descending,
-            key: None,
-            latest: TopOnly,
-          ),
-        ),
-      ],
-      [agent("w", view([]), [#("cache", Some("entry"))])],
-    )
-  let entry = fn(m) {
-    value.object([#("entry", value.object([#("metric", JInt(m))]))])
-  }
-  let events = [
-    started(wf),
-    branch_call("#0.a#0", "a", "w", JNull),
-    branch_call("#0.b#0", "b", "w", JNull),
-    returned("#0.b#0", entry(2)),
-    returned("#0.a#0", entry(1)),
-  ]
-  let swapped = [
-    started(wf),
-    branch_call("#0.a#0", "a", "w", JNull),
-    branch_call("#0.b#0", "b", "w", JNull),
-    returned("#0.a#0", entry(1)),
-    returned("#0.b#0", entry(2)),
-  ]
-  assert state_of(events, "cache") == state_of(swapped, "cache")
 }
 
 // --- Resume: pin, journal, divergence ---
@@ -590,6 +608,13 @@ pub fn resume_names_each_result_defining_field_test() {
     == PinMismatch("workflow_digest", "wf1", "wf2")
   assert refusal(Pin(..pin(), semantics: "wallis-core/1"))
     == PinMismatch("semantics", run.semantics, "wallis-core/1")
+  assert refusal(
+      Pin(
+        ..pin(),
+        inputs: dict.from_list([#("advice.md", "a1"), #("mount.kb", "d")]),
+      ),
+    )
+    == PinMismatch("inputs.mount.kb", "<absent>", "d")
 }
 
 pub fn replayed_request_is_answered_from_journal_test() {
@@ -598,8 +623,7 @@ pub fn replayed_request_is_answered_from_journal_test() {
   let #(s, effects) = run.step(s, call("#0", "worker", JInt(0)))
   assert effects == [Deliver("#0", summary("s0"))]
   let #(_, effects) = run.step(s, call("#1", "worker", JInt(1)))
-  let assert [CallAgent(id: "#1", view:, ..)] = effects
-  assert string.contains(view, "s0")
+  let assert [CallAgent(id: "#1", input: JInt(1), ..)] = effects
 }
 
 pub fn replay_divergence_is_refused_without_changing_the_run_test() {
@@ -633,85 +657,4 @@ pub fn interrupted_run_log_equals_uninterrupted_test() {
     ])
   assert list.append(log, log2) == expected_log
   assert run.snapshot(s) == run.snapshot(expected)
-}
-
-// --- Ownership ---
-
-pub fn claim_is_logged_and_works_on_finished_runs_test() {
-  let events = [started(basic()), types.Claimed("harness:a")]
-  let #(s, effects, log) = replay(events)
-  assert effects == [Checkpoint]
-  assert list.length(log) == 2
-  assert snapshot_get(s, "owner") == JString("harness:a")
-  let #(s, _, _) =
-    replay_from(s, [types.BodyFinished(JNull), types.Claimed("harness:b")])
-  assert snapshot_get(s, "owner") == JString("harness:b")
-}
-
-// --- Steering ---
-
-pub fn steering_a_running_node_is_logged_and_joins_its_conversation_test() {
-  let events = [
-    started(basic()),
-    call("#0", "worker", JNull),
-    types.Steered("#0", "focus on recall", "m1"),
-  ]
-  let #(s, effects, log) = replay(events)
-  assert effects == [Checkpoint]
-  assert list.length(log) == 3
-  // A reissue after a kill carries the steering message.
-  let #(s2, _) = run.step(s, Resumed(pin()))
-  let assert #(
-    _,
-    [CallAgent(transcript: [Message(User, "focus on recall")], ..)],
-  ) = run.step(s2, call("#0", "worker", JNull))
-  // Only the eventual output is journaled.
-  let done = list.append(events, [returned("#0", summary("recall first"))])
-  assert state_of(done, "runs") == JArray([JString("recall first")])
-  // Steering a node that is not running is refused.
-  assert last(list.append(done, [types.Steered("#0", "late", "m2")]))
-    == [Refuse(None, types.NodeNotRunning("#0"))]
-}
-
-pub fn interrupt_is_logged_for_a_running_node_test() {
-  let events = [
-    started(basic()),
-    call("#0", "worker", JNull),
-    types.Interrupted("#0"),
-  ]
-  let #(_, effects, log) = replay(events)
-  assert effects == [Checkpoint]
-  assert list.length(log) == 3
-  assert last([started(basic()), types.Interrupted("#9")])
-    == [Refuse(None, types.NodeNotRunning("#9"))]
-}
-
-pub fn pause_holds_new_calls_until_resume_test() {
-  let events = [
-    started(basic()),
-    call("#0", "worker", JNull),
-    types.PauseRequested,
-    returned("#0", summary("s0")),
-    call("#1", "worker", JNull),
-  ]
-  // The in-flight call finished; the new one is held.
-  assert last(events) == []
-  assert status_after(events) == Some(Idle(Some(types.PausedByUser)))
-  let resumed = list.append(events, [types.ResumeRequested])
-  let assert [CallAgent(id: "#1", ..)] = last(resumed)
-  assert status_after(resumed) == Some(Running)
-}
-
-pub fn cancelling_a_node_fails_it_for_the_body_test() {
-  let events = [
-    started(basic()),
-    call("#0", "worker", JNull),
-    types.NodeCancelled("#0"),
-  ]
-  assert last(events)
-    == [Fail("#0", AgentGaveUp("worker", "cancelled by the owner"))]
-  // A late result is ignored.
-  assert last(list.append(events, [returned("#0", summary("late"))])) == []
-  assert last([started(basic()), types.NodeCancelled("#0")])
-    == [Refuse(None, types.NodeNotRunning("#0"))]
 }

@@ -1,6 +1,7 @@
 // Runs the SIDERIUS example end to end with scripted agents and scripts.
 // No model, network or device: this checks that the declarations, the loop
-// and the carried state fit together, not SIDERIUS itself.
+// and the carried history (the body's local variables) fit together, not
+// SIDERIUS itself.
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -126,7 +127,8 @@ function scripts() {
 	});
 }
 
-const local = { data: { siderius_data: "data" } };
+const mountsOf = (root: string) => ({ data: join(root, "data"), config: join(root, "siderius") });
+const local = {};
 
 function projectRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "wallis-siderius-"));
@@ -144,13 +146,22 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 
 	const executor = agents();
 	const runner = scripts();
-	const result = await runWorkflow({ workflow, dir: join(root, "run"), executor, scripts: runner, input, root, seed: 11, inboxPollMs: null, local });
+	const result = await runWorkflow({ workflow, dir: join(root, "run"), executor, scripts: runner, input, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
 	assert.equal(result.outcome?.type, "done", JSON.stringify(result.status));
-	const out = (result.outcome as unknown as { value: { stop_reason: string; iterations: number; incumbent: { score: number } } }).value;
+	const out = (result.outcome as unknown as { value: { stop_reason: string; iterations: number; incumbent: { score: number }; carried: Record<string, never> } }).value;
 	assert.equal(out.stop_reason, "iterations_exhausted");
 	assert.equal(out.iterations, 7);
 
-	const { state } = JSON.parse(result.snapshot);
+	// The carried history is the body's local variables, returned at the end.
+	const carried = out.carried as unknown as {
+		runs: unknown[];
+		knowledge_cache: { model_type: string; key_findings: unknown[]; error_signatures: unknown[] }[];
+		findings_archive: unknown[];
+		collapse_history: Record<string, unknown>;
+		prediction: { version: number; v1: unknown; v2: unknown; info_gain_v2: number };
+	};
+	const state = { ...carried, prediction_version: carried.prediction.version, prediction_v1: carried.prediction.v1, prediction_v2: carried.prediction.v2, info_gain_v2: carried.prediction.info_gain_v2 };
+	assert.equal(JSON.parse(result.snapshot).state, undefined, "the core holds no workflow state");
 	// Knowledge cache: top 4 by valid formal score plus the current model.
 	assert.deepEqual(
 		state.knowledge_cache.map((e: { model_type: string }) => e.model_type),
@@ -159,7 +170,7 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 	assert.equal(out.incumbent.score, 0.9);
 	// Each model holds its own consolidated findings (at most 8); misses and overflow are archived.
 	for (const entry of state.knowledge_cache) assert.ok(entry.key_findings.length <= 8);
-	assert.equal(state.knowledge_cache.find((e: { model_type: string }) => e.model_type === "m5").key_findings.length, 2);
+	assert.equal(state.knowledge_cache.find((e) => e.model_type === "m5")!.key_findings.length, 2);
 	assert.ok(state.findings_archive.length > 0);
 	const consolidations = executor.calls.filter((c) => c.agent === "consolidate_findings");
 	assert.equal(consolidations.length, 6, "one call per model with a cache hit");
@@ -170,19 +181,27 @@ test("the SIDERIUS workflow runs end to end on scripted agents and scripts", asy
 	assert.deepEqual(state.prediction_v2, { confirmed: 1, refuted: 5 });
 	assert.ok(Math.abs(state.info_gain_v2 - 0.7) < 1e-9);
 	// Error signatures live in their model's entry, deduped by the 3-field key.
-	assert.deepEqual(state.knowledge_cache.find((e: { model_type: string }) => e.model_type === "m1").error_signatures, [
+	assert.deepEqual(state.knowledge_cache.find((e) => e.model_type === "m1")!.error_signatures, [
 		{ failure_class: "gradient", top_user_frame: "forward", error_type: "AssertionError", short_message: "no grad", last_frames: ["forward", "loss"], evidence_iters: [1] },
 	]);
 	// Collapse history is pruned to the last 3 iterations.
 	assert.deepEqual(Object.keys(state.collapse_history).sort(), ["m4", "m5", "m6"]);
 
-	// The judge saw the capped projection, never the confidence.
-	for (const call of executor.calls.filter((c) => c.agent === "evidence_judge")) {
-		assert.ok(call.view.length <= 4000);
-		assert.doesNotMatch(call.view, /confidence/);
+	// The judge gets the capped projection the body builds, never the confidence.
+	const judged = executor.calls.filter((c) => c.agent === "evidence_judge");
+	for (const call of judged) {
+		const { evidence, omitted } = call.input as { evidence: unknown[]; omitted: number };
+		assert.ok(JSON.stringify(evidence).length <= 4000);
+		assert.ok(evidence.length <= 24);
+		assert.doesNotMatch(JSON.stringify(call.input), /confidence/);
+		assert.ok(omitted >= 0);
 	}
-	const lastJudge = executor.calls.filter((c) => c.agent === "evidence_judge").at(-1)!;
-	assert.ok((lastJudge.omitted.evidence ?? 0) > 0 || lastJudge.view.split("\n").length - 2 <= 24);
+	assert.equal((judged.at(-1)!.input as { evidence: unknown[] }).evidence.length, 14, "two entries per iteration");
+	// The judge is not steerable; agents get the carried history pushed into their input.
+	assert.equal(result.run.nodes.find((n) => n.agent === "evidence_judge")!.steerable, false);
+	const lastInterpret = executor.calls.filter((c) => c.agent === "interpret").at(-1)!;
+	assert.equal((lastInterpret.input as { history: { runs: unknown[] } }).history.runs.length, 6);
+	assert.ok(lastInterpret.workspace.mounts.config, "the config mount (advice.md) is readable");
 
 	// Each candidate: Trial rounds, then one forced Formal round.
 	const scopes = runner.calls.filter((c) => c.script === "train").map((c) => (c.args as { scope: string }).scope);
@@ -204,13 +223,13 @@ test("JudgeStop request_input: the stop-check node asks the operator, and the re
 			stop_check: conversation({ idle: question }, { submit: { decision: "stop", note: "operator agreed" } }),
 		});
 	const askInput = { ...input, stops: { noImprovementBodies: 0, judgeCriterion: "stop when evidence repeats", judgeOnMet: "request_input" } };
-	const first = await runWorkflow({ workflow, dir, executor: make(), scripts: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local });
+	const first = await runWorkflow({ workflow, dir, executor: make(), scripts: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
 	assert.deepEqual(first.status, { type: "idle", reason: null });
 	const asking = first.run.nodes.find((n) => n.agent === "stop_check")!;
-	assert.deepEqual(asking.status, { type: "node_idle", last_message: question });
+	assert.equal(asking.type === "node_idle" && asking.question, question);
 
 	const executor = make();
-	const done = await runWorkflow({ workflow, dir, executor, scripts: scripts(), root, local, sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
+	const done = await runWorkflow({ workflow, dir, executor, scripts: scripts(), root, local, mounts: mountsOf(root), sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
 	const out = (done.outcome as unknown as { value: { stop_reason: string; iterations: number } }).value;
 	assert.equal(out.stop_reason, "operator_stop");
 	assert.equal(out.iterations, 2);

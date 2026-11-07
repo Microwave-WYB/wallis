@@ -2,12 +2,13 @@
 // answer from scripted responses, for tests and examples: no model, network
 // or device.
 //
-// The contract (round 3):
-//   Executor    { id, capabilities, start(NodeSpec) -> NodeSession }
-//   NodeSession { turn(message?) -> TurnResult, rebind?(model), handle(), close() }
+// The contract:
+//   Executor    { id, capabilities, contextWindow?(model), start(NodeSpec) -> NodeSession }
+//   NodeSession { turn(message?) -> TurnResult, rebind?(model), steer?(text), interrupt?(), handle(), close() }
 //   TurnResult  = submitted | ended | agent_error | executor_error
 //
-// - A node is one agent call and its conversation. `turn()` runs the first
+// An agent is a function: (input, inbox) -> dialogue -> submitted(output) | failure.
+// - A node is one agent call and its dialogue. `turn()` runs the first
 //   turn; `turn(message)` appends a user message and continues. The host keeps
 //   the session open while the node is idle and closes it when it is done.
 // - `NodeSpec.transcript` is the conversation so far (for a session rebuilt
@@ -19,12 +20,15 @@
 //   message is its question. `agent_error` (gave up, maxTurns) reaches the
 //   body as a typed failure. `executor_error` (provider, auth, billing)
 //   leaves the call incomplete and pauses the run; so does anything thrown.
+// - A submitted output is `unknown` here: the host parses it against the
+//   agent's output schema (and its artifact refs against the store) before
+//   anything is logged.
 
-import type { ArtifactRef, Json } from "../sdk/index.ts";
+import type { AgentFailure, ArtifactRef, Json } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 import { schemaErrors } from "../sdk/validate.ts";
 import type { NodeDirs } from "./artifacts.ts";
-import type { Message, Usage, Write } from "./core.ts";
+import type { Message, Usage } from "./core.ts";
 
 export type AgentDeclaration = Declarations["agents"][string];
 
@@ -43,17 +47,21 @@ export interface NodeSpec {
 	readonly declaration: AgentDeclaration;
 	/** Resolved model string (`provider/model[:thinking]`). */
 	readonly model: string;
-	/** The rendered view: the call's snapshot of the run state. */
-	readonly view: string;
-	readonly omitted: Readonly<Record<string, number>>;
+	/** The input as the first prompt shows it: in full, except folded fields. */
+	readonly prompt: string;
+	/** The full input: the `input` variable inside codemode. */
 	readonly input: Json;
+	/** An operator note from a restart, for the first prompt. */
+	readonly note: string | null;
+	/** The resolved model's window in tokens, when the executor knows it. */
+	readonly contextTokens: number | undefined;
 	readonly maxTurns: number;
 	readonly digest: string;
 	/** Messages after the first prompt, so far: the agent's questions and the replies. */
 	readonly transcript: readonly Message[];
 	/** JSON Schema of the result: pass it to the provider as structured output and check `submit_result` with it. */
 	readonly outputSchema: Json;
-	/** The node's dirs: its sandbox level, mounted input artifacts, scratch dir and data dirs. */
+	/** The node's dirs: its sandbox level, mounted input artifacts, scratch dir, mounts and spill dir. */
 	readonly workspace: NodeDirs;
 	/** The `export_artifact` tool: stores a file from the node's scratch dir and returns its ref for `submit_result`. */
 	readonly exportArtifact: (path: string, media: string, name?: string) => ArtifactRef;
@@ -61,17 +69,15 @@ export interface NodeSpec {
 	readonly mcp: Json | null;
 	/** Appends to the node's observational transcript. */
 	readonly log: (entry: TranscriptEntry) => void;
-	/** Delivers steering messages queued for a running turn; see `NodeSession.steer`. */
-	readonly signal?: AbortSignal;
 }
 
 /** What a scripted fake sees for one turn: the spec with the transcript including the current message. */
 export type AgentCall = NodeSpec;
 
 export type TurnResult =
-	| { readonly type: "submitted"; readonly output: Json; readonly emits?: readonly Write[]; readonly usage?: Usage }
+	| { readonly type: "submitted"; readonly output: unknown; readonly usage?: Usage }
 	| { readonly type: "ended"; readonly message: string; readonly usage?: Usage }
-	| { readonly type: "agent_error"; readonly error: string; readonly usage?: Usage }
+	| { readonly type: "agent_error"; readonly failure: AgentFailure; readonly usage?: Usage }
 	| { readonly type: "executor_error"; readonly error: string };
 
 export interface NodeSession {
@@ -96,6 +102,8 @@ export interface Capabilities {
 export interface Executor {
 	readonly id: string;
 	readonly capabilities?: Capabilities;
+	/** The model's context window in tokens, for the window check before a call. */
+	contextWindow?(model: string): number | undefined;
 	start(spec: NodeSpec): Promise<NodeSession> | NodeSession;
 }
 
@@ -117,7 +125,8 @@ export interface ScriptCall {
 }
 
 export interface ScriptResult {
-	readonly output: Json;
+	/** Parsed by the host against the script's output schema. */
+	readonly output: unknown;
 	readonly minutes: number;
 }
 
@@ -130,16 +139,18 @@ export interface ScriptRunner {
 /** One scripted turn of a fake agent. */
 export type Turn =
 	/** Submits a result. */
-	| { readonly submit: Json; readonly emits?: readonly Write[]; readonly usage?: Usage }
+	| { readonly submit: Json; readonly usage?: Usage }
 	/** Submits each in order until one passes `submit_result` validation; each attempt is a turn. */
-	| { readonly submits: readonly Json[]; readonly emits?: readonly Write[]; readonly usage?: Usage }
+	| { readonly submits: readonly Json[]; readonly usage?: Usage }
 	/** Ends the turn without a result: the node goes idle with this message. */
 	| { readonly idle: string; readonly usage?: Usage }
 	/** The executor fails (provider, auth, billing). */
 	| { readonly unavailable: string }
 	| { readonly giveUp: string; readonly usage?: Usage }
+	/** The dialogue outgrew the window with compaction off. */
+	| { readonly contextExhausted: true; readonly usage?: Usage }
 	/** Same as `submit`. */
-	| { readonly output: Json; readonly emits?: readonly Write[]; readonly usage?: Usage };
+	| { readonly output: Json; readonly usage?: Usage };
 
 /** A multi-turn conversation: turn i answers the prompt after i replies. */
 export interface Conversation {
@@ -195,13 +206,20 @@ export class FakeExecutor implements Executor {
 	readonly #scripts: Scripts<AgentCall, Turn | Conversation>;
 	readonly #onCall: ((call: AgentCall) => void) | undefined;
 
+	readonly #window: number | undefined;
+
 	constructor(
 		responses: Responses<AgentCall, Turn | Conversation>,
-		options: { id?: string; onCall?: (call: AgentCall) => void } = {},
+		options: { id?: string; onCall?: (call: AgentCall) => void; contextWindow?: number } = {},
 	) {
 		this.#scripts = new Scripts(responses);
 		this.#onCall = options.onCall;
 		this.id = options.id ?? "fake";
+		this.#window = options.contextWindow;
+	}
+
+	contextWindow(_model: string): number | undefined {
+		return this.#window;
 	}
 
 	start(spec: NodeSpec): NodeSession {
@@ -231,18 +249,23 @@ export class FakeExecutor implements Executor {
 
 	#play(call: AgentCall, turn: Turn): TurnResult {
 		if ("unavailable" in turn) return { type: "executor_error", error: turn.unavailable };
-		if ("giveUp" in turn) return { type: "agent_error", error: turn.giveUp, usage: turn.usage ?? TURN_USAGE };
+		if ("giveUp" in turn) return { type: "agent_error", failure: { type: "gave_up", error: turn.giveUp }, usage: turn.usage ?? TURN_USAGE };
+		if ("contextExhausted" in turn) return { type: "agent_error", failure: { type: "context_exhausted" }, usage: turn.usage ?? TURN_USAGE };
 		if ("idle" in turn) return { type: "ended", message: turn.idle, usage: turn.usage ?? TURN_USAGE };
 		const attempts = "submits" in turn ? turn.submits : ["submit" in turn ? turn.submit : turn.output];
 		for (const [i, output] of attempts.entries()) {
 			const n = i + 1;
 			const spent = turn.usage ?? { usd: 0.01 * n, tokens: 100 * n, turns: n };
-			if (n > call.maxTurns) return { type: "agent_error", error: `maxTurns exceeded (${call.maxTurns})`, usage: spent };
+			if (n > call.maxTurns) return { type: "agent_error", failure: { type: "gave_up", error: `maxTurns exceeded (${call.maxTurns})` }, usage: spent };
 			const errors = validateSubmission(call, output);
 			this.submissions.push({ id: call.id, output, errors });
-			if (errors.length === 0) return { type: "submitted", output, emits: turn.emits ?? [], usage: spent };
+			if (errors.length === 0) return { type: "submitted", output, usage: spent };
 		}
-		return { type: "agent_error", error: "gave up: no submit_result passed validation", usage: turn.usage ?? { usd: 0.01, tokens: 100, turns: attempts.length } };
+		return {
+			type: "agent_error",
+			failure: { type: "gave_up", error: "gave up: no submit_result passed validation" },
+			usage: turn.usage ?? { usd: 0.01, tokens: 100, turns: attempts.length },
+		};
 	}
 }
 

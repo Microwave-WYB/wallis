@@ -5,7 +5,7 @@
 //
 // Confinement (bubblewrap on Linux): the system dirs read-only, the
 // interpreter and the scripts dir read-only, the node's input artifacts and
-// declared data dirs read-only, its scratch dir writable, no network, a
+// declared mounts read-only, its scratch dir writable, no network, a
 // clean environment. Nothing else of the filesystem is visible.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -58,7 +58,7 @@ export function bwrapArgs(dirs: NodeDirs, readOnly: readonly string[]): string[]
 	const args = ["--die-with-parent", "--new-session", "--unshare-all", "--clearenv", ...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
 	for (const path of new Set(readOnly)) args.push("--ro-bind", path, path);
 	if (dirs.level !== "none") args.push("--ro-bind", dirs.inputs, dirs.inputs);
-	for (const path of Object.values(dirs.data)) args.push("--ro-bind", path, path);
+	for (const path of Object.values(dirs.mounts)) args.push("--ro-bind", path, path);
 	if (dirs.scratch) args.push("--bind", dirs.scratch, dirs.scratch);
 	args.push("--chdir", dirs.scratch ?? "/tmp");
 	return args;
@@ -116,7 +116,7 @@ export class ProcessScripts implements ScriptRunner {
 			WALLIS_SCRATCH: dirs.scratch ?? "",
 			WALLIS_COMPUTE_MINUTES: call.computeMinutes === null ? "" : String(call.computeMinutes),
 		};
-		for (const [name, path] of Object.entries(dirs.data)) env[`WALLIS_DATA_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] = path;
+		for (const [name, path] of Object.entries(dirs.mounts)) env[`WALLIS_MOUNT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] = path;
 		const exe = interpreter(file);
 		let command: string;
 		let argv: string[];
@@ -146,7 +146,7 @@ export class ProcessScripts implements ScriptRunner {
 				const minutes = (Date.now() - started) / 60_000;
 				if (code !== 0) return fail(new ScriptError(`${call.script} exited ${signal ?? code}: ${stderr.trim().slice(-500)}`));
 				try {
-					done({ output: JSON.parse(stdout) as Json, minutes });
+					done({ output: JSON.parse(stdout) as unknown, minutes });
 				} catch {
 					fail(new ScriptError(`${call.script} wrote no JSON on stdout: ${stdout.slice(0, 200)}`));
 				}

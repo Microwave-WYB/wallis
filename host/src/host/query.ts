@@ -47,7 +47,7 @@ function workflowName(path: string): string {
 }
 
 export type Attention =
-	| { readonly kind: "node_idle"; readonly runId: string; readonly node: string; readonly agent: string; readonly message: string }
+	| { readonly kind: "node_idle"; readonly runId: string; readonly node: string; readonly agent: string; readonly message: string; readonly steerable: boolean }
 	| { readonly kind: "run_idle"; readonly runId: string; readonly reason: IdleReason }
 	| { readonly kind: "finished"; readonly runId: string; readonly outcome: Outcome }
 	| { readonly kind: "stopped"; readonly runId: string };
@@ -58,9 +58,7 @@ export function attention(view: RunView): Attention[] {
 	const status = view.run.status;
 	if (status?.type === "finished") return [{ kind: "finished", runId: view.runId, outcome: status.outcome }];
 	for (const node of view.run.nodes) {
-		if (node.status.type === "node_idle") {
-			items.push({ kind: "node_idle", runId: view.runId, node: node.id, agent: node.agent, message: node.status.last_message });
-		}
+		if (node.type === "node_idle") items.push({ kind: "node_idle", runId: view.runId, node: node.id, agent: node.agent, message: node.question, steerable: node.steerable });
 	}
 	if (status?.type === "idle" && status.reason) items.push({ kind: "run_idle", runId: view.runId, reason: status.reason });
 	if (view.stopped && status?.type === "running") items.push({ kind: "stopped", runId: view.runId });
@@ -136,7 +134,9 @@ export function describe(items: readonly Attention[]): string {
 						...truncate(item.message, MESSAGE_CAP)
 							.split("\n")
 							.map((l) => `  > ${l}`),
-						`Reply with: npx wallis send ${item.runId} '${item.node}' "<your reply>"`,
+						item.steerable
+							? `Reply with: npx wallis send ${item.runId} '${item.node}' "<your reply>"`
+							: `Its agent is not steerable: restart it (npx wallis restart ${item.runId} '${item.node}') or cancel it (npx wallis cancel ${item.runId} --node '${item.node}')`,
 					].join("\n");
 				case "run_idle":
 					return [
@@ -228,7 +228,7 @@ export function exportArtifact(dir: string, selector: string, target: string): s
 }
 
 /**
- * Applies a control event (a claim) to a run no process drives: takes the
+ * Applies a control event (a claim, pause or node cancel) to a run no process drives: takes the
  * lock, refolds, steps the core and appends the event if it is accepted.
  */
 export function applyControl(dir: string, event: Event): Refusal | null {
@@ -279,6 +279,11 @@ export function listRunViews(root: string): RunView[] {
 	return listRuns(root).map((p) => inspectRun(p.dir));
 }
 
+/** The latest observed value per label, for `wallis status`. */
+export function latestObservations(v: RunView): Record<string, Json> {
+	return Object.fromEntries(v.run.observations.map((o) => [o.label, o.value]));
+}
+
 /** One line per run, for `wallis ls` and `list_runs`. */
 export function runLine(v: RunView): string {
 	const status = v.run.status?.type ?? "unknown";
@@ -295,13 +300,13 @@ export function renderTree(v: RunView): string {
 	const lines = [runLine(v)];
 	for (const node of v.run.nodes) {
 		const depth = (node.id.match(/[.>]/g) ?? []).length;
-		const status =
-			node.status.type === "node_idle"
-				? `idle: ${truncate(node.status.last_message, 80)}`
-				: node.status.type === "node_done"
-					? `done (${node.status.outcome.type})`
-					: "running";
-		lines.push(`${"  ".repeat(depth + 1)}${node.id}  ${node.agent}  ${node.model}  ${status}`);
+		const status = node.type === "node_idle" ? `idle: ${truncate(node.question, 80)}` : node.type === "node_done" ? `done (${node.outcome.type})` : "running";
+		const inbox = node.inbox.length > 0 ? `  inbox: ${node.inbox.map((m) => `${m.kind}@${m.step}`).join(",")}` : "";
+		lines.push(`${"  ".repeat(depth + 1)}${node.id}  ${node.agent}  ${node.model}  ${status}${node.steerable ? "" : "  (not steerable)"}${inbox}`);
+	}
+	for (const o of v.run.observations) {
+		const depth = (o.at.match(/[.>]/g) ?? []).length;
+		lines.push(`${"  ".repeat(depth + 1)}${o.at}  observe ${o.label} = ${truncate(JSON.stringify(o.value), 120)}`);
 	}
 	return lines.join("\n");
 }

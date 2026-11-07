@@ -74,7 +74,7 @@ export type ArtifactDraft = { readonly artifact: string; readonly media: string;
 
 /**
  * What a node may touch on disk. `none`: no filesystem tools. `read-only`:
- * its input artifacts and declared data dirs, read-only. `workspace`: the
+ * its input artifacts and declared mounts, read-only. `workspace`: the
  * same plus a private writable scratch dir, kept while the node is idle and
  * deleted when it is done.
  */
@@ -86,6 +86,25 @@ export interface Resources {
 	readonly memoryGb?: number;
 }
 
+// --- Mounts ----------------------------------------------------------------------
+
+/**
+ * Mount table: name -> default host dir. Relative paths resolve against the
+ * workflow dir; an empty string means the caller or the local profile must
+ * supply it. Mounts are read-only: there is no writable variant. Writes
+ * leave a node only as returned artifacts (and `wallis export`).
+ */
+export type MountTable = { readonly [name: string]: string };
+
+export interface Mounts<T extends MountTable = MountTable> {
+	readonly kind: "mounts";
+	readonly table: T;
+}
+
+export function defineMounts<const T extends MountTable>(table: T): Mounts<T> {
+	return { kind: "mounts", table };
+}
+
 // --- Scripts and tools ---------------------------------------------------------
 
 /** A domain script under `scripts/`, run in the sandbox. Args and output are checked against the schemas. */
@@ -95,23 +114,29 @@ export interface ScriptDef<I extends TSchema = TSchema, O extends TSchema = TSch
 	readonly description: string;
 	readonly input: I;
 	readonly output: O;
-	/** Default `workspace`: input artifacts and data read-only, a private scratch dir. */
+	/** Default `workspace`: input artifacts and mounts read-only, a private scratch dir. */
 	readonly sandbox: SandboxLevel;
-	/** Data dirs (names from the local profile), mounted read-only. */
-	readonly data: readonly string[];
+	/** Mounted read-only, by name from the workflow's mount table. */
+	readonly mounts: readonly string[];
 	readonly resources: Resources;
 }
 
-export function defineScript<I extends TSchema, O extends TSchema>(spec: {
+export interface ScriptSpec<T extends MountTable, I extends TSchema, O extends TSchema> {
 	readonly name: string;
 	readonly description?: string;
 	readonly input: I;
 	readonly output: O;
 	readonly sandbox?: SandboxLevel;
-	readonly data?: readonly string[];
+	readonly mounts?: readonly (keyof T & string)[];
 	readonly resources?: Resources;
-}): ScriptDef<I, O> {
-	return { kind: "script", description: "", sandbox: "workspace", data: [], resources: {}, ...spec };
+}
+
+/** `env` is needed only to name mounts: `defineScript({ mounts }, { ..., mounts: ["data"] })`. */
+export function defineScript<I extends TSchema, O extends TSchema>(spec: ScriptSpec<{}, I, O>): ScriptDef<I, O>;
+export function defineScript<const T extends MountTable, I extends TSchema, O extends TSchema>(env: { readonly mounts: Mounts<T> }, spec: ScriptSpec<T, I, O>): ScriptDef<I, O>;
+export function defineScript(a: unknown, b?: unknown): ScriptDef {
+	const spec = (b ?? a) as ScriptSpec<MountTable, TSchema, TSchema>;
+	return { kind: "script", description: "", sandbox: "workspace", resources: {}, ...spec, mounts: [...(spec.mounts ?? [])] };
 }
 
 export interface ToolDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
@@ -128,209 +153,60 @@ export function defineTool<I extends TSchema, O extends TSchema>(spec: Omit<Tool
 	return { kind: "tool", ...spec };
 }
 
-// --- Reducers ------------------------------------------------------------------
+// --- Large inputs --------------------------------------------------------------------
 
-/** Wire form of a reducer, as the core decodes it. */
-export type ReducerSpec =
-	| { type: "replace" }
-	| { type: "append" }
-	| { type: "union" }
-	| { type: "sum" }
-	| { type: "count_by_key" }
-	| { type: "top_k"; k: number; by: string; order: "ascending" | "descending"; key: string | null; latest: "keep_latest" | "top_only" }
-	| { type: "append_by_key"; key: string }
-	| { type: "freeze" };
-
-/** `W` is what one write carries, `V` the field value. `schema` validates every write. */
-export interface Reducer<W = unknown, V = unknown> {
-	readonly kind: "reducer";
-	readonly spec: ReducerSpec;
-	readonly initial: V;
-	readonly schema: TSchema;
-	/** Phantom: the write type. */
-	readonly write?: W;
-}
-
-function reducer<W, V>(spec: ReducerSpec, initial: V, schema: TSchema): Reducer<W, V> {
-	return { kind: "reducer", spec, initial, schema };
-}
-
-/** Last write wins. */
-export function replace<S extends TSchema>(value: S, initial: Static<S> | null = null): Reducer<Static<S>, Static<S> | null> {
-	return reducer({ type: "replace" }, initial, value);
-}
-
-/** Adds one item per write. Not commutative. */
-export function append<S extends TSchema>(item: S): Reducer<Static<S>, Static<S>[]> {
-	return reducer({ type: "append" }, [], item);
-}
-
-/** Set union of the written list; stored sorted. Commutative. */
-export function union<S extends TSchema>(item: S): Reducer<Static<S>[], Static<S>[]> {
-	return reducer({ type: "union" }, [], Type.Array(item));
-}
-
-/** Adds numbers. Commutative. */
-export function sum(): Reducer<number, number> {
-	return reducer({ type: "sum" }, 0, Type.Number());
-}
-
-/** Counts keys; a write is one key or a list of keys. Commutative. */
-export function countByKey(): Reducer<string | string[], Record<string, number>> {
-	return reducer({ type: "count_by_key" }, {}, Type.Union([Type.String(), Type.Array(Type.String())]));
-}
-
-export interface TopKOptions {
-	/** Entries kept by score (the latest write, if kept, comes on top of these). */
-	readonly k: number;
-	/** Dotted path of the numeric score. */
-	readonly by: string;
-	readonly order: "ascending" | "descending";
-	/** Dotted path of an identity key; a new entry replaces the old one with that key. */
-	readonly key?: string;
-	/** Also keep the latest write when it is not in the top k. Makes the reducer non-commutative. */
-	readonly keepLatest?: boolean;
-}
-
-export function topK<S extends TSchema>(options: TopKOptions, item: S): Reducer<Static<S>, Static<S>[]> {
-	return reducer(
-		{
-			type: "top_k",
-			k: options.k,
-			by: options.by,
-			order: options.order,
-			key: options.key ?? null,
-			latest: options.keepLatest ? "keep_latest" : "top_only",
-		},
-		[],
-		item,
-	);
-}
-
-/** Appends each write to the list under its key. Never pruned. Not commutative. */
-export function appendByKey<S extends TSchema>(options: { readonly key: string }, item: S): Reducer<Static<S>, Record<string, Static<S>[]>> {
-	return reducer({ type: "append_by_key", key: options.key }, {}, item);
-}
-
-/** First write wins; later writes are ignored. */
-export function freeze<S extends TSchema>(value: S, initial: Static<S> | null = null): Reducer<Static<S>, Static<S> | null> {
-	return reducer({ type: "freeze" }, initial, value);
-}
-
-
-// --- Pruning helpers -------------------------------------------------------------
-//
-// Plain functions for body code, not reducers: a body that prunes or merges
-// writes the result back with `replace`.
-
-/** The last `n` items, in order. */
-export function lastN<T>(items: readonly T[], n: number): T[] {
-	return n <= 0 ? [] : items.slice(-n);
-}
-
-/** Groups items by key, in first-seen key order, applying `each` to every group. */
-export function perKey<T, U = T[]>(items: readonly T[], key: (item: T) => string, each: (group: T[], key: string) => U = (g) => g as U): Record<string, U> {
-	const groups = new Map<string, T[]>();
-	for (const item of items) {
-		const k = key(item);
-		const group = groups.get(k);
-		if (group) group.push(item);
-		else groups.set(k, [item]);
-	}
-	return Object.fromEntries([...groups].map(([k, group]) => [k, each(group, k)]));
-}
+/** The JSON Schema keyword that marks a foldable field. */
+export const FOLD = "x-wallis-fold";
 
 /**
- * The top `k` items by score. Ties keep their input order; items without a
- * score (null) come last.
+ * Marks an input field that may be folded. Fields render in full by
+ * default. A foldable field whose canonical JSON is at most `maxChars`
+ * renders in full too; a longer one renders as a deterministic skeleton
+ * (item counts, field names, the head of long strings). The full input is
+ * always the `input` variable inside codemode.
  */
-export function topKBy<T>(items: readonly T[], k: number, score: (item: T) => number | null, order: "ascending" | "descending"): T[] {
-	const sign = order === "descending" ? -1 : 1;
-	return items
-		.map((item, i) => ({ item, i, s: score(item) }))
-		.sort((a, b) => (a.s === null ? (b.s === null ? a.i - b.i : 1) : b.s === null ? -1 : sign * (a.s - b.s) || a.i - b.i))
-		.slice(0, Math.max(0, k))
-		.map((e) => e.item);
-}
-
-/** One item per key, in first-seen order; a later duplicate is folded in with `merge` (default: the first wins). */
-export function dedupeBy<T>(items: readonly T[], key: (item: T) => string, merge: (kept: T, next: T) => T = (kept) => kept): T[] {
-	const kept = new Map<string, T>();
-	for (const item of items) {
-		const k = key(item);
-		const prior = kept.get(k);
-		kept.set(k, prior === undefined ? item : merge(prior, item));
-	}
-	return [...kept.values()];
-}
-
-// --- State and views -----------------------------------------------------------
-
-export type Fields = { readonly [field: string]: Reducer };
-
-export interface State<F extends Fields = Fields> {
-	readonly kind: "state";
-	readonly fields: F;
-}
-
-export function defineState<const F extends Fields>(fields: F): State<F> {
-	return { kind: "state", fields };
-}
-
-export type ValueOf<R> = R extends Reducer<unknown, infer V> ? V : never;
-export type WriteOf<R> = R extends Reducer<infer W, unknown> ? W : never;
-
-export interface ViewSpec<K extends string = string> {
-	readonly fields: readonly K[];
-	readonly maxChars: number;
-	readonly maxItems: number;
-	/** Window step for append-only lists. Defaults to a quarter of `maxItems`. */
-	readonly chunk?: number;
-	/** Keys removed from every object, at any depth. */
-	readonly omit?: readonly string[];
-}
-
-/** A view over `state`. Field names are checked against the state. */
-export function view<F extends Fields, const K extends keyof F & string>(_state: State<F>, spec: ViewSpec<K>): ViewSpec<K> {
-	return spec;
+export function Foldable<S extends TSchema>(schema: S, options: { readonly maxChars: number }): S {
+	return { ...schema, [FOLD]: { maxChars: options.maxChars } };
 }
 
 // --- Agents --------------------------------------------------------------------
 
-export interface Env<M extends ModelTable, F extends Fields, J extends McpConfig> {
+export interface Env<M extends ModelTable, J extends McpConfig, T extends MountTable> {
 	readonly models: Models<M>;
-	readonly state?: State<F>;
 	readonly mcp?: Mcp<J>;
+	readonly mounts?: Mounts<T>;
 }
 
-/** Output path (a top-level output key) or `{ emit: true }` for the executor's `emit` tool. */
-export type WriteSource<O extends TSchema> = (keyof Static<O> & string) | { readonly emit: true };
-
-export interface AgentSpec<M extends ModelTable, F extends Fields, J extends McpConfig, I extends TSchema, O extends TSchema> {
+export interface AgentSpec<M extends ModelTable, J extends McpConfig, T extends MountTable, I extends TSchema, O extends TSchema> {
 	readonly name: string;
 	readonly model: keyof M & string;
 	/** Prompt text, usually `import p from "./p.md" with { type: "text" }`. */
 	readonly prompt: string;
+	/** Everything the agent needs is pushed in here; agents never read workflow memory. */
 	readonly input: I;
 	/** The result the agent submits; executors pass it to the model as the structured-output schema. */
 	readonly output: O;
-	readonly view?: ViewSpec<keyof F & string>;
-	readonly writes?: { readonly [K in keyof F & string]?: WriteSource<O> };
 	readonly mcp?: McpSelection<J>;
 	readonly tools?: readonly ToolDef[];
 	readonly skills?: readonly string[];
+	/** Model turns per call. A codemode call is a turn, so at least 2. Default 16. */
 	readonly maxTurns?: number;
 	/** Capabilities checked in preflight. */
 	readonly needs?: { readonly structuredOutput?: boolean; readonly toolCalls?: boolean; readonly contextTokens?: number };
-	/**
-	 * Run tool use through codemode: the model writes a script that calls the
-	 * agent's tools. Default on for agents that have tools; `false` disables.
-	 */
-	readonly codemode?: boolean;
 	/** What the node may touch on disk; see `SandboxLevel`. Default `none`. */
 	readonly sandbox?: SandboxLevel;
-	/** Data dirs (names from the local profile), mounted read-only. */
-	readonly data?: readonly string[];
+	/** Mounted read-only, by name from the workflow's mount table. */
+	readonly mounts?: readonly (keyof T & string)[];
+	/**
+	 * Default true. A non-steerable node accepts only cancel and a restart
+	 * without a note: no answers, steering or interrupts.
+	 */
+	readonly steerable?: boolean;
+	/**
+	 * Default true: a dialogue that outgrows the model's window is compacted
+	 * (logged). `false`: it fails as `context_exhausted` instead.
+	 */
+	readonly compaction?: boolean;
 }
 
 export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
@@ -340,24 +216,24 @@ export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSche
 	readonly prompt: string;
 	readonly input: I;
 	readonly output: O;
-	readonly view: ViewSpec;
-	readonly writes: { readonly [field: string]: string | { readonly emit: true } };
 	readonly mcp: { readonly [server: string]: readonly string[] | "*" };
 	readonly tools: readonly ToolDef[];
 	readonly skills: readonly string[];
 	readonly maxTurns: number;
-	readonly needs: AgentSpec<ModelTable, Fields, McpConfig, I, O>["needs"];
+	readonly needs: AgentSpec<ModelTable, McpConfig, MountTable, I, O>["needs"];
 	readonly sandbox: SandboxLevel;
-	readonly data: readonly string[];
-	readonly codemode: boolean;
+	readonly mounts: readonly string[];
+	readonly steerable: boolean;
+	readonly compaction: boolean;
 }
 
-const NO_VIEW: ViewSpec = { fields: [], maxChars: 0, maxItems: 0 };
-
-export function defineAgent<const M extends ModelTable, const F extends Fields, const J extends McpConfig, I extends TSchema, O extends TSchema>(
-	_env: Env<M, F, J>,
-	spec: AgentSpec<M, F, J, I, O>,
+export function defineAgent<const M extends ModelTable, const J extends McpConfig, const T extends MountTable, I extends TSchema, O extends TSchema>(
+	_env: Env<M, J, T>,
+	spec: AgentSpec<M, J, T, I, O>,
 ): AgentDef<I, O> {
+	const maxTurns = spec.maxTurns ?? 16;
+	// Codemode is always on and a codemode call is a turn.
+	if (maxTurns < 2) throw new Error(`agent ${spec.name}: maxTurns must be at least 2 (a codemode call is a turn)`);
 	return {
 		kind: "agent",
 		name: spec.name,
@@ -365,34 +241,34 @@ export function defineAgent<const M extends ModelTable, const F extends Fields, 
 		prompt: spec.prompt,
 		input: spec.input,
 		output: spec.output,
-		view: spec.view ?? NO_VIEW,
-		writes: (spec.writes ?? {}) as AgentDef["writes"],
 		mcp: (spec.mcp ?? {}) as AgentDef["mcp"],
 		tools: spec.tools ?? [],
 		skills: spec.skills ?? [],
-		maxTurns: spec.maxTurns ?? 16,
+		maxTurns,
 		needs: spec.needs,
 		sandbox: spec.sandbox ?? "none",
-		data: spec.data ?? [],
-		codemode: spec.codemode ?? true,
+		mounts: [...(spec.mounts ?? [])],
+		steerable: spec.steerable ?? true,
+		compaction: spec.compaction ?? true,
 	};
 }
 
 // --- Errors the body sees --------------------------------------------------------
 
-/** Why the core refused a request. Mirrors `Refusal` in the core. */
+/** Why the core refused a request or an event. Mirrors `Refusal` in the core. */
 export type Refusal =
 	| { readonly type: "pin_mismatch"; readonly field: string; readonly recorded: string; readonly current: string }
 	| { readonly type: "path_diverged"; readonly request: string }
-	| { readonly type: "non_commutative_write_in_branch"; readonly field: string; readonly branch: string }
 	| { readonly type: "unknown_agent"; readonly name: string }
 	| { readonly type: "unknown_script"; readonly name: string }
-	| { readonly type: "unknown_field"; readonly field: string }
-	| { readonly type: "write_not_allowed"; readonly agent: string; readonly field: string }
-	| { readonly type: "reducer_rejected"; readonly field: string; readonly message: string }
 	| { readonly type: "needs_unmet"; readonly agent: string; readonly need: string }
+	| { readonly type: "mount_unset"; readonly mount: string }
+	| { readonly type: "input_too_large"; readonly agent: string; readonly field: string | null; readonly chars: number; readonly limit: number }
+	| { readonly type: "not_owner"; readonly by: string; readonly owner: string | null }
 	| { readonly type: "not_idle"; readonly node: string }
 	| { readonly type: "node_not_running"; readonly node: string }
+	| { readonly type: "not_steerable"; readonly node: string }
+	| { readonly type: "not_live"; readonly node: string }
 	| { readonly type: "unknown_alias"; readonly alias: string }
 	| { readonly type: "journal_missing"; readonly request: string }
 	| { readonly type: "invalid_declaration"; readonly message: string }
@@ -401,11 +277,28 @@ export type Refusal =
 	| { readonly type: "already_started" }
 	| { readonly type: "not_running" };
 
+/** Why an agent call failed. Mirrors `AgentFailure` in the core. */
+export type AgentFailure =
+	| { readonly type: "gave_up"; readonly error: string }
+	| { readonly type: "context_exhausted" }
+	| { readonly type: "cancelled_by_owner" };
+
 /** Why a run failed. Mirrors `FailReason` in the core. */
 export type FailReason =
 	| { readonly type: "body_error"; readonly message: string }
-	| { readonly type: "agent_gave_up"; readonly agent: string; readonly error: string }
+	| { readonly type: "agent_gave_up"; readonly agent: string; readonly failure: AgentFailure }
 	| { readonly type: "script_crashed"; readonly script: string; readonly error: string };
+
+export function failureText(failure: AgentFailure): string {
+	switch (failure.type) {
+		case "gave_up":
+			return failure.error;
+		case "context_exhausted":
+			return "context exhausted";
+		case "cancelled_by_owner":
+			return "cancelled by the owner";
+	}
+}
 
 export class Refused extends Error {
 	override readonly name = "Refused";
@@ -416,15 +309,15 @@ export class Refused extends Error {
 	}
 }
 
-/** The agent gave up: it hit maxTurns, or never submitted a valid result. */
+/** The agent call failed: it gave up, ran out of turns or context, or its owner cancelled it. */
 export class AgentFailed extends Error {
 	override readonly name = "AgentFailed";
 	readonly agent: string;
-	readonly error: string;
-	constructor(agent: string, error: string) {
-		super(`${agent}: ${error}`);
+	readonly failure: AgentFailure;
+	constructor(agent: string, failure: AgentFailure) {
+		super(`${agent}: ${failureText(failure)}`);
 		this.agent = agent;
-		this.error = error;
+		this.failure = failure;
 	}
 }
 
@@ -440,7 +333,7 @@ export class ScriptFailed extends Error {
 	}
 }
 
-/** The body passed a value that does not match its schema (agent input, script args, a state write). */
+/** The body passed a value that does not match its schema (agent input, script args). */
 export class SchemaError extends Error {
 	override readonly name = "SchemaError";
 	readonly subject: string;
@@ -468,33 +361,33 @@ export interface PinSpec {
 	readonly files?: readonly string[];
 }
 
-export interface ReadResult<F extends Fields, K extends keyof F> {
-	readonly text: string;
-	readonly omitted: { readonly [field: string]: number };
-	readonly data: { readonly [P in K]: ValueOf<F[P]> };
-}
-
-/** What the workflow body sees. Every method is a request to the core. */
-export interface Ctx<F extends Fields> {
+/**
+ * What the workflow body sees: typed calls, each affecting the body only
+ * through its return value. Run memory is the body's own local variables;
+ * a resume rebuilds them by replaying the body over the journal.
+ */
+export interface Ctx {
 	/** Run seed from the pin. `Math.random` is already seeded from it. */
 	readonly seed: number;
 	/**
 	 * Calls an agent. Throws `SchemaError` for a bad input, `AgentFailed` when
-	 * the agent gives up, `Refused` when the core refuses the request. An
-	 * exhausted budget pauses the run instead of throwing.
+	 * the call fails, `Refused` when the core refuses it (for example
+	 * `input_too_large`). An exhausted budget pauses the run instead.
 	 */
 	call<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>, input: Static<I>): Promise<Static<O>>;
 	/** Runs a script. Throws `SchemaError` for bad args, `ScriptFailed` on a crash or a bad output. */
 	script<I extends TSchema, O extends TSchema>(script: ScriptDef<I, O>, args: Static<I>): Promise<Static<O>>;
-	read<const K extends keyof F & string>(spec: ViewSpec<K>): Promise<ReadResult<F, K>>;
-	/** Writes to a state field. Throws `SchemaError` when the value does not match the field. */
-	emit<K extends keyof F & string>(field: K, value: WriteOf<F[K]>): Promise<void>;
-	/** Runs branches concurrently. Only commutative reducers may be written in them. */
-	parallel<const B extends { readonly [key: string]: (ctx: Ctx<F>) => Promise<unknown> }>(
+	/** Runs branches concurrently; each gets its own request ids. */
+	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(
 		branches: B,
 	): Promise<{ -readonly [K in keyof B]: Awaited<ReturnType<B[K]>> }>;
-	/** Runs a sub-workflow. It gets no access to this run's state and returns only its output. */
+	/** Runs a sub-workflow and returns its output. */
 	sub<I extends TSchema, O extends TSchema>(workflow: SubWorkflowDef<I, O>, input: Static<I>): Promise<Static<O>>;
+	/**
+	 * Monitoring only: logged for `wallis status`, `tree` and `show`, never
+	 * returned to the body and never matched on replay.
+	 */
+	observe(label: string, value: Json): void;
 }
 
 export interface SubWorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
@@ -502,18 +395,18 @@ export interface SubWorkflowDef<I extends TSchema = TSchema, O extends TSchema =
 	readonly name: string;
 	readonly input: I;
 	readonly output: O;
-	readonly run: (ctx: Ctx<{}>, input: Static<I>) => Promise<Static<O>>;
+	readonly run: (ctx: Ctx, input: Static<I>) => Promise<Static<O>>;
 }
 
 export function subWorkflow<I extends TSchema, O extends TSchema>(spec: Omit<SubWorkflowDef<I, O>, "kind">): SubWorkflowDef<I, O> {
 	return { kind: "sub-workflow", ...spec };
 }
 
-export interface WorkflowSpec<M extends ModelTable, F extends Fields, J extends McpConfig, I extends TSchema, O extends TSchema> {
+export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T extends MountTable, I extends TSchema, O extends TSchema> {
 	readonly name: string;
 	readonly models: Models<M>;
-	readonly state: State<F>;
 	readonly mcp?: Mcp<J>;
+	readonly mounts?: Mounts<T>;
 	/** Every agent the body may call. */
 	readonly agents: readonly AgentDef[];
 	/** Every script the body may run. */
@@ -522,16 +415,16 @@ export interface WorkflowSpec<M extends ModelTable, F extends Fields, J extends 
 	readonly pin?: PinSpec;
 	readonly input: I;
 	readonly output: O;
-	readonly run: (ctx: Ctx<F>, input: Static<I>) => Promise<Static<O>>;
+	readonly run: (ctx: Ctx, input: Static<I>) => Promise<Static<O>>;
 }
 
-export interface WorkflowDef<F extends Fields = Fields, I extends TSchema = TSchema, O extends TSchema = TSchema> {
+export interface WorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
 	readonly kind: "workflow";
-	readonly spec: WorkflowSpec<ModelTable, F, McpConfig, I, O>;
+	readonly spec: WorkflowSpec<ModelTable, McpConfig, MountTable, I, O>;
 }
 
-export function workflow<const M extends ModelTable, const F extends Fields, const J extends McpConfig, I extends TSchema, O extends TSchema>(
-	spec: WorkflowSpec<M, F, J, I, O>,
-): WorkflowDef<F, I, O> {
-	return { kind: "workflow", spec: spec as unknown as WorkflowSpec<ModelTable, F, McpConfig, I, O> };
+export function workflow<const M extends ModelTable, const J extends McpConfig, const T extends MountTable, I extends TSchema, O extends TSchema>(
+	spec: WorkflowSpec<M, J, T, I, O>,
+): WorkflowDef<I, O> {
+	return { kind: "workflow", spec: spec as unknown as WorkflowSpec<ModelTable, McpConfig, MountTable, I, O> };
 }

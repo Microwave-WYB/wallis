@@ -1,20 +1,22 @@
-// Schema checks at the boundary: typed script outputs (A), every state
-// write (B), and the model fixing its own output inside its loop (C).
+// Schema checks at the boundary: typed script outputs (A), agent outputs
+// parsed before anything is logged (B), and the model fixing its own output
+// inside its loop (C).
 
 import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { EventLog, FakeExecutor, FakeScripts, runWorkflow, type Turn } from "../src/host/index.ts";
+import { EventLog, type Executor, FakeExecutor, FakeScripts, runWorkflow, type Turn } from "../src/host/index.ts";
 import { tmp } from "./util.ts";
 
 const workflow = resolve(fileURLToPath(new URL(".", import.meta.url)), "fixtures/boundary/workflow.ts");
 
-async function run(mode: string, options: { tagger?: Turn; strict?: Turn; score?: unknown } = {}) {
+async function run(mode: string, options: { tagger?: Turn; strict?: Turn; reporter?: Turn; score?: unknown } = {}) {
 	const dir = join(tmp(), "run");
 	const executor = new FakeExecutor({
 		tagger: options.tagger ?? { submit: { tags: ["ok"] } },
 		strict: options.strict ?? { submit: { answer: 1 } },
+		reporter: options.reporter ?? { submit: { report: { digest: `sha256:${"0".repeat(64)}`, name: "r.md", media: "text/markdown" } } },
 	});
 	const scripts = new FakeScripts({ measure: { output: { score: options.score ?? 0.5 } as never, minutes: 1 } });
 	const result = await runWorkflow({ workflow, dir, executor, scripts, input: { mode }, inboxPollMs: null });
@@ -43,30 +45,26 @@ test("script args are checked in the sandbox: a typed error and nothing logged",
 	assert.ok(!r.log.some((e) => e.type === "requested"));
 });
 
-// --- B. State writes ---
+// --- B. Agent outputs ---
 
-test("a body write that does not match its field throws a typed error and commits nothing", async () => {
-	const r = await run("emit_bad");
-	assert.deepEqual(r.value, { error: "SchemaError", subject: "write to state field scores" });
-	assert.deepEqual(r.result.run.state.scores, []);
-	assert.ok(!r.log.some((e) => e.type === "requested"));
-});
-
-test("an executor emit that does not match its field fails the call: nothing is committed", async () => {
-	const r = await run("agent", { tagger: { submit: { tags: ["ok"] }, emits: [{ field: "scores", value: "high" }] } });
+test("an agent output that does not match its schema fails the call; nothing is logged as a result", async () => {
+	// An executor that skips its own submit_result check: the host parses the output anyway.
+	const dir = join(tmp(), "run");
+	const executor: Executor = { id: "lax", start: () => ({ turn: async () => ({ type: "submitted", output: { tags: ["much too long"] } }), handle: () => null, close: () => {} }) };
+	const result = await runWorkflow({ workflow, dir, executor, input: { mode: "agent" }, inboxPollMs: null });
+	const r = { value: (result.outcome as { value?: unknown }).value, log: new EventLog(join(dir, "log.jsonl")).read() };
 	assert.equal((r.value as { error: string }).error, "AgentFailed");
-	assert.match((r.value as { message: string }).message, /emit to state field scores does not match its schema/);
-	assert.deepEqual(r.result.run.state.scores, []);
-	assert.deepEqual(r.result.run.state.tags, []);
+	assert.match((r.value as { message: string }).message, /output does not match its schema/);
 	assert.ok(r.log.some((e) => e.type === "agent_failed"));
+	assert.ok(!r.log.some((e) => e.type === "agent_returned"));
+	const ok = await run("agent");
+	assert.deepEqual(ok.value, { tags: ["ok"] });
 });
 
-test("a declared write mapping is checked against its field too", async () => {
-	const r = await run("agent", { tagger: { submit: { tags: ["much too long"] } } });
-	assert.match((r.value as { message: string }).message, /write to state field tags does not match its schema/);
-	assert.deepEqual(r.result.run.state.tags, []);
-	const ok = await run("agent", { tagger: { submit: { tags: ["ok"] }, emits: [{ field: "scores", value: 3 }] } });
-	assert.deepEqual(ok.result.run.state, { scores: [3], tags: ["ok"] });
+test("an artifact ref in an output is verified against the run's store", async () => {
+	const r = await run("report");
+	assert.deepEqual(r.value, { error: "AgentFailed", agent: "reporter", failure: "gave_up", message: `artifact r.md (sha256:${"0".repeat(64)}) is not in the run's store` });
+	assert.ok(!r.log.some((e) => e.type === "agent_returned"));
 });
 
 // --- C. The model fixes its output inside its own loop ---
@@ -80,7 +78,7 @@ test("an invalid submit_result goes back to the model; the node completes on a v
 	assert.deepEqual(r.executor.submissions.map((s) => s.errors.length > 0), [true, true, false]);
 	// The log keeps only the final, valid output, with the whole call's usage.
 	const returned = r.log.filter((e) => e.type === "agent_returned");
-	assert.deepEqual(returned, [{ type: "agent_returned", id: "#0", output: { answer: 2 }, emits: [], usage: { usd: 0.03, tokens: 300, turns: 3 }, model: "fake/default" }]);
+	assert.deepEqual(returned, [{ type: "agent_returned", id: "#0", output: { answer: 2 }, usage: { usd: 0.03, tokens: 300, turns: 3 }, model: "fake/default" }]);
 	assert.ok(!JSON.stringify(r.log).includes('"two"'));
 	// Replay is identical: a second run gives the same log, a resume executes nothing.
 	const again = await run("submit", { strict });
@@ -93,8 +91,9 @@ test("an invalid submit_result goes back to the model; the node completes on a v
 
 test("never submitting a valid result, or running out of turns, is an agent failure", async () => {
 	const gaveUp = await run("submit", { strict: { submits: [{ answer: 0 }, { answer: -1 }] } });
-	assert.deepEqual(gaveUp.value, { error: "AgentFailed", agent: "strict", message: "gave up: no submit_result passed validation" });
+	assert.deepEqual(gaveUp.value, { error: "AgentFailed", agent: "strict", failure: "gave_up", message: "gave up: no submit_result passed validation" });
 	const turns = await run("submit", { strict: { submits: [{ answer: 0 }, { answer: 0 }, { answer: 0 }, { answer: 0 }, { answer: 5 }] } });
-	assert.deepEqual(turns.value, { error: "AgentFailed", agent: "strict", message: "maxTurns exceeded (4)" });
-	assert.deepEqual(turns.result.run.nodes[0]!.status, { type: "node_done", outcome: { type: "gave_up", error: "maxTurns exceeded (4)" } });
+	assert.deepEqual(turns.value, { error: "AgentFailed", agent: "strict", failure: "gave_up", message: "maxTurns exceeded (4)" });
+	const node = turns.result.run.nodes[0]!;
+	assert.deepEqual(node.type === "node_done" && node.outcome, { type: "node_failed", failure: { type: "gave_up", error: "maxTurns exceeded (4)" } });
 });

@@ -15,12 +15,13 @@ export function tmp(prefix = "wallis-"): string {
 	return mkdtempSync(join(tmpdir(), prefix));
 }
 
-/** A project with the `ask` and `two-node` examples as workflows. */
+/** A project with the `ask` and `two-node` examples and the `fanout` fixture as workflows. */
 export function project(): string {
 	const root = tmp("wallis-project-");
 	for (const name of ["ask", "two-node"]) {
 		cpSync(resolve(here, "../examples", name), join(root, ".agents", "workflows", name), { recursive: true, filter: (f) => !f.endsWith("run.ts") });
 	}
+	cpSync(resolve(here, "fixtures/fanout"), join(root, ".agents", "workflows", "fanout"), { recursive: true });
 	return root;
 }
 

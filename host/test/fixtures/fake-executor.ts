@@ -8,13 +8,18 @@
 import { appendFileSync } from "node:fs";
 import { type AgentCall, conversation, FakeExecutor, type NodeSpec } from "../../src/host/index.ts";
 
-export const responses = {
+export const responses: ConstructorParameters<typeof FakeExecutor>[0] = {
 	planner: { submit: { outline: ["why", "how", "so what"], note: "outline has three points" } },
-	scout: conversation(
-		{ idle: "Who is the audience: experts or newcomers?" },
-		{ submit: { outline: ["what a product is", "why it folds"], note: "for newcomers" } },
-	),
+	// The ask example's scout asks first; the fanout fixture's scout reports errors.
+	scout: (call: AgentCall) =>
+		"area" in (call.input as object)
+			? { submit: { errors: [`E-${(call.input as { area: string }).area}`] } }
+			: conversation({ idle: "Who is the audience: experts or newcomers?" }, { submit: { outline: ["what a product is", "why it folds"], note: "for newcomers" } }),
 	writer: { submit: { text: "Why. How. So what.", words: 4 } },
+	// The fanout fixture.
+	judge: { submit: { findings: [{ content: "f", confidence: 0.5 }] } },
+	merger: { submit: { items: [], archived: [] } },
+	attempt: { submit: { ok: true } },
 };
 
 export default function create() {

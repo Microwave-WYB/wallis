@@ -3,12 +3,9 @@
 
 import gleam/dict
 import gleam/dynamic/decode
-import gleam/float
-import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/order
 import gleam/string
 
 pub type Value {
@@ -95,51 +92,4 @@ fn get_segments(value: Value, segments: List(String)) -> Option(Value) {
       }
     _, _ -> None
   }
-}
-
-/// Removes the given keys from every object, at any depth.
-pub fn without_keys(value: Value, keys: List(String)) -> Value {
-  case keys, value {
-    [], _ -> value
-    _, JArray(items) -> JArray(list.map(items, without_keys(_, keys)))
-    _, JObject(entries) ->
-      entries
-      |> list.filter(fn(e) { !list.contains(keys, e.0) })
-      |> list.map(fn(e) { #(e.0, without_keys(e.1, keys)) })
-      |> JObject
-    _, _ -> value
-  }
-}
-
-pub fn as_number(value: Value) -> Option(Float) {
-  case value {
-    JInt(i) -> Some(int.to_float(i))
-    JFloat(f) -> Some(f)
-    _ -> None
-  }
-}
-
-/// Total order on values by canonical text, used to break ties.
-pub fn compare(a: Value, b: Value) -> order.Order {
-  string.compare(canonical(a), canonical(b))
-}
-
-pub fn equal(a: Value, b: Value) -> Bool {
-  canonical(a) == canonical(b)
-}
-
-/// Adds two numbers; integers stay integers.
-pub fn add(a: Value, b: Value) -> Result(Value, String) {
-  case a, b {
-    JInt(x), JInt(y) -> Ok(JInt(x + y))
-    _, _ ->
-      case as_number(a), as_number(b) {
-        Some(x), Some(y) -> Ok(JFloat(x +. y))
-        _, _ -> Error("expected numbers")
-      }
-  }
-}
-
-pub fn describe_number(value: Float) -> String {
-  float.to_string(value)
 }
