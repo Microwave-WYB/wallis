@@ -9,7 +9,12 @@
 ## Toolchain
 
 - Tools are declared in `mise.toml` (Gleam, Node). Do not install them globally.
-- `mise run build` and `mise run test` build and test the core.
+- npm dependencies live in `host/package.json` with exact versions;
+  `mise run install` installs them from the lockfile.
+- `mise run build` builds the core. `mise run test` runs the core and host
+  tests. `mise run typecheck` type-checks `host/` and `.agents/workflows/`.
+- After changing a type in `core/src/wallis_core/types.gleam`, regenerate
+  its codecs: from `core/`, `node ../tools/gleam-codegen.mjs <file> <Type>...`.
 
 ## Core rules
 
@@ -22,3 +27,9 @@
   actions rather than writing them by hand.
 - Every core behavior gets a test that replays a sequence of events; no test
   may need a model, network or device.
+
+## Host and SDK rules
+
+- `host/src/sdk/` runs inside the QuickJS sandbox: no Node imports.
+- Host tests use the fake executor and fake scripts; never real model calls
+  or API keys.

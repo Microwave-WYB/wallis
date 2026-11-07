@@ -1,7 +1,9 @@
 # wallis design
 
 Status as of 2026-11-06. Sections are marked **decided** (agreed with the
-owner), **proposed** (drafted, not yet confirmed) or **open**.
+owner), **proposed** (drafted, not yet confirmed) or **open**. Details the
+first prototype had to fix are marked **prototype choice**: the simplest
+option consistent with the section they sit in, not yet confirmed.
 
 ## Goal (decided)
 
@@ -65,6 +67,38 @@ The core decides budget, pin, journal hits, views and reducers. A thin TS host
 executes effects and feeds results back as events. Values cross the boundary
 as JSON only.
 
+As built (`core/src/wallis_core/types.gleam`):
+
+```gleam
+// Event:  Started(workflow, pin, input) | Resumed(pin)
+//       | Requested(id, branch, Call | Script | Read | Commit)
+//       | AgentReturned(id, output, emits, usage) | AgentFailed(id, error, usage)
+//       | ScriptReturned(id, output, minutes) | ScriptFailed(id, error, minutes)
+//       | BodyFinished(output) | BodyFailed(error)
+// Effect: Checkpoint | CallAgent(..) | RunScript(..) | Deliver(id, value)
+//       | Fail(id, error) | Refuse(Option(id), reason) | Finish(outcome)
+```
+
+- Prototype choice: the body talks to the core only through `Requested`
+  events: `Call` (agent), `Script`, `Read` (a view of the state) and
+  `Commit` (body writes, `ctx.emit`). Each is answered by `Deliver`, `Fail`
+  or `Refuse(Some(id))`, which reject the body's promise with `AgentFailed`
+  or `Refused`. `Refuse(None)` stops the run.
+- Prototype choice: `Checkpoint` means "append the event just stepped to the
+  log". The core emits it for every event that changes the run, and not for
+  replayed requests or `Resumed`.
+- Prototype choice: the host holds `RunState` as an opaque handle;
+  `step_json` and `snapshot_json` carry events, effects and state snapshots
+  as JSON text.
+- Prototype choice: request ids come from the body's branch path and a
+  per-branch counter: `#0`, `#1`, `#2.a#0` (branch `a` of the parallel at
+  `#2`), `#3>retry#0` (sub-workflow `retry` at `#3`). The order results
+  arrive in does not change them. A merge call is `<id>/merge/<field>`.
+- Prototype choice: decoders and encoders in `types.gleam` come from the
+  Gleam language server code actions, driven headless by
+  `tools/gleam-codegen.mjs`. The recursive JSON `Value` decoder is
+  hand-written, because the action cannot generate it.
+
 ## State, views and reducers (proposed)
 
 - One state per run. Agents never touch it directly: they read through a view
@@ -85,6 +119,42 @@ as JSON only.
   of a full re-render, with a periodic reset.
 - Sub-workflows own their state and return only their output.
 
+Prototype choices:
+
+- Commutativity: `union`, `sum`, `countByKey` and `topK` without
+  `keepLatest` are commutative. `replace`, `append`, `appendByKey`, `freeze`,
+  `llmMerge` and `topK` with `keepLatest` are not. A non-commutative write
+  from a parallel branch is refused (the request gets `Refuse`, nothing is
+  written). Merging such writes at the join is not built.
+- Reducer details: `union` stores items sorted by canonical value. `topK`
+  breaks score ties by canonical value; unscored entries sort last. With
+  `key`, a new entry replaces the old entry with that key. `keepLatest` keeps
+  the latest write plus the top k of the others. `freeze`: the first write
+  wins, later writes are ignored. `appendByKey` never prunes.
+- `llmMerge`: the merge agent gets `{ current, incoming, max }` and returns
+  `{ items, archived }`. Items past `max` are archived too. Each field has a
+  per-run call cap. Past the cap, or when the merge call fails, the reducer
+  keeps the newest `max` items deterministically. Archived items go through
+  the reducer of the declared `archive` field. The call's other writes wait
+  for its merges and are applied together.
+- Agent writes: an agent declares `writes: { field: outputKey | { emit: true } }`.
+  Output keys map to writes when the call ends; `emit` writes must target a
+  declared field.
+- Views: fields are ordered frozen, then append-only (`append`, `union`,
+  `appendByKey`), then volatile, then by declaration order. Append-only
+  lists show their newest items, and the window start moves in steps of
+  `chunk` (default `maxItems / 4`). Volatile lists show their head. Objects
+  show their first `maxItems` keys, and their list values are windowed too.
+  Over `maxChars`, the view drops one item at a time from the field showing
+  the most; then it truncates the text with a marker. Each field renders as
+  `<field name="…" omitted="n">`, then one canonical JSON item per line.
+  `omit` removes keys at any depth.
+- Snapshot isolation: a call's view is rendered when it is requested. Its
+  writes are buffered until it returns and checked atomically: one bad write
+  refuses them all.
+- Sub-workflows have no state of their own. They get a context without
+  `read` or `emit`, and their request ids are prefixed.
+
 ## Durability (proposed)
 
 - wallis keeps its own append-only event log; run state is a fold over it.
@@ -94,6 +164,34 @@ as JSON only.
   randomness, so replay is deterministic. A path divergence is an error.
 - pi-durable is optional and internal to the pi executor (node checkpoints).
 
+Prototype choices:
+
+- The journal key is a digest of the request id, kind, name and canonical
+  input. The digest is a pure, non-cryptographic 64-bit FNV-1a (two lanes),
+  because the core has no FFI. Identical calls at different positions are
+  not memoized.
+- On resume the host refolds the log into a fresh core, then steps
+  `Resumed(pin)`, then reruns the body from the start. The input comes from
+  the logged `started` event. Replay rules for a request whose id is already
+  recorded:
+  - a different digest halts the run (path divergence);
+  - a completed request is answered from the journal;
+  - a request that was in flight is issued again with its original view.
+
+  The resumed run's log therefore equals an uninterrupted run's.
+- The sandbox is `quickjs-wasi` 3.6.2 (the version pi-codemode 1.5.0 uses),
+  used directly rather than through pi-codemode. It loads the `encoding`
+  extension (TypeBox needs `TextEncoder`) and nothing else. The virtual clock
+  starts at 2025-01-01T00:00:00Z and advances 1 ms per read; the timezone is
+  UTC; `Math.random` is mulberry32 seeded from the pin. The guest calls a
+  synchronous `__wallis_send`; the host answers by calling
+  `__wallis_deliver` and draining the job queue.
+- The bundle comes from esbuild: `.md` files load as text, `.json` as JSON,
+  and `wallis` maps to the SDK. The workflow digest is the sha256 of the
+  bundle.
+- The log is JSONL, fsynced per line. A partial last line, from a crash
+  mid-write, is ignored.
+
 ## Pin and budget (proposed)
 
 - Pin: workflow digest (bundled code, prompts, mcp.json), declared input
@@ -102,6 +200,26 @@ as JSON only.
 - Budget: LLM spend (run USD and tokens, per-agent turns) checked before every
   agent call; compute budget (for example training minutes) passed to scripts
   and enforced by the sandbox.
+
+Prototype choices:
+
+- Pin fields:
+  - `workflow_digest`;
+  - `models`: the resolved alias table;
+  - `seed`;
+  - `inputs`: the sha256 of each file in the workflow's `pin.files`, which
+    are relative to the project root.
+
+  On resume they are compared in that order, and the first mismatch is
+  refused as `pin mismatch: <field>`.
+- Budget fields:
+  - `usd`, `tokens`, `turns` (run totals) and `computeMinutes`.
+  - A call is refused once spend reaches a limit. In-flight calls are not
+    reserved, so parallel calls can overshoot by what is in flight.
+  - Each call gets `maxTurns = min(agent.maxTurns, turns left)`.
+  - `RunScript` carries the compute minutes left.
+  - Merge calls are checked like any other call. A merge refused for budget
+    uses the deterministic fallback.
 
 ## Tools and sandbox (proposed)
 
@@ -114,6 +232,21 @@ as JSON only.
   without fs or network to obtain declarations, which are shown for approval
   on first run or when the digest changes.
 
+## SDK (prototype choice)
+
+The `wallis` package in `host/` exports `defineModels`, `defineMcp`,
+`defineState`, `defineAgent(env, spec)`, `defineTool`, `subWorkflow`,
+`workflow`, `view`, the reducers, TypeBox's `Type`, and the errors `Refused`
+and `AgentFailed`. `env = { models, state?, mcp? }` exists for typing:
+- an agent's `model` is `keyof` the alias table;
+- `view.fields` and `writes` keys are state fields;
+- `writes` values are output keys;
+- `mcp` keys are servers in the imported `mcp.json`.
+
+The body gets `ctx.call` (typed by the agent's TypeBox schemas and checked at
+run time), `script`, `read`, `emit` (typed by the field's reducer),
+`parallel`, `sub` and `seed`. This is a draft answer to open item 4.
+
 ## Executors (proposed)
 
 `CallAgent` is an effect; the executor is a handler. v0 implements pi only.
@@ -122,6 +255,22 @@ built-in tools, a system prompt without ambient context, structured output
 and usage reports; unsupported declarations are refused. Notes for Claude
 Code 2.1.301: `--bare` gives the cleanest isolation but needs an API key;
 subscription auth needs a leak test.
+
+## Prototype status
+
+Built: the core (`core/`), the SDK and host (`host/`), a fake executor and
+script runner, the two-node example with a kill-and-resume test, and the
+SIDERIUS example (`.agents/workflows/siderius/`, see its `MAPPING.md`).
+
+Not built yet:
+- the pi executor and preflight;
+- the MCP proxy, `defineTool` serving, `sandbox_exec`, secret injection and
+  script sandboxing;
+- the `state_read` pull tool and persistent sessions;
+- pure script reducers and merging non-commutative writes at a join;
+- the local profile file (resolution accepts a profile object);
+- declaration approval on first run or digest change;
+- the MCP server exposing workflows to harnesses.
 
 ## Open
 
