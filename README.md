@@ -13,7 +13,15 @@ an infinite product that folds term by term toward π. A wallis run works the
 same way: it is a fold of the workflow body over its journal of agent and
 script results, one call at a time.
 
-Status: first prototype. See [docs/design.md](docs/design.md).
+Status: an experimental prototype, not published to npm. Its tests pass, but no
+workflow has been run against a real model at length. See
+[docs/design.md](docs/design.md) for the design and every prototype choice.
+
+The repository also holds an experiment on whether a framework is needed at
+all: [`comparison/`](comparison/) contains a framework-free alternative (a
+skill that teaches an agent to orchestrate pi micro agents in a small custom
+TypeScript program) and the runner used to have two sandboxed agents replicate
+SIDERIUS with each approach.
 
 ## Layout
 
@@ -27,6 +35,7 @@ Status: first prototype. See [docs/design.md](docs/design.md).
 | `host/src/host/capability.ts`, `render.ts`, `mounts.ts` | Capabilities (`OwnedRun`, `IdleNode`, `SteerableNode`, `LiveNode`, `ResumableRun`), Foldable input rendering and the window check, read-only mounts |
 | `host/src/host/confine.ts`, `commands.ts`, `slots.ts` | Declared bwrap sandboxes (binaries, setup, mounts); command calls; machine-wide resource and provider slots |
 | `.agents/workflows/siderius/` | SIDERIUS expressed as a wallis workflow; `MAPPING.md` lists what maps and what does not |
+| `comparison/` | The framework-free alternative and the comparison experiment; see its README |
 | `tools/gleam-codegen.mjs` | Drives `gleam lsp` code actions to generate decoders and JSON encoders |
 | `docs/design.md` | Current design: decided, proposed and open items, plus prototype choices |
 
@@ -66,3 +75,16 @@ any module whose default export returns `{ executor, commands? }`, such as the
 scripted fake in `host/test/fixtures/fake-executor.ts`. Machine settings
 (mount dirs, binaries, retry delays, provider limits, slots, model remaps) live in the local profile:
 `~/.config/wallis/profile.json` and `.wallis/profile.json`.
+
+## Acknowledgements
+
+The reference workload is [SIDERIUS](https://github.com/yuema137/SIDERIUS)
+(MIT License). The SIDERIUS example and the comparison replicate its design
+and concepts; see `MAPPING.md` for how they correspond.
+
+wallis builds on [pi](https://github.com/earendil-works/pi) (pi-agent-core,
+pi-ai, pi-codemode, pi-mcp) for its agent executor.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

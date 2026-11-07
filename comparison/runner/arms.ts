@@ -51,8 +51,10 @@ export interface Status {
 
 /** Starts arm "a" (custom pi program) or "b" (wallis workflow) in the background. */
 export function builderArm(arm: "a" | "b", options: ArmOptions = {}) {
-	if (!process.env.FIREWORKS_API_KEY) {
-		const auth = JSON.parse(readFileSync(`${homedir()}/.pi/agent/auth.json`, "utf8")) as Record<string, { key?: string }>;
+	// pi's own credential store wins over the environment (a stale key in ~/.env once shadowed it).
+	const authFile = `${homedir()}/.pi/agent/auth.json`;
+	if (existsSync(authFile)) {
+		const auth = JSON.parse(readFileSync(authFile, "utf8")) as Record<string, { key?: string }>;
 		if (auth.fireworks?.key) process.env.FIREWORKS_API_KEY = auth.fireworks.key; // never logged
 	}
 	const dir = options.workDir ?? `${here}work/${arm}`;
