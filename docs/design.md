@@ -233,6 +233,14 @@ Prototype choices:
 
 ## Schemas at the boundary (decided)
 
+Schema style: workflows write schemas as TypeBox, either as builders or as
+`Type.Script` modules (TS syntax). Constrained types (`maxLength`,
+`minimum`, integers) are builders passed in as the Script context:
+`Type.Script({ ShortText: Type.String({ maxLength: 500 }) }, "type F = { statement: ShortText }")`.
+`Options<...>` inside a Script string is not applied by typebox 1.3.27, so it
+is not used. The SIDERIUS example uses Script modules for its named shapes
+and keeps builders for small inline ones.
+
 - Scripts declare TypeBox args and outputs (`defineScript`), and
   `ctx.script(script, args)` is typed by them.
 - Every state field has a write schema, enforced for every write: `ctx.emit`,

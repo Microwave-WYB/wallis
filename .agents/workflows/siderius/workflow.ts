@@ -64,162 +64,136 @@ const models = defineModels({
 const mcp = defineMcp(mcpConfig);
 
 // --- Schemas -----------------------------------------------------------------
+//
+// TypeBox Script modules: TS syntax for shapes; constrained types are
+// builders passed in as the module's context.
 
-const Score = Type.Union([Type.Number(), Type.Null()]);
+const Int = Type.Integer();
+const Strength = Type.Integer({ minimum: 1, maximum: 5 });
+/** cache_entry.py: statements are capped at 500 chars. */
+const Statement = Type.String({ maxLength: 500 });
+/** The existing short_message (up to 120 chars) wins. */
+const ShortMessage = Type.String({ maxLength: 120 });
 
-/** One iteration's summary (tuning_output_to_model_run_summary). */
-const RunSummary = Type.Object({
-	iteration: Type.Integer(),
-	model_type: Type.String(),
-	status: Type.Union([Type.Literal("tuned"), Type.Literal("no_candidate"), Type.Literal("infrastructure_abort")]),
-	best_score: Score,
-	best_valid_formal_score: Score,
-	termination_reason: Type.String(),
-	take_home: Type.String(),
-});
+const S = Type.Script(
+	{ Int, Strength, Statement, ShortMessage },
+	`
+	type Score = number | null
+	type Config = Record<string, number | string | boolean>
 
-const Finding = Type.Object({
-	kind: Type.Union([Type.Literal("finding"), Type.Literal("bottleneck")]),
-	statement: Type.String({ maxLength: 500 }),
-	strength: Type.Integer({ minimum: 1, maximum: 5 }),
-	evidence_iters: Type.Array(Type.Integer()),
-	model_type: Type.String(),
-});
+	// One iteration's summary (tuning_output_to_model_run_summary).
+	type RunSummary = {
+		iteration: Int, model_type: string,
+		status: "tuned" | "no_candidate" | "infrastructure_abort",
+		best_score: Score, best_valid_formal_score: Score,
+		termination_reason: string, take_home: string
+	}
 
-/** What the validator reports; the body adds the iterations it was seen in. */
-const RawSignature = Type.Object({
-	failure_class: Type.String(),
-	top_user_frame: Type.String(),
-	error_type: Type.String(),
-	short_message: Type.String({ maxLength: 120 }),
-	last_frames: Type.Array(Type.String()),
-});
+	type Finding = {
+		kind: "finding" | "bottleneck", statement: Statement, strength: Strength,
+		evidence_iters: Int[], model_type: string
+	}
 
-const ErrorSignature = Type.Object({
-	failure_class: Type.String(),
-	top_user_frame: Type.String(),
-	error_type: Type.String(),
-	short_message: Type.String({ maxLength: 120 }),
-	last_frames: Type.Array(Type.String()),
-	evidence_iters: Type.Array(Type.Integer()),
-});
+	// What the validator reports; the body adds the iterations it was seen in.
+	type RawSignature = {
+		failure_class: string, top_user_frame: string, error_type: string,
+		short_message: ShortMessage, last_frames: string[]
+	}
+	type ErrorSignature = {
+		failure_class: string, top_user_frame: string, error_type: string,
+		short_message: ShortMessage, last_frames: string[], evidence_iters: Int[]
+	}
 
-/**
- * A knowledge-cache entry: one per model, holding its own consolidated
- * findings and bottlenecks (at most 8 each) and its error signatures, as in
- * SIDERIUS. `rank_score` is the best Health-valid formal score with its sign
- * normalized by the metric order (higher is better).
- */
-const CacheEntry = Type.Object({
-	model_type: Type.String(),
-	description: Type.String(),
-	iteration: Type.Integer(),
-	rank_score: Score,
-	stats: Type.Object({ best_score: Score, best_formal_score: Score, best_valid_formal_score: Score }),
-	key_findings: Type.Array(Finding),
-	bottlenecks: Type.Array(Finding),
-	error_signatures: Type.Array(ErrorSignature),
-});
+	// One per model, holding its own consolidated findings and bottlenecks (at
+	// most 8 each) and its error signatures. rank_score is the best Health-valid
+	// formal score, sign-normalized by the metric order (higher is better).
+	type CacheEntry = {
+		model_type: string, description: string, iteration: Int, rank_score: Score,
+		stats: { best_score: Score, best_formal_score: Score, best_valid_formal_score: Score },
+		key_findings: Finding[], bottlenecks: Finding[], error_signatures: ErrorSignature[]
+	}
 
-const CollapseEntry = Type.Object({
-	model_type: Type.String(),
-	iteration: Type.Integer(),
-	signature: Type.String(),
-	check_name: Type.String(),
-	count: Type.Integer(),
-	human_readable: Type.String(),
-});
+	type CollapseEntry = {
+		model_type: string, iteration: Int, signature: string, check_name: string,
+		count: Int, human_readable: string
+	}
 
-/**
- * Evidence from data analysis and literature review. Union stores items in
- * canonical order, and canonical JSON sorts keys, so `at` ("iter-007") comes
- * first and the order is chronological: the judge's window shows the newest.
- */
-const Evidence = Type.Object({
-	at: Type.String(),
-	source: Type.Union([Type.Literal("data_analysis"), Type.Literal("literature")]),
-	content: Type.String(),
-	source_ref: Type.String(),
-	confidence: Type.Number(),
-});
+	// Union stores items in canonical order, and canonical JSON sorts keys, so
+	// "at" ("iter-007") comes first and the judge's window shows the newest.
+	type Evidence = {
+		at: string, source: "data_analysis" | "literature", content: string,
+		source_ref: string, confidence: number
+	}
 
-/** The chain formal incumbent: best Health-valid formal score. */
-const Incumbent = Type.Object({ rank_score: Type.Number(), score: Type.Number(), model_type: Type.String(), iteration: Type.Integer() });
+	// The chain formal incumbent: best Health-valid formal score.
+	type Incumbent = { rank_score: number, score: number, model_type: string, iteration: Int }
 
-const Proposal = Type.Object({
-	model_name: Type.String(),
-	model_type: Type.String(),
-	output_type: Type.String(),
-	model_description: Type.String(),
-	mathematical_definition: Type.String(),
-	motivation: Type.String(),
-	baseline_config: Type.Record(Type.String(), Type.Union([Type.Number(), Type.String(), Type.Boolean()])),
-	prediction: Type.Object({ statement: Type.String(), expected_score: Type.Number() }),
-});
+	type Proposal = {
+		model_name: string, model_type: string, output_type: string,
+		model_description: string, mathematical_definition: string, motivation: string,
+		baseline_config: Config,
+		prediction: { statement: string, expected_score: number }
+	}
 
-const Config = Type.Record(Type.String(), Type.Union([Type.Number(), Type.String(), Type.Boolean()]));
+	type Scope = "trial" | "formal"
+	type Direction = "higher_is_better" | "lower_is_better"
+	type HealthCheck = { check_name: string, metrics: Record<string, number> }
+	type SkillInput = { skill: string, args: Record<string, string> }
+	type SkillOutput = { result_ref: string, summary: string }
+	`,
+);
+
+const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheEntry, CollapseEntry, Evidence, Incumbent, Proposal, Scope, Direction, HealthCheck, SkillInput, SkillOutput } = S;
 
 // --- Scripts: the task package's domain code, with typed args and outputs ------
-
-const Scope = Type.Union([Type.Literal("trial"), Type.Literal("formal")]);
-const HealthCheck = Type.Object({ check_name: Type.String(), metrics: Type.Record(Type.String(), Type.Number()) });
-const Direction = Type.Union([Type.Literal("higher_is_better"), Type.Literal("lower_is_better")]);
 
 const trainScript = defineScript({
 	name: "train",
 	description: "Train one candidate config on the trial or formal scope (training_skill).",
-	input: Type.Object({
-		config: Config,
-		scope: Scope,
-		max_epochs: Type.Integer(),
-		time_budget_minutes: Type.Number(),
-		seed: Type.Integer(),
-		data_scope: Type.String(),
-	}),
-	output: Type.Object({
-		status: Type.Union([Type.Literal("ok"), Type.Literal("oom"), Type.Literal("gate_refused"), Type.Literal("infrastructure_abort")]),
-		checkpoint: Type.Union([Type.String(), Type.Null()]),
-		minutes: Type.Number(),
-	}),
+	input: Type.Script({ Config, Scope, Int }, `{
+		config: Config, scope: Scope, max_epochs: Int, time_budget_minutes: number,
+		seed: Int, data_scope: string
+	}`),
+	output: Type.Script(`{
+		status: "ok" | "oom" | "gate_refused" | "infrastructure_abort",
+		checkpoint: string | null, minutes: number
+	}`),
 });
 
 const evaluateScript = defineScript({
 	name: "evaluate",
 	description: "Score a checkpoint on the trial or formal evaluation portion (inference_skill, evaluate_metric).",
-	input: Type.Object({ checkpoint: Type.String(), scope: Scope }),
-	output: Type.Object({ scoreable: Type.Boolean(), score: Score, metric_id: Type.String() }),
+	input: Type.Script({ Scope }, `{ checkpoint: string, scope: Scope }`),
+	output: Type.Script({ Score }, `{ scoreable: boolean, score: Score, metric_id: string }`),
 });
 
 const healthScript = defineScript({
 	name: "health",
 	description: "Run the scientific Health gates of the effective Health config (round_health.py).",
-	input: Type.Object({ checkpoint: Type.String(), health_config: Type.String(), model_type: Type.String() }),
-	output: Type.Object({ valid: Type.Boolean(), policy: Type.Union([Type.Literal("blocking"), Type.Literal("recording")]), failed_checks: Type.Array(HealthCheck) }),
+	input: Type.Script(`{ checkpoint: string, health_config: string, model_type: string }`),
+	output: Type.Script({ HealthCheck }, `{ valid: boolean, policy: "blocking" | "recording", failed_checks: HealthCheck[] }`),
 });
 
 const fingerprintScript = defineScript({
 	name: "fingerprint",
 	description: "Turn failed Health checks into collapse fingerprints.",
-	input: Type.Object({ failed_checks: Type.Array(HealthCheck), model_type: Type.String(), iteration: Type.Integer() }),
-	output: Type.Object({ entries: Type.Array(CollapseEntry) }),
+	input: Type.Script({ HealthCheck, Int }, `{ failed_checks: HealthCheck[], model_type: string, iteration: Int }`),
+	output: Type.Script({ CollapseEntry }, `{ entries: CollapseEntry[] }`),
 });
 
 const metricOrderScript = defineScript({
 	name: "metric_order",
 	description: "Reconcile the run's MetricSpec and report its direction (MetricOrder).",
-	input: Type.Object({ data_scope: Type.String() }),
-	output: Type.Object({ metric_id: Type.String(), direction: Direction }),
+	input: Type.Script(`{ data_scope: string }`),
+	output: Type.Script({ Direction }, `{ metric_id: string, direction: Direction }`),
 });
 
 const validateScript = defineScript({
 	name: "validate",
 	description: "Deterministic validator checks 1-7 and 9.",
-	input: Type.Object({ model_file_path: Type.String(), probe_seed: Type.Integer() }),
-	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), checks: Type.Record(Type.String(), Type.Boolean()) }),
+	input: Type.Script({ Int }, `{ model_file_path: string, probe_seed: Int }`),
+	output: Type.Script(`{ passed: boolean, error: string | null, checks: Record<string, boolean> }`),
 });
-
-const SkillInput = Type.Object({ skill: Type.String(), args: Type.Record(Type.String(), Type.String()) });
-const SkillOutput = Type.Object({ result_ref: Type.String(), summary: Type.String() });
 
 const runSkillScript = defineScript({
 	name: "run_skill",
