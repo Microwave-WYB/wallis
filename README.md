@@ -22,6 +22,8 @@ Status: first prototype. See [docs/design.md](docs/design.md).
 | `host/` | The `wallis` npm package (not published): the SDK (`src/sdk/`), the thin host (`src/host/`: QuickJS sandbox, JSONL log, sessions, resume, fork, fake executor, MCP server) and the CLI (`src/cli/main.ts`) |
 | `host/examples/two-node/` | A two-node workflow and a runner that can kill itself mid-call |
 | `host/examples/ask/` | Two nodes, the first of which asks the human a question |
+| `host/src/host/pi.ts`, `tools.ts` | The pi executor (pi-agent-core, in process) and the wallis tool layer (allowlist, logging, codemode, MCP via pi-mcp) |
+| `host/src/host/scripts.ts`, `slots.ts` | Domain scripts under bubblewrap; machine-wide resource and provider slots |
 | `.agents/workflows/siderius/` | SIDERIUS expressed as a wallis workflow; `MAPPING.md` lists what maps and what does not |
 | `tools/gleam-codegen.mjs` | Drives `gleam lsp` code actions to generate decoders and JSON encoders |
 | `docs/design.md` | Current design: decided, proposed and open items, plus prototype choices |
@@ -54,6 +56,9 @@ wallis interrupt <run> <node> [text] | pause <run> | cancel <run> --node <node> 
 wallis serve --executor <module>   # stdio MCP server: run, send, get_run, cancel, wait
 ```
 
-There is no real executor yet: `--executor` takes a module whose default
-export returns `{ executor, scripts? }`, such as the scripted fake in
-`host/test/fixtures/fake-executor.ts`.
+The default executor is pi (`host/src/executors/pi.ts`, pi-ai's built-in
+providers, auth from their usual environment variables). `--executor` takes
+any module whose default export returns `{ executor, scripts? }`, such as the
+scripted fake in `host/test/fixtures/fake-executor.ts`. Machine settings
+(data dirs, provider limits, slots, model remaps) live in the local profile:
+`~/.config/wallis/profile.json` and `.wallis/profile.json`.

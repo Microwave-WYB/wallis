@@ -35,6 +35,13 @@
 - Host tests use the fake executor and fake scripts; never real model calls
   or API keys. CLI and MCP tests load `host/test/fixtures/fake-executor.ts`
   as the executor module and work in throwaway projects (`test/util.ts`).
+- pi executor tests use pi-ai's faux provider (`fauxProvider().setResponses`);
+  never real paid model calls.
+- CLI tests run detached hosts with `WALLIS_HOST=plain` (set in
+  `test/util.ts`) so SIGKILL tests are not restarted by systemd; tests that
+  need bwrap or systemd skip with a message when unavailable.
+- Reducers are built-in deterministic merges only; custom or LLM-based
+  merging is workflow code (owner decision).
 - Every value crossing the sandbox or executor boundary is schema-checked on
   both sides (`src/sdk/validate.ts`); keep new boundaries that way.
 - The body sees typed errors only (`Refused`, `AgentFailed`, `ScriptFailed`,
