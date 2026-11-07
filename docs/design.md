@@ -456,9 +456,10 @@ Prototype choices:
 
 ## Tools and sandbox (proposed)
 
-- Executors connect only to wallis. wallis proxies the declared stdio MCP
-  servers, enforces per-agent tool allowlists, injects secrets into server
-  processes only, logs calls and can rate-limit per node.
+- Executors connect only to wallis. wallis reaches the declared MCP servers
+  (stdio and Streamable HTTP, through pi-mcp), enforces per-agent tool
+  allowlists, injects secrets into server processes only, logs calls and
+  can rate-limit per node. See Executors for the tool layer.
 - Workflow-defined tools (`defineTool`) and `sandbox_exec` are served the same
   way.
 - Loading is sandboxed too: the bundled workflow is evaluated in QuickJS
@@ -489,14 +490,83 @@ An uncaught `AgentFailed` or `ScriptFailed` ends the run as
 a draft answer to open item 4. There are no workflow version declarations
 (owner decision).
 
-## Executors (proposed)
+## Executors (decided, round 3)
 
-`CallAgent` is an effect; the executor is a handler. v0 implements pi only.
-Other executors need an LLM loop, an MCP client restricted to wallis, disabled
-built-in tools, a system prompt without ambient context, structured output
-and usage reports; unsupported declarations are refused. Notes for Claude
-Code 2.1.301: `--bare` gives the cleanest isolation but needs an API key;
-subscription auth needs a leak test.
+```
+Executor    { id, capabilities, start(NodeSpec) -> NodeSession }
+NodeSession { turn(message?) -> TurnResult, rebind?(model), steer?(text), interrupt?(), handle(), close() }
+TurnResult  = submitted | ended | agent_error | executor_error
+```
+
+A node is one agent call and its conversation. The host starts a session
+on the node's first turn and keeps it open while the node is idle. It
+closes the session when the node is done, or when its host process exits.
+`NodeSpec` carries the following:
+- the conversation so far, so a session can be rebuilt after a restart;
+- the output JSON Schema;
+- the node's dirs and its `exportArtifact`;
+- the selected MCP server configs;
+- a transcript sink.
+
+**pi** is built: in process, through `@earendil-works/pi-agent-core`'s
+`Agent` (1.5.0, exact pins). It has no built-in tools and no ambient
+context: no AGENTS.md or CLAUDE.md, no user extensions or skills. Its tools
+come from the wallis tool layer as `AgentTool`s.
+
+The tool layer (`host/src/host/tools.ts`) builds every tool per node. It
+enforces the agent's allowlist, logs every call to the node's transcript,
+counts calls against a per-node budget, and injects secrets into MCP
+server processes only. The tools:
+- `submit_result`, validated; errors go back to the model;
+- `state_read`, capped, against the call's snapshot;
+- `emit`, for declared emit fields only;
+- fs and exec tools confined to the node's dirs: `read_file` and
+  `list_dir` from `read-only`; `write_file`, `export_artifact` and `exec`
+  (bwrap) at `workspace`;
+- declared `defineTool`s, served by their scripts;
+- the allowlisted tools of upstream MCP servers, through
+  `@earendil-works/pi-mcp`.
+
+**codemode** is on by default for every agent with tools beyond
+`submit_result` and `state_read`, and `codemode: false` disables it. The
+model then gets `codemode` and `submit_result`. A codemode script runs in
+pi-codemode's `CodemodeSandbox` and can call only that agent's allowlisted
+tools, including `submit_result` and `state_read`. Every nested call goes
+through the same allowlist, logging and budget.
+
+Later rounds (not built):
+- an **ACP executor**: generic; it enforces the allowlist by denying
+  `session/request_permission` for non-wallis tools;
+- a **Claude Agent SDK executor**.
+
+Notes for Claude Code 2.1.301: `--bare` gives the cleanest isolation but
+needs an API key; subscription auth needs a leak test.
+
+Prototype choices:
+
+- Model strings are `provider/model[:thinking]`. A trailing `:<level>` is a
+  thinking level only if it names one, so OpenRouter-style ids with colons
+  survive.
+- `ended`, `agent_error` and `executor_error` for pi:
+  - a turn whose last assistant message stops with text and no submission is
+    `ended`, and the text is the question;
+  - `stopReason: "error"` is an `executor_error` (provider, auth, billing);
+  - reaching `maxTurns` without a submission aborts the agent and is an
+    `agent_error`.
+- pi validates tool arguments against `parameters` before the wallis
+  `submit_result` check runs; both return errors to the model. Only accepted
+  calls reach the tool layer's log.
+- A rebuilt session gets the conversation so far folded into its first
+  prompt ("Conversation so far: …"), not as synthetic assistant messages.
+- A rebind inside a live session sets the pi agent's model. Across sessions
+  (resume), the node restarts with its transcript.
+- The per-node tool budget is 10 calls per allowed turn, at least 16. Nested
+  calls count.
+- MCP tools are named `mcp__<server>__<tool>`. `${VAR}` in a server's `env`
+  or `headers` is resolved from the host environment for that process only.
+- The CLI's default executor module is `host/src/executors/pi.ts` (pi with
+  pi-ai's built-in providers). The default script runner is
+  `ProcessScripts`.
 
 ## Prototype status
 
@@ -510,8 +580,7 @@ Built:
 - the SIDERIUS example (`.agents/workflows/siderius/`, see its `MAPPING.md`).
 
 Not built yet:
-- the pi executor and its preflight capabilities (preflight runs against
-  whatever capabilities an executor declares);
+- the ACP and Claude Agent SDK executors;
 - the MCP proxy, `defineTool` serving, `sandbox_exec`, secret injection and
   script sandboxing;
 - the `state_read` pull tool and persistent sessions beyond the transcript;

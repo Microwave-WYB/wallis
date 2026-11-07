@@ -140,6 +140,7 @@ function agentDeclaration(agent: AgentDef) {
 		needs: agent.needs ?? {},
 		sandbox: agent.sandbox,
 		data: agent.data,
+		codemode: agent.codemode,
 		max_turns: agent.maxTurns,
 	};
 }

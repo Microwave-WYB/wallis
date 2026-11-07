@@ -285,6 +285,12 @@ export class Session {
 		return prepareNode(this.paths.dir, id, level, input, Object.fromEntries(data.map((n) => [n, this.#dataPath(n)])));
 	}
 
+	#mcpFor(declaration: Declarations["agents"][string]): Json | null {
+		const servers = (this.#decl.mcp as { mcpServers?: Record<string, Json> } | null)?.mcpServers;
+		if (!servers) return null;
+		return Object.fromEntries(Object.keys(declaration.mcp).filter((s) => s in servers).map((s) => [s, servers[s]!]));
+	}
+
 	#preflight(): void {
 		const caps = this.#options.executor.capabilities;
 		if (!caps) return;
@@ -488,6 +494,7 @@ export class Session {
 			workspace,
 			exportArtifact: (path, media, name) =>
 				resolveDrafts(name === undefined ? { artifact: path, media } : { artifact: path, media, name }, this.paths.dir, workspace.scratch) as unknown as ArtifactRef,
+			mcp: this.#mcpFor(declaration),
 			log,
 		};
 		const base = { id: effect.id, model: effect.model };

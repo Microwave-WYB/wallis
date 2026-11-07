@@ -322,6 +322,11 @@ export interface AgentSpec<M extends ModelTable, F extends Fields, J extends Mcp
 	readonly maxTurns?: number;
 	/** Capabilities checked in preflight. */
 	readonly needs?: { readonly structuredOutput?: boolean; readonly toolCalls?: boolean; readonly contextTokens?: number };
+	/**
+	 * Run tool use through codemode: the model writes a script that calls the
+	 * agent's tools. Default on for agents that have tools; `false` disables.
+	 */
+	readonly codemode?: boolean;
 	/** What the node may touch on disk; see `SandboxLevel`. Default `none`. */
 	readonly sandbox?: SandboxLevel;
 	/** Data dirs (names from the local profile), mounted read-only. */
@@ -344,6 +349,7 @@ export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSche
 	readonly needs: AgentSpec<ModelTable, Fields, McpConfig, I, O>["needs"];
 	readonly sandbox: SandboxLevel;
 	readonly data: readonly string[];
+	readonly codemode: boolean;
 }
 
 const NO_VIEW: ViewSpec = { fields: [], maxChars: 0, maxItems: 0 };
@@ -368,6 +374,7 @@ export function defineAgent<const M extends ModelTable, const F extends Fields, 
 		needs: spec.needs,
 		sandbox: spec.sandbox ?? "none",
 		data: spec.data ?? [],
+		codemode: spec.codemode ?? true,
 	};
 }
 

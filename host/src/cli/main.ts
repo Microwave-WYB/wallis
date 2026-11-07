@@ -15,7 +15,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { Json } from "../sdk/index.ts";
@@ -23,10 +23,13 @@ import type { BudgetKind } from "../host/core.ts";
 import { EventLog } from "../host/log.ts";
 import { attention, describe, exportArtifact, forkRun, inspectRun, pending, waitForAttention } from "../host/query.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
+import { ProcessScripts } from "../host/scripts.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
 import { acquireLock, appendInbox, lockHolder, newMessageId, newRunId, readMeta, runPaths, runsDir, writeMeta } from "../host/store.ts";
 
 const self = fileURLToPath(import.meta.url);
+/** pi, with pi-ai's built-in providers. */
+const DEFAULT_EXECUTOR = fileURLToPath(new URL("../executors/pi.ts", import.meta.url));
 
 const { values, positionals } = parseArgs({
 	allowPositionals: true,
@@ -89,16 +92,16 @@ function detach(dir: string, extra: string[] = []): void {
 async function drive(dir: string, options: Partial<SessionOptions>): Promise<void> {
 	const paths = runPaths(dir);
 	const meta = readMeta(paths);
-	const module = values.executor ? resolve(values.executor) : (meta?.executor ?? process.env.WALLIS_EXECUTOR ?? null);
-	if (!module) throw new Error("no executor: pass --executor <module> (the pi executor is not built yet)");
+	const module = values.executor ? resolve(values.executor) : (meta?.executor ?? process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
 	if (meta && module !== meta.executor) writeMeta(paths, { ...meta, executor: module });
 	const kit = await loadExecutor(module);
 	const start = meta?.start ?? {};
 	const fresh = new EventLog(paths.log).read().length === 0;
+	const workflow = meta?.workflow;
 	const session = await startSession({
 		dir,
 		executor: kit.executor,
-		scripts: kit.scripts,
+		scripts: kit.scripts ?? (workflow ? new ProcessScripts({ workflowDir: dirname(workflow) }) : undefined),
 		executorModule: module,
 		root: meta?.root ?? root,
 		...(fresh ? start : {}),
@@ -228,8 +231,7 @@ async function main(): Promise<number> {
 		case "serve": {
 			const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
 			const { createMcpServer } = await import("../host/mcp.ts");
-			const module = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? null);
-			if (!module) throw new Error("no executor: pass --executor <module> (the pi executor is not built yet)");
+			const module = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
 			const server = createMcpServer(new Runs(root, await loadExecutor(module), module));
 			await server.connect(new StdioServerTransport());
 			return new Promise<number>(() => {});

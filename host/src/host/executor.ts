@@ -57,6 +57,8 @@ export interface NodeSpec {
 	readonly workspace: NodeDirs;
 	/** The `export_artifact` tool: stores a file from the node's scratch dir and returns its ref for `submit_result`. */
 	readonly exportArtifact: (path: string, media: string, name?: string) => ArtifactRef;
+	/** Configs of the MCP servers this agent selected (from the workflow's mcp.json). */
+	readonly mcp: Json | null;
 	/** Appends to the node's observational transcript. */
 	readonly log: (entry: TranscriptEntry) => void;
 	/** Delivers steering messages queued for a running turn; see `NodeSession.steer`. */
