@@ -1,9 +1,15 @@
 // Test fixture: parallel branches, a sub-workflow with retries, llmMerge,
 // a script, a capped read, and a budget-limited loop.
 
-import { defineAgent, defineModels, defineState, llmMerge, append, Refused, subWorkflow, union, Type, view, workflow } from "wallis";
+import { append, defineAgent, defineModels, defineScript, defineState, llmMerge, subWorkflow, Type, union, view, workflow } from "wallis";
 
 const models = defineModels({ default: "fake/default" });
+
+const train = defineScript({
+	name: "train",
+	input: Type.Object({ minutes: Type.Number() }),
+	output: Type.Object({ budget: Type.Union([Type.Number(), Type.Null()]) }),
+});
 
 const Finding = Type.Object({ content: Type.String(), confidence: Type.Number() });
 
@@ -73,7 +79,7 @@ export default workflow({
 	models,
 	state,
 	agents: [scout, judge, merger, attempt],
-	scripts: ["train"],
+	scripts: [train],
 	budget: { usd: 1, computeMinutes: 5 },
 	input: Type.Null(),
 	output: Type.Any(),
@@ -84,14 +90,10 @@ export default workflow({
 		});
 		const verdict = await ctx.call(judge, { seen: found.a.errors.length + found.b.errors.length });
 		const tries = await ctx.sub(retry, { max: 3 });
-		const trained = await ctx.script("train", { minutes: 5 });
-		let refused = "";
-		try {
-			await ctx.script("train", { minutes: 1 });
-		} catch (e) {
-			if (e instanceof Refused) refused = e.message;
-		}
+		const trained = await ctx.script(train, { minutes: 5 });
+		// The compute budget is spent: this pauses the run until it is raised.
+		const again = await ctx.script(train, { minutes: 1 });
 		const seen = await ctx.read(view(state, { fields: ["findings", "archive"], maxChars: 1000, maxItems: 10 }));
-		return { verdict, tries, trained, refused, findings: seen.data.findings, archive: seen.data.archive };
+		return { verdict, tries, trained, again, findings: seen.data.findings, archive: seen.data.archive };
 	},
 });

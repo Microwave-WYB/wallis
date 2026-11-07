@@ -6,16 +6,21 @@
 // Request ids come from the branch path and a per-branch counter, so they
 // are the same on every replay regardless of the order results arrive in.
 
-import Value from "typebox/value";
-import type { AgentDef, Ctx, Fields, Json, SubWorkflowDef, ViewSpec, WorkflowDef } from "./index.ts";
-import { AgentFailed, Refused } from "./index.ts";
+import type { AgentDef, Ctx, FailReason, Fields, Json, Refusal, ScriptDef, SubWorkflowDef, ViewSpec, WorkflowDef } from "./index.ts";
+import { AgentFailed, Refused, SchemaError, ScriptFailed } from "./index.ts";
+import { schemaErrors } from "./validate.ts";
 
-type Reply = { type: "deliver"; value: Json } | { type: "fail"; error: string } | { type: "refuse"; reason: string };
+/** What the host answers a request with. */
+export type Reply =
+	| { type: "deliver"; value: Json }
+	| { type: "fail"; reason: FailReason }
+	| { type: "refuse"; refusal: Refusal }
+	| { type: "schema"; subject: string; errors: string[] };
 
 interface Host {
 	__wallis_send(json: string): void;
 	__wallis_done(json: string): void;
-	__wallis_fail(message: string): void;
+	__wallis_fail(json: string): void;
 }
 
 const pending = new Map<string, (reply: Reply) => void>();
@@ -36,17 +41,24 @@ function unwrap(reply: Reply): Json {
 		case "deliver":
 			return reply.value;
 		case "fail":
-			throw new AgentFailed(reply.error);
+			switch (reply.reason.type) {
+				case "agent_gave_up":
+					throw new AgentFailed(reply.reason.agent, reply.reason.error);
+				case "script_crashed":
+					throw new ScriptFailed(reply.reason.script, reply.reason.error);
+				case "body_error":
+					throw new Error(reply.reason.message);
+			}
 		case "refuse":
-			throw new Refused(reply.reason);
+			throw new Refused(reply.refusal);
+		case "schema":
+			throw new SchemaError(reply.subject, reply.errors);
 	}
 }
 
-function check(schema: unknown, value: unknown, what: string): void {
-	if (!Value.Check(schema as never, value)) {
-		const first = Value.Errors(schema as never, value)[0];
-		throw new TypeError(`${what} does not match its schema${first ? `: ${first.instancePath} ${first.message}` : ""}`);
-	}
+function check(schema: unknown, value: unknown, subject: string): void {
+	const errors = schemaErrors(schema, value);
+	if (errors.length > 0) throw new SchemaError(subject, errors);
 }
 
 export function wireView(spec: ViewSpec): Json {
@@ -59,35 +71,43 @@ export function wireView(spec: ViewSpec): Json {
 	};
 }
 
-function makeCtx<F extends Fields>(path: string, branch: string | null, seed: number): Ctx<F> {
+function makeCtx<F extends Fields>(path: string, branch: string | null, seed: number, fields: Fields): Ctx<F> {
 	let counter = 0;
 	const next = () => `${path}#${counter++}`;
 	const ctx: Ctx<F> = {
 		seed,
-		async call(agent, input) {
-			check(agent.input, input, `input of ${agent.name}`);
+		async call(agent: AgentDef, input) {
+			check(agent.input, input, `input of agent ${agent.name}`);
 			const output = unwrap(await request(next(), branch, { type: "call", agent: agent.name, input: input as Json }));
-			check(agent.output, output, `output of ${agent.name}`);
+			const errors = schemaErrors(agent.output, output);
+			if (errors.length > 0) throw new AgentFailed(agent.name, `output does not match its schema: ${errors.join("; ")}`);
 			return output as never;
 		},
-		async script(name, args) {
-			return unwrap(await request(next(), branch, { type: "script", script: name, args: args ?? null }));
+		async script(script: ScriptDef, args) {
+			check(script.input, args, `args of script ${script.name}`);
+			const output = unwrap(await request(next(), branch, { type: "script", script: script.name, args: args as Json }));
+			const errors = schemaErrors(script.output, output);
+			if (errors.length > 0) throw new ScriptFailed(script.name, `output does not match its schema: ${errors.join("; ")}`);
+			return output as never;
 		},
 		async read(spec) {
 			return unwrap(await request(next(), branch, { type: "read", view: wireView(spec) })) as never;
 		},
 		async emit(field, value) {
+			const reducer = fields[field];
+			if (!reducer) throw new SchemaError(`state field ${field}`, ["no such field"]);
+			check(reducer.schema, value, `write to state field ${field}`);
 			unwrap(await request(next(), branch, { type: "commit", writes: [{ field, value: value as Json }] }));
 		},
 		async parallel(branches) {
 			const at = next();
 			const keys = Object.keys(branches);
-			const results = await Promise.all(keys.map((key) => branches[key]!(makeCtx<F>(`${at}.${key}`, `${at}.${key}`, seed))));
+			const results = await Promise.all(keys.map((key) => branches[key]!(makeCtx<F>(`${at}.${key}`, `${at}.${key}`, seed, fields))));
 			return Object.fromEntries(keys.map((key, i) => [key, results[i]])) as never;
 		},
 		async sub(sub: SubWorkflowDef, input) {
 			check(sub.input, input, `input of sub-workflow ${sub.name}`);
-			const output = await sub.run(makeCtx<{}>(`${next()}>${sub.name}`, branch, seed), input as never);
+			const output = await sub.run(makeCtx<{}>(`${next()}>${sub.name}`, branch, seed, {}), input as never);
 			check(sub.output, output, `output of sub-workflow ${sub.name}`);
 			return output as never;
 		},
@@ -113,6 +133,7 @@ function agentDeclaration(agent: AgentDef) {
 		prompt: agent.prompt,
 		input: agent.input,
 		output: agent.output,
+		writes: agent.writes,
 		mcp: agent.mcp,
 		tools: agent.tools.map((t) => ({ name: t.name, description: t.description, input: t.input, output: t.output, script: t.script })),
 		skills: agent.skills,
@@ -130,6 +151,7 @@ export function declarations(def: WorkflowDef) {
 		if (names.has(agent.name)) throw new Error(`duplicate agent name ${agent.name}`);
 		names.add(agent.name);
 	}
+	const scripts = spec.scripts ?? [];
 	return {
 		core: {
 			name: spec.name,
@@ -141,7 +163,7 @@ export function declarations(def: WorkflowDef) {
 				writes: Object.entries(a.writes).map(([field, src]) => ({ field, from: typeof src === "string" ? src : null })),
 				max_turns: a.maxTurns,
 			})),
-			scripts: [...(spec.scripts ?? [])],
+			scripts: scripts.map((s) => s.name),
 			budget: {
 				usd: spec.budget?.usd ?? null,
 				tokens: spec.budget?.tokens ?? null,
@@ -152,6 +174,9 @@ export function declarations(def: WorkflowDef) {
 		models: spec.models.table,
 		pin: { files: [...(spec.pin?.files ?? [])] },
 		agents: Object.fromEntries(spec.agents.map((a) => [a.name, agentDeclaration(a)])),
+		scripts: Object.fromEntries(scripts.map((s) => [s.name, { description: s.description, input: s.input, output: s.output }])),
+		/** Per state field: the schema every write must match. */
+		fields: Object.fromEntries(Object.entries(spec.state.fields).map(([name, r]) => [name, r.schema])),
 		mcp: spec.mcp?.config ?? null,
 		input: spec.input,
 		output: spec.output,
@@ -159,6 +184,12 @@ export function declarations(def: WorkflowDef) {
 }
 
 export type Declarations = ReturnType<typeof declarations>;
+
+function failReason(error: unknown): FailReason {
+	if (error instanceof AgentFailed) return { type: "agent_gave_up", agent: error.agent, error: error.error };
+	if (error instanceof ScriptFailed) return { type: "script_crashed", script: error.script, error: error.error };
+	return { type: "body_error", message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
+}
 
 export function install(def: WorkflowDef): void {
 	const g = globalThis as Record<string, unknown>;
@@ -174,13 +205,13 @@ export function install(def: WorkflowDef): void {
 		const input = JSON.parse(inputJson) as Json;
 		const run = async () => {
 			check(def.spec.input, input, "workflow input");
-			const output = await def.spec.run(makeCtx("", null, seed), input as never);
+			const output = await def.spec.run(makeCtx("", null, seed, def.spec.state.fields), input as never);
 			check(def.spec.output, output, "workflow output");
 			return output;
 		};
 		run().then(
 			(output) => host().__wallis_done(JSON.stringify(output ?? null)),
-			(error: unknown) => host().__wallis_fail(error instanceof Error ? `${error.name}: ${error.message}` : String(error)),
+			(error: unknown) => host().__wallis_fail(JSON.stringify(failReason(error))),
 		);
 	};
 }

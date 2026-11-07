@@ -22,27 +22,28 @@ function lines(path: string): unknown[] {
 test("a killed run resumes to the same state and log as an uninterrupted run", () => {
 	const dir = mkdtempSync(join(tmpdir(), "wallis-resume-"));
 
-	const whole = run(["--log", join(dir, "whole.jsonl")]);
+	const whole = run(["--dir", join(dir, "whole")]);
 	assert.equal(whole.status, 0, whole.stderr);
 	const expected = JSON.parse(whole.stdout);
 	assert.equal(expected.outcome.type, "done");
 
 	// Killed while the writer call is in flight.
-	const killedLog = join(dir, "killed.jsonl");
-	const killed = run(["--log", killedLog, "--exec-log", join(dir, "exec-killed.jsonl"), "--kill-on", "writer"]);
+	const killedDir = join(dir, "killed");
+	const killedLog = join(killedDir, "log.jsonl");
+	const killed = run(["--dir", killedDir, "--exec-log", join(dir, "exec-killed.jsonl"), "--kill-on", "writer"]);
 	assert.equal(killed.signal, "SIGKILL");
 	const atKill = lines(killedLog) as { type: string; id?: string }[];
 	assert.ok(atKill.some((e) => e.type === "agent_returned" && e.id === "#0"), "planner completed before the kill");
 	assert.ok(!atKill.some((e) => e.type === "agent_returned" && e.id === "#1"), "writer was in flight");
 
-	const resumed = run(["--log", killedLog, "--exec-log", join(dir, "exec-resumed.jsonl")]);
+	const resumed = run(["--dir", killedDir, "--exec-log", join(dir, "exec-resumed.jsonl")]);
 	assert.equal(resumed.status, 0, resumed.stderr);
 	const result = JSON.parse(resumed.stdout);
 	assert.equal(result.resumed, true);
 
 	assert.deepEqual(result.outcome, expected.outcome);
 	assert.equal(result.snapshot, expected.snapshot);
-	assert.equal(readFileSync(killedLog, "utf8"), readFileSync(join(dir, "whole.jsonl"), "utf8"));
+	assert.equal(readFileSync(killedLog, "utf8"), readFileSync(join(dir, "whole", "log.jsonl"), "utf8"));
 
 	// The completed planner call was answered from the journal, not re-executed.
 	assert.deepEqual(lines(join(dir, "exec-killed.jsonl")), [
@@ -54,10 +55,10 @@ test("a killed run resumes to the same state and log as an uninterrupted run", (
 
 test("resuming a finished run reports its outcome without executing anything", () => {
 	const dir = mkdtempSync(join(tmpdir(), "wallis-resume-"));
-	const log = join(dir, "run.jsonl");
-	const first = run(["--log", log]);
+	const log = join(dir, "run");
+	const first = run(["--dir", log]);
 	assert.equal(first.status, 0, first.stderr);
-	const again = run(["--log", log, "--exec-log", join(dir, "exec.jsonl")]);
+	const again = run(["--dir", log, "--exec-log", join(dir, "exec.jsonl")]);
 	assert.equal(again.status, 0, again.stderr);
 	assert.deepEqual(JSON.parse(again.stdout).outcome, JSON.parse(first.stdout).outcome);
 	assert.throws(() => readFileSync(join(dir, "exec.jsonl")));
