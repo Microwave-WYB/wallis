@@ -13,8 +13,9 @@
   `mise run install` installs them from the lockfile.
 - `mise run build` builds the core. `mise run test` runs the core and host
   tests. `mise run typecheck` type-checks `host/` and `.agents/workflows/`.
-- After changing a type in `core/src/wallis_core/types.gleam`, regenerate
-  its codecs: from `core/`, `node ../tools/gleam-codegen.mjs <file> <Type>...`.
+- After changing a type in `core/src/wallis_core/types.gleam`, delete its
+  old `_decoder`/`_to_json` functions and regenerate them: from `core/`,
+  `node ../tools/gleam-codegen.mjs <file> <Type>...`.
 
 ## Core rules
 
