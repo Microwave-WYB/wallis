@@ -3,7 +3,7 @@
 `workflow.ts` expresses the SIDERIUS research loop
 (github.com/yuema137/SIDERIUS, commit 5ccb436) as a wallis workflow. The
 mapping is approximate. The workflow type-checks, and it runs end to end
-only with scripted agents and scripts (`host/test/siderius.test.ts`); the
+only with scripted agents and commands (`host/test/siderius.test.ts`); the
 prompts, `trainer/` and `checks/` are placeholders.
 
 Since round 5 the directory is laid out by who may see what: `trainer/`
@@ -138,7 +138,7 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 11. **Collapse history.** Pruned like SIDERIUS (window and per-model cap), but
     each fingerprint is kept as its own entry. SIDERIUS merges occurrences of
     one signature (`occurrences[{iteration, count, source_exp_ids}]`).
-12. **Metric order.** The direction is dynamic in SIDERIUS. Here a script
+12. **Metric order.** The direction is dynamic in SIDERIUS. Here a command
     reports it, and a sign-normalized `rank_score` ranks in one direction.
     Not expressed: SIDERIUS refuses to cap an unrankable cache (no
     MetricSpec).
@@ -172,8 +172,8 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
     cannot read files.
 18. **Compute budgets.** SIDERIUS budgets wall time per attempt (Trial and
     Formal), VRAM (`trial_vram_budget_gb`, `gpu_pair_ceiling_gib`), epochs
-    and data portions. Here they are script arguments plus one run-level
-    `computeMinutes` (a script is killed when it runs out). `train` and
+    and data portions. Here they are command inputs plus one run-level
+    `computeMinutes` (a command is killed when it runs out). `train` and
     `evaluate` declare `resources` (GPU, memory) and wait for machine slots;
     VRAM is not measured.
 19. **Resource envelope and access policy for data analysis.** Scripts run
