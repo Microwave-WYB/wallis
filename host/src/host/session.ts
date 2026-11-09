@@ -50,7 +50,7 @@ import { type Mount, MountError, mountDigest, resolveMounts } from "./mounts.ts"
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
-import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
+import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, type RunPaths, runPaths, updateMeta, writeMeta } from "./store.ts";
 
 export interface SessionOptions {
 	/** The run directory. A directory without a log starts a new run. */
@@ -519,13 +519,13 @@ export class Session {
 			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, digests)]));
 			this.#boxes = can ? new Sandboxes({ decls, bins, mounts, mountDigests: digests }) : null;
 			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
-				writeMeta(this.paths, {
+			updateMeta(this.paths, (meta) => ({
 				...meta,
 				bins: Object.fromEntries(Object.entries(bins).map(([n, path]) => [n, versions[n] === undefined ? { path } : { path, version: versions[n]! }])),
 				base: meta.base ?? baseIdentity(),
 				confined: this.#boxes !== null,
 				answers: Object.fromEntries(Object.entries(this.#decl.orchestrators).map(([name, o]) => [name, o.output as unknown as Json])),
-			});
+			}));
 		} catch (error) {
 			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
 			throw error;
@@ -554,7 +554,7 @@ export class Session {
 		}
 		// What ran, for `describe`: a toolset is code from the project, bundled per session.
 		const bundles = this.#sources.bundleDigests();
-		if (Object.keys(bundles).length > 0) writeMeta(this.paths, { ...readMeta(this.paths)!, toolsets: bundles });
+		if (Object.keys(bundles).length > 0) updateMeta(this.paths, (meta) => ({ ...meta, toolsets: bundles }));
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
 			if (resolved.unknown !== null) throw new RunRefused({ type: "unknown_tool", name: resolved.unknown });
@@ -565,10 +565,10 @@ export class Session {
 
 	/** A warning about tools: printed, and recorded once in run metadata. */
 	#warn(text: string): void {
-		const meta = readMeta(this.paths)!;
-		if ((meta.warnings ?? []).includes(text)) return;
+		if ((readMeta(this.paths)!.warnings ?? []).includes(text)) return;
 		process.stderr.write(`wallis: warning: ${text}\n`);
-		writeMeta(this.paths, { ...meta, warnings: [...(meta.warnings ?? []), text] });
+		// Merged under the meta lock: a concurrent CLI write is kept, and so is this warning.
+		updateMeta(this.paths, (meta) => ((meta.warnings ?? []).includes(text) ? meta : { ...meta, warnings: [...(meta.warnings ?? []), text] }));
 	}
 
 	/** A body tool, by id, from the preflight listing. */

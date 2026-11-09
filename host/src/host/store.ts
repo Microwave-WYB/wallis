@@ -12,7 +12,7 @@
 // time and never logged.
 
 import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { Json, Refusal } from "../sdk/index.ts";
 
@@ -94,9 +94,45 @@ export function readMeta(paths: RunPaths): RunMeta | null {
 	return existsSync(paths.meta) ? (JSON.parse(readFileSync(paths.meta, "utf8")) as RunMeta) : null;
 }
 
+/** Atomic: written to a temp file, then renamed over it, so a reader never sees half a file. */
 export function writeMeta(paths: RunPaths, meta: RunMeta): void {
 	mkdirSync(paths.dir, { recursive: true });
-	writeFileSync(paths.meta, `${JSON.stringify(meta, null, 2)}\n`);
+	const temp = `${paths.meta}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	writeFileSync(temp, `${JSON.stringify(meta, null, 2)}\n`);
+	renameSync(temp, paths.meta);
+}
+
+const META_LOCK_STALE_MS = 5_000;
+
+/**
+ * Read, edit and write the metadata under `meta.lock` (an exclusive
+ * create), so writers in other processes (the CLI, a host) never lose each
+ * other's changes. A lock older than a few seconds was left by a dead
+ * writer and is taken over.
+ */
+export function updateMeta(paths: RunPaths, edit: (meta: RunMeta) => RunMeta): void {
+	const lock = `${paths.meta}.lock`;
+	for (;;) {
+		try {
+			closeSync(openSync(lock, "wx"));
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - statSync(lock).mtimeMs > META_LOCK_STALE_MS) rmSync(lock, { force: true });
+			} catch {
+				// Released meanwhile.
+			}
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+		}
+	}
+	try {
+		const meta = readMeta(paths);
+		if (meta === null) throw new Error(`run ${paths.id} has no metadata`);
+		writeMeta(paths, edit(meta));
+	} finally {
+		rmSync(lock, { force: true });
+	}
 }
 
 // --- Lock ----------------------------------------------------------------------

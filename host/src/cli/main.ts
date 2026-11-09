@@ -58,7 +58,7 @@ import { ProcessCommands } from "../host/commands.ts";
 import { CONTINUE } from "../host/query.ts";
 import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
-import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir, writeMeta } from "../host/store.ts";
+import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir, updateMeta, writeMeta } from "../host/store.ts";
 import { toJson } from "../sdk/validate.ts";
 
 const self = fileURLToPath(import.meta.url);
@@ -191,7 +191,7 @@ async function drive(dir: string, options: Partial<SessionOptions>): Promise<voi
 	const paths = runPaths(dir);
 	const meta = readMeta(paths);
 	const module = values.executor ? resolve(values.executor) : (meta?.executor ?? process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
-	if (meta && module !== meta.executor) writeMeta(paths, { ...meta, executor: module });
+	if (meta && module !== meta.executor) updateMeta(paths, (m) => ({ ...m, executor: module }));
 	const kit = await loadExecutor(module);
 	const local = loadProfile(meta?.root ?? root);
 	const start = meta?.start ?? {};
