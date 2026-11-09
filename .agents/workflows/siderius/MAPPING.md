@@ -41,8 +41,8 @@ the SIDERIUS code, the code's behavior is noted here.
 | `ChainState` and `research_history.py` | Local variables of the body: `runs`, `knowledgeCache`, `findingsArchive`, `collapseHistory`, `predictionV1`/`predictionV2`/`infoGainV2`, `evidence`, `incumbent`, `lastRejections`. The run returns them as `carried`. |
 | Target check before each iteration (2159) | `atLeast(direction, incumbent.score, target)` on the local `incumbent` |
 | `ResultInterpretationAgent` (route `interpret`) | Agent `interpret`. Its input carries `history` (runs, knowledge cache, collapse history; each `Foldable`) and `prediction_memory`. It reads `advice.md` from the `config` mount (`sandbox: "read-only"`). |
-| `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with the `analysis` sandbox: the data mount read-only and a shell (`bash`), which replaces SIDERIUS's `run_skill` tool. Its input carries the last 4 run summaries. |
-| `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review`: MCP only, no sandbox (no filesystem). `mcp: { arxiv: [...], semantic_scholar: "*" }` (direct: they only read) over `mcp.json`; each server runs in its own sandbox from the overlay (`arxiv-mcp`, `scholar-mcp`), with the network (MCP servers are the run's only channel outside; agents and commands have none). `S2_API_KEY` reaches only the Semantic Scholar server's process. The knowledge cache arrives `Foldable`. |
+| `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with `workspace: { access: "exec", sandbox: analysis }`: the data mount read-only and a shell (`bash`), which replaces SIDERIUS's `run_skill` tool. Its input carries the last 4 run summaries. |
+| `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review`: no workspace (no filesystem); `tools: [lit.searchArxiv, lit.searchScholar]`, custom tools in `tools/literature.ts` (read-only, `replay: "safe"`), served by wallis under node from the `literature-tools` sandbox with the network. `S2_API_KEY` reaches only that process. The knowledge cache arrives `Foldable`. |
 | Judge strategies, projection caps (`judge-strategies-contract.md`) | Agent `evidence_judge`, `steerable: false`. `judgeProjection` in body code: the newest 24 entries without self-reported confidence, oldest dropped until the JSON fits 4000 chars, with an `omitted` count. |
 | `JudgeStop` (authored loops), `on_met: "stop"` | `stops.judgeCriterion` plus `verdict.stop.recommend`, with `stops.judgeOnMet: "stop"` |
 | `JudgeStop` `on_met: "request_input"` (pause and ask the operator) | `stops.judgeOnMet: "request_input"`: the orchestrator node `stop_check` carries the iteration, the criterion and the judge's reason; the orchestrator submits `stop` or `continue` (`submit_result`, or `wallis submit`), checked against its answer schema. |
@@ -191,12 +191,13 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 22. **Infrastructure halt.** SIDERIUS writes a marker and exits with code 3.
     Here it is only the `infrastructure_abort` stop reason.
 23. **Literature cache** (`cache/literature/root_papers`) is not expressed.
-24. **`mcp.json` pins are placeholders.** The server packages and versions
-    were not checked against a registry.
+24. **The literature tools are a sketch.** `tools/literature.ts` calls the
+    public arXiv and Semantic Scholar search APIs with minimal parsing; it
+    was not run against them (tests list the tools only).
 
 ### wallis prototype limits that affect this example
 
-25. The `trainer`, `checks`, `coding`, `analysis` and MCP sandboxes have
+25. The `trainer`, `checks`, `coding`, `analysis` and `literature-tools` sandboxes have
     only met scripted commands and agents in tests; `trainer/` and
     `checks/` hold placeholders, and the lock is a stub. The MCP sandboxes'
     domain allowlists are recorded but not enforced per domain (bwrap

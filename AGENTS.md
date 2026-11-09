@@ -71,12 +71,14 @@ generics or wrappers that add no proof.
   (`Idle(turn_limit)`), not a failure.
 - One node union (agent | command | workflow | MCP tool | orchestrator);
   agents are called through `ctx.session(agent).call(input)` only, every
-  other node with `ctx.call`. Agents' tools are MCP tools (direct or `ask`)
-  and built-ins only; commands are called by workflow code only. Multi-step
-  concurrent branches use `ctx.parallel`/`ctx.map`.
-- Outward side effects only through `ask`-mode MCP tools the orchestrator
-  approves; agents and commands never get network (no sandbox `network`
-  option); every MCP result is journaled.
+  other node (and tool values) with `ctx.call`. Agents' `tools` are `ask`,
+  toolset tools and MCP tools only; file tools come from `workspace`
+  access; commands are called by workflow code only. Multi-step concurrent
+  branches use `ctx.parallel`/`ctx.map`.
+- Agents interact with the workflow only through input and output; outward
+  writes happen in the body (ask first with an orchestrator node). Agents
+  and commands never get network; tool processes do. Every tool result is
+  journaled; write-capable tools given to agents are warnings.
 - Sandboxes are declared (`defineSandbox`), bwrap only, nothing implicit:
   never mount the workflow dir implicitly, never add a writable mount.
 - Recovery is the most important property: keep transient-error retries
@@ -86,12 +88,13 @@ generics or wrappers that add no proof.
   tokens are information only.
 - Interventions carry `by` and go through the capability checks on both
   sides (host, then core). Verbs: send (idle: reply; running: steer),
-  submit (orchestrator nodes, approvals), interrupt (no message), restart,
-  cancel, pause, resume.
+  submit (orchestrator nodes), interrupt (no message), restart, cancel,
+  pause, resume.
 - Every value crossing the sandbox or executor boundary is schema-checked on
   both sides (`src/sdk/validate.ts`); keep new boundaries that way.
 - The body sees typed errors only (`Refused`, `AgentFailed`,
-  `CommandFailed`, `ToolFailed`, `WorkflowFailed`, `SchemaError`, each with
+  `CommandFailed`, `ToolFailed`, `OrchestratorCancelled`, `WorkflowFailed`,
+  `SchemaError`, each with
   a typed failure); never make it match on message text.
 - Compile-time guarantees get `@ts-expect-error` tests in
   `host/test/sdk-types.ts`.
