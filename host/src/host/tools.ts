@@ -110,7 +110,9 @@ export class NodeTools {
 		this.#cap = cap;
 	}
 
+	/** A name is given once: a second tool by that name is an error, never a replacement. */
 	add(tool: WallisToolRun): void {
+		if (this.#tools.has(tool.name)) throw new Error(`tool_name_taken: agent ${this.spec.agent} would see two tools named ${tool.name}`);
 		this.#tools.set(tool.name, tool);
 	}
 
@@ -145,9 +147,10 @@ export class NodeTools {
 	 * error if it worked only on the sandbox; else its outcome is unknown.
 	 */
 	crashPolicy(name: string, key: string, args: Json): CrashPolicy {
-		if (RERUN.has(name)) return "rerun";
+		// External tools first: a built-in's name never decides for one.
 		const info = this.external.get(name);
 		if (info) return info.replay === "safe" || this.recorded(key, info, args) !== null ? "rerun" : "unknown";
+		if (RERUN.has(name)) return "rerun";
 		if (name === "codemode") return [...this.external.values()].every((t) => t.replay === "safe") ? "rerun" : "unknown";
 		return "sandbox";
 	}
@@ -434,6 +437,8 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 	const resolved = resolveAgentTools(spec.agent, declared, listing);
 	for (const w of resolved.warnings) spec.warn(w);
 	if (resolved.unknown !== null) spec.warn(`agent ${spec.agent}: tool ${resolved.unknown} is not offered by its source`);
+	// The listing changed since the preflight: the call fails (held) rather than give a tool another's name.
+	if (resolved.taken !== null) throw new Error(`tool_name_taken: agent ${spec.agent} would see two tools named ${resolved.taken}`);
 	for (const info of resolved.tools) {
 		const client = clients.get(sourceKey(info.source))!;
 		tools.external.set(info.name, info);

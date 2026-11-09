@@ -534,7 +534,9 @@ export class Session {
 	/**
 	 * Preflight of the tool sources (with confinement off too: it only
 	 * skips confinement): every declared source is listed; an agent's tool
-	 * that no source offers is refused (`unknown_tool`); tools that may write
+	 * that no source offers is refused (`unknown_tool`), and so is a tool
+	 * name an agent would see twice, or a built-in's (`tool_name_taken`);
+	 * tools that may write
 	 * outside, and tools a whole MCP server leaves out, are warnings, printed
 	 * and recorded in run metadata.
 	 */
@@ -545,6 +547,7 @@ export class Session {
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
 			if (resolved.unknown !== null) throw new RunRefused({ type: "unknown_tool", name: resolved.unknown });
+			if (resolved.taken !== null) throw new RunRefused({ type: "tool_name_taken", agent, name: resolved.taken });
 			for (const w of resolved.warnings) this.#warn(w);
 		}
 	}

@@ -120,9 +120,10 @@ defineAgent(env, { ..., workspace: { sandbox: py, access: "exec" }, tools: [ask,
   type-only, and at run time only the path is used, so the implementation
   never enters the workflow VM. wallis bundles the module with esbuild
   together with a runner that registers each tool on the official MCP SDK
-  server over stdio (`parameters` as `inputSchema`; `outputSchema`,
-  `structuredContent` and `annotations` passed through; the export name and
-  `replay` in `_meta`), and runs it under node in the toolset's sandbox,
+  server over stdio under its export name, so two exports never share a
+  route (`parameters` as `inputSchema`; `outputSchema`,
+  `structuredContent` and `annotations` passed through; the tool's `name`,
+  which its agent sees, and `replay` in `_meta`), and runs it under node in the toolset's sandbox,
   with only its named secrets in its environment. A cancelled request
   aborts the tool's `signal`.
 - **Existing MCP servers** are an adapter. `defineMcp(mcpJson, overlay)`
@@ -132,7 +133,12 @@ defineAgent(env, { ..., workspace: { sandbox: py, access: "exec" }, tools: [ask,
   (the others are named in a warning); `scholar.search` is one tool. Tool
   names are checked at preflight (`unknown_tool`): MCP is an unknown
   external object, with no codegen. Agent-visible names are
-  `mcp__<server>__<tool>`. MCP servers run in their own sandboxes and never
+  `mcp__<server>__<tool>`. An agent sees each name once: a custom or MCP
+  tool named like a built-in (`codemode`, `submit_result`, `read_spill`,
+  `ask`, `read`, `write`, `edit`, `ls`, `bash`, `export_artifact`), or two
+  of its tools by one name, are refused at preflight (`tool_name_taken`);
+  if a source's listing changes after it, the agent call fails (held)
+  rather than one tool replacing another. MCP servers run in their own sandboxes and never
   see an agent's input artifacts or scratch dir: MCP tools that expect
   local file paths cannot work on agent files (use the workspace or custom
   tools for files), and wallis offers no MCP `roots`.

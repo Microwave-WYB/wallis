@@ -72,7 +72,7 @@ test("each MCP connection gets its own scratch dir; a toolset runs bundled under
 	const t = await sources.connect({ kind: "toolset", path: "./lib.ts" });
 	try {
 		const listed = await t.listTools();
-		assert.deepEqual(listed.map((x) => [x.name, (x._meta as Record<string, unknown>)["wallis/export"], (x._meta as Record<string, unknown>)["wallis/replay"]]), [["where", "where", "safe"]]);
+		assert.deepEqual(listed.map((x) => [x.name, (x._meta as Record<string, unknown>)["wallis/name"], (x._meta as Record<string, unknown>)["wallis/replay"]]), [["where", "where", "safe"]]);
 		const r = await t.callTool("where", {});
 		// Its sandbox's scratch dir; only its declared secret.
 		assert.deepEqual(r.structuredContent, { cwd: "/w", secret: "s3cret", home: "/w" });

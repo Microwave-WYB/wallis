@@ -64,11 +64,12 @@ type Listed = { name: string; description?: string; inputSchema?: unknown; outpu
 export function toolInfos(source: Source, listed: readonly Listed[]): ToolInfo[] {
 	return listed.map((t) => {
 		const annotations = t.annotations ?? {};
-		const exported = typeof t._meta?.["wallis/export"] === "string" ? (t._meta["wallis/export"] as string) : t.name;
+		// A toolset tool is served under its export name; the name its agent sees is in `_meta`.
+		const shown = t._meta?.["wallis/name"];
 		return source.kind === "toolset"
 			? {
-					id: `custom:${source.path}#${exported}`,
-					name: t.name,
+					id: `custom:${source.path}#${t.name}`,
+					name: typeof shown === "string" ? shown : t.name,
 					source,
 					remote: t.name,
 					description: t.description ?? t.name,
@@ -91,8 +92,19 @@ export function toolInfos(source: Source, listed: readonly Listed[]): ToolInfo[]
 	});
 }
 
-/** An agent's tool values against the listed tools: the tools it gets, warnings, and the first unknown tool. */
-export function resolveAgentTools(agent: string, descs: readonly ToolDesc[], listing: ReadonlyMap<string, readonly ToolInfo[]>): { tools: ToolInfo[]; warnings: string[]; unknown: string | null } {
+/** What wallis gives agents itself: no custom or MCP tool may take these names. */
+export const BUILT_IN_TOOLS: ReadonlySet<string> = new Set(["codemode", "submit_result", "read_spill", "ask", "read", "write", "edit", "ls", "bash", "export_artifact"]);
+
+/**
+ * An agent's tool values against the listed tools: the tools it gets,
+ * warnings, the first unknown tool, and the first name that is taken (a
+ * built-in's, or another of its tools').
+ */
+export function resolveAgentTools(
+	agent: string,
+	descs: readonly ToolDesc[],
+	listing: ReadonlyMap<string, readonly ToolInfo[]>,
+): { tools: ToolInfo[]; warnings: string[]; unknown: string | null; taken: string | null } {
 	const tools: ToolInfo[] = [];
 	const warnings: string[] = [];
 	let unknown: string | null = null;
@@ -110,12 +122,19 @@ export function resolveAgentTools(agent: string, descs: readonly ToolDesc[], lis
 		if (found) tools.push(found);
 		else unknown ??= id;
 	}
+	const seen = new Map<string, string>();
+	let taken: string | null = null;
+	for (const t of tools) {
+		const prior = seen.get(t.name);
+		if (BUILT_IN_TOOLS.has(t.name) || (prior !== undefined && prior !== t.id)) taken ??= t.name;
+		seen.set(t.name, t.id);
+	}
 	for (const t of tools) {
 		if (writesOutside(t.annotations)) {
 			warnings.push(`agent ${agent}: tool ${t.name} may write outside (${t.annotations.readOnlyHint === undefined ? "unannotated" : JSON.stringify(t.annotations)}); outward writes belong in the workflow body`);
 		}
 	}
-	return { tools, warnings, unknown };
+	return { tools, warnings, unknown, taken };
 }
 
 type ServerConfig = { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> };

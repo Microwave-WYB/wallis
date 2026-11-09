@@ -2,7 +2,9 @@
 // under node in the toolset's own sandbox. It serves each exported tool (a
 // pi AgentTool plus MCP annotations) over stdio with the official MCP SDK:
 // `parameters` become `inputSchema`; `outputSchema`, `structuredContent` and
-// `annotations` pass through; the export name and `replay` go in `_meta`.
+// `annotations` pass through. Each is served under its export name, so two
+// exports never share a route; the name the agent sees (`name`) and
+// `replay` go in `_meta`.
 // A cancelled request aborts the tool's `signal`. Nothing else is offered
 // (no resources, prompts, sampling or elicitation).
 
@@ -24,20 +26,20 @@ const isTool = (v: unknown): v is Tool => typeof v === "object" && v !== null &&
 
 export async function serve(module: Record<string, unknown>): Promise<void> {
 	const tools = Object.entries(module).filter((e): e is [string, Tool] => isTool(e[1]));
-	const byName = new Map(tools.map(([, t]) => [t.name, t]));
+	const byExport = new Map(tools);
 	const server = new Server({ name: "wallis-toolset", version: "0.0.0" }, { capabilities: { tools: {} } });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({
 		tools: tools.map(([key, t]) => ({
-			name: t.name,
+			name: key,
 			description: t.description ?? t.name,
 			inputSchema: t.parameters,
 			...(t.outputSchema ? { outputSchema: t.outputSchema } : {}),
 			...(t.annotations ? { annotations: t.annotations } : {}),
-			_meta: { "wallis/export": key, "wallis/replay": t.replay ?? "never" },
+			_meta: { "wallis/name": t.name, "wallis/replay": t.replay ?? "never" },
 		})),
 	}));
 	server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-		const tool = byName.get(request.params.name);
+		const tool = byExport.get(request.params.name);
 		if (!tool) return { content: [{ type: "text", text: `no tool ${request.params.name}` }], isError: true };
 		try {
 			const r = await tool.execute(String(extra.requestId), request.params.arguments ?? {}, extra.signal);
