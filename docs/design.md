@@ -37,6 +37,30 @@ bugs are the classes this removes.
   `wallis run` (the first session's parameters), written once before any
   host runs; with the inbox, it is input, not state.
 
+### Workspaces are layers (decided, foundation round)
+
+- A session value's `/w` is an overlay of immutable layers, bottom first,
+  with the call's own upper dir on top: in bwrap, the kernel's overlay
+  (`--overlay-src <layer>… --overlay <upper> <work> /w`); the host's own
+  file tools resolve paths the same way (upper first, then the layers
+  top-down; whiteouts and opaque dirs honoured), and write to the upper.
+- After a call returns, its upper dir (only the changes; deletions as
+  whiteouts) becomes a layer: its manifest (each changed file's sha256) is
+  written to `layers/<hex>.json`, `<hex>` being the manifest's sha256, and
+  the dir is renamed to `layers/<hex>`, so nothing is copied. Then
+  `agent_returned` names the session's layers after the call (the commit
+  point). The session value after it is the parent's layers plus that
+  one; beyond 16 layers they are squashed into one (hardlinks and merged
+  manifests: an unchanged file is never copied or hashed again). A call in
+  flight keeps its upper dir across a host exit; a restart starts a new
+  attempt with an empty one, so the workspace matches the dialogue.
+- `ctx.files(s)` is a Tree (`{ kind: "tree", layers }`) of that session's
+  `/w`, without copying. `ctx.session(agent, { from: tree })` seeds a new
+  session with it, copy-on-write; a Tree in a command's or an agent's
+  input is mounted read-only at `/in/trees/<hex>` (its `path` given to
+  `run`). The layers a new session starts from are part of its calls' key.
+- No knobs: no snapshot option and no linear mode.
+
 ## Governing principle (decided, round 4)
 
 Types make illegal states unrepresentable. Where types cannot reach (time,
@@ -189,10 +213,9 @@ defineAgent(env, { ..., workspace: { sandbox: py, access: "exec" }, tools: [ask,
 
 Prototype choices:
 
-- The sandbox layout stays `/w` (scratch), `/w/<mount>` (mounts) and
-  `/run/wallis/inputs/<hex>/<name>` (input artifacts). The layout `/in`,
-  `/w`, `/mnt/<name>` is planned for round 8: moving it touches commands'
-  argv in every workflow, not only agents.
+- The sandbox layout is `/in` (input artifacts, and Trees at
+  `/in/trees/<hex>`, read-only), `/w` (the workspace), `/mnt/<name>`
+  (mounts, read-only) and `/tmp` (plain, ephemeral) (foundation round).
 - With `noUncheckedIndexedAccess`, `server.tool` reads as `McpTool |
   undefined` (tool names are not typed); `tools` and `ctx.call` take that.
 - `describe` shows the warnings of the latest preflight of that workflow in
@@ -969,9 +992,10 @@ Prototype choices:
 
 Prototype choices:
 
-- Layout inside a sandbox: `/w` is the call's scratch dir and working
-  directory; each mount is at `/w/<name>`, read-only; input artifacts are
-  at `/run/wallis/inputs/<hex>/<name>`; binaries at `/run/wallis/bin`; the
+- Layout inside a sandbox: `/w` is the working directory (a command's
+  private dir; an agent's overlay of its session's layers); each mount is
+  at `/mnt/<name>`, read-only; input artifacts are at `/in/<hex>/<name>`
+  and Trees at `/in/trees/<hex>`; binaries at `/run/wallis/bin`; the
   setup env at `/run/wallis/env`. Plus `/usr`, `/etc`, the merged-`/usr`
   symlinks, private `/proc`, `/dev`, `/tmp`, no network, and the sandbox
   dies with the host. The environment is exactly `PATH`, `HOME=/w`,
@@ -1153,8 +1177,10 @@ external result. The tools:
 - `codemode` and `submit_result` (validated: schema and output cap), and
   `read_spill`, which pages output spilled at the context cap, always;
 - the workspace's file tools by access (`read`, `ls`; `write`, `edit`,
-  `export_artifact`; `bash`), on the sandbox's paths (`/w` scratch,
-  `/w/<mount>` read-only, `/run/wallis/inputs` read-only);
+  `export_artifact`; `bash`), on the sandbox's paths (`/w` the workspace,
+  read through its layers and written to the call's upper dir; `/in`,
+  `/in/trees/<hex>` and `/mnt/<name>` read-only); an agent with a
+  workspace gets one short note on these dirs in its system prompt;
 - `ask`, if declared;
 - custom tools and MCP tools from their sources (`toolsets.ts`), over one
   connection per source for the call. Every result is journaled

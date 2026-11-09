@@ -19,7 +19,7 @@ export type Event =
 	| { type: "requested"; id: string; request: Json; node_digest: string; occurrence: string }
 	| { type: "code_changed"; from: string; to: string }
 	/** `dialogue`: the session's dialogue after the call, a blob written before this event. */
-	| { type: "agent_returned"; id: string; output: Json; usage: Usage; model: string; dialogue: string | null }
+	| { type: "agent_returned"; id: string; output: Json; usage: Usage; model: string; dialogue: string | null; layers: string[] | null }
 	| { type: "agent_idle"; id: string; message: string; usage: Usage; model: string }
 	| { type: "agent_failed"; id: string; failure: AgentFailure; usage: Usage; model: string }
 	| { type: "turn_limit_reached"; id: string; used: number; limit: number; usage: Usage; model: string }
@@ -154,8 +154,8 @@ export type CallAgentEffect = {
 	note: string | null;
 	/** The session value the call continues (null: a new session). */
 	session: string | null;
-	/** The first call of the session's lineage (its slot): whose workspace the call shares. */
-	lineage: string;
+	/** The session's workspace: its layers (digests), bottom first. */
+	layers: string[];
 	/** The session's dialogue before this call (a blob digest): where a new attempt starts. */
 	history: string | null;
 	/** This attempt's newest dialogue (a blob digest): where a reissued attempt resumes. */

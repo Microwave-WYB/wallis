@@ -145,7 +145,8 @@ const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheE
 // mount the checkpoint.
 //
 // Nothing is implicit: the workflow dir is never mounted. Each sandbox sees
-// only the mounts it names, read-only, plus its call's private scratch dir.
+// only the mounts it names, read-only at /mnt/<name>, its inputs at /in, and
+// its call's /w (a private dir for a command, a layered workspace for an agent).
 // `trainer/` and `checks/` are workflow-relative mounts; `prompts/` is
 // never mounted anywhere, so no agent or command can read the judge's
 // prompt or the Health code it is graded by. `data` (the dataset) and
@@ -159,9 +160,9 @@ const mounts = defineMounts({ trainer: "./trainer", checks: "./checks", data: ""
 
 /** Files in the `config` mount, as the sandboxes see them. */
 const files = {
-	dataScope: "config/data_scope.json",
-	healthConfig: "config/health_config.yaml",
-	advice: "config/advice.md",
+	dataScope: "/mnt/config/data_scope.json",
+	healthConfig: "/mnt/config/health_config.yaml",
+	advice: "/mnt/config/advice.md",
 };
 
 /** train and evaluate: the trainer's locked environment, built once by `uv sync`, then used offline. */
@@ -170,7 +171,7 @@ const trainerBox = defineSandbox(
 	{
 		name: "trainer",
 		requires: ["uv", "sh"],
-		setup: [["sh", "-c", 'UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" uv sync --frozen --project trainer']],
+		setup: [["sh", "-c", 'UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" uv sync --frozen --project /mnt/trainer']],
 		mounts: ["trainer", "data", "config"],
 	},
 );
@@ -195,7 +196,7 @@ const literatureBox = defineSandbox({}, { name: "literature-tools", requires: ["
 const lit = toolset<typeof import("./tools/literature.ts")>("./tools/literature.ts", { sandbox: literatureBox, secrets: ["S2_API_KEY"] });
 
 /** The default protocol: input JSON on stdin, output JSON (with artifact drafts) on stdout. */
-const trainerRun = (script: string) => ["sh", "-c", `UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" exec uv run --offline --no-sync --project trainer python trainer/${script}`] as const;
+const trainerRun = (script: string) => ["sh", "-c", `UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" exec uv run --offline --no-sync --project /mnt/trainer python /mnt/trainer/${script}`] as const;
 
 // --- Commands: the task package's domain code, as typed adapters ------------------
 
@@ -231,7 +232,7 @@ const healthScript = command({
 	sandbox: checksBox,
 	input: Type.Script({ Checkpoint }, `{ checkpoint: Checkpoint, health_config: string, model_type: string }`),
 	output: Type.Script({ HealthCheck }, `{ valid: boolean, policy: "blocking" | "recording", failed_checks: HealthCheck[] }`),
-	run: ["python3", "checks/health.py"],
+	run: ["python3", "/mnt/checks/health.py"],
 });
 
 const fingerprintScript = command({
@@ -240,7 +241,7 @@ const fingerprintScript = command({
 	sandbox: checksBox,
 	input: Type.Script({ HealthCheck, Int }, `{ failed_checks: HealthCheck[], model_type: string, iteration: Int }`),
 	output: Type.Script({ CollapseEntry }, `{ entries: CollapseEntry[] }`),
-	run: ["python3", "checks/fingerprint.py"],
+	run: ["python3", "/mnt/checks/fingerprint.py"],
 });
 
 const metricOrderScript = command({
@@ -249,7 +250,7 @@ const metricOrderScript = command({
 	sandbox: checksBox,
 	input: Type.Script(`{ data_scope: string }`),
 	output: Type.Script({ Direction }, `{ metric_id: string, direction: Direction }`),
-	run: ["python3", "checks/metric_order.py"],
+	run: ["python3", "/mnt/checks/metric_order.py"],
 });
 
 const validateScript = command({
@@ -258,7 +259,7 @@ const validateScript = command({
 	sandbox: checksBox,
 	input: Type.Script({ ModelPlugin, Int }, `{ model: ModelPlugin, probe_seed: Int }`),
 	output: Type.Script(`{ passed: boolean, error: string | null, checks: Record<string, boolean> }`),
-	run: ["python3", "checks/validate.py"],
+	run: ["python3", "/mnt/checks/validate.py"],
 });
 
 // --- Findings consolidation (cache_consolidator.list_merge) ---------------------

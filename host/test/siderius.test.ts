@@ -108,7 +108,7 @@ function scripts() {
 		// train gets the model plugin as a mounted input artifact and returns the checkpoint as one.
 		train: (call: CommandCall) => {
 			const model = (call.input as { model: { digest: string; name: string; path: string } }).model;
-			assert.equal(model.path, `/run/wallis/inputs/${model.digest.slice(7)}/${model.name}`);
+			assert.equal(model.path, `/in/${model.digest.slice(7)}/${model.name}`);
 			const plugin = readFileSync(join(call.workspace.inputs, model.digest.slice(7), model.name), "utf8");
 			const scope = (call.input as { scope: string }).scope;
 			writeFileSync(join(call.workspace.scratch, "ckpt.bin"), `${plugin}${scope}`);

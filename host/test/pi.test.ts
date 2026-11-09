@@ -58,7 +58,7 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		retryUnknown: false,
 		record: () => {},
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
-		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", mounts: {}, spill: join(tmp(), "spill") },
+		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", work: null, trees: [], mounts: {}, spill: join(tmp(), "spill") },
 		sandbox: { type: "none" },
 		checkpoint: () => {},
 		resume: null,
@@ -244,7 +244,7 @@ test("the tool layer: workspace access gives pi's file tools on the sandbox's pa
 	const mount = tmp();
 	writeFileSync(join(mount, "notes.txt"), "from the mount\nline 2");
 	writeFileSync(join(mount, "dot.png"), Buffer.from("89504e470d0a1a0a", "hex"));
-	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), mounts: { data: mount }, spill: join(dir, "spill") };
+	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), work: null, trees: [], mounts: { data: mount }, spill: join(dir, "spill") };
 	mkdirSync(join(dir, "scratch"), { recursive: true });
 	const at = (access: 0 | 1 | 2 | 3) => spec({ declaration: { ...spec().declaration, access }, workspace: ws, sandbox: { type: "unavailable", name: "shell", reason: "test" } });
 	const names = async (access: 0 | 1 | 2 | 3) => (await buildNodeTools(at(access))).agentTools().map((t) => t.name).sort();
@@ -256,8 +256,8 @@ test("the tool layer: workspace access gives pi's file tools on the sandbox's pa
 	const tools = await buildNodeTools(s);
 	const run = (name: string, args: Record<string, unknown>) => tools.invoke(name, args as never, false, undefined, "0/t1");
 	// Paths are the sandbox's: /w is scratch, /w/<mount> is the mount (read-only).
-	assert.equal((await run("read", { path: "/w/data/notes.txt", offset: 2 })).text, "line 2");
-	assert.equal((await run("write", { path: "data/x", content: "no" })).isError, true);
+	assert.equal((await run("read", { path: "/mnt/data/notes.txt", offset: 2 })).text, "line 2");
+	assert.equal((await run("write", { path: "/mnt/data/x", content: "no" })).isError, true);
 	assert.equal((await run("write", { path: "out.txt", content: "yes yes" })).text, "wrote 7 characters to out.txt");
 	assert.equal((await run("edit", { path: "out.txt", oldText: "yes", newText: "no" })).isError, true, "oldText must occur once");
 	assert.equal((await run("edit", { path: "out.txt", oldText: "yes yes", newText: "no" })).text, "edited out.txt");
@@ -265,7 +265,7 @@ test("the tool layer: workspace access gives pi's file tools on the sandbox's pa
 	assert.deepEqual((await run("ls", {})).value, ["out.txt"]);
 	assert.equal((await run("read", { path: "/etc/passwd" })).isError, true);
 	// read returns images as image content.
-	assert.deepEqual((await run("read", { path: "/w/data/dot.png" })).images, [{ data: Buffer.from("89504e470d0a1a0a", "hex").toString("base64"), mimeType: "image/png" }]);
+	assert.deepEqual((await run("read", { path: "/mnt/data/dot.png" })).images, [{ data: Buffer.from("89504e470d0a1a0a", "hex").toString("base64"), mimeType: "image/png" }]);
 	// Declared but not buildable here: bash says so, typed as an error for the model.
 	assert.match((await run("bash", { command: "id" })).text, /no sandbox: test/);
 	const refused = await tools.invoke("exec", { command: "id" }, true, undefined, "0/t1");

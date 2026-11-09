@@ -54,7 +54,7 @@ pub fn started(wf: Workflow) -> Event {
 pub fn call(id: String, agent: String, input: Value) -> Event {
   Requested(
     id:,
-    request: Call(agent:, input:, session: None),
+    request: Call(agent:, input:, session: None, from: []),
     node_digest: agent <> "@" <> id,
     occurrence: "0",
   )
@@ -69,7 +69,7 @@ pub fn cached(
 ) -> Event {
   Requested(
     id:,
-    request: Call(agent: "worker", input:, session: None),
+    request: Call(agent: "worker", input:, session: None, from: []),
     node_digest: node,
     occurrence: int.to_string(occurrence),
   )
@@ -80,7 +80,7 @@ pub fn cached(
 pub fn session_call(id: String, session: Option(String), input: Value) -> Event {
   Requested(
     id:,
-    request: Call(agent: "worker", input:, session:),
+    request: Call(agent: "worker", input:, session:, from: []),
     node_digest: "worker",
     occurrence: "0",
   )
@@ -150,6 +150,7 @@ pub fn returned(id: String, output: Value) -> Event {
     usage: usage(),
     model: "fake/model",
     dialogue: None,
+    layers: None,
   )
 }
 

@@ -18,7 +18,7 @@ const make = command({
 	sandbox: node,
 	input: Type.Object({ text: Type.String() }),
 	output: Type.Object({ model: Artifact("text/plain") }),
-	run: ["node", "scripts/make.mjs"],
+	run: ["node", "/mnt/scripts/make.mjs"],
 });
 
 /** A typed adapter: argv built from the mounted input, the output parsed from stdout and a file. */
@@ -27,7 +27,7 @@ const train = command({
 	sandbox: trainer,
 	input: Type.Object({ model: Artifact("text/plain") }),
 	output: Type.Object({ checkpoint: Artifact("application/octet-stream"), size: Type.Number() }),
-	run: (i) => ["node", "scripts/train.mjs", i.model.path],
+	run: (i) => ["node", "/mnt/scripts/train.mjs", i.model.path],
 	parse: (r) => ({ checkpoint: r.file("ckpt.bin", "application/octet-stream"), size: Number(r.stdout.trim()) }),
 	resources: { memoryGb: 1 },
 });
@@ -47,7 +47,7 @@ const probe = command({
 	sandbox: node,
 	input: Type.Object({ model: Artifact("text/plain"), outside: Type.String() }),
 	output: Type.Record(Type.String(), Type.Boolean()),
-	run: ["node", "scripts/probe.mjs"],
+	run: ["node", "/mnt/scripts/probe.mjs"],
 });
 
 const writer = defineAgent(

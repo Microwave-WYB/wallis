@@ -438,6 +438,7 @@ pub fn usd_and_tokens_are_recorded_and_never_hold_a_call_test() {
       Usage(999.5, 10_000_000, 1),
       "fake/model",
       None,
+      None,
     ),
     call("#1", "worker", JNull),
   ]
@@ -643,6 +644,7 @@ pub fn executor_error_pauses_and_retry_reissues_test() {
         support.usage(),
         "other/model",
         None,
+        None,
       ),
     )
   let assert [Checkpoint, Deliver("#0", _)] = effects
@@ -732,6 +734,7 @@ fn ok(id, result) {
     JString(result),
     support.usage(),
     "fake/model",
+    None,
     None,
   )
 }
@@ -943,6 +946,43 @@ pub fn calling_a_session_value_again_is_a_branch_test() {
   assert support.session_of(a) != support.session_of(b)
   let assert Ok(JArray(sessions)) = Ok(support.snapshot_get(state, "sessions"))
   assert list.length(sessions) == 3
+}
+
+pub fn a_session_value_carries_its_workspace_layers_test() {
+  // A new session seeded from a tree: its first call starts on those layers.
+  let seeded =
+    types.Requested(
+      "#0",
+      types.Call("worker", input(1), None, ["sha256:tree"]),
+      "worker",
+      "0",
+    )
+  let #(state, effects, _) = replay([started(basic()), seeded])
+  let assert [Checkpoint, CallAgent(layers: ["sha256:tree"], ..)] = effects
+  // The host reports the layers after the call; the next call starts there,
+  // and the session value carries them.
+  let #(state, effects) =
+    run.step(
+      state,
+      types.AgentReturned(
+        "#0",
+        summary("a"),
+        support.usage(),
+        "fake/model",
+        None,
+        Some(["sha256:tree", "sha256:l1"]),
+      ),
+    )
+  let assert Some(s1) = support.session_of(effects)
+  let assert [Checkpoint, Deliver(value: value.JObject(answer), ..)] = effects
+  assert list.key_find(answer, "layers")
+    == Ok(JArray([JString("sha256:tree"), JString("sha256:l1")]))
+  let assert [Checkpoint, CallAgent(layers: ["sha256:tree", "sha256:l1"], ..)] =
+    run.step(state, support.session_call("#1", Some(s1), input(2))).1
+  // The same input on a new session from other layers is another call.
+  let unseeded = support.session_call("#2", None, input(1))
+  let assert [Checkpoint, CallAgent(id: "#2", layers: [], ..)] =
+    run.step(state, unseeded).1
 }
 
 pub fn a_session_value_the_run_never_answered_with_is_refused_test() {

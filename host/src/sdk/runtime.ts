@@ -9,7 +9,7 @@
 // synchronously when `ctx.call` is invoked, so they are the same on every
 // replay regardless of the order results arrive in.
 
-import type { AgentDef, CallableNode, CommandDef, CommandResult, Ctx, FailReason, Json, Refusal, SandboxDef, Session, Tool, TSchema, WorkflowDef, WorkflowNode } from "./index.ts";
+import type { AgentDef, CallableNode, CommandDef, CommandResult, Ctx, FailReason, Json, Refusal, SandboxDef, Session, Tool, Tree, TSchema, WorkflowDef, WorkflowNode } from "./index.ts";
 import { AgentFailed, CommandFailed, mcpDecl, OrchestratorCancelled, Refused, SchemaError, ToolFailed, toolDesc, toolsetDecl, WorkflowFailed } from "./index.ts";
 import { schemaErrors } from "./validate.ts";
 
@@ -99,13 +99,14 @@ export function toolId(desc: { kind: "custom"; toolset: string; export: string }
 const agents = new Map<string, AgentDef>();
 
 /** What an agent call answers with: its output and the session value after it. */
-const ANSWER = { type: "object", required: ["output", "session"], properties: { session: { type: "string" } } };
+const ANSWER = { type: "object", required: ["output", "session", "layers"], properties: { session: { type: "string" }, layers: { type: "array", items: { type: "string" } } } };
 
 /** A session value, checked: plain data the body may keep, pass to any branch and call again. */
 function asSession(value: unknown): Session | null {
 	if (typeof value !== "object" || value === null || (value as { kind?: unknown }).kind !== "session") return null;
 	const v = value as { agent?: unknown; id?: unknown };
-	return typeof v.agent === "string" && (v.id === null || typeof v.id === "string") ? (value as Session) : null;
+	const layers = (value as { layers?: unknown }).layers;
+	return typeof v.agent === "string" && (v.id === null || typeof v.id === "string") && Array.isArray(layers) && layers.every((l) => typeof l === "string") ? (value as Session) : null;
 }
 
 function makeCtx(path: string, seed: number): Ctx {
@@ -114,13 +115,14 @@ function makeCtx(path: string, seed: number): Ctx {
 	const next = () => `${path}#${counter++}`;
 	/** An agent call of a session value: its output, and the session value after it. */
 	const callAgent = async (id: string, agent: AgentDef, input: unknown, session: Session) => {
-		const answer = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json, session: session.id }));
+		// A new session's workspace starts from its `from` layers; a later one's is the core's.
+		const answer = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json, session: session.id, from: session.id === null ? [...session.layers] : [] }));
 		const shape = schemaErrors(ANSWER, answer);
 		if (shape.length > 0) throw new SchemaError(`answer of agent ${agent.name}`, shape);
-		const { output, session: next } = answer as { output: Json; session: string };
+		const { output, session: next, layers } = answer as { output: Json; session: string; layers: string[] };
 		const errors = schemaErrors(agent.output, output);
 		if (errors.length > 0) throw new AgentFailed(agent.name, { type: "gave_up", error: `output does not match its schema: ${errors.join("; ")}` });
-		const after: Session = { kind: "session", agent: agent.name, id: next };
+		const after: Session = { kind: "session", agent: agent.name, id: next, layers };
 		return [output, after];
 	};
 	/** An orchestrator node: its answer is checked against `output` here too. */
@@ -191,9 +193,13 @@ function makeCtx(path: string, seed: number): Ctx {
 			}
 		}) as unknown as Ctx["call"],
 		// A new session is a value: no id is taken, and two are equal.
-		session(agent) {
-			const session: Session = { kind: "session", agent: agent.name, id: null };
+		session(agent, options) {
+			const session: Session = { kind: "session", agent: agent.name, id: null, layers: [...(options?.from?.layers ?? [])] };
 			return session as never;
+		},
+		files(session) {
+			const tree: Tree = { kind: "tree", layers: [...session.layers] };
+			return tree;
 		},
 		parallel(branches) {
 			const at = next();

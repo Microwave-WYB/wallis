@@ -40,6 +40,7 @@ import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
 import { putDialogue, readDialogue } from "./dialogues.ts";
+import { commitLayer, layersAfter, type Work } from "./layers.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
 import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
 import { bundleWorkflow } from "./bundle.ts";
@@ -603,7 +604,8 @@ export class Session {
 		if (name === null) return { type: "none" };
 		const boxes = this.#boxes;
 		if (!boxes) return { type: "unavailable", name, reason: "confinement is off or bubblewrap cannot create a sandbox here" };
-		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs }) };
+		const overlay = dirs.work === null ? undefined : { lowers: dirs.work.lowers, ovl: dirs.work.ovl };
+		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs, ...(overlay ? { overlay } : {}), trees: dirs.trees }) };
 	}
 
 	#mountDirs(names: readonly string[]): Record<string, string> {
@@ -891,7 +893,7 @@ export class Session {
 	 * A producer's output, parsed: JSON, drafts stored as artifacts, every ref
 	 * verified against the store, then the schema. Errors are a string.
 	 */
-	#parseOutput(output: unknown, schema: unknown, scratch: string | null): { ok: true; value: Json } | { ok: false; error: string; missing?: string } {
+	#parseOutput(output: unknown, schema: unknown, scratch: string | Work | null): { ok: true; value: Json } | { ok: false; error: string; missing?: string } {
 		const json = toJson(output);
 		if (!json.ok) return { ok: false, error: `output is not JSON: ${json.errors.join("; ")}` };
 		let value: Json;
@@ -950,8 +952,8 @@ export class Session {
 		let workspace: NodeDirs;
 		try {
 			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
-			// The scratch dir belongs to the session's lineage (its first call) and outlives its calls.
-			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), join(this.paths.dir, "work", `lineage-${effect.lineage.slice(0, 16)}`, "scratch"));
+			// The call's /w: its session's layers, with its own upper dir on top.
+			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), effect.layers);
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -1002,7 +1004,7 @@ export class Session {
 			workspace,
 			sandbox: this.#agentSandbox(declaration.sandbox, workspace),
 			exportArtifact: (path, media, name) =>
-				resolveDrafts(name === undefined ? { artifact: path, media } : { artifact: path, media, name }, this.paths.dir, workspace.scratch) as unknown as ArtifactRef,
+				resolveDrafts(name === undefined ? { artifact: path, media } : { artifact: path, media, name }, this.paths.dir, workspace.work ?? workspace.scratch) as unknown as ArtifactRef,
 			connect: (source) => this.#sources!.connect(source),
 			warn: (text) => {
 				log({ kind: "note", text: `warning: ${text}` });
@@ -1079,8 +1081,13 @@ export class Session {
 								done();
 								return;
 							case "submitted": {
-								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
-								if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage, dialogue: newest });
+								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.work ?? workspace.scratch);
+								if (parsed.ok) {
+									// The call's changes become a layer, written before the event that names it.
+									const committed = workspace.work === null ? null : commitLayer(this.paths.dir, workspace.work, workspace.root);
+									const layers = layersAfter(this.paths.dir, effect.layers, committed);
+									this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage, dialogue: newest, layers });
+								}
 								else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
 								done();
 							}
@@ -1175,7 +1182,7 @@ export class Session {
 		const abort = new AbortController();
 		this.#commandAborts.set(id, abort);
 		const env: Record<string, string> = effect.compute_minutes === null ? {} : { WALLIS_COMPUTE_MINUTES: String(effect.compute_minutes) };
-		const spawn = this.#boxes?.spawn(declaration.sandbox, argv.argv, { scratch: workspace.scratch, inputs: workspace.inputs }, { gpu: (declaration.resources.gpu ?? 0) > 0, env }) ?? null;
+		const spawn = this.#boxes?.spawn(declaration.sandbox, argv.argv, { scratch: workspace.scratch, inputs: workspace.inputs, trees: workspace.trees }, { gpu: (declaration.resources.gpu ?? 0) > 0, env }) ?? null;
 		const log = this.#transcriptLog(id);
 		log({ kind: "note", text: `argv: ${JSON.stringify(argv.argv)}` });
 		const done = () => {

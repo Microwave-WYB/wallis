@@ -86,6 +86,10 @@ generics or wrappers that add no proof.
   writes happen in the body (ask first with an orchestrator node). Agents
   and commands never get network; tool processes do. Every tool result is
   journaled; write-capable tools given to agents are warnings.
+- The sandbox layout is fixed: `/in` (inputs, read-only), `/w` (the
+  workspace; an agent's is an overlay of its session's layers), `/mnt/<name>`
+  (mounts, read-only), `/tmp`. Layers and blobs are written before the event
+  that names them.
 - Sandboxes are declared (`defineSandbox`), bwrap only, nothing implicit:
   never mount the workflow dir implicitly, never add a writable mount.
 - Recovery is the most important property: keep transient-error retries

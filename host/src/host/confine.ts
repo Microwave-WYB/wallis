@@ -5,9 +5,14 @@
 //   /usr /etc /bin /lib*          the host base, read-only
 //   /run/wallis/bin/<name>        each required binary, alone, read-only
 //   /run/wallis/env               the setup env ($WALLIS_ENV), read-only
-//   /run/wallis/inputs/<hex>/<n>  the call's input artifacts, read-only
-//   /w                            the call's private scratch dir (cwd, writable)
-//   /w/<mount>                    each declared mount, read-only
+//   /in/<hex>/<n>                 the call's input artifacts, read-only
+//   /in/trees/<hex>               each Tree in its input, read-only
+//   /w                            the call's workspace (cwd, writable): for an
+//                                 agent, an overlay of its session's layers
+//                                 with the call's own upper dir; for a
+//                                 command, a private dir
+//   /mnt/<name>                   each declared mount, read-only
+//   /tmp                          plain, ephemeral
 // and nothing else: not the workflow dir, not $HOME. The network is off
 // for agents and commands, always; only `setup` and MCP servers whose
 // overlay declares `network: "full"` (the default) share the host network.
@@ -33,7 +38,7 @@ import type { Declarations } from "../sdk/runtime.ts";
 export type SandboxDecl = Declarations["sandboxes"][string];
 
 /** Paths inside a sandbox. */
-export const LAYOUT = { work: "/w", inputs: "/run/wallis/inputs", bin: "/run/wallis/bin", env: "/run/wallis/env" } as const;
+export const LAYOUT = { work: "/w", inputs: "/in", trees: "/in/trees", mounts: "/mnt", tmp: "/tmp", bin: "/run/wallis/bin", env: "/run/wallis/env" } as const;
 
 export class SandboxError extends Error {
 	override readonly name = "SandboxError";
@@ -139,8 +144,13 @@ export interface Spawn {
 }
 
 export interface CallDirs {
+	/** `/w`: a private dir, or (with `layers`) the overlay's upper dir. */
 	readonly scratch: string;
 	readonly inputs: string | null;
+	/** An agent's workspace: its session's layers (bottom first) and overlayfs's work dir. */
+	readonly overlay?: { readonly lowers: readonly string[]; readonly ovl: string };
+	/** Trees in the input: each read-only at `/in/trees/<hex>`, as an overlay of its layers. */
+	readonly trees?: readonly { readonly at: string; readonly lowers: readonly string[] }[];
 }
 
 export interface SpawnOptions {
@@ -195,8 +205,16 @@ export class Sandboxes {
 		for (const r of s.requires) args.push("--ro-bind", this.#bins[r.name]!, `${LAYOUT.bin}/${r.name}`);
 		if (envDir) args.push(options.setup ? "--bind" : "--ro-bind", envDir, LAYOUT.env);
 		if (dirs.inputs) args.push("--ro-bind", dirs.inputs, LAYOUT.inputs);
-		args.push("--bind", dirs.scratch, LAYOUT.work);
-		for (const m of s.mounts) args.push("--ro-bind", this.#mounts[m]!, `${LAYOUT.work}/${m}`);
+		for (const t of dirs.trees ?? []) {
+			for (const l of t.lowers) args.push("--overlay-src", l);
+			args.push("--ro-overlay", t.at);
+		}
+		// An agent's /w: the kernel's overlay of its session's layers and the call's upper dir.
+		if (dirs.overlay && dirs.overlay.lowers.length > 0) {
+			for (const l of dirs.overlay.lowers) args.push("--overlay-src", l);
+			args.push("--overlay", dirs.scratch, dirs.overlay.ovl, LAYOUT.work);
+		} else args.push("--bind", dirs.scratch, LAYOUT.work);
+		for (const m of s.mounts) args.push("--ro-bind", this.#mounts[m]!, `${LAYOUT.mounts}/${m}`);
 		args.push("--chdir", LAYOUT.work, "--");
 		const program = argv[0] ?? "";
 		args.push(program in this.#bins || s.requires.some((r) => r.name === program) ? `${LAYOUT.bin}/${program}` : program, ...argv.slice(1));

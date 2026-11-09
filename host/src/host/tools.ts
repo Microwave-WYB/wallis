@@ -8,8 +8,10 @@
 // declared tools:
 // - file tools from its workspace access, named as in pi: `read` gives
 //   read and ls, `write` adds write, edit and export_artifact, `exec` adds
-//   bash (in its sandbox). `/w` is the scratch dir; mounts and
-//   `/run/wallis/inputs` are read-only. `read` returns images as image
+//   bash (in its sandbox). `/w` is the workspace: the session's layers with
+//   the call's own upper dir on top (reads resolve through them as overlayfs
+//   does, writes go to the upper dir); `/in`, `/in/trees/<hex>` and
+//   `/mnt/<name>` are read-only. `read` returns images as image
 //   content;
 // - `ask(message)`, opt-in: the turn ends and the reply becomes its result;
 // - custom tools and MCP tools, from their sources (toolsets.ts), over one
@@ -33,6 +35,7 @@ import { type McpClient, toLlmContent } from "@earendil-works/pi-mcp";
 import { type Json, Type } from "../sdk/index.ts";
 import Value from "typebox/value";
 import { LAYOUT, runSpawn } from "./confine.ts";
+import { listIn, resolveIn } from "./layers.ts";
 import { type NodeSpec, validateSubmission } from "./executor.ts";
 import { canonical } from "./render.ts";
 import { resolveAgentTools, type Source, sourceKey, type ToolInfo, toolInfos } from "./toolsets.ts";
@@ -318,24 +321,39 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 	const access = spec.declaration.access;
 	if (access > 0) {
 		const box = spec.sandbox;
-		/** A path as the agent sees it (`/w/...`, `/w/<mount>/...`, `/run/wallis/inputs/...`) mapped to the host. */
-		const toHost = (path: string): { abs: string; writable: boolean } => {
+		/**
+		 * A path as the agent sees it (`/w/...`, `/in/...`, `/in/trees/<hex>/...`,
+		 * `/mnt/<name>/...`) mapped to the host: for reading, through the
+		 * workspace's layers; `upper` is where a write to it lands.
+		 */
+		const toHost = (path: string): { abs: string; writable: boolean; upper: string | null; rest: string } => {
 			const p = posix.normalize(path.startsWith("/") ? path : `${LAYOUT.work}/${path}`);
 			const under = (root: string) => p === root || p.startsWith(`${root}/`);
-			if (under(LAYOUT.inputs)) return { abs: join(ws.inputs, p.slice(LAYOUT.inputs.length)), writable: false };
+			const after = (root: string) => p.slice(root.length).replace(/^\//, "");
+			for (const t of ws.trees) {
+				if (!under(t.at)) continue;
+				const found = resolveIn({ lowers: t.lowers, upper: join(ws.root, ".no-upper"), ovl: "" }, after(t.at));
+				return { abs: found?.path ?? join(ws.root, ".missing", after(t.at)), writable: false, upper: null, rest: after(t.at) };
+			}
+			if (under(LAYOUT.mounts)) {
+				const [first, ...more] = after(LAYOUT.mounts).split("/");
+				if (!first || !(first in ws.mounts)) throw new Error(`${path} is not a mount of this node`);
+				return { abs: join(ws.mounts[first]!, ...more), writable: false, upper: null, rest: "" };
+			}
+			if (under(LAYOUT.inputs)) return { abs: join(ws.inputs, after(LAYOUT.inputs)), writable: false, upper: null, rest: "" };
 			if (!under(LAYOUT.work)) throw new Error(`${path} is outside this node's sandbox`);
-			const rest = p.slice(LAYOUT.work.length).replace(/^\//, "");
-			const [first, ...more] = rest.split("/");
-			if (first && first in ws.mounts) return { abs: join(ws.mounts[first]!, ...more), writable: false };
-			return { abs: join(ws.scratch, rest), writable: true };
+			const rest = after(LAYOUT.work);
+			const upper = join(ws.scratch, rest);
+			if (ws.work === null) return { abs: upper, writable: true, upper, rest };
+			return { abs: resolveIn(ws.work, rest)?.path ?? upper, writable: true, upper, rest };
 		};
 		const writable = (path: string) => {
 			const target = toHost(path);
-			if (!target.writable || !within([ws.scratch], target.abs)) throw new Error(`${path} is read-only: only your scratch dir (${LAYOUT.work}) is writable`);
-			return target.abs;
+			if (!target.writable || target.upper === null || !within([ws.scratch], target.upper)) throw new Error(`${path} is read-only: only your workspace (${LAYOUT.work}) is writable`);
+			return target.upper;
 		};
-		const mounts = Object.keys(ws.mounts).map((m) => `${LAYOUT.work}/${m}`).join(", ") || "none";
-		const where = `${LAYOUT.work} is your scratch dir (writable, the working directory); mounts ${mounts} and ${LAYOUT.inputs} are read-only`;
+		const mounts = Object.keys(ws.mounts).map((m) => `${LAYOUT.mounts}/${m}`).join(", ") || "none";
+		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files) and the mounts ${mounts} are read-only`;
 		const builtins: Record<string, WallisToolRun> = {
 			read: {
 				name: "read",
@@ -371,9 +389,11 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				run: async (args) => {
 					const { path, oldText, newText } = args as { path: string; oldText: string; newText: string };
 					const abs = writable(path);
-					const text = readFileSync(abs, "utf8");
+					// Read through the layers (the file may be from an earlier call); written to the upper dir.
+					const text = readFileSync(toHost(path).abs, "utf8");
 					const count = oldText === "" ? 0 : text.split(oldText).length - 1;
 					if (count !== 1) return { text: `oldText occurs ${count} times in ${path}; it must occur exactly once`, isError: true };
+					mkdirSync(dirname(abs), { recursive: true });
 					writeFileSync(abs, text.replace(oldText, () => newText));
 					return { text: `edited ${path}` };
 				},
@@ -384,11 +404,13 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				parameters: { type: "object", properties: { path: { type: "string" }, limit: { type: "integer", minimum: 1 } } },
 				run: async (args) => {
 					const { path, limit } = args as { path?: string; limit?: number };
-					const dir = toHost(path ?? LAYOUT.work).abs;
-					const entries = readdirSync(dir)
+					const target = toHost(path ?? LAYOUT.work);
+					const dir = target.abs;
+					const merged = target.upper !== null && ws.work !== null ? listIn(ws.work, target.rest) : null;
+					const entries = (merged ?? readdirSync(dir))
 						.sort()
 						.slice(0, limit ?? LS_LIMIT)
-						.map((name) => (statSync(resolve(dir, name)).isDirectory() ? `${name}/` : name));
+						.map((name) => (statSync(toHost(posix.join(path ?? LAYOUT.work, name)).abs).isDirectory() ? `${name}/` : name));
 					return { text: entries.join("\n"), value: entries };
 				},
 			},

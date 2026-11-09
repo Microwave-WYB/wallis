@@ -3,7 +3,7 @@
 Train one candidate config. Args: model (an artifact ref; the plugin is
 mounted read-only; its path is in the input (`model.path`)), config, scope
 (trial|formal), max_epochs, time_budget_minutes, seed, data_scope. The
-dataset is the read-only mount at /w/data (cwd is /w, the call's scratch dir). Output: {status,
+dataset is the read-only mount at /mnt/data (cwd is /w, the call's scratch dir). Output: {status,
 checkpoint, minutes}, where checkpoint is an artifact draft
 {"artifact": "<file in the scratch dir>", "media": "application/x-checkpoint"}.
 

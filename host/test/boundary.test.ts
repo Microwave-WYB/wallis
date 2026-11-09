@@ -79,7 +79,7 @@ test("an invalid submit_result goes back to the model; the node completes on a v
 	assert.deepEqual(r.executor.submissions.map((s) => s.errors.length > 0), [true, true, false]);
 	// The log keeps only the final, valid output, with the whole call's usage.
 	const returned = r.log.filter((e) => e.type === "agent_returned");
-	assert.deepEqual(returned, [{ type: "agent_returned", id: "#0", output: { answer: 2 }, usage: { usd: 0.03, tokens: 300, turns: 3 }, model: "fake/default", dialogue: null }]);
+	assert.deepEqual(returned, [{ type: "agent_returned", id: "#0", output: { answer: 2 }, usage: { usd: 0.03, tokens: 300, turns: 3 }, model: "fake/default", dialogue: null, layers: [] }]);
 	assert.ok(!JSON.stringify(r.log).includes('"two"'));
 	// Replay is identical: a second run gives the same log, a resume executes nothing.
 	const again = await run("submit", { strict });

@@ -1,6 +1,7 @@
 // Reading runs without driving them: status from a refold of the log, the
 // derived `stopped`, what needs attention, and agent-readable summaries.
 
+import { spawnSync } from "node:child_process";
 import { constants, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
@@ -344,8 +345,9 @@ export function forkRun(source: string, target: string): RunPaths {
 	if (existsSync(to.log)) throw new Error(`run ${to.id} already exists`);
 	const events = new EventLog(from.log).read().filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested");
 	mkdirSync(to.dir, { recursive: true });
-	// Blobs first: the log names them.
+	// Blobs and layers first: the log names them. Both are immutable, so hardlinks share them.
 	shareBlobs(from.dir, to.dir);
+	if (existsSync(join(from.dir, "layers"))) spawnSync("cp", ["-al", join(from.dir, "layers"), join(to.dir, "layers")]);
 	// The work dirs (session scratch dirs): later session calls see their /w. Reflinked where
 	// the filesystem can, else copied.
 	if (existsSync(join(from.dir, "work"))) cpSync(join(from.dir, "work"), join(to.dir, "work"), { recursive: true, mode: constants.COPYFILE_FICLONE });

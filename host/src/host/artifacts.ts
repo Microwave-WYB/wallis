@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
+import { layerDir, prepareWork, removeWork, resolveIn, type Work } from "./layers.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
@@ -117,12 +118,14 @@ export class ArtifactError extends Error {
  * refs, storing the files. A draft must name a regular file inside the
  * node's scratch dir.
  */
-export function resolveDrafts(value: Json, runDir: string, scratch: string | null): Json {
+export function resolveDrafts(value: Json, runDir: string, scratch: string | Work | null): Json {
 	if (isDraft(value)) {
 		if (!scratch) throw new ArtifactError(`artifact ${value.artifact}: this node has no scratch dir`);
-		const path = resolve(scratch, value.artifact);
-		const rel = relative(scratch, path);
+		const base = typeof scratch === "string" ? scratch : scratch.upper;
+		const rel = relative(base, resolve(base, value.artifact));
 		if (rel.startsWith("..") || rel.startsWith(sep) || rel === "") throw new ArtifactError(`artifact ${value.artifact} is outside the node's scratch dir`);
+		// An agent's workspace: the file may be in any of its session's layers.
+		const path = typeof scratch === "string" ? join(scratch, rel) : (resolveIn(scratch, rel)?.path ?? join(scratch.upper, rel));
 		if (!existsSync(path) || !lstatSync(path).isFile()) throw new ArtifactError(`artifact ${value.artifact} is not a file in the node's scratch dir`, value.artifact);
 		return storeFile(runDir, path, value.media, value.name ?? basename(path)) as unknown as Json;
 	}
@@ -154,8 +157,12 @@ export interface NodeDirs {
 	readonly root: string;
 	/** `<inputs>/<sha256 hex>/<name>` for every artifact in the node's input. */
 	readonly inputs: string;
-	/** The call's private writable dir: `/w` inside its sandbox. */
+	/** Where writes to `/w` land: a command's private dir, or an agent call's upper dir. */
 	readonly scratch: string;
+	/** An agent call's workspace: its session's layers under `scratch` (null for a command). */
+	readonly work: Work | null;
+	/** Every Tree in the input, read-only at `/in/trees/<hex>`: its layers, bottom first. */
+	readonly trees: readonly { readonly at: string; readonly lowers: readonly string[] }[];
 	/** Mounts by name, read-only. */
 	readonly mounts: Readonly<Record<string, string>>;
 	/** Host-owned: where capped tool and codemode output spills. Not a tool-visible dir. */
@@ -176,10 +183,20 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
  * input artifacts. An agent call's scratch dir is its session's (`scratch`),
  * which outlives the call.
  */
-export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>, scratch?: string): NodeDirs {
+export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>, layers: readonly string[] | null = null): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
-	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: scratch ?? join(root, "scratch"), mounts, spill: join(root, "spill") };
 	verifyRefs(input, runDir);
+	let work: Work | null = null;
+	if (layers !== null) {
+		const prepared = prepareWork(runDir, root, layers);
+		if ("missing" in prepared) throw new ArtifactError(`layer ${prepared.missing} of the session's workspace is not in the store`);
+		work = prepared;
+	}
+	const trees = treesIn(input).map((t) => {
+		for (const l of t.layers) if (!existsSync(layerDir(runDir, l))) throw new ArtifactError(`layer ${l} of a tree in the input is not in the store`);
+		return { at: treePath(t), lowers: t.layers.map((l) => layerDir(runDir, l)) };
+	});
+	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: work?.upper ?? join(root, "scratch"), work, trees, mounts, spill: join(root, "spill") };
 	mkdirSync(dirs.inputs, { recursive: true });
 	mkdirSync(dirs.scratch, { recursive: true });
 	for (const ref of refsIn(input)) {
@@ -192,17 +209,44 @@ export function prepareNode(runDir: string, id: string, input: Json, mounts: Rea
 	return dirs;
 }
 
-/** The input as a command's `run` sees it: every artifact ref with its `path` inside the sandbox. */
+/** A Tree value: a session's workspace, as its layers (see `ctx.files`). */
+export type TreeRef = { readonly kind: "tree"; readonly layers: readonly string[] };
+
+export function isTree(value: unknown): value is TreeRef {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const v = value as Record<string, unknown>;
+	return v.kind === "tree" && Array.isArray(v.layers) && v.layers.every((l) => typeof l === "string" && DIGEST.test(l));
+}
+
+/** Every Tree in a JSON value. */
+export function treesIn(value: Json): TreeRef[] {
+	const found: TreeRef[] = [];
+	const walk = (v: Json) => {
+		if (isTree(v)) found.push(v);
+		else if (Array.isArray(v)) v.forEach(walk);
+		else if (v !== null && typeof v === "object") Object.values(v).forEach(walk);
+	};
+	walk(value);
+	return found;
+}
+
+/** Where a Tree is mounted inside a sandbox: `/in/trees/<hex of its layers>`. */
+export function treePath(tree: TreeRef): string {
+	return `/in/trees/${createHash("sha256").update(tree.layers.join("\n")).digest("hex").slice(0, 16)}`;
+}
+
+/** The input as a command's `run` sees it: every artifact ref and Tree with its `path` inside the sandbox. */
 export function mountedInput(value: Json, inputsAt: string): Json {
+	if (isTree(value)) return { kind: "tree", layers: [...value.layers], path: treePath(value) };
 	if (isRef(value)) return { ...value, path: `${inputsAt}/${value.digest.slice("sha256:".length)}/${value.name}` };
 	if (Array.isArray(value)) return value.map((v) => mountedInput(v, inputsAt));
 	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mountedInput(v, inputsAt)]));
 	return value;
 }
 
-/** Deletes a done node's dirs: what it did not export is discarded. */
+/** Deletes a done node's dirs: what it did not export (or commit as a layer) is discarded. */
 export function discardNode(runDir: string, id: string): void {
-	rmSync(join(runDir, "work", nodeDirName(id)), { recursive: true, force: true });
+	removeWork(join(runDir, "work", nodeDirName(id)));
 }
 
 /** Shares the blobs of one run with another (fork): hardlinks, else copies. */

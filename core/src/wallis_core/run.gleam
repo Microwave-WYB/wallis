@@ -95,10 +95,9 @@ type Run {
 }
 
 /// Where a session value comes from: the call (slot) and attempt that
-/// answered with it, and the first call of its lineage (whose workspace it
-/// shares until workspaces are layers).
+/// answered with it, and its workspace: layers, bottom first.
 type Origin {
-  Origin(after: Slot, attempt: Int, root: Slot)
+  Origin(after: Slot, attempt: Int, layers: List(Digest))
 }
 
 type Spent {
@@ -108,12 +107,14 @@ type Spent {
 /// A call of the body, by kind. `inbox` (newest first) lists the
 /// interventions it received. `attempts` are newest first and never empty.
 type Call {
-  /// A call of a session value (`None`: a new session).
+  /// A call of a session value (`None`: a new session, whose workspace
+  /// starts from the layers `from`).
   AgentCall(
     id: RequestId,
     agent: String,
     input: Value,
     session: Option(SessionId),
+    from: List(Digest),
     inbox: List(InboxMessage),
     attempts: List(Attempt(AgentAttempt)),
   )
@@ -378,7 +379,7 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       ),
       [types.Checkpoint],
     )
-    types.AgentReturned(id:, output:, usage:, model:, dialogue:) ->
+    types.AgentReturned(id:, output:, usage:, model:, dialogue:, layers:) ->
       agent_returned(
         run,
         rid(id),
@@ -386,6 +387,7 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
         usage,
         model,
         option.map(dialogue, ids.digest),
+        option.map(layers, list.map(_, ids.digest)),
       )
     types.AgentFailed(id:, failure:, usage:, model:) ->
       agent_settled(run, rid(id), usage, model, fn(name) {
@@ -808,11 +810,24 @@ fn replace_head(attempts: List(Attempt(s)), state: s) -> List(Attempt(s)) {
 /// it depends on the whole dialogue before it.
 fn slot_of(node: Digest, request: Request, occurrence: String) -> Slot {
   let #(kind, name, body, within) = case request {
-    types.Call(agent:, input:, session:) -> #(
+    // A new session is keyed by the layers it starts from.
+    types.Call(agent:, input:, session: Some(s), ..) -> #(
       "call",
       agent,
       input,
-      option.map(session, ids.session_id),
+      Some(ids.session_id(s)),
+    )
+    types.Call(agent:, input:, session: None, from: []) -> #(
+      "call",
+      agent,
+      input,
+      None,
+    )
+    types.Call(agent:, input:, session: None, from:) -> #(
+      "call",
+      agent,
+      input,
+      Some(ids.session_id("new:" <> string.join(from, ","))),
     )
     types.Command(command:, input:) -> #("command", command, input, None)
     types.Tool(tool:, input:, ..) -> #("tool", tool, input, None)
@@ -837,7 +852,7 @@ fn requested(
     Error(Nil) -> new_attempt(run, id, slot, request, [])
     Ok(call) ->
       case live(call) {
-        LiveSettled(entry) -> #(run, [deliver(id, slot, call, entry)])
+        LiveSettled(entry) -> #(run, [deliver(run, id, slot, call, entry)])
         LiveOpen -> {
           let moved = call_id(call) != id
           let run = put(run, slot, with_id(call, id))
@@ -950,22 +965,35 @@ fn answer_effect(id: RequestId, entry: Entry) -> Effect {
 }
 
 /// The answer of a settled call. An agent call answers with its output and
-/// the session value after it.
-fn deliver(id: RequestId, slot: Slot, call: Call, entry: Entry) -> Effect {
+/// the session value after it (its id and its workspace's layers).
+fn deliver(
+  run: Run,
+  id: RequestId,
+  slot: Slot,
+  call: Call,
+  entry: Entry,
+) -> Effect {
   case call, entry {
-    AgentCall(attempts:, ..), Answered(output) ->
+    AgentCall(attempts:, ..), Answered(output) -> {
+      let next = ids.next_session(slot, list.length(attempts))
+      let layers = case dict.get(run.sessions, next) {
+        Ok(origin) -> origin.layers
+        Error(Nil) -> []
+      }
       types.Deliver(
         ids.request_text(id),
         value.object([
           #("output", output),
+          #("session", value.JString(ids.session_text(next))),
           #(
-            "session",
-            value.JString(
-              ids.session_text(ids.next_session(slot, list.length(attempts))),
+            "layers",
+            value.JArray(
+              list.map(layers, fn(l) { value.JString(ids.digest_text(l)) }),
             ),
           ),
         ]),
       )
+    }
     AgentCall(..), Errored(_) | AgentCall(..), Refused(_) ->
       answer_effect(id, entry)
     CommandCall(..), _
@@ -1040,7 +1068,7 @@ fn begin(
   prior: List(Call),
 ) -> #(Run, List(Effect)) {
   case request {
-    types.Call(agent: name, input:, session:) -> {
+    types.Call(agent: name, input:, session:, from:) -> {
       // A session value is one this run answered with (or a new one).
       let known = case session {
         Some(s) -> dict.has_key(run.sessions, ids.session_id(s))
@@ -1062,6 +1090,7 @@ fn begin(
               agent: name,
               input:,
               session: option.map(session, ids.session_id),
+              from: list.map(from, ids.digest),
               inbox: [],
               attempts: [
                 Tried(AgentAttempt(0, agent.max_turns, [], state)),
@@ -1185,7 +1214,7 @@ fn call_effect(
         transcript: dialogue.transcript,
         note: dialogue.note,
         session: option.map(session, ids.session_text),
-        lineage: ids.slot_text(lineage(run, slot, call)),
+        layers: list.map(layers_of(run, call), ids.digest_text),
         history: history_of(run, call) |> option.map(ids.digest_text),
         checkpoint: dialogue.checkpoint |> option.map(ids.digest_text),
         recorded: list.reverse(a.tools),
@@ -1324,7 +1353,16 @@ fn settle_agent(
   served: Option(String),
   usage: Usage,
 ) -> #(Run, List(Effect)) {
-  settle_agent_with(run, slot, call, entry, served, usage, dialogue_after(run, call))
+  settle_agent_with(
+    run,
+    slot,
+    call,
+    entry,
+    served,
+    usage,
+    dialogue_after(run, call),
+    None,
+  )
 }
 
 fn settle_agent_with(
@@ -1335,8 +1373,10 @@ fn settle_agent_with(
   served: Option(String),
   usage: Usage,
   dialogue: Option(Digest),
+  layers: Option(List(Digest)),
 ) -> #(Run, List(Effect)) {
-  let root = lineage(run, slot, call)
+  // The workspace after the call: the layers the host reports, else unchanged.
+  let layers = option.unwrap(layers, layers_of(run, call))
   let call =
     update_agent(call, fn(a) {
       AgentAttempt(
@@ -1354,7 +1394,7 @@ fn settle_agent_with(
         sessions: dict.insert(
           run.sessions,
           ids.next_session(slot, n),
-          Origin(slot, n, root),
+          Origin(slot, n, layers),
         ),
       )
     }
@@ -1365,9 +1405,8 @@ fn settle_agent_with(
     | OrchestratorCall(..), _
     | RefusedCall(..), _ -> run
   }
-  #(put(spend(run, usage), slot, call), [
-    deliver(call_id(call), slot, call, entry),
-  ])
+  let run = put(spend(run, usage), slot, call)
+  #(run, [deliver(run, call_id(call), slot, call, entry)])
 }
 
 /// A returned agent call: the dialogue it names is the session's after it.
@@ -1378,6 +1417,7 @@ fn agent_returned(
   usage: Usage,
   model: String,
   dialogue: Option(Digest),
+  layers: Option(List(Digest)),
 ) -> #(Run, List(Effect)) {
   case lookup(run, id) {
     Ok(#(slot, call)) ->
@@ -1398,6 +1438,7 @@ fn agent_returned(
               served,
               usage,
               dialogue,
+              layers,
             )
           #(run, [types.Checkpoint, ..effects])
         }
@@ -1406,20 +1447,18 @@ fn agent_returned(
   }
 }
 
-/// The first call of a session value's lineage: its workspace, until
-/// workspaces are layers.
-fn lineage(run: Run, slot: Slot, call: Call) -> Slot {
+/// The workspace a call starts from: its session value's layers, or for a
+/// new session the layers it was seeded `from`.
+fn layers_of(run: Run, call: Call) -> List(Digest) {
   case call {
     AgentCall(session: Some(s), ..) ->
       case dict.get(run.sessions, s) {
-        Ok(origin) -> origin.root
-        Error(Nil) -> slot
+        Ok(origin) -> origin.layers
+        Error(Nil) -> []
       }
-    AgentCall(session: None, ..)
-    | CommandCall(..)
-    | ToolCall(..)
-    | OrchestratorCall(..)
-    | RefusedCall(..) -> slot
+    AgentCall(session: None, from:, ..) -> from
+    CommandCall(..) | ToolCall(..) | OrchestratorCall(..) | RefusedCall(..) ->
+      []
   }
 }
 

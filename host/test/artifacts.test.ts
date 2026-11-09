@@ -77,11 +77,10 @@ test("artifacts flow between commands and agents by ref; argv and parse are type
 	const log = readFileSync(join(s.dir, "log.jsonl"), "utf8");
 	assert.doesNotMatch(log, /"artifact":/);
 	assert.doesNotMatch(log, /not-exported/);
-	// Calls' dirs are discarded; only the writer session's scratch dir stays, cleaned with the run.
-	const left = existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [];
-	assert.equal(left.length, 1);
-	assert.match(left[0]!, /^lineage-[0-9a-f]{16}$/);
-	assert.deepEqual(readdirSync(join(s.dir, "work", left[0]!)), ["scratch"]);
+	// Calls' dirs are discarded; what the writer left in its /w is a layer of its session.
+	assert.deepEqual(existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [], []);
+	const layers = readdirSync(join(s.dir, "layers")).filter((f) => f.endsWith(".json"));
+	assert.equal(layers.length, 1);
 	const started = new EventLog(join(s.dir, "log.jsonl")).read()[0] as { pin: { inputs: Record<string, string> } };
 	assert.match(started.pin.inputs["mount.corpus"]!, /^mount:sha256:[0-9a-f]{64}$/);
 	// Run metadata: resolved binaries with versions, and the base.
@@ -162,7 +161,7 @@ test("setup runs once per digest with the network on, writes $WALLIS_ENV, and it
 	);
 });
 
-test("a session's scratch dir outlives its calls; a done call's own dir is deleted", { skip }, async () => {
+test("an idle call keeps its workspace's changes; when it is done they are a layer and its own dir is deleted", { skip }, async () => {
 	const s = setup();
 	const executor = () =>
 		new FakeExecutor({
@@ -178,16 +177,15 @@ test("a session's scratch dir outlives its calls; a done call's own dir is delet
 		});
 	const idle = await run(s, { executor: executor() });
 	const node = idle.run.nodes.find((n) => n.type === "node_idle")!;
-	// The session's lineage keeps one scratch dir (named by its first call's slot).
-	const lineage = readdirSync(join(s.dir, "work")).filter((d) => d.startsWith("lineage-"));
-	assert.equal(lineage.length, 1);
-	const scratch = join(s.dir, "work", lineage[0]!, "scratch");
+	// The idle call's changes wait in its upper dir, across the host's exit.
 	const own = join(s.dir, "work", node.id.replace(/[^A-Za-z0-9._-]/g, "_"));
-	assert.equal(readFileSync(join(scratch, "draft.md"), "utf8"), "draft");
-	assert.ok(existsSync(own));
+	assert.equal(readFileSync(join(own, "upper", "draft.md"), "utf8"), "draft");
 	const done = await run(s, { executor: executor(), sends: [{ node: node.id, text: "yes" }] });
 	const report = (done.outcome as unknown as { value: { report: { digest: string } } }).value.report;
 	assert.equal(readFileSync(blobPath(s.dir, report.digest), "utf8"), "draft, short");
-	assert.ok(existsSync(join(scratch, "report.md")), "the session's scratch dir stays");
 	assert.ok(!existsSync(own), "the call's own dir is gone");
+	// Its changes are the session's new layer: content-addressed, with its manifest.
+	const manifests = readdirSync(join(s.dir, "layers")).filter((f) => f.endsWith(".json"));
+	const mine = manifests.find((f) => "report.md" in (JSON.parse(readFileSync(join(s.dir, "layers", f), "utf8")) as object))!;
+	assert.equal(readFileSync(join(s.dir, "layers", mine.replace(/\.json$/, ""), "draft.md"), "utf8"), "draft");
 });

@@ -693,6 +693,22 @@ export type CallableNode<I extends TSchema = TSchema, O extends TSchema = TSchem
 declare const SESSION_TYPES: unique symbol;
 
 /**
+ * A directory tree as a value: a session's workspace, named by its layers
+ * (`ctx.files(s)`), without copying. In a command's or an agent's input it
+ * is mounted read-only (its `path` inside the sandbox is given to `run`);
+ * a session seeded `from` it gets it copy-on-write.
+ */
+export interface Tree {
+	readonly kind: "tree";
+	readonly layers: readonly string[];
+}
+
+/** The schema of a Tree in an input or output. */
+export function TreeValue() {
+	return Type.Object({ kind: Type.Literal("tree"), layers: Type.Array(Type.String({ pattern: "^sha256:[0-9a-f]{64}$" })) }, { additionalProperties: false });
+}
+
+/**
  * A conversation with one agent, as a value: `ctx.call(session, input)`
  * appends the input to the session's dialogue as a new message and returns
  * the agent's validated output and the session value after the call. The
@@ -705,6 +721,8 @@ export interface Session<I extends TSchema = TSchema, O extends TSchema = TSchem
 	readonly kind: "session";
 	readonly agent: string;
 	readonly id: string | null;
+	/** Its workspace (`/w`): layers in the run's store, bottom first. `ctx.files(s)` names them as a Tree. */
+	readonly layers: readonly string[];
 	/** Types only: the agent's input and output. */
 	readonly [SESSION_TYPES]?: { readonly input: I; readonly output: O };
 }
@@ -760,8 +778,14 @@ export interface Ctx {
 	call<P, S extends TSchema>(tool: CustomTool<P, unknown>, input: NoInfer<P>, schema: S): Promise<Static<S>>;
 	call(tool: McpTool | undefined, input: { readonly [key: string]: Json }): Promise<unknown>;
 	call<S extends TSchema>(tool: McpTool | undefined, input: { readonly [key: string]: Json }, schema: S): Promise<Static<S>>;
-	/** A new session with an agent (no call yet): the only way to call one. A value: it takes no request id. */
-	session<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>): Session<I, O>;
+	/**
+	 * A new session with an agent (no call yet): the only way to call one. A
+	 * value: it takes no request id. `from` seeds its workspace with a Tree
+	 * (copy-on-write).
+	 */
+	session<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>, options?: { readonly from?: Tree }): Session<I, O>;
+	/** A session's workspace as a Tree, without copying. */
+	files(session: Session): Tree;
 	/** Runs branches concurrently; each gets its own request ids. */
 	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(
 		branches: B,

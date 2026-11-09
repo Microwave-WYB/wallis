@@ -67,6 +67,9 @@ export function parseModel(text: string): { provider: string; id: string; thinki
 	return { provider: text.slice(0, slash), id: rest, thinking };
 }
 
+/** The one note on the dirs, for an agent with a workspace. */
+const WORKSPACE = "Your files: /w is your workspace (writable; it carries over to the next call of this conversation), /in holds your input files and /mnt/<name> shared data (read-only), /tmp is scratch.";
+
 const SYSTEM = `Work only with the tools you are given; codemode runs a script that can call them all, and sees your full input as \`input\`.
 When you are done, call submit_result with a result that matches its schema; if it does not match, you get the errors and may resubmit.`;
 
@@ -162,7 +165,7 @@ class PiNodeSession implements NodeSession {
 		this.#compacted = saved?.compacted ?? history?.compacted ?? null;
 		this.#started = saved !== null && saved.messages.length > 0;
 		const { model, thinking } = this.#resolve(spec.model);
-		const system = `${SYSTEM}\n\n${spec.declaration.prompt}`;
+		const system = `${SYSTEM}${spec.declaration.access > 0 ? `\n${WORKSPACE}` : ""}\n\n${spec.declaration.prompt}`;
 		const streamFn = (options.models.streamSimple as (...a: unknown[]) => never).bind(options.models);
 		this.#agent = new Agent({
 			initialState: { systemPrompt: system, model: model as never, thinkingLevel: thinking ?? "off", tools: tools.agentTools(), messages: saved?.messages ?? history?.messages ?? [] },

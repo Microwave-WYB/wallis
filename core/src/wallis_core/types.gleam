@@ -198,6 +198,9 @@ pub type Event {
     usage: Usage,
     model: String,
     dialogue: Option(String),
+    /// The session's layers after the call (its changes as a new layer,
+    /// squashed when deep), written before this event. `None`: unchanged.
+    layers: Option(List(String)),
   )
   /// The agent ended its turn with neither a result nor a question.
   AgentIdle(id: String, message: String, usage: Usage, model: String)
@@ -302,7 +305,7 @@ pub fn event_to_json(event: Event) -> json.Json {
       #("node_digest", json.string(node_digest)),
       #("occurrence", json.string(occurrence)),
     ])
-    AgentReturned(id:, output:, usage:, model:, dialogue:) -> json.object([
+    AgentReturned(id:, output:, usage:, model:, dialogue:, layers:) -> json.object([
       #("type", json.string("agent_returned")),
       #("id", json.string(id)),
       #("output", json_value.to_json(output)),
@@ -311,6 +314,10 @@ pub fn event_to_json(event: Event) -> json.Json {
       #("dialogue", case dialogue {
         option.None -> json.null()
         option.Some(value) -> json.string(value)
+      }),
+      #("layers", case layers {
+        option.None -> json.null()
+        option.Some(value) -> json.array(value, json.string)
       }),
     ])
     AgentIdle(id:, message:, usage:, model:) -> json.object([
@@ -540,7 +547,8 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use usage <- decode.field("usage", usage_decoder())
       use model <- decode.field("model", decode.string)
       use dialogue <- decode.field("dialogue", decode.optional(decode.string))
-      decode.success(AgentReturned(id:, output:, usage:, model:, dialogue:))
+      use layers <- decode.field("layers", decode.optional(decode.list(decode.string)))
+      decode.success(AgentReturned(id:, output:, usage:, model:, dialogue:, layers:))
     }
     "agent_idle" -> {
       use id <- decode.field("id", decode.string)
@@ -733,12 +741,15 @@ pub fn event_decoder() -> decode.Decoder(Event) {
 
 
 
+
+
 pub type Request {
   /// A call of a session value: `session` is its id (`None` for a new
   /// session, which has had no call). The call continues that session's
   /// dialogue; its answer carries the session after it. Calling the same
-  /// value again is a branch.
-  Call(agent: String, input: Value, session: Option(String))
+  /// value again is a branch. `from`: the layers a new session's workspace
+  /// starts from (a Tree; empty otherwise).
+  Call(agent: String, input: Value, session: Option(String), from: List(String))
   Command(command: String, input: Value)
   /// A tool called by the body (a custom tool or an MCP tool). `replay`
   /// says whether a call in flight at a crash may be made again.
@@ -749,7 +760,7 @@ pub type Request {
 
 pub fn request_to_json(request: Request) -> json.Json {
   case request {
-    Call(agent:, input:, session:) -> json.object([
+    Call(agent:, input:, session:, from:) -> json.object([
       #("type", json.string("call")),
       #("agent", json.string(agent)),
       #("input", json_value.to_json(input)),
@@ -757,6 +768,7 @@ pub fn request_to_json(request: Request) -> json.Json {
         option.None -> json.null()
         option.Some(value) -> json.string(value)
       }),
+      #("from", json.array(from, json.string)),
     ])
     Command(command:, input:) -> json.object([
       #("type", json.string("command")),
@@ -784,7 +796,8 @@ pub fn request_decoder() -> decode.Decoder(Request) {
       use agent <- decode.field("agent", decode.string)
       use input <- decode.field("input", json_value.decoder())
       use session <- decode.field("session", decode.optional(decode.string))
-      decode.success(Call(agent:, input:, session:))
+      use from <- decode.field("from", decode.list(decode.string))
+      decode.success(Call(agent:, input:, session:, from:))
     }
     "command" -> {
       use command <- decode.field("command", decode.string)
@@ -805,6 +818,8 @@ pub fn request_decoder() -> decode.Decoder(Request) {
     _ -> decode.failure(Command(command: "", input: json_value.JNull), "Request")
   }
 }
+
+
 
 
 
@@ -1123,9 +1138,9 @@ pub type Effect {
     note: Option(String),
     /// The session value the call continues (`None`: a new session).
     session: Option(String),
-    /// The first call of the session's lineage (its slot): whose workspace
-    /// the call shares, until workspaces are layers.
-    lineage: String,
+    /// The session's workspace: its layers (blob-store dirs), bottom first;
+    /// the call's `/w` is an overlay of them with its own upper dir.
+    layers: List(String),
     /// The digest of the session's dialogue before this call (a blob): where
     /// a new attempt starts. `None` for a session's first call.
     history: Option(String),
@@ -1160,7 +1175,7 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
     Checkpoint -> json.object([
       #("type", json.string("checkpoint")),
     ])
-    CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, lineage:, history:, checkpoint:, recorded:) -> json.object([
+    CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, layers:, history:, checkpoint:, recorded:) -> json.object([
       #("type", json.string("call_agent")),
       #("id", json.string(id)),
       #("agent", json.string(agent)),
@@ -1178,7 +1193,7 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
         option.None -> json.null()
         option.Some(value) -> json.string(value)
       }),
-      #("lineage", json.string(lineage)),
+      #("layers", json.array(layers, json.string)),
       #("history", case history {
         option.None -> json.null()
         option.Some(value) -> json.string(value)
@@ -1251,11 +1266,11 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
       use transcript <- decode.field("transcript", decode.list(message_decoder()))
       use note <- decode.field("note", decode.optional(decode.string))
       use session <- decode.field("session", decode.optional(decode.string))
-      use lineage <- decode.field("lineage", decode.string)
+      use layers <- decode.field("layers", decode.list(decode.string))
       use history <- decode.field("history", decode.optional(decode.string))
       use checkpoint <- decode.field("checkpoint", decode.optional(decode.string))
       use recorded <- decode.field("recorded", decode.list(tool_result_decoder()))
-      decode.success(CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, lineage:, history:, checkpoint:, recorded:))
+      decode.success(CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, layers:, history:, checkpoint:, recorded:))
     }
     "run_command" -> {
       use id <- decode.field("id", decode.string)
@@ -1298,6 +1313,8 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
     _ -> decode.failure(Checkpoint, "Effect")
   }
 }
+
+
 
 
 

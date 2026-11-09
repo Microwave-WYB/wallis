@@ -48,7 +48,7 @@ test("each MCP connection gets its own scratch dir; a toolset runs bundled under
 	});
 	const sources = new ToolSources({
 		decl: {
-			mcp: { mcpServers: { probe: { command: "node", args: ["/w/srv/server.mjs"] } } },
+			mcp: { mcpServers: { probe: { command: "node", args: ["/mnt/srv/server.mjs"] } } },
 			mcpServers: { probe: { sandbox: "srv", network: "none" } },
 			toolsets: { "./lib.ts": { sandbox: "tools", secrets: ["TOKEN"], network: "none" } },
 		} as never,
