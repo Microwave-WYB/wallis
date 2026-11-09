@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runSpawn } from "../src/host/confine.ts";
-import { appendInbox, bwrapAvailable, FakeExecutor, runPaths, runWorkflow } from "../src/host/index.ts";
+import { appendInbox, bwrapAvailable, FakeExecutor, ProcessCommands, runPaths, runWorkflow } from "../src/host/index.ts";
 import { layerDir, listIn, readManifest } from "../src/host/layers.ts";
 import { tmp } from "./util.ts";
 
@@ -138,3 +138,23 @@ test("a host killed between a layer's commit and the event that names it resumes
 		for (const l of e.layers) assert.ok(existsSync(layerDir(dir, l)) && existsSync(`${layerDir(dir, l)}.json`), l);
 	}
 });
+
+/** The shell agent, run for real in its bwrap sandbox. */
+function shell() {
+	return new FakeExecutor({
+		shell: async (call) => {
+			if (call.sandbox.type !== "bwrap") return { giveUp: `no sandbox: ${call.sandbox.type}` };
+			const r = await runSpawn(call.sandbox.spawn(["bash", "-c", (call.input as { script: string }).script]), "", { timeoutMs: 20_000 });
+			return { submit: { out: `${r.stdout}${r.stderr}` } };
+		},
+	});
+}
+
+const bwrap = { skip: !bwrapAvailable() && "bwrap cannot create a sandbox here" };
+const real = (dir: string, mode: string) => ({ workflow, dir, input: { mode }, inboxPollMs: null, confine: "require" as const, bins: { bash: "/usr/bin/bash" }, commands: new ProcessCommands() });
+
+test("a one-layer Tree is mounted read-only for a command and for an exec agent", bwrap, async () => {
+	const done = await runWorkflow({ ...real(join(tmp(), "run"), "tree"), executor: shell() });
+	assert.deepEqual(done.outcome, { type: "done", value: { layers: 1, command: "from-tree", agent: "from-tree" } });
+});
+

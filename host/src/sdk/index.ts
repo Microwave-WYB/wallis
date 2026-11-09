@@ -705,7 +705,8 @@ export interface Tree {
 
 /** The schema of a Tree in an input or output. */
 export function TreeValue() {
-	return Type.Object({ kind: Type.Literal("tree"), layers: Type.Array(Type.String({ pattern: "^sha256:[0-9a-f]{64}$" })) }, { additionalProperties: false });
+	// Typed as a Tree (its layers read-only), so `ctx.files(s)` fits it.
+	return Type.Unsafe<Tree>(Type.Object({ kind: Type.Literal("tree"), layers: Type.Array(Type.String({ pattern: "^sha256:[0-9a-f]{64}$" })) }, { additionalProperties: false }));
 }
 
 /**

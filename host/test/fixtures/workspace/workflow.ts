@@ -2,7 +2,7 @@
 // file (or none) into its /w and reports what it sees there; each mode
 // shapes a different tree of session values.
 
-import { defineAgent, defineModels, defineSandbox, Type, workflow } from "wallis";
+import { command, defineAgent, defineModels, defineSandbox, TreeValue, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "fake/default" });
 const Step = Type.Object({ write: Type.Union([Type.String(), Type.Null()]), size: Type.Optional(Type.Integer()) });
@@ -18,17 +18,28 @@ const shell = defineAgent(
 		name: "shell",
 		model: "default",
 		prompt: "Run the script.",
-		input: Type.Object({ script: Type.String() }),
+		input: Type.Object({ script: Type.String(), tree: Type.Optional(TreeValue()) }),
 		output: Type.Object({ out: Type.String() }),
 		workspace: { access: "exec", sandbox: defineSandbox({}, { name: "shell", requires: ["bash"] }) },
 	},
 );
 
+/** Reads a.txt from the Tree in its input, mounted read-only under /in/trees. */
+const peek = command({
+	name: "peek",
+	sandbox: defineSandbox({}, { name: "peek", requires: ["bash"] }),
+	input: Type.Object({ tree: TreeValue() }),
+	output: Type.String(),
+	run: ["bash", "-c", "cat /in/trees/*/a.txt"],
+	parse: (r) => r.stdout.trim(),
+});
+
 export default workflow({
 	name: "workspace",
 	models,
 	agents: [worker, shell],
-	input: Type.Object({ mode: Type.Union([Type.Literal("branches"), Type.Literal("from"), Type.Literal("deep"), Type.Literal("big"), Type.Literal("restart"), Type.Literal("shell")]) }),
+	commands: [peek],
+	input: Type.Object({ mode: Type.Union([Type.Literal("branches"), Type.Literal("from"), Type.Literal("deep"), Type.Literal("big"), Type.Literal("restart"), Type.Literal("shell"), Type.Literal("tree")]) }),
 	output: Type.Any(),
 	run: async (ctx, input) => {
 		if (input.mode === "shell") {
@@ -37,6 +48,14 @@ export default workflow({
 			[, s] = await ctx.call(s, { script: "rm b.txt; cat a.txt" });
 			const [listed] = await ctx.call(s, { script: "ls -R" });
 			return { listed: listed.out };
+		}
+		if (input.mode === "tree") {
+			// A one-layer Tree, to a command and to an exec agent.
+			const [, s] = await ctx.call(ctx.session(shell), { script: "echo from-tree > a.txt" });
+			const tree = ctx.files(s);
+			const command = await ctx.call(peek, { tree });
+			const [agent] = await ctx.call(ctx.session(shell), { script: "cat /in/trees/*/a.txt", tree });
+			return { layers: tree.layers.length, command, agent: agent.out.trim() };
 		}
 		const [, s1] = await ctx.call(ctx.session(worker), { write: "a.txt" });
 		switch (input.mode) {

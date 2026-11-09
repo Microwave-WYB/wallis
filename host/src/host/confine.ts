@@ -206,8 +206,13 @@ export class Sandboxes {
 		if (envDir) args.push(options.setup ? "--bind" : "--ro-bind", envDir, LAYOUT.env);
 		if (dirs.inputs) args.push("--ro-bind", dirs.inputs, LAYOUT.inputs);
 		for (const t of dirs.trees ?? []) {
-			for (const l of t.lowers) args.push("--overlay-src", l);
-			args.push("--ro-overlay", t.at);
+			// bwrap's --ro-overlay needs two layers: none is an empty dir, one is a read-only bind.
+			if (t.lowers.length === 0) args.push("--tmpfs", t.at, "--remount-ro", t.at);
+			else if (t.lowers.length === 1) args.push("--ro-bind", t.lowers[0]!, t.at);
+			else {
+				for (const l of t.lowers) args.push("--overlay-src", l);
+				args.push("--ro-overlay", t.at);
+			}
 		}
 		// An agent's /w: the kernel's overlay of its session's layers and the call's upper dir.
 		if (dirs.overlay && dirs.overlay.lowers.length > 0) {

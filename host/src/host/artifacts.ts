@@ -197,6 +197,8 @@ export function prepareNode(runDir: string, id: string, input: Json, mounts: Rea
 		return { at: treePath(t), lowers: t.layers.map((l) => layerDir(runDir, l)) };
 	});
 	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: work?.upper ?? join(root, "scratch"), work, trees, mounts, spill: join(root, "spill") };
+	// Mount points inside the read-only /in exist before the sandbox starts.
+	for (const t of trees) mkdirSync(join(dirs.inputs, t.at.slice(`${"/in"}/`.length)), { recursive: true });
 	mkdirSync(dirs.inputs, { recursive: true });
 	mkdirSync(dirs.scratch, { recursive: true });
 	for (const ref of refsIn(input)) {
