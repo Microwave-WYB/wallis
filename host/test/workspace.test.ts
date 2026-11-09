@@ -5,6 +5,7 @@
 // upper dir and lists /w through the layers, as the host's file tools do.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -30,6 +31,18 @@ function worker(spoil?: { file: string }) {
 			return { submit: { saw: listIn(call.workspace.work!, "") ?? [] } };
 		},
 	});
+}
+
+/** Every layer in the store still matches its manifest: each file re-hashed. */
+function verifyLayers(dir: string): void {
+	for (const f of readdirSync(join(dir, "layers")).filter((n) => n.endsWith(".json"))) {
+		const manifest = JSON.parse(readFileSync(join(dir, "layers", f), "utf8")) as Record<string, { type: string; sha256?: string }>;
+		for (const [path, entry] of Object.entries(manifest)) {
+			if (entry.type !== "file") continue;
+			const sha = createHash("sha256").update(readFileSync(join(dir, "layers", f.replace(/\.json$/, ""), path))).digest("hex");
+			assert.equal(sha, entry.sha256, `${f} ${path}`);
+		}
+	}
 }
 
 const opts = (dir: string, mode: string) => ({ workflow, dir, input: { mode }, confine: "off" as const, inboxPollMs: null });
@@ -128,9 +141,18 @@ test("a host killed between a layer's commit and the event that names it resumes
 		await runWorkflow({ workflow: ${JSON.stringify(workflow)}, dir: ${JSON.stringify(dir)}, input: { mode: "deep" }, confine: "off", inboxPollMs: null, executor });`;
 	const killed = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", env: { ...process.env, WALLIS_CRASH_AT: "layer:3" }, timeout: 60_000 });
 	assert.equal(killed.signal, "SIGKILL", killed.stderr);
-	const done = await runWorkflow({ workflow, dir, confine: "off", inboxPollMs: null, executor: worker() });
+	// The reissued call writes nothing: f01.txt can only come from the layer it committed.
+	const resumed = new FakeExecutor({
+		worker: (call) => {
+			const step = call.input as { write: string | null };
+			if (step.write !== null && step.write !== "f01.txt") writeFileSync(join(call.workspace.scratch, step.write), step.write);
+			return { submit: { saw: listIn(call.workspace.work!, "") ?? [] } };
+		},
+	});
+	const done = await runWorkflow({ workflow, dir, confine: "off", inboxPollMs: null, executor: resumed });
 	const value = (done.outcome as unknown as { value: { saw: string[] } }).value;
 	assert.deepEqual(value.saw, ["a.txt", ...Array.from({ length: 20 }, (_, i) => `f${String(i).padStart(2, "0")}.txt`)]);
+	verifyLayers(dir);
 	// Every layer the log names is in the store, with its manifest.
 	const { EventLog } = await import("../src/host/log.ts");
 	for (const e of new EventLog(join(dir, "log.jsonl")).read()) {
@@ -194,4 +216,21 @@ test("a file or symlink over a lower layer's directory replaces it: squash and l
 	assert.deepEqual(Object.keys(squashed).sort(), ["a", "b"]);
 	assert.equal(squashed.a!.type, "file");
 	assert.equal(squashed.b!.type, "symlink");
+});
+
+test("a commit marker restores only its own attempt, from the layer, replacing any upper dir left beside it", () => {
+	const dir = tmp();
+	const committed = layerOf(dir, (u) => writeFileSync(join(u, "done.txt"), "done"));
+	const root = join(dir, "work", "_7");
+	mkdirSync(join(root, "upper"), { recursive: true });
+	writeFileSync(join(root, "upper", "stray.txt"), "half a copy");
+	writeFileSync(join(root, "committed"), `${committed} 1`);
+	// A restart (attempt 2) starts fresh: the marker is not its own.
+	const other = prepareWork(dir, root, [], 2);
+	if ("missing" in other) throw new Error("no work");
+	assert.ok(!existsSync(join(root, "committed")));
+	writeFileSync(join(root, "committed"), `${committed} 2`);
+	const mine = prepareWork(dir, root, [], 2);
+	if ("missing" in mine) throw new Error("no work");
+	assert.deepEqual(readdirSync(mine.upper), ["done.txt"]);
 });

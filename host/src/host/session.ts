@@ -953,7 +953,7 @@ export class Session {
 		try {
 			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
 			// The call's /w: its session's layers, with its own upper dir on top.
-			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), effect.layers);
+			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), effect.layers, effect.attempt);
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -1092,7 +1092,7 @@ export class Session {
 								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.work ?? workspace.scratch);
 								if (parsed.ok) {
 									// The call's changes become a layer, written before the event that names it.
-									const committed = workspace.work === null ? null : commitLayer(this.paths.dir, workspace.work, workspace.root);
+									const committed = workspace.work === null ? null : commitLayer(this.paths.dir, workspace.work, workspace.root, effect.attempt);
 									const layers = layersAfter(this.paths.dir, effect.layers, committed);
 									this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage, dialogue: newest, layers });
 								}

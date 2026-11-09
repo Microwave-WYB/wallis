@@ -20,7 +20,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { crashPoint } from "./artifacts.ts";
 
@@ -55,17 +55,28 @@ export function readManifest(runDir: string, digest: string): Manifest {
 	return JSON.parse(readFileSync(`${layerDir(runDir, digest)}.json`, "utf8")) as Manifest;
 }
 
-/** The call's workspace dirs for these layers (each must be in the store). */
-export function prepareWork(runDir: string, root: string, layers: readonly string[]): Work | { readonly missing: string } {
+/** The call's workspace dirs for these layers (each must be in the store), for this attempt of the call. */
+export function prepareWork(runDir: string, root: string, layers: readonly string[], attempt = 1): Work | { readonly missing: string } {
 	for (const l of layers) if (!existsSync(layerDir(runDir, l)) || !existsSync(`${layerDir(runDir, l)}.json`)) return { missing: l };
 	const work: Work = { lowers: layers.map((l) => layerDir(runDir, l)), upper: join(root, "upper"), ovl: join(root, "ovl") };
 	// The call's changes were committed as a layer, but the event naming it was not logged (the
 	// host died in between): the reissued call continues with them, copied (never linked: the
 	// layer is immutable).
+	// The marker names the layer and the attempt that committed it: only that attempt continues with
+	// it, and then always from the layer (an upper dir left beside it is discarded). It is copied into
+	// a temp dir first and renamed only once the copy succeeded.
 	const committed = join(root, "committed");
-	if (!existsSync(work.upper) && existsSync(committed)) {
-		const from = layerDir(runDir, readFileSync(committed, "utf8").trim());
-		if (existsSync(from)) spawnSync("cp", ["-a", "--reflink=auto", from, work.upper]);
+	if (existsSync(committed)) {
+		const [digest, of] = readFileSync(committed, "utf8").trim().split(" ");
+		const from = layerDir(runDir, digest ?? "");
+		if (Number(of) === attempt && existsSync(from)) {
+			rmSync(work.upper, { recursive: true, force: true });
+			const temp = `${work.upper}.restore`;
+			rmSync(temp, { recursive: true, force: true });
+			const r = spawnSync("cp", ["-a", "--reflink=auto", from, temp], { encoding: "utf8" });
+			if (r.status !== 0) throw new Error(`cannot restore the call's changes from layer ${digest}: ${r.stderr.trim()}`);
+			renameSync(temp, work.upper);
+		}
 		rmSync(committed, { force: true });
 	}
 	mkdirSync(work.upper, { recursive: true });
@@ -128,23 +139,55 @@ function digestOf(manifest: Manifest): { digest: string; text: string } {
  * dir renamed into the store (or dropped, if the store has that layer).
  * Null when the call changed nothing.
  */
-export function commitLayer(runDir: string, work: Work, root: string): string | null {
+export function commitLayer(runDir: string, work: Work, root: string, attempt = 1): string | null {
 	if (!existsSync(work.upper)) return null;
 	const manifest = manifestOf(work.upper);
 	if (Object.keys(manifest).length === 0) return null;
 	const { digest, text } = digestOf(manifest);
 	const dir = layerDir(runDir, digest);
 	mkdirSync(layersDir(runDir), { recursive: true });
-	if (!existsSync(`${dir}.json`)) {
-		writeFileSync(`${dir}.json.${process.pid}.tmp`, text);
-		renameSync(`${dir}.json.${process.pid}.tmp`, `${dir}.json`);
-	}
+	if (!existsSync(`${dir}.json`)) writeDurably(`${dir}.json`, text);
 	// Named in the call's dir first: a host that dies before the event restores the upper dir from it.
-	writeFileSync(join(root, "committed"), digest);
+	writeDurably(join(root, "committed"), `${digest} ${attempt}`);
 	if (existsSync(dir)) rmSync(work.upper, { recursive: true, force: true });
-	else renameSync(work.upper, dir);
+	else {
+		syncTree(work.upper);
+		renameSync(work.upper, dir);
+		syncPath(layersDir(runDir));
+	}
 	crashPoint("layer");
 	return digest;
+}
+
+/** fsync of one file or dir. */
+export function syncPath(path: string): void {
+	const fd = openSync(path, constants.O_RDONLY);
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Every file and dir under `root` (and it) on disk; links and special files have nothing to sync. */
+function syncTree(root: string): void {
+	const walk = (path: string) => {
+		const st = lstatSync(path);
+		if (st.isDirectory()) {
+			for (const name of readdirSync(path)) walk(join(path, name));
+			syncPath(path);
+		} else if (st.isFile()) syncPath(path);
+	};
+	walk(root);
+}
+
+/** A file written whole and durable: a temp file, fsynced, renamed, and its dir fsynced. */
+export function writeDurably(path: string, text: string): void {
+	const temp = `${path}.${process.pid}.tmp`;
+	writeFileSync(temp, text);
+	syncPath(temp);
+	renameSync(temp, path);
+	syncPath(dirname(path));
 }
 
 /** One layer for a stack of them: files hardlinked, manifests merged; nothing is copied or hashed again. */
@@ -176,8 +219,10 @@ export function squash(runDir: string, layers: readonly string[]): string {
 		else if (entry.type === "symlink") symlinkSync(entry.target, target);
 		else if (entry.type === "file") linkSync(join(layerDir(runDir, from), path), target);
 	}
-	writeFileSync(`${dir}.json`, text);
+	syncTree(temp);
+	writeDurably(`${dir}.json`, text);
 	renameSync(temp, dir);
+	syncPath(layersDir(runDir));
 	return digest;
 }
 

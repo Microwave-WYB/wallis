@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
-import { layerDir, locate, prepareWork, removeWork, ViewError, type ViewEntry, type Work, workRoot } from "./layers.ts";
+import { layerDir, locate, prepareWork, removeWork, syncPath, ViewError, type ViewEntry, type Work, workRoot } from "./layers.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
@@ -74,7 +74,9 @@ export function putBlob(runDir: string, text: string): string {
 		const temp = `${target}.${process.pid}.tmp`;
 		writeFileSync(temp, text);
 		chmodSync(temp, 0o444);
+		syncPath(temp);
 		renameSync(temp, target);
+		syncPath(blobsDir(runDir));
 		crashPoint("blob");
 	}
 	return digest;
@@ -192,12 +194,12 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
  * input artifacts. An agent call's scratch dir is its session's (`scratch`),
  * which outlives the call.
  */
-export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>, layers: readonly string[] | null = null): NodeDirs {
+export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>, layers: readonly string[] | null = null, attempt = 1): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
 	verifyRefs(input, runDir);
 	let work: Work | null = null;
 	if (layers !== null) {
-		const prepared = prepareWork(runDir, root, layers);
+		const prepared = prepareWork(runDir, root, layers, attempt);
 		if ("missing" in prepared) throw new ArtifactError(`layer ${prepared.missing} of the session's workspace is not in the store`);
 		work = prepared;
 	}
