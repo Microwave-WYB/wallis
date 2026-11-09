@@ -914,7 +914,7 @@ pub fn a_later_session_call_is_keyed_by_the_dialogue_before_it_test() {
     run.step(state, support.session_call("#5", 1, input(9)))
 }
 
-pub fn restarting_a_session_call_invalidates_its_later_calls_test() {
+pub fn restarting_a_held_session_call_reissues_it_after_its_previous_call_test() {
   let events = [
     started(basic()),
     support.session_call("#0", 0, input(1)),
@@ -922,7 +922,6 @@ pub fn restarting_a_session_call_invalidates_its_later_calls_test() {
     support.session_call("#0", 1, input(2)),
     failed("#0:1", "boom"),
     types.BodyFailed(AgentGaveUp("worker", GaveUp("boom"))),
-    // An earlier execution had also recorded call 2 of the session.
   ]
   let #(state, _, _) = replay(events)
   let #(state, effects) =
