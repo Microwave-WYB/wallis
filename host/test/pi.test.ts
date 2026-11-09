@@ -60,7 +60,8 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
 		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", mounts: {}, spill: join(tmp(), "spill") },
 		sandbox: { type: "none" },
-		checkpoint: join(tmp(), "session.json"),
+		checkpoint: () => {},
+		resume: null,
 		exportArtifact: () => {
 			throw new Error("no scratch");
 		},
@@ -340,8 +341,9 @@ test("external results are journaled as { tool, args, outcome } under <turn>/<ca
 });
 
 test("pi: an ask that is not the last tool call of its message still pauses; later calls in the message are not run; the reply reaches it after a host restart", async () => {
-	const checkpoint = join(tmp(), "session.json");
-	const s = () => spec({ declaration: { ...spec().declaration, tools: [{ kind: "ask" }] }, checkpoint });
+	// The checkpoints the host would journal; a reissued call resumes from the newest.
+	let saved: Json | null = null;
+	const s = () => spec({ declaration: { ...spec().declaration, tools: [{ kind: "ask" }] }, checkpoint: (state) => void (saved = state), resume: saved });
 	const first = faux();
 	first.provider.setResponses([fauxAssistantMessage([fauxToolCall("ask", { message: "Louder?" }), fauxToolCall("codemode", { code: "return 1" })], { stopReason: "toolUse" })]);
 	const asked = await (await first.executor.start(s())).turn();
@@ -363,14 +365,12 @@ test("pi: an ask that is not the last tool call of its message still pauses; lat
 
 test("pi: a reissued call whose checkpoint ends in an unsafe external tool call reports outcome_unknown and runs nothing", async () => {
 	const { s, count } = withSources([{ kind: "mcp_tool", server: "fx", tool: "post" }]);
-	const checkpoint = join(tmp(), "session.json");
 	const messages = [
 		{ role: "user", content: "Input", timestamp: 1 },
 		{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "mcp__fx__post", arguments: {} }], stopReason: "toolUse", timestamp: 2, api: "faux", provider: "faux", model: "faux-1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } },
 	];
-	writeFileSync(checkpoint, JSON.stringify({ messages, turns: 0, compacted: null }));
 	const { executor } = faux();
-	const session = await executor.start({ ...s, checkpoint });
+	const session = await executor.start({ ...s, resume: { messages, turns: 0, compacted: null } as unknown as Json });
 	const r = await session.turn();
 	await session.close();
 	assert.deepEqual(r, { type: "outcome_unknown", tool: "mcp__fx__post", args: {}, usage: { usd: 0, tokens: 0, turns: 0 } });

@@ -13,7 +13,8 @@
 // same loop. Later tool calls of the same message are not run.
 //
 // Durability: after every completed step the node's whole conversation
-// (messages, tool calls, results) is checkpointed in its work dir, so a
+// (messages, tool calls, results) is checkpointed through the host (a blob
+// and its digest in the journal, before anything else happens), so a
 // reissued or resumed call continues from the last completed turn instead of
 // starting over. Transient provider errors (429, 529, 5xx, timeouts, the
 // network) are retried with backoff here, before anything is reported.
@@ -25,11 +26,11 @@
 // compacted with pi's summarizer and the compaction is logged; with
 // `compaction: false` the call fails as `context_exhausted`.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { estimateTokens, generateSummary } from "@earendil-works/pi-coding-agent";
+import Type from "typebox";
+import Value from "typebox/value";
 import type { Json } from "../sdk/index.ts";
 import type { Usage } from "./core.ts";
 import type { Capabilities, Executor, NodeSession, NodeSpec, TurnResult } from "./executor.ts";
@@ -117,6 +118,9 @@ export const RETRY_DELAYS_MS: readonly number[] = [5_000, 30_000, 120_000];
 
 const QUOTA = /\n\n\[Turn \d+ of \d+\]$/;
 
+/** The checkpoint's outer shape, checked when it is read back; messages are pi's own. */
+const CheckpointShape = Type.Object({ messages: Type.Array(Type.Object({ role: Type.String() })), turns: Type.Integer({ minimum: 0 }), compacted: Type.Union([Type.Null(), Type.Object({ replaces: Type.Integer() })]) });
+
 /** What a node's checkpoint holds: the whole conversation after its last completed step, and its turn count. */
 interface Checkpoint {
 	readonly messages: AgentMessage[];
@@ -146,9 +150,9 @@ class PiNodeSession implements NodeSession {
 		this.#options = options;
 		this.#model = spec.model;
 		this.#limit = spec.turnLimit;
-		const saved = this.#load(spec.checkpoint);
+		const saved = this.#load(spec.resume);
 		// A new call of a session starts from where its previous call left the dialogue.
-		const history = saved === null && spec.history !== null ? this.#load(spec.history) : null;
+		const history = saved === null ? this.#load(spec.history) : null;
 		// A question the previous call left unanswered (it was cancelled) is closed, not inherited.
 		const open = history ? pendingResult(history.messages) : null;
 		if (history && open) {
@@ -196,30 +200,25 @@ class PiNodeSession implements NodeSession {
 		});
 	}
 
-	#load(file: string): Checkpoint | null {
-		if (!existsSync(file)) return null;
-		try {
-			const saved = JSON.parse(readFileSync(file, "utf8")) as Checkpoint;
-			// A reply that failed or was cut off is not progress: drop it.
-			const messages = [...saved.messages];
-			while (messages.length > 0) {
-				const last = messages.at(-1) as { role: string; stopReason?: string };
-				if (last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) messages.pop();
-				else break;
-			}
-			return { ...saved, messages };
-		} catch {
-			return null;
+	/** A checkpoint value from the journal's blobs (its shape is this executor's own). */
+	#load(value: Json | null): Checkpoint | null {
+		if (value === null) return null;
+		if (!Value.Check(CheckpointShape, value)) throw new Error("checkpoint is not a pi checkpoint");
+		const saved = value as unknown as Checkpoint;
+		// A reply that failed or was cut off is not progress: drop it.
+		const messages = [...saved.messages];
+		while (messages.length > 0) {
+			const last = messages.at(-1) as { role: string; stopReason?: string };
+			if (last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) messages.pop();
+			else break;
 		}
+		return { ...saved, messages };
 	}
 
-	/** Atomically: the conversation so far, so a reissued or resumed call continues from here. */
+	/** The conversation so far, journaled (a blob, then its digest), so a reissued or resumed call continues from here. */
 	#save(): void {
-		const file = this.#spec.checkpoint;
-		mkdirSync(dirname(file), { recursive: true });
 		const data: Checkpoint = { messages: this.#agent.state.messages, turns: this.#turns, compacted: this.#compacted };
-		writeFileSync(`${file}.tmp`, JSON.stringify(data));
-		renameSync(`${file}.tmp`, file);
+		this.#spec.checkpoint(JSON.parse(JSON.stringify(data)) as Json);
 	}
 
 	/**

@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { semanticLog } from "./util.ts";
 import { fileURLToPath } from "node:url";
 import { EventLog, FakeCommands, FakeExecutor, resolveModels, RunRefused, runWorkflow } from "../src/host/index.ts";
 
@@ -48,7 +49,7 @@ test("runs are deterministic: same log for the same inputs and seed", async () =
 		runWorkflow({ ...quiet, workflow: twoNode, dir: join(dir, name), executor: new FakeExecutor(twoNodeResponses), input: { topic: "x" }, seed });
 	const a = await run("a", 3);
 	const b = await run("b", 3);
-	assert.equal(readFileSync(join(dir, "a", "log.jsonl"), "utf8"), readFileSync(join(dir, "b", "log.jsonl"), "utf8"));
+	assert.equal(semanticLog(join(dir, "a", "log.jsonl")), semanticLog(join(dir, "b", "log.jsonl")));
 	assert.deepEqual(a.outcome, b.outcome);
 	const c = await run("c", 4);
 	assert.notDeepEqual(c.outcome, a.outcome, "the seed reaches Math.random");

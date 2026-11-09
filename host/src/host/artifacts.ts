@@ -1,6 +1,7 @@
 // The run's content-addressed blob store and per-node directories.
 //
-//   .wallis/runs/<id>/blobs/<sha256 hex>        one file per distinct content
+//   .wallis/runs/<id>/blobs/<sha256 hex>        one file per distinct content: artifacts,
+//                                                and values events refer to (dialogues)
 //   .wallis/runs/<id>/work/<node>/inputs/<hex>/<name>   read-only input artifacts
 //   .wallis/runs/<id>/work/<node>/scratch/      the call's private writable dir (/w in its sandbox)
 //
@@ -9,7 +10,7 @@
 // as artifacts are discarded. No directory is shared between nodes.
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
 
@@ -57,6 +58,48 @@ export function storeFile(runDir: string, path: string, media: string, name = ba
 		chmodSync(target, 0o444);
 	}
 	return { digest, name, media };
+}
+
+/**
+ * Writes a value the log will refer to (a dialogue, a layer manifest) as a
+ * blob, before the event that names its digest: written to a temp file and
+ * renamed, so a blob is whole or absent. Returns its digest.
+ */
+export function putBlob(runDir: string, text: string): string {
+	const digest = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+	const target = blobPath(runDir, digest);
+	if (!existsSync(target)) {
+		mkdirSync(blobsDir(runDir), { recursive: true });
+		const temp = `${target}.${process.pid}.tmp`;
+		writeFileSync(temp, text);
+		chmodSync(temp, 0o444);
+		renameSync(temp, target);
+		crashPoint("blob");
+	}
+	return digest;
+}
+
+/** A blob's text, or null when the store does not have it. */
+export function readBlob(runDir: string, digest: string): string | null {
+	if (!DIGEST.test(digest)) return null;
+	const path = blobPath(runDir, digest);
+	return existsSync(path) ? readFileSync(path, "utf8") : null;
+}
+
+/**
+ * Fault injection for crash tests: `WALLIS_CRASH_AT=<point>:<n>` kills this
+ * process (SIGKILL) at the nth time it reaches `point`, e.g. right after a
+ * blob is written and before the event that names it.
+ */
+const crashes = new Map<string, number>();
+export function crashPoint(point: string): void {
+	const at = process.env.WALLIS_CRASH_AT;
+	if (!at) return;
+	const [name, n] = at.split(":");
+	if (name !== point) return;
+	const count = (crashes.get(point) ?? 0) + 1;
+	crashes.set(point, count);
+	if (count === Number(n)) process.kill(process.pid, "SIGKILL");
 }
 
 export class ArtifactError extends Error {

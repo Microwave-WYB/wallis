@@ -3,7 +3,11 @@
 // A run is a directory, by default `.wallis/runs/<run_id>/` under the
 // project root:
 //   log.jsonl    the append-only event log (the run is a fold over it)
-//   meta.json    workflow path, project root, executor module
+//   blobs/       content-addressed values the log names (artifacts, dialogues)
+//   meta.json    a cache: the host facts the log notes (`noted` events), with the
+//                log size it was derived at; rebuilt from the log when stale
+//   start.json   the launch request of `wallis run` (before any host): the first
+//                session's parameters, written once
 //   lock         the pid of the host process driving the run
 //   inbox.jsonl  interventions for a run another process drives (.done: taken, .refused: refused)
 //
@@ -14,7 +18,11 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import Type, { type Static } from "typebox";
+import Value from "typebox/value";
 import type { Json, Refusal } from "../sdk/index.ts";
+import { Core } from "./core.ts";
+import { EventLog } from "./log.ts";
 
 export interface RunPaths {
 	readonly dir: string;
@@ -58,81 +66,97 @@ export function listRuns(root: string): RunPaths[] {
 
 // --- Meta ----------------------------------------------------------------------
 
-export interface RunMeta {
-	readonly run_id: string;
-	readonly workflow: string;
-	readonly root: string;
+/** Host facts the log notes (`noted` events), checked when read back. */
+const Facts = Type.Object({
+	workflow: Type.String(),
+	root: Type.String(),
 	/** Module whose default export creates the executor and script runner. */
-	readonly executor: string | null;
-	readonly created: string;
-	readonly forked_from?: { readonly run_id: string; readonly at: number };
+	executor: Type.Union([Type.String(), Type.Null()]),
+	created: Type.String(),
+	forked_from: Type.Optional(Type.Object({ run_id: Type.String(), at: Type.Integer() })),
 	/** Every required binary: the absolute path resolved at run creation (reused on resume), and its version. */
-	readonly bins?: Readonly<Record<string, { readonly path: string; readonly version?: string }>>;
+	bins: Type.Optional(Type.Record(Type.String(), Type.Object({ path: Type.String(), version: Type.Optional(Type.String()) }))),
 	/** The host base the sandboxes run on. */
-	readonly base?: { readonly distro: string; readonly kernel: string };
+	base: Type.Optional(Type.Object({ distro: Type.String(), kernel: Type.String() })),
 	/** Whether the run's sandboxes were built with bwrap. */
-	readonly confined?: boolean;
-	/** Each toolset's bundle digest (its module and the runner, as run), by path: from the latest preflight. */
-	readonly toolsets?: Readonly<Record<string, string>>;
+	confined: Type.Optional(Type.Boolean()),
 	/** Preflight warnings: agent tools that may write outside, tools a server leaves out. */
-	readonly warnings?: readonly string[];
+	warnings: Type.Optional(Type.Array(Type.String())),
 	/** Answer schemas of the workflow's orchestrator nodes, for pending items. */
-	readonly answers?: Readonly<Record<string, Json>>;
-	/** Parameters for the first session of a run started detached. */
-	readonly start?: {
-		readonly input?: Json;
-		readonly seed?: number;
-		readonly models?: Readonly<Record<string, string>>;
-		readonly mounts?: Readonly<Record<string, string>>;
-		readonly bins?: Readonly<Record<string, string>>;
-		readonly callerPath?: string;
-		readonly owner?: string;
-	};
-}
+	answers: Type.Optional(Type.Record(Type.String(), Type.Unsafe<Json>({}))),
+	/** Each toolset's bundle digest (its module and the runner, as run), by path. */
+	toolsets: Type.Optional(Type.Record(Type.String(), Type.String())),
+});
 
-export function readMeta(paths: RunPaths): RunMeta | null {
-	return existsSync(paths.meta) ? (JSON.parse(readFileSync(paths.meta, "utf8")) as RunMeta) : null;
-}
+/** Parameters for the first session of a run started by `wallis run`. */
+const Start = Type.Object({
+	input: Type.Optional(Type.Unsafe<Json>({})),
+	seed: Type.Optional(Type.Number()),
+	models: Type.Optional(Type.Record(Type.String(), Type.String())),
+	mounts: Type.Optional(Type.Record(Type.String(), Type.String())),
+	bins: Type.Optional(Type.Record(Type.String(), Type.String())),
+	callerPath: Type.Optional(Type.String()),
+	owner: Type.Optional(Type.String()),
+});
 
-/** Atomic: written to a temp file, then renamed over it, so a reader never sees half a file. */
-export function writeMeta(paths: RunPaths, meta: RunMeta): void {
+/** The launch request: what the first host notes, and how it starts. */
+const Launch = Type.Object({ workflow: Type.String(), root: Type.String(), executor: Type.Union([Type.String(), Type.Null()]), created: Type.String(), start: Type.Optional(Start) });
+export type Launch = Static<typeof Launch>;
+
+export type RunMeta = Static<typeof Facts> & { readonly run_id: string; readonly start?: Static<typeof Start> };
+
+/** Writes `start.json` once, atomically, before any host runs. */
+export function writeLaunch(paths: RunPaths, launch: Launch): void {
 	mkdirSync(paths.dir, { recursive: true });
-	const temp = `${paths.meta}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-	writeFileSync(temp, `${JSON.stringify(meta, null, 2)}\n`);
-	renameSync(temp, paths.meta);
+	writeAtomic(join(paths.dir, "start.json"), `${JSON.stringify(launch, null, 2)}\n`);
 }
 
-const META_LOCK_STALE_MS = 5_000;
+function readLaunch(paths: RunPaths): Launch | null {
+	const file = join(paths.dir, "start.json");
+	if (!existsSync(file)) return null;
+	const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+	if (!Value.Check(Launch, raw)) throw new Error(`${file} is not a launch request`);
+	return raw;
+}
+
+const Cache = Type.Object({ log_bytes: Type.Integer(), meta: Facts });
+
+/** The cached metadata, or null when there is none (or another process just replaced it). */
+function readCache(file: string): Static<typeof Cache> | null {
+	let text: string;
+	try {
+		text = readFileSync(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	const raw: unknown = JSON.parse(text);
+	return Value.Check(Cache, raw) ? raw : null;
+}
+
+function writeAtomic(file: string, text: string): void {
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	writeFileSync(temp, text);
+	renameSync(temp, file);
+}
 
 /**
- * Read, edit and write the metadata under `meta.lock` (an exclusive
- * create), so writers in other processes (the CLI, a host) never lose each
- * other's changes. A lock older than a few seconds was left by a dead
- * writer and is taken over.
+ * The run's metadata: derived from the facts its log notes, else (before a
+ * host has run) from its launch request. `meta.json` caches it with the log
+ * size it was derived at, written atomically; a stale cache is rebuilt.
  */
-export function updateMeta(paths: RunPaths, edit: (meta: RunMeta) => RunMeta): void {
-	const lock = `${paths.meta}.lock`;
-	for (;;) {
-		try {
-			closeSync(openSync(lock, "wx"));
-			break;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			try {
-				if (Date.now() - statSync(lock).mtimeMs > META_LOCK_STALE_MS) rmSync(lock, { force: true });
-			} catch {
-				// Released meanwhile.
-			}
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
-		}
-	}
-	try {
-		const meta = readMeta(paths);
-		if (meta === null) throw new Error(`run ${paths.id} has no metadata`);
-		writeMeta(paths, edit(meta));
-	} finally {
-		rmSync(lock, { force: true });
-	}
+export function readMeta(paths: RunPaths): RunMeta | null {
+	const launch = readLaunch(paths);
+	const start = launch?.start === undefined ? {} : { start: launch.start };
+	const size = existsSync(paths.log) ? statSync(paths.log).size : 0;
+	if (size === 0) return launch ? { run_id: paths.id, workflow: launch.workflow, root: launch.root, executor: launch.executor, created: launch.created, ...start } : null;
+	const cached = readCache(paths.meta);
+	if (cached !== null && cached.log_bytes === size) return { ...cached.meta, run_id: paths.id, ...start };
+	const facts = Core.refold(new EventLog(paths.log).read()).facts();
+	if (Object.keys(facts).length === 0) return launch ? { run_id: paths.id, workflow: launch.workflow, root: launch.root, executor: launch.executor, created: launch.created, ...start } : null;
+	if (!Value.Check(Facts, facts)) throw new Error(`run ${paths.id}: the facts its log notes are malformed: ${[...Value.Errors(Facts, facts)].map((e) => `${e.instancePath} ${e.message}`).join("; ")}`);
+	writeAtomic(paths.meta, `${JSON.stringify({ log_bytes: size, meta: facts }, null, 2)}\n`);
+	return { ...facts, run_id: paths.id, ...start };
 }
 
 // --- Lock ----------------------------------------------------------------------

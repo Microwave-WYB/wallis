@@ -66,7 +66,15 @@ export function lines(path: string): Record<string, unknown>[] {
 		.map((l) => JSON.parse(l));
 }
 
-/** Message ids are chosen by the sender; everything else must match. */
+/** Message ids are chosen by the sender, and host facts (`noted`: paths, times) differ between runs; everything else must match. */
 export function normalized(log: Record<string, unknown>[]): unknown[] {
-	return log.map((e) => (e.type === "sent" ? { ...e, message_id: "<id>" } : e));
+	return log.filter((e) => e.type !== "noted").map((e) => (e.type === "sent" ? { ...e, message_id: "<id>" } : e));
+}
+
+/** A log file without its host facts (`noted` events), for comparing runs. */
+export function semanticLog(path: string): string {
+	return lines(path)
+		.filter((e) => e.type !== "noted")
+		.map((e) => `${JSON.stringify(e)}\n`)
+		.join("");
 }

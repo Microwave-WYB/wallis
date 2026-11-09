@@ -1,4 +1,5 @@
 import gleam/dict
+import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -887,14 +888,73 @@ pub fn a_session_call_continues_after_its_previous_call_test() {
   let first = [
     started(basic()),
     support.session_call("#0", 0, input(1)),
+    types.AgentProgressed("#0:0", "dialogue-a"),
     returned("#0:0", summary("a")),
   ]
-  let assert [CallAgent(previous: Some(prev), ..)] =
+  // The second call continues where the first ended: its dialogue blob.
+  let assert [CallAgent(history: Some("dialogue-a"), checkpoint: None, ..)] =
     last(list.append(first, [support.session_call("#0", 1, input(2))]))
-  // The second call continues where the first ended: its slot.
-  let assert [CallAgent(previous: None, digest: first_slot, ..)] =
+  let assert [CallAgent(history: None, checkpoint: None, ..)] =
     last([started(basic()), support.session_call("#0", 0, input(1))])
-  assert prev == first_slot
+}
+
+pub fn a_call_that_never_took_a_step_passes_its_history_on_test() {
+  // Call 1 is refused before its first step: call 2 continues from call 0.
+  let assert [CallAgent(id: "#0:2", history: Some("dialogue-a"), ..)] =
+    last([
+      started(basic()),
+      support.session_call("#0", 0, input(1)),
+      types.AgentProgressed("#0:0", "dialogue-a"),
+      returned("#0:0", summary("a")),
+      support.session_call("#0", 1, input(2)),
+      types.InputRejected("#0:1", None, 10, 5),
+      support.session_call("#0", 2, input(3)),
+    ])
+}
+
+pub fn a_reissued_call_resumes_from_its_newest_checkpoint_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.AgentProgressed("#0", "step-1"),
+    types.AgentProgressed("#0", "step-2"),
+  ]
+  let #(state, _, _) = replay(events)
+  let #(state, _) = run.step(state, Resumed(pin()))
+  let assert [CallAgent(id: "#0", checkpoint: Some("step-2"), ..)] =
+    run.step(state, call("#0", "worker", JNull)).1
+  // A checkpoint for a call that is not running is refused, not dropped.
+  let #(done, _) = run.step(state, returned("#0", summary("s")))
+  let assert [Refuse(None, types.NodeNotRunning("#0"))] =
+    run.step(done, types.AgentProgressed("#0", "late")).1
+}
+
+pub fn the_journal_keeps_every_attempt_and_the_model_that_served_it_test() {
+  let #(state, _, _) =
+    replay([
+      started(basic()),
+      call("#0", "worker", JNull),
+      failed("#0", "boom"),
+      types.BodyFailed(AgentGaveUp("worker", GaveUp("boom"))),
+      types.Restarted("#0", None, human, 0),
+    ])
+  // The failed attempt stays, under the new one.
+  assert run.attempts(state, "#0") == ["open", "errored by fake/model"]
+  let #(state, _) = run.step(state, returned("#0", summary("s")))
+  assert run.attempts(state, "#0")
+    == ["answered by fake/model", "errored by fake/model"]
+}
+
+pub fn host_facts_are_noted_even_after_the_end_test() {
+  let #(state, _, _) =
+    replay([
+      started(basic()),
+      types.BodyFinished(JNull),
+      types.Noted("executor", JString("fake")),
+    ])
+  assert json.to_string(run.host_facts(state)) == "{\"executor\":\"fake\"}"
+  // Facts are about the host, not the run: the snapshot does not have them.
+  assert !string.contains(json.to_string(run.snapshot(state)), "executor\":\"fake")
 }
 
 pub fn a_later_session_call_is_keyed_by_the_dialogue_before_it_test() {
@@ -935,18 +995,23 @@ pub fn restarting_a_session_call_rewinds_the_session_test() {
   let #(state, _) = run.step(state, support.session_call("#0", 0, input(2)))
   let #(state, effects) =
     run.step(state, types.Restarted("#0:0", None, human, 0))
-  let assert [Checkpoint, CallAgent(id: "#0:0", previous: None, ..)] = effects
-  // The session's later calls are invalidated: the old call 1 is gone from
-  // the journal, even when it is requested after the old call 0 again.
+  let assert [Checkpoint, CallAgent(id: "#0:0", history: None, ..)] = effects
+  // The session's later calls are forgotten: the old call 1 is not live in
+  // the journal, even when it is requested after the old call 0 again (its
+  // attempt is kept, under the forgotten mark).
   let #(state, _) = run.step(state, support.session_call("#0", 0, input(1)))
-  let assert [Checkpoint, CallAgent(id: "#0:1", ..)] =
-    run.step(state, support.session_call("#0", 1, input(9))).1
+  let #(state, effects) =
+    run.step(state, support.session_call("#0", 1, input(9)))
+  let assert [Checkpoint, CallAgent(id: "#0:1", ..)] = effects
+  assert run.attempts(state, "#0:1")
+    == ["open", "forgotten", "answered by fake/model"]
 }
 
 pub fn restarting_a_held_session_call_reissues_it_after_its_previous_call_test() {
   let events = [
     started(basic()),
     support.session_call("#0", 0, input(1)),
+    types.AgentProgressed("#0:0", "dialogue-a"),
     returned("#0:0", summary("a")),
     support.session_call("#0", 1, input(2)),
     failed("#0:1", "boom"),
@@ -955,8 +1020,10 @@ pub fn restarting_a_held_session_call_reissues_it_after_its_previous_call_test()
   let #(state, _, _) = replay(events)
   let #(state, effects) =
     run.step(state, types.Restarted("#0:1", None, human, 0))
-  let assert [Checkpoint, CallAgent(id: "#0:1", previous: Some(_), ..)] =
-    effects
+  let assert [
+    Checkpoint,
+    CallAgent(id: "#0:1", history: Some("dialogue-a"), ..),
+  ] = effects
   let #(_, effects) = run.step(state, returned("#0:1", summary("b2")))
   assert list.contains(effects, Deliver("#0:1", summary("b2")))
 }

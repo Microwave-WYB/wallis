@@ -8,7 +8,7 @@ import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
 import { Core, type Event, type FailReason, type IdleCause, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
-import { acquireLock, listRuns, lockHolder, readMeta, type RunPaths, runPaths, writeMeta } from "./store.ts";
+import { acquireLock, listRuns, lockHolder, readMeta, type RunPaths, runPaths } from "./store.ts";
 
 export interface RunView {
 	readonly runId: string;
@@ -332,8 +332,8 @@ export async function waitForAttention(dir: string, options: { timeoutMs?: numbe
 }
 
 /**
- * Copies a run into a new one: its whole journal (a cache), blobs,
- * session dialogues and work dirs, so
+ * Copies a run into a new one: its whole journal (a cache), blobs and
+ * work dirs, so
  * the fork re-executes the body and every unchanged call hits. Only the
  * events that ended the source are left out. The cache is per run and its
  * forks; it is never shared implicitly with other runs.
@@ -344,16 +344,15 @@ export function forkRun(source: string, target: string): RunPaths {
 	if (existsSync(to.log)) throw new Error(`run ${to.id} already exists`);
 	const events = new EventLog(from.log).read().filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested");
 	mkdirSync(to.dir, { recursive: true });
-	writeFileSync(to.log, events.map((e) => `${JSON.stringify(e)}\n`).join(""));
-	const meta = readMeta(from);
-	if (meta) writeMeta(to, { ...meta, run_id: to.id, created: new Date().toISOString(), forked_from: { run_id: from.id, at: events.length } });
+	// Blobs first: the log names them.
 	shareBlobs(from.dir, to.dir);
-	// Sessions' dialogues, by slot, and the work dirs (node checkpoints, session scratch dirs):
-	// in-flight calls continue from their checkpoints and later session calls see their /w.
-	// Reflinked where the filesystem can, else copied.
-	for (const dir of ["sessions", "work"]) {
-		if (existsSync(join(from.dir, dir))) cpSync(join(from.dir, dir), join(to.dir, dir), { recursive: true, mode: constants.COPYFILE_FICLONE });
-	}
+	// The work dirs (session scratch dirs): later session calls see their /w. Reflinked where
+	// the filesystem can, else copied.
+	if (existsSync(join(from.dir, "work"))) cpSync(join(from.dir, "work"), join(to.dir, "work"), { recursive: true, mode: constants.COPYFILE_FICLONE });
+	// Where the fork comes from is a fact of its own log; meta.json is derived from it.
+	const at = events.length;
+	events.push({ type: "noted", key: "created", value: new Date().toISOString() }, { type: "noted", key: "forked_from", value: { run_id: from.id, at } });
+	writeFileSync(to.log, events.map((e) => `${JSON.stringify(e)}\n`).join(""));
 	return to;
 }
 

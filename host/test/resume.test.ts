@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { semanticLog } from "./util.ts";
 import { fileURLToPath } from "node:url";
 
 const runner = resolve(fileURLToPath(import.meta.url), "../../examples/two-node/run.ts");
@@ -43,7 +44,7 @@ test("a killed run resumes to the same state and log as an uninterrupted run", (
 
 	assert.deepEqual(result.outcome, expected.outcome);
 	assert.equal(result.snapshot, expected.snapshot);
-	assert.equal(readFileSync(killedLog, "utf8"), readFileSync(join(dir, "whole", "log.jsonl"), "utf8"));
+	assert.equal(semanticLog(killedLog), semanticLog(join(dir, "whole", "log.jsonl")));
 
 	// The completed planner call was answered from the journal, not re-executed.
 	assert.deepEqual(lines(join(dir, "exec-killed.jsonl")), [

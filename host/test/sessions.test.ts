@@ -107,37 +107,17 @@ test("a call after a cancelled one continues the dialogue the cancelled call lef
 	});
 });
 
-test("a session call whose previous dialogue is missing is refused (dialogue_missing), never started fresh", async () => {
+test("a session call whose previous dialogue blob is missing is refused (dialogue_missing), never started fresh", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "two" } });
-	const { readdirSync, rmSync } = await import("node:fs");
-	for (const f of readdirSync(join(dir, "sessions"))) rmSync(join(dir, "sessions", f));
+	const { rmSync } = await import("node:fs");
+	const { EventLog } = await import("../src/host/log.ts");
+	const { blobPath } = await import("../src/host/artifacts.ts");
+	// Every dialogue blob call 0 left: the store lost them.
+	for (const e of new EventLog(join(dir, "log.jsonl")).read()) if (e.type === "agent_progressed" && e.id === "#0:0") rmSync(blobPath(dir, e.dialogue), { force: true });
 	const { appendInbox, runPaths } = await import("../src/host/store.ts");
 	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0:1", by: "human" });
 	const done = await runWorkflow({ ...opts(dir), executor: executor() });
 	assert.equal(done.outcome?.type, "failed");
 	assert.match(JSON.stringify(done.outcome), /refused: dialogue_missing/);
-});
-
-test("a crash between journaling a call's result and saving its dialogue does not break the session: the dialogue is recovered from the call's work dir", async () => {
-	const dir = join(tmp(), "run");
-	await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "two" } });
-	const { cpSync, mkdirSync, readdirSync, rmSync, writeFileSync } = await import("node:fs");
-	// The state the crash window leaves: call 0's result is in the log, its dialogue is not in
-	// sessions/, and its work dir (checkpoint and slot) still exists.
-	// Call 1 waits on its question, so the only saved dialogue is call 0's.
-	const files = readdirSync(join(dir, "sessions"));
-	assert.equal(files.length, 1);
-	const saved = files[0];
-	// A slot is `<hex>#<occurrence>`; its file name has `_` for `#`.
-	const slot = saved!.replace(/_(\d+)\.json$/, "#$1");
-	mkdirSync(join(dir, "work", "_0_0"), { recursive: true });
-	cpSync(join(dir, "sessions", saved!), join(dir, "work", "_0_0", "session.json"));
-	writeFileSync(join(dir, "work", "_0_0", "call.json"), JSON.stringify({ digest: slot, previous: null }));
-	rmSync(join(dir, "sessions", saved!));
-	// Call 1 is restarted, so it needs call 0's dialogue again.
-	const { appendInbox, runPaths } = await import("../src/host/store.ts");
-	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0:1", note: "no need to ask", by: "human" });
-	const done = await runWorkflow({ ...opts(dir), executor: executor() });
-	assert.deepEqual(done.outcome, { type: "done", value: { one: { heard: 1, saw_ask: false, reply: "" }, two: { heard: 2, saw_ask: false, reply: "" } } });
 });

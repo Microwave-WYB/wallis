@@ -20,21 +20,22 @@
 // checks them again when it applies the event.
 //
 // Agents are called through sessions: each call of a session continues the
-// dialogue its previous call left (`sessions/<slot>.json`, copied from the
-// call's checkpoint when it ends), and the session's scratch dir
+// dialogue its previous call left. Every checkpoint of a call is written as
+// a blob before `agent_progressed` names its digest; the core keeps the
+// newest per attempt and passes it to the session's next call (`history`)
+// or to a reissued attempt (`checkpoint`). The session's scratch dir
 // (`work/<session>/scratch`) outlives its calls. Tools reached by agents or
 // by the body (toolsets and MCP servers) are journaled, so nothing outside
 // is called twice; preflight lists every tool source and warns about tools
 // given to agents that may write outside.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { type ArtifactRef, type CommandFailure, type Json, type Refusal, type ToolFailure, Type } from "../sdk/index.ts";
-import Value from "typebox/value";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
-import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
+import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, putBlob, readBlob, resolveDrafts, verifyRefs } from "./artifacts.ts";
 import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
@@ -50,7 +51,7 @@ import { type Mount, MountError, mountDigest, resolveMounts } from "./mounts.ts"
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
-import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, type RunPaths, runPaths, updateMeta, writeMeta } from "./store.ts";
+import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, type RunPaths, runPaths } from "./store.ts";
 
 export interface SessionOptions {
 	/** The run directory. A directory without a log starts a new run. */
@@ -126,9 +127,6 @@ export class RunRefused extends Error {
 
 const NO_USAGE: Usage = { usd: 0, tokens: 0, turns: 0 };
 
-/** An agent call's slot and its session's previous slot, kept in its work dir. */
-const CallSlots = Type.Object({ digest: Type.String(), previous: Type.Union([Type.String(), Type.Null()]) });
-
 function digestFile(path: string): string {
 	return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 }
@@ -145,15 +143,6 @@ export async function startSession(options: SessionOptions): Promise<Session> {
 		const workflow = options.workflow ?? meta?.workflow;
 		if (!workflow) throw new Error(`run ${paths.id} has no workflow`);
 		const root = options.root ?? meta?.root ?? process.cwd();
-		if (!meta) {
-			writeMeta(paths, {
-				run_id: paths.id,
-				workflow: resolve(workflow),
-				root: resolve(root),
-				executor: options.executorModule ?? null,
-				created: new Date().toISOString(),
-			});
-		}
 		const bundle = await bundleWorkflow(workflow);
 		const session = new Session(paths, options, root, resolve(workflow), bundle.digest, release);
 		await session.boot(bundle.code);
@@ -195,6 +184,8 @@ export class Session {
 	readonly #nodeDigests = new Map<string, string>();
 	/** Occurrences of each (node, input) in this execution of the body. */
 	#occurrences = new Map<string, number>();
+	/** Facts noted before the core started: logged right after `started`. */
+	readonly #pendingFacts = new Map<string, Json>();
 	#code = "";
 	#input: Json = null;
 	#seed = 0;
@@ -207,8 +198,6 @@ export class Session {
 	#listing = new Map<string, ToolInfo[]>();
 	/** The body's connections: one per source for the run (this session). */
 	readonly #bodyClients = new Map<string, Promise<McpClient>>();
-	/** Agent calls in flight: their slot and their session's previous slot, to save the dialogue when they end. */
-	readonly #agentCalls = new Map<string, { digest: string; previous: string | null }>();
 	/** Interrupts that came before the call's executor session opened. */
 	readonly #interruptBeforeStart = new Set<string>();
 	/** Restarted agent calls whose unknown tool call is to be made again. */
@@ -362,9 +351,7 @@ export class Session {
 	cancelNode(node: LiveNode): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
-		// A cancelled call ends its session's turn too: the next call continues from what it left.
-		// Saved before the cancel is journaled, so a crash in between cannot lose it.
-		this.#saveDialogue(id);
+		// A cancelled call ends its session's turn too: the next call continues from its newest checkpoint.
 		const refusal = this.#feed({ type: "node_cancelled", node: id, by: node.owned.by })[0];
 		if (refusal) return refusal;
 		this.#interruptBeforeStart.delete(id);
@@ -449,12 +436,14 @@ export class Session {
 			};
 			input = o.input ?? null;
 			this.#refuseOn(this.#feed({ type: "started", workflow: decl.core as unknown as Json, pin, input }));
+			this.#noteOrigin();
 			this.#feed({ type: "executor_changed", name: o.executor.id });
 			if (o.owner) this.#feed({ type: "claimed", owner: o.owner });
 		} else {
 			const first = prior[0]!;
 			if (first.type !== "started") throw new Error(`log ${this.paths.log} does not begin with a started event`);
 			this.#core = Core.refold(prior);
+			this.#noteOrigin();
 			for (const e of prior) if (e.type === "sent" || e.type === "steered") this.#seen.add(e.message_id);
 			seed = o.seed ?? first.pin.seed;
 			input = first.input;
@@ -511,9 +500,9 @@ export class Session {
 	#prepareSandboxes(fresh: boolean, inputs: Readonly<Record<string, string>>): void {
 		const o = this.#options;
 		const decls = this.#decl.sandboxes;
-		const meta = readMeta(this.paths)!;
+		const meta = readMeta(this.paths);
 		try {
-			const bins = fresh || !meta.bins
+			const bins = fresh || !meta?.bins
 				? resolveBins(this.#decl.core.name, decls, { callTime: o.bins, profile: this.#local.bins, path: o.callerPath ?? process.env.PATH })
 				: Object.fromEntries(Object.entries(meta.bins).map(([n, b]) => [n, b.path]));
 			const confine = o.confine ?? "auto";
@@ -524,13 +513,10 @@ export class Session {
 			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, digests)]));
 			this.#boxes = can ? new Sandboxes({ decls, bins, mounts, mountDigests: digests }) : null;
 			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
-			updateMeta(this.paths, (meta) => ({
-				...meta,
-				bins: Object.fromEntries(Object.entries(bins).map(([n, path]) => [n, versions[n] === undefined ? { path } : { path, version: versions[n]! }])),
-				base: meta.base ?? baseIdentity(),
-				confined: this.#boxes !== null,
-				answers: Object.fromEntries(Object.entries(this.#decl.orchestrators).map(([name, o]) => [name, o.output as unknown as Json])),
-			}));
+			this.#note("bins", Object.fromEntries(Object.entries(bins).map(([n, path]): [string, Json] => [n, versions[n] === undefined ? { path } : { path, version: versions[n] }])));
+			this.#note("base", meta?.base ?? baseIdentity());
+			this.#note("confined", this.#boxes !== null);
+			this.#note("answers", Object.fromEntries(Object.entries(this.#decl.orchestrators).map(([name, o]) => [name, o.output as unknown as Json])));
 		} catch (error) {
 			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
 			throw error;
@@ -559,7 +545,7 @@ export class Session {
 		}
 		// What ran, for `describe`: a toolset is code from the project, bundled per session.
 		const bundles = this.#sources.bundleDigests();
-		if (Object.keys(bundles).length > 0) updateMeta(this.paths, (meta) => ({ ...meta, toolsets: bundles }));
+		if (Object.keys(bundles).length > 0) this.#note("toolsets", bundles);
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
 			if (resolved.unknown !== null) throw new RunRefused({ type: "unknown_tool", name: resolved.unknown });
@@ -568,12 +554,42 @@ export class Session {
 		}
 	}
 
-	/** A warning about tools: printed, and recorded once in run metadata. */
+	/** A warning about tools: printed, and noted once (run metadata). */
 	#warn(text: string): void {
-		if ((readMeta(this.paths)!.warnings ?? []).includes(text)) return;
+		const warnings = (this.#fact("warnings") as string[] | undefined) ?? [];
+		if (warnings.includes(text)) return;
 		process.stderr.write(`wallis: warning: ${text}\n`);
-		// Merged under the meta lock: a concurrent CLI write is kept, and so is this warning.
-		updateMeta(this.paths, (meta) => ((meta.warnings ?? []).includes(text) ? meta : { ...meta, warnings: [...(meta.warnings ?? []), text] }));
+		this.#note("warnings", [...warnings, text]);
+	}
+
+	/**
+	 * A host fact, logged as `noted` when it changes (`meta.json` is derived
+	 * from these). Before the core has started (preflight of a new run) it is
+	 * kept, and logged right after `started`.
+	 */
+	#note(key: string, value: Json): void {
+		if (this.#core.snapshot().status === null) {
+			this.#pendingFacts.set(key, value);
+			return;
+		}
+		if (canonical(this.#fact(key) ?? null) === canonical(value) && this.#fact(key) !== undefined) return;
+		this.#feed({ type: "noted", key, value });
+	}
+
+	#fact(key: string): Json | undefined {
+		if (this.#core.snapshot().status === null) return this.#pendingFacts.get(key);
+		return this.#core.facts()[key];
+	}
+
+	/** Logs the facts kept before the core started, and where the run comes from. */
+	#noteOrigin(): void {
+		const meta = readMeta(this.paths);
+		this.#note("workflow", this.#workflow);
+		this.#note("root", resolve(this.#root));
+		this.#note("executor", this.#options.executorModule ?? meta?.executor ?? null);
+		if (this.#fact("created") === undefined) this.#note("created", meta?.created ?? new Date().toISOString());
+		for (const [key, value] of this.#pendingFacts) this.#note(key, value);
+		this.#pendingFacts.clear();
 	}
 
 	/** A body tool, by id, from the preflight listing. */
@@ -912,15 +928,14 @@ export class Session {
 		const failed = (error: string) =>
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error }, usage: NO_USAGE })));
 
-		this.#agentCalls.set(id, { digest: effect.digest, previous: effect.previous });
 		// An interrupt is for the turn it was made against; one left by an earlier attempt is not this call's.
 		this.#interruptBeforeStart.delete(id);
-		// A session call continues its previous call's dialogue; a missing one is recovered from the
-		// previous call's work dir (a crash after its result was journaled), else refused, never a fresh start.
-		const previous = effect.previous === null ? null : this.#dialogue(effect.previous);
-		if (previous !== null && !existsSync(previous)) this.#recoverDialogue(effect.previous!);
-		if (previous !== null && !existsSync(previous)) {
-			log({ kind: "note", text: `the session's previous dialogue ${previous} is missing` });
+		// A session call continues its previous call's dialogue, and a reissued attempt its newest
+		// checkpoint: blobs the journal names. A missing one is refused, never a fresh start.
+		const history = effect.history === null ? null : this.#dialogueBlob(effect.history);
+		const resume = effect.checkpoint === null ? null : this.#dialogueBlob(effect.checkpoint);
+		if (history === undefined || resume === undefined) {
+			log({ kind: "note", text: `a dialogue blob the journal names is missing (${effect.history ?? ""} ${effect.checkpoint ?? ""})` });
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "previous_dialogue_missing", id })));
 			return;
 		}
@@ -932,10 +947,8 @@ export class Session {
 			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), join(this.paths.dir, "work", nodeDirName(session), "scratch"));
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
-			this.#saveDialogue(id);
 			return failed(error.message);
 		}
-		writeFileSync(join(workspace.root, "call.json"), JSON.stringify({ digest: effect.digest, previous: effect.previous }));
 		const rendered = renderInput(declaration.input, effect.input);
 		const contextTokens = this.#options.executor.contextWindow?.(effect.model);
 		if (effect.transcript.length === 0) {
@@ -943,7 +956,6 @@ export class Session {
 			const over = windowCheck(declaration.prompt.length + (effect.note?.length ?? 0), rendered, contextTokens);
 			if (over) {
 				log({ kind: "note", text: `input refused: ${over.chars} chars over the window's ${over.limit}` });
-				this.#saveDialogue(id);
 				queueMicrotask(() => this.#later(() => this.#feed({ type: "input_rejected", id, ...over })));
 				return;
 			}
@@ -961,11 +973,16 @@ export class Session {
 			contextTokens,
 			turn: effect.turn,
 			turnLimit: effect.turn_limit,
-			checkpoint: join(workspace.root, "session.json"),
+			// The blob first, then the event naming it, synchronously: a crash in between leaves an unreferenced blob.
+			checkpoint: (state) => {
+				if (!current()) return;
+				const dialogue = putBlob(this.paths.dir, JSON.stringify(state));
+				this.#later(() => this.#feed({ type: "agent_progressed", id, dialogue }));
+			},
+			resume,
 			digest: effect.digest,
 			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
-			// An empty dialogue file: the previous call left nothing (it never started).
-			history: previous !== null && statSync(previous).size > 0 ? previous : null,
+			history,
 			recorded: new Map(effect.recorded.map((r) => [r.call, r.result])),
 			retryUnknown: this.#retryUnknown.delete(id),
 			// Journaled before the model sees it; a result of a restarted call is dropped by the core.
@@ -984,7 +1001,6 @@ export class Session {
 			},
 			log,
 		};
-		// The dialogue is saved before the call's end is journaled (`#saveDialogue`), then the node is dropped.
 		const done = () => {
 			this.#closeNode(id);
 			discardNode(this.paths.dir, id);
@@ -1050,13 +1066,11 @@ export class Session {
 								this.#feed({ type: "turn_limit_reached", ...base, used: turn.used, limit: turn.limit, usage });
 								return;
 							case "agent_error":
-								this.#saveDialogue(id);
 								this.#feed({ type: "agent_failed", ...base, failure: turn.failure, usage });
 								done();
 								return;
 							case "submitted": {
 								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
-								this.#saveDialogue(id);
 								if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage });
 								else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
 								done();
@@ -1073,50 +1087,10 @@ export class Session {
 			);
 	}
 
-	/** Where a session's dialogue after the call with this slot is kept. */
-	#dialogue(slot: string): string {
-		return join(this.paths.dir, "sessions", `${slot.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
-	}
-
-	/**
-	 * When an agent call ends, on every path (a result, a failure, a cancel,
-	 * a refused input, a workspace failure), its session's dialogue is saved
-	 * for the next call: the call's checkpoint, else its previous dialogue,
-	 * else an empty file (nothing to continue). It is saved before the end is
-	 * journaled.
-	 */
-	#saveDialogue(id: string): void {
-		// Issued in this session, or by an earlier host (its slot is in the call's work dir).
-		const file = join(this.paths.dir, "work", nodeDirName(id), "call.json");
-		const recorded: unknown = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
-		const call = this.#agentCalls.get(id) ?? (Value.Check(CallSlots, recorded) ? recorded : null);
-		if (!call) return;
-		this.#agentCalls.delete(id);
-		mkdirSync(join(this.paths.dir, "sessions"), { recursive: true });
-		const checkpoint = join(this.paths.dir, "work", nodeDirName(id), "session.json");
-		const previous = call.previous === null ? null : this.#dialogue(call.previous);
-		if (existsSync(checkpoint)) copyFileSync(checkpoint, this.#dialogue(call.digest));
-		else if (previous !== null && existsSync(previous)) copyFileSync(previous, this.#dialogue(call.digest));
-		else writeFileSync(this.#dialogue(call.digest), "");
-	}
-
-	/**
-	 * The dialogue after the call with this slot, from that call's work dir:
-	 * left there when the host died between journaling the call's end and
-	 * saving its dialogue (or by a host from before saves came first).
-	 */
-	#recoverDialogue(slot: string): void {
-		const work = join(this.paths.dir, "work");
-		if (!existsSync(work)) return;
-		for (const dir of readdirSync(work)) {
-			const file = join(work, dir, "call.json");
-			if (!existsSync(file)) continue;
-			const recorded: unknown = JSON.parse(readFileSync(file, "utf8"));
-			if (!Value.Check(CallSlots, recorded) || recorded.digest !== slot) continue;
-			this.#agentCalls.set(dir, recorded);
-			this.#saveDialogue(dir);
-			return;
-		}
+	/** A dialogue blob the journal names, parsed; undefined when the store does not have it. */
+	#dialogueBlob(digest: string): Json | undefined {
+		const text = readBlob(this.paths.dir, digest);
+		return text === null ? undefined : (JSON.parse(text) as Json);
 	}
 
 	/**

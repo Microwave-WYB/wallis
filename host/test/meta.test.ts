@@ -1,17 +1,46 @@
-// Run metadata is written atomically (temp file, then rename), so a reader
-// in another process (`wallis wait`, `inspectRun`) never parses half a file;
-// read-modify-write goes through `updateMeta` under a lock, so concurrent
-// writers in different processes never lose each other's changes.
+// Run metadata is a cache: the host facts the log notes (`noted` events),
+// derived when read and kept in meta.json with the log size it was derived
+// at. A missing or stale cache is rebuilt from the log; the cache is written
+// atomically (temp file, then rename), so a reader in another process never
+// parses half a file.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { readMeta, runPaths, writeMeta } from "../src/host/store.ts";
+import { FakeExecutor, runWorkflow } from "../src/host/index.ts";
+import { EventLog } from "../src/host/log.ts";
+import { readMeta, runPaths } from "../src/host/store.ts";
 import { tmp } from "./util.ts";
 
-const store = resolve(fileURLToPath(new URL(".", import.meta.url)), "../src/host/store.ts");
+const here = fileURLToPath(new URL(".", import.meta.url));
+const store = resolve(here, "../src/host/store.ts");
+const twoNode = resolve(here, "../examples/two-node/workflow.ts");
+const responses = { planner: { output: { outline: ["a"], note: "n" } }, writer: { output: { text: "t", words: 1 } } };
+
+async function aRun(): Promise<string> {
+	const dir = join(tmp(), "run");
+	await runWorkflow({ workflow: twoNode, dir, executor: new FakeExecutor(responses), input: { topic: "x" }, inboxPollMs: null, confine: "off", executorModule: "/kit.ts" });
+	return dir;
+}
+
+test("meta.json is derived from the facts the log notes; a missing or stale cache is rebuilt", async () => {
+	const dir = await aRun();
+	const paths = runPaths(dir);
+	const noted = new EventLog(paths.log).read().flatMap((e) => (e.type === "noted" ? [e.key] : []));
+	assert.deepEqual(noted.slice(0, 4), ["workflow", "root", "executor", "created"]);
+	const meta = readMeta(paths)!;
+	assert.equal(meta.workflow, twoNode);
+	assert.equal(meta.executor, "/kit.ts");
+	assert.equal(meta.confined, false);
+	rmSync(paths.meta);
+	assert.deepEqual(readMeta(paths), meta);
+	// A cache from another log size is not trusted.
+	writeFileSync(paths.meta, JSON.stringify({ log_bytes: 1, meta: { ...meta, executor: "/stale.ts" } }));
+	assert.equal(readMeta(paths)!.executor, "/kit.ts");
+});
 
 /** A node process running `body` with `store.ts` imported as `s` and the run's paths as `paths`. */
 function child(dir: string, body: string): Promise<number | null> {
@@ -20,40 +49,20 @@ function child(dir: string, body: string): Promise<number | null> {
 	return new Promise((done) => p.on("exit", (status) => done(status)));
 }
 
-const base = (dir: string) => ({ run_id: runPaths(dir).id, workflow: "w.ts", root: "/", executor: null, created: "now" });
-
-test("a reader never sees a half-written meta.json while another process rewrites it", async () => {
-	const dir = join(tmp(), "run");
+test("a reader never sees a half-written meta.json while another process rebuilds it", async () => {
+	const dir = await aRun();
 	const paths = runPaths(dir);
-	writeMeta(paths, base(dir));
-	// Large enough that a truncate-then-write is caught midway.
 	let done = false;
-	const writer = child(
-		dir,
-		'const m = s.readMeta(paths); const w = Array.from({ length: 4000 }, (_, i) => `warning ${i} ${"x".repeat(40)}`); for (let i = 0; i < 300; i++) s.writeMeta(paths, { ...m, warnings: w.slice(0, 3000 + i) });',
-	).then((status) => {
+	const writer = child(dir, 'import { rmSync } from "node:fs"; for (let i = 0; i < 200; i++) { rmSync(paths.meta, { force: true }); s.readMeta(paths); }').then((status) => {
 		done = true;
 		return status;
 	});
 	let reads = 0;
 	while (!done) {
-		const meta = readMeta(paths);
-		assert.ok(meta === null || meta.run_id === paths.id);
+		assert.equal(readMeta(paths)!.run_id, paths.id);
 		reads++;
 		await new Promise((r) => setImmediate(r));
 	}
 	assert.equal(await writer, 0);
 	assert.ok(reads > 0);
-	assert.equal(readMeta(paths)!.warnings!.length, 3299);
-});
-
-test("concurrent updateMeta from two processes keeps every change", async () => {
-	const dir = join(tmp(), "run");
-	const paths = runPaths(dir);
-	writeMeta(paths, base(dir));
-	const adds = (who: string) => child(dir, `for (let i = 0; i < 150; i++) s.updateMeta(paths, (m) => ({ ...m, warnings: [...(m.warnings ?? []), "${who}" + i] }));`);
-	assert.deepEqual(await Promise.all([adds("a"), adds("b")]), [0, 0]);
-	const warnings = readMeta(paths)!.warnings!;
-	assert.equal(warnings.length, 300);
-	assert.equal(new Set(warnings).size, 300);
 });

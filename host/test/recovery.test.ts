@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type { NodeSpec, TranscriptEntry } from "../src/host/executor.ts";
 import { appendInbox, EventLog, FakeCommands, FakeExecutor, PiExecutor, runPaths, runWorkflow, startSession } from "../src/host/index.ts";
+import { blobPath } from "../src/host/artifacts.ts";
 import { writesOutside } from "../src/host/toolsets.ts";
 import { transientError } from "../src/host/pi.ts";
 import { tmp } from "./util.ts";
@@ -80,7 +81,10 @@ test("R2: SIGKILL at turn 3; the resumed node continues at turn 3 and turns 1-2 
 	const dir = join(tmp(), "run");
 	const killed = spawnSync(process.execPath, [resolve(here, "fixtures/crash/drive.ts"), dir, "3"], { encoding: "utf8", timeout: 60_000 });
 	assert.equal(killed.signal, "SIGKILL", killed.stderr);
-	const checkpoint = JSON.parse(readFileSync(join(dir, "work", "_0_0", "session.json"), "utf8")) as { turns: number };
+	// The newest checkpoint the log names is a blob, written before the event.
+	const progressed = new EventLog(join(dir, "log.jsonl")).read().filter((e) => e.type === "agent_progressed");
+	const newest = progressed.at(-1) as { dialogue: string };
+	const checkpoint = JSON.parse(readFileSync(blobPath(dir, newest.dialogue), "utf8")) as { turns: number };
 	assert.equal(checkpoint.turns, 2);
 	const { provider, executor } = faux();
 	const requests: string[] = [];
@@ -100,18 +104,36 @@ test("R2: SIGKILL at turn 3; the resumed node continues at turn 3 and turns 1-2 
 	assert.ok(notes(transcript(dir)).some((n) => n.startsWith("resumed from its checkpoint after turn 2")));
 });
 
+test("R2: SIGKILL between a checkpoint blob and the event that names it: the blob is unreferenced, the run resumes from the checkpoint before it", async () => {
+	const dir = join(tmp(), "run");
+	// The third checkpoint blob is written; the host dies before journaling it.
+	const killed = spawnSync(process.execPath, [resolve(here, "fixtures/crash/drive.ts"), dir, "99"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, WALLIS_CRASH_AT: "blob:3" } });
+	assert.equal(killed.signal, "SIGKILL", killed.stderr);
+	const named = new Set(new EventLog(join(dir, "log.jsonl")).read().flatMap((e) => (e.type === "agent_progressed" ? [e.dialogue.slice("sha256:".length)] : [])));
+	assert.equal(named.size, 2);
+	const stored = (await import("node:fs")).readdirSync(join(dir, "blobs"));
+	// Every blob the log names is whole; the third is in the store, named by nothing.
+	for (const hex of named) assert.ok(stored.includes(hex));
+	const orphans = stored.filter((hex) => !named.has(hex));
+	assert.equal(orphans.length, 1);
+	JSON.parse(readFileSync(join(dir, "blobs", orphans[0]!), "utf8"));
+	const { provider, executor } = faux();
+	provider.setResponses([submit({ summary: "resumed" })]);
+	const r = await runWorkflow({ workflow: piWorkflow, dir, executor, confine: "off", inboxPollMs: null });
+	assert.deepEqual(r.outcome, { type: "done", value: { summary: "resumed" } });
+	assert.ok(notes(transcript(dir)).some((n) => /^resumed from its checkpoint after turn \d/.test(n)));
+});
+
 test("R2: a tool call in flight at a crash is re-run if it only reads, else becomes an error the model sees", async () => {
 	const { provider, executor } = faux();
 	const dir = tmp();
 	const entries: TranscriptEntry[] = [];
-	const checkpoint = join(dir, "session.json");
 	const call = (name: string, args: Record<string, unknown>, id: string) => ({ type: "toolCall", id, name, arguments: args });
 	// A checkpoint that ends with an assistant turn whose tools never returned.
 	const messages = [
 		{ role: "user", content: "Input", timestamp: 1 },
 		{ role: "assistant", content: [call("read_spill", { name: "1.txt" }, "a"), call("bash", { command: "rm x" }, "b")], stopReason: "toolUse", timestamp: 2, api: "faux", provider: "faux", model: "faux-1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } },
 	];
-	(await import("node:fs")).writeFileSync(checkpoint, JSON.stringify({ messages, turns: 1, compacted: null }));
 	const seen: string[] = [];
 	provider.setResponses([
 		(ctx) => {
@@ -134,7 +156,8 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		contextTokens: undefined,
 		turn: 1,
 		turnLimit: 6,
-		checkpoint,
+		checkpoint: () => {},
+		resume: { messages, turns: 1, compacted: null },
 		digest: "d",
 		transcript: [],
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer" } } },

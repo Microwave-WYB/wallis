@@ -71,13 +71,19 @@ export interface NodeSpec {
 	/** Model turns this node has used, and how many it may use before it stops (`turn_limit`). */
 	readonly turn: number;
 	readonly turnLimit: number;
-	/** Where the executor checkpoints the node's conversation after every completed step (in its work dir). */
-	readonly checkpoint: string;
+	/**
+	 * Checkpoints the node's conversation after every completed step (the
+	 * executor's own format): the host writes it as a blob and journals its
+	 * digest before it returns, so a reissued call resumes from it.
+	 */
+	readonly checkpoint: (state: Json) => void;
+	/** This call's newest checkpoint, when it is reissued after a crash; else null. */
+	readonly resume: Json | null;
 	readonly digest: string;
 	/** Messages after the first prompt, so far: the agent's questions and the replies. */
 	readonly transcript: readonly Message[];
 	/** The session's dialogue after its previous call (the executor's checkpoint format), or null for its first call. */
-	readonly history: string | null;
+	readonly history: Json | null;
 	/** The owner restarted an unknown outcome: make the unknown tool call again (once) instead of reporting it. */
 	readonly retryUnknown: boolean;
 	/** MCP tool results already journaled for this call, by tool call key. */

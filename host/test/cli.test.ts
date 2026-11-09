@@ -56,7 +56,7 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	// Monitoring.
 	assert.match(wallis(root, ["ls"]).stdout, new RegExp(`${id}  ask  finished \\(done\\)`));
 	assert.match(wallis(root, ["tree", id]).stdout, /#0:0  scout/);
-	assert.match(wallis(root, ["log", id, "--since", "1", "--limit", "1"]).stdout, /^1\t\{"type":"executor_changed"/);
+	assert.match(wallis(root, ["log", id, "--since", "1", "--limit", "1"]).stdout, /^1\t\{"type":"noted","key":"workflow"/);
 	assert.match(wallis(root, ["log", id, "--follow"]).stdout, /"type":"body_finished"/);
 	assert.match(wallis(root, ["show", id, "#0:0"]).stdout, /"kind":"user","text":"newcomers"/);
 

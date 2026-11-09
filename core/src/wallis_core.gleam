@@ -45,6 +45,11 @@ pub fn snapshot_json(state: RunState) -> String {
   json.to_string(run.snapshot(state))
 }
 
+/// JSON of the host facts the log noted.
+pub fn facts_json(state: RunState) -> String {
+  json.to_string(run.host_facts(state))
+}
+
 /// The core's semantics version, pinned with every run.
 pub fn semantics() -> String {
   run.semantics

@@ -1,9 +1,41 @@
 # wallis design
 
-Status as of 2026-11-09 (round 7). Sections are marked **decided** (agreed with the
+Status as of 2026-11-09 (foundation round). Sections are marked **decided** (agreed with the
 owner), **proposed** (drafted, not yet confirmed) or **open**. Details the
 first prototype had to fix are marked **prototype choice**: the simplest
 option consistent with the section they sit in, not yet confirmed.
+
+## Everything is a value (decided, foundation round)
+
+**The only mutation is appending an event to the run log.** Every side
+file is either a content-addressed blob that an event references, or a
+cache derivable from the log. Crash windows between writes, semantics held
+in host memory, arrival-order dependence, rewind bugs and name-as-identity
+bugs are the classes this removes.
+
+- **One commit point.** A value a later event depends on (a dialogue, a
+  workspace layer) is written to `blobs/<sha256>` (temp file, then rename)
+  before the event that names its digest. A crash in between leaves an
+  unreferenced blob and no event: the run resumes from the event before.
+- **The journal only grows.** Each slot keeps its attempts, newest first.
+  A restart, a rewind or a forget adds an attempt (a rewound slot gets a
+  `forgotten` mark); the newest attempt is the live one, and no known
+  result is erased. Each settled attempt records the model that served it
+  and the session's dialogue after it.
+- **Config changes are events** (`alias_rebound`, `budget_raised`,
+  `executor_changed`).
+- **Checkpoints are events.** Every checkpoint of an agent call is a blob,
+  then `agent_progressed(id, dialogue)`; a reissued attempt resumes from
+  its newest (`call_agent.checkpoint`), and the session's next call starts
+  from what its previous call left (`call_agent.history`).
+- **Run metadata is a cache.** The host notes facts about a run (workflow
+  path, root, executor module, binaries, base, confinement, warnings,
+  answer schemas, toolset digests, fork origin) as `noted(key, value)`
+  events; `meta.json` is derived from them, cached with the log size it
+  was derived at, written atomically and rebuilt when stale. Facts are not
+  part of the run's snapshot. `start.json` is the launch request of
+  `wallis run` (the first session's parameters), written once before any
+  host runs; with the inbox, it is input, not state.
 
 ## Governing principle (decided, round 4)
 
@@ -445,19 +477,21 @@ Prototype choices:
 
 - `CallAgent` carries the transcript after the first prompt (questions,
   answers, steers, decisions), the node's turns so far and its allowance,
-  the slot of the session's previous call (`previous`) and the MCP results
+  the session's dialogue before the call (`history`, a blob digest), this
+  attempt's newest checkpoint (`checkpoint`) and the MCP results
   already journaled for the call (`recorded`). An answer to a node at its
   turn limit without more turns is refused (`no_turns_left`); a restart
   resets the allowance to `maxTurns`, or to `--turns`.
 - A session call's journal slot includes its previous call's slot, so a
   later call is keyed by the whole dialogue before it. The core keeps the
   chain (`<session>:<index>` → slot) for the current execution of the body.
-- When a call ends, the host copies its checkpoint to
-  `sessions/<slot>.json` before it journals the end; the session's next
-  call starts from it (a fork copies `sessions/`). A missing one is
-  recovered from the previous call's work dir (`call.json` names its slot)
-  before the call is refused (`dialogue_missing`). A restart discards the call's own checkpoint, so it
-  starts from its previous call's dialogue again. The session's scratch dir
+- Every checkpoint of a call is a blob named by `agent_progressed`; when a
+  call ends, its newest checkpoint is the session's dialogue for the next
+  call (a call that never took a step passes on the dialogue it started
+  from). A blob the journal names that the store does not have is refused
+  (`dialogue_missing`), never a fresh start. A restart is a new attempt
+  without a checkpoint, so it starts from its previous call's dialogue
+  again. The session's scratch dir
   (`work/<session>/scratch`) is not rewound.
 - `foreign_session` is checked in the workflow VM, by identity: each
   handle keeps the ctx that created it, and `ctx.call` compares it with
@@ -551,7 +585,8 @@ allowed verbs with their arguments as JSON Schema and the CLI form.
 
 Prototype choices:
 
-- Runs live in `.wallis/runs/<run_id>/`: `log.jsonl`, `meta.json`, `lock`,
+- Runs live in `.wallis/runs/<run_id>/`: `log.jsonl`, `blobs/`,
+  `meta.json` (a cache), `start.json` (the launch request), `lock`,
   `inbox.jsonl` and `inbox.jsonl.done`. A run id is
   `<workflow>-<UTC stamp>-<4 hex>`.
 - A session drives a run until it is finished or idle, then releases the
@@ -567,8 +602,8 @@ Prototype choices:
 - The `wait` cap is 30 s. A timeout returns "still running" (exit code 2 in
   the CLI).
 - The executor is a module whose default export returns
-  `{ executor, commands? }`. It is passed with `--executor`, recorded in
-  `meta.json`, and reused on resume. There is no default executor until pi
+  `{ executor, commands? }`. It is passed with `--executor`, noted in the
+  log (`meta.json`), and reused on resume. There is no default executor until pi
   is built.
 
 ## Ownership and notification (decided, round 3)
@@ -714,8 +749,8 @@ Prototype choices:
   finished: the failure is held (`Idle(NodeFailure)` once nothing else can
   proceed, an attention item meanwhile) and independent branches keep
   running. The owner `restart`s the node (optionally with a note,
-  `--model` rebind or `--turns`): its journal entry is invalidated, it
-  reruns, and the body runs again against the journal, so everything
+  `--model` rebind or `--turns`): a new attempt opens at its slot (the
+  failed one stays in the journal), it reruns, and the body runs again against the journal, so everything
   completed is a hit and it continues. Or the owner `cancel`s it: only then
   does the failure propagate, and the run finishes Failed if the body does
   not handle it. Commands work the same way (a restart reruns them, e.g.
@@ -743,14 +778,16 @@ Prototype choices:
   it would duplicate the wallis tool layer (allowlist, caps, spills,
   sandboxes) and the executor's turn contract. pi-agent-core already
   restores a conversation (`initialState.messages`) and continues it
-  (`continue()`), so the pi executor writes `work/<node>/session.json`
-  itself (atomically, after every assistant message and every turn) and
-  restores from it. A reply that failed or was aborted is never progress
+  (`continue()`), so the pi executor checkpoints its conversation through
+  the host (`NodeSpec.checkpoint`: a blob, then `agent_progressed`, after
+  every assistant message and every turn) and restores from the newest
+  (`NodeSpec.resume`). A reply that failed or was aborted is never progress
   and is dropped on restore.
-- The semantics version is `wallis-core/6` (round 7: opt-in ask, ended
-  without result, unknown outcomes, body tool replay, orchestrator restart
-  and cancel, `dialogue_missing`; round 6 was sessions, tool journaling,
-  orchestrator nodes).
+- The semantics version is `wallis-core/7` (foundation round: an
+  append-only journal of attempts, checkpoints and host facts as events,
+  and the session, workspace and identity changes below; round 7 was
+  opt-in ask, ended without result, unknown outcomes, body tool replay,
+  orchestrator restart and cancel). Logs of earlier versions are not read.
 - The core's "issued in this session" set is filled from every effect that
   issues a call (an exhaustive match), so a call in flight is not issued
   again when the body runs again in the same session (round 7 fix: body
@@ -948,8 +985,7 @@ Prototype choices:
 - A command's memory scope wraps bwrap in `systemd-run --user --scope -p
   MemoryMax=…`; the session-bus variables it needs are unset inside.
 - Per-node dirs: `work/<node>/inputs/<hex>/<name>`, `work/<node>/scratch/`,
-  `work/<node>/spill/` and the pi checkpoint `work/<node>/session.json`,
-  deleted when the node is done.
+  and `work/<node>/spill/`, deleted when the node is done.
 
 ## Mounts (decided, round 4)
 
@@ -990,9 +1026,11 @@ Prototype choices:
 - **Resume re-executes the body against the cache.** Unchanged calls hit;
   anything changed misses and executes; downstream calls miss
   automatically when their inputs change. There is no path divergence.
-- **Restart invalidates that node's entry** (logged), so it executes again;
-  a session call's restart also invalidates the session's later calls and
-  drops the call's journaled MCP results: the outside is asked again.
+- **Restart opens a new attempt** at that node's slot (logged), so it
+  executes again; a session call's restart also forgets the session's
+  later calls (a `forgotten` attempt each) and starts without the call's
+  journaled MCP results: the outside is asked again. Earlier attempts and
+  their results stay in the journal.
 - **MCP calls are journaled** like every call: a body MCP node's result is
   its entry; an agent's MCP results join its call's record. Replay,
   resume, the restart of an unrelated node and fork reuse them.

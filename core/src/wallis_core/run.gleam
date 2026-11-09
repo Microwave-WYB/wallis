@@ -41,7 +41,7 @@ import wallis_core/types.{
 import wallis_core/value.{type Value}
 
 /// Bumped when a change to the core changes what a log means.
-pub const semantics = "wallis-core/6"
+pub const semantics = "wallis-core/7"
 
 pub opaque type RunState {
   NotYetStarted
@@ -72,10 +72,10 @@ type Run {
     admission: Admission,
     /// By request id (display and interventions only).
     requests: Dict(String, Record),
-    /// The journal: a cache from slot (node, input, occurrence) to result.
-    journal: Dict(String, Entry),
-    /// Which request id holds each slot that has a record.
-    slots: Dict(String, String),
+    /// The journal: a cache from slot (node, input, occurrence) to its
+    /// attempts, newest first. It only grows: a restart, a rewind or a
+    /// forget adds an attempt, and the newest is the live one.
+    journal: Dict(String, List(Attempt)),
     /// The slot of each session call (`<session>:<index>`) in this
     /// execution of the body: call k's slot includes call k-1's, so a
     /// session's later calls are keyed by everything before them.
@@ -87,7 +87,23 @@ type Run {
     spent: Spent,
     /// Newest first.
     observations: List(Observation),
+    /// Host facts (`Noted`): what `meta.json` is derived from.
+    facts: Dict(String, Value),
   )
+}
+
+/// One attempt at a slot. `Forgotten`: a rewind (or a forget) left the
+/// slot without a live attempt, so its next request is a new call.
+type Attempt {
+  Forgotten
+  /// Made by request `id`: open while it runs, settled with its result.
+  Tried(id: String, settled: Option(Settled))
+}
+
+/// A settled attempt: its result, the model that served it (agent calls),
+/// and the digest of the session's dialogue after it (agent calls).
+type Settled {
+  Settled(entry: Entry, served: Option(String), dialogue: Option(String))
 }
 
 type Spent {
@@ -121,10 +137,15 @@ type Kind {
   RefusedKind
 }
 
-/// An agent call's dialogue after its input: the messages so far, and the
-/// operator note of a restart.
+/// An agent call's dialogue after its input: the messages so far, the
+/// operator note of a restart, and the digest of this attempt's newest
+/// checkpoint (a blob; `None` before its first step).
 type Dialogue {
-  Dialogue(transcript: List(Message), note: Option(String))
+  Dialogue(
+    transcript: List(Message),
+    note: Option(String),
+    checkpoint: Option(String),
+  )
 }
 
 type Progress {
@@ -171,8 +192,11 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
           resume(r, resumable),
         )
       }
-    // Ownership changes even on a finished run.
+    // Ownership and host facts change even on a finished run.
     Active(r), types.Claimed(owner:) -> #(Active(Run(..r, owner: Some(owner))), [
+      types.Checkpoint,
+    ])
+    Active(r), types.Noted(key:, value:) -> #(Active(note(r, key, value)), [
       types.Checkpoint,
     ])
     Active(Run(lifecycle: Live, ..) as r), _ -> {
@@ -220,12 +244,12 @@ fn start(
           admission: Admitting,
           requests: dict.new(),
           journal: dict.new(),
-          slots: dict.new(),
           chain: dict.new(),
           issued: dict.new(),
           hold: None,
           spent: Spent(0.0, 0, 0, 0.0),
           observations: [],
+          facts: dict.new(),
         ),
       ),
       [types.Checkpoint],
@@ -421,6 +445,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
     types.Claimed(owner:) -> #(Run(..run, owner: Some(owner)), [
       types.Checkpoint,
     ])
+    types.Noted(key:, value:) -> #(note(run, key, value), [types.Checkpoint])
+    types.AgentProgressed(id:, dialogue:) -> progressed(run, id, dialogue)
     types.BodyFinished(output:) -> finish(run, types.Done(output))
     types.BodyFailed(reason:) -> body_failed(run, reason)
     types.Started(..) | types.Resumed(..) -> #(run, [])
@@ -478,9 +504,10 @@ fn leaf(reason: FailReason) -> FailReason {
 fn failed_node(run: Run, failure: FailReason) -> Result(String, Nil) {
   sorted_requests(run)
   |> list.find_map(fn(e) {
-    case dict.get(run.journal, { e.1 }.digest) {
+    case live_entry(run, { e.1 }.digest) {
       Ok(Errored(f)) if f == failure -> Ok(e.0)
-      _ -> Error(Nil)
+      Ok(Errored(_)) | Ok(Answered(_)) | Ok(Refused(_)) | Error(Nil) ->
+        Error(Nil)
     }
   })
 }
@@ -575,9 +602,11 @@ fn requested(
       Run(..run, chain: dict.insert(run.chain, chain_key(session, index), slot))
     _ -> run
   }
-  case dict.get(run.journal, slot), dict.get(run.slots, slot) {
-    Ok(entry), _ -> #(run, [answer_effect(id, entry)])
-    Error(Nil), Ok(old) ->
+  case live_attempt(run, slot) {
+    Tried(settled: Some(settled), ..) -> #(run, [
+      answer_effect(id, settled.entry),
+    ])
+    Tried(id: old, settled: None) ->
       case dict.get(run.requests, old) {
         Ok(record) -> {
           let moved = old != id
@@ -589,7 +618,7 @@ fn requested(
                 requests: run.requests
                   |> dict.delete(old)
                   |> dict.insert(id, record),
-                slots: dict.insert(run.slots, slot, id),
+                journal: rebind_attempt(run.journal, slot, id),
               )
           }
           let #(run, effects) = reissue(run, id, slot, record)
@@ -600,7 +629,7 @@ fn requested(
         }
         Error(Nil) -> new_request(run, id, slot, request)
       }
-    Error(Nil), Error(Nil) -> new_request(run, id, slot, request)
+    Forgotten -> new_request(run, id, slot, request)
   }
 }
 
@@ -610,9 +639,74 @@ fn new_request(
   slot: String,
   request: Request,
 ) -> #(Run, List(Effect)) {
-  let run = Run(..run, slots: dict.insert(run.slots, slot, id))
+  let run = open_attempt(run, slot, id)
   let #(run, effects) = live_request(run, id, slot, request)
   #(run, [types.Checkpoint, ..effects])
+}
+
+// --- The journal ---------------------------------------------------------------
+
+/// The newest attempt at a slot; a slot never tried is like a forgotten one.
+fn live_attempt(run: Run, slot: String) -> Attempt {
+  case dict.get(run.journal, slot) {
+    Ok([newest, ..]) -> newest
+    Ok([]) | Error(Nil) -> Forgotten
+  }
+}
+
+/// The live result of a slot, if its newest attempt settled.
+fn live_entry(run: Run, slot: String) -> Result(Entry, Nil) {
+  case live_attempt(run, slot) {
+    Tried(settled: Some(settled), ..) -> Ok(settled.entry)
+    Tried(settled: None, ..) | Forgotten -> Error(Nil)
+  }
+}
+
+fn push_attempt(run: Run, slot: String, attempt: Attempt) -> Run {
+  let attempts = dict.get(run.journal, slot) |> result.unwrap([])
+  Run(..run, journal: dict.insert(run.journal, slot, [attempt, ..attempts]))
+}
+
+/// A new attempt at a slot, made by request `id`.
+fn open_attempt(run: Run, slot: String, id: String) -> Run {
+  push_attempt(run, slot, Tried(id, None))
+}
+
+/// A rewind: the slot keeps its attempts, and has no live one.
+fn forget(run: Run, slot: String) -> Run {
+  case live_attempt(run, slot) {
+    Forgotten -> run
+    Tried(..) -> push_attempt(run, slot, Forgotten)
+  }
+}
+
+/// The open attempt moves to the request id that asked for it now.
+fn rebind_attempt(
+  journal: Dict(String, List(Attempt)),
+  slot: String,
+  id: String,
+) -> Dict(String, List(Attempt)) {
+  case dict.get(journal, slot) {
+    Ok([Tried(settled: None, ..), ..older]) ->
+      dict.insert(journal, slot, [Tried(id, None), ..older])
+    // Only an open attempt moves; `requested` checked that it is one.
+    Ok([Tried(settled: Some(_), ..), ..]) | Ok([Forgotten, ..]) | Ok([]) | Error(
+      Nil,
+    ) -> journal
+  }
+}
+
+/// The newest attempt settles; a slot without an open attempt gets one.
+fn close_attempt(run: Run, slot: String, id: String, settled: Settled) -> Run {
+  let attempts = dict.get(run.journal, slot) |> result.unwrap([])
+  let attempts = case attempts {
+    [Tried(settled: None, ..), ..older] -> [Tried(id, Some(settled)), ..older]
+    [Tried(settled: Some(_), ..), ..] | [Forgotten, ..] | [] -> [
+      Tried(id, Some(settled)),
+      ..attempts
+    ]
+  }
+  Run(..run, journal: dict.insert(run.journal, slot, attempts))
 }
 
 /// Every call issued by these effects, so a replay in the same session does
@@ -722,7 +816,7 @@ fn live_request(
               [],
             )
             Ok(Nil) -> {
-              let dialogue = Dialogue([], None)
+              let dialogue = Dialogue([], None, None)
               // Recorded first: the effect reads the call's place in its session.
               let run =
                 record(run, id, Record(d, kind, AwaitingAgent(dialogue)))
@@ -817,21 +911,13 @@ fn call_effect(
   )
   // The node's turns so far and its allowance (a new call has neither
   // yet), the previous call of its session and its journaled tool results.
-  let #(turn, turn_limit, previous, recorded) = case
+  let #(turn, turn_limit, history, recorded) = case
     dict.get(run.requests, id)
   {
-    Ok(Record(
-      kind: AgentKind(steps:, allowed:, session:, index:, tools:, ..),
-      ..,
-    )) -> #(
+    Ok(Record(kind: AgentKind(steps:, allowed:, tools:, ..), ..) as rec) -> #(
       steps,
       allowed,
-      case index > 0 {
-        True ->
-          dict.get(run.chain, chain_key(session, index - 1))
-          |> option.from_result
-        False -> None
-      },
+      history_of(run, rec),
       list.reverse(tools),
     )
     _ -> #(0, agent.max_turns, None, [])
@@ -846,7 +932,8 @@ fn call_effect(
     digest: d,
     transcript: dialogue.transcript,
     note: dialogue.note,
-    previous:,
+    history:,
+    checkpoint: dialogue.checkpoint,
     recorded:,
   ))
 }
@@ -918,12 +1005,89 @@ fn settle(
   rec: Record,
   entry: Entry,
 ) -> #(Run, List(Effect)) {
-  let run =
-    Run(
-      ..record(run, id, rec),
-      journal: dict.insert(run.journal, rec.digest, entry),
-    )
+  let served = case rec.progress {
+    Completed(model:) -> model
+    Blocked(..)
+    | AwaitingAgent(..)
+    | AgentWaiting(..)
+    | Unavailable(..)
+    | AwaitingCommand
+    | AwaitingTool
+    | ToolUnknown
+    | AwaitingOrchestrator -> None
+  }
+  // Read before the record is replaced: the dialogue the attempt reached.
+  let settled = Settled(entry:, served:, dialogue: dialogue_after(run, id))
+  let run = close_attempt(record(run, id, rec), rec.digest, id, settled)
   #(run, [answer_effect(id, entry)])
+}
+
+/// The session's dialogue after an agent call ends: its newest checkpoint,
+/// else the dialogue it started from (it never took a step).
+fn dialogue_after(run: Run, id: String) -> Option(String) {
+  case dict.get(run.requests, id) {
+    Ok(Record(kind: AgentKind(..), progress:, ..) as rec) ->
+      case progress {
+        AwaitingAgent(dialogue: d)
+        | AgentWaiting(dialogue: d, ..)
+        | Unavailable(dialogue: d, ..) ->
+          option.or(d.checkpoint, history_of(run, rec))
+        Blocked(..)
+        | Completed(..)
+        | AwaitingCommand
+        | AwaitingTool
+        | ToolUnknown
+        | AwaitingOrchestrator -> history_of(run, rec)
+      }
+    Ok(Record(kind: CommandKind(..), ..))
+    | Ok(Record(kind: ToolKind(..), ..))
+    | Ok(Record(kind: OrchestratorKind(..), ..))
+    | Ok(Record(kind: RefusedKind, ..))
+    | Error(Nil) -> None
+  }
+}
+
+/// The session's dialogue before an agent call: what its previous call
+/// left (`None` for a session's first call).
+fn history_of(run: Run, rec: Record) -> Option(String) {
+  case rec.kind {
+    AgentKind(session:, index:, ..) if index > 0 ->
+      case dict.get(run.chain, chain_key(session, index - 1)) {
+        Ok(previous) ->
+          case live_attempt(run, previous) {
+            Tried(settled: Some(settled), ..) -> settled.dialogue
+            Tried(settled: None, ..) | Forgotten -> None
+          }
+        Error(Nil) -> None
+      }
+    AgentKind(..)
+    | CommandKind(..)
+    | ToolKind(..)
+    | OrchestratorKind(..)
+    | RefusedKind -> None
+  }
+}
+
+/// A checkpoint of a running agent call: a reissued attempt resumes there.
+fn progressed(run: Run, id: String, dialogue: String) -> #(Run, List(Effect)) {
+  case dict.get(run.requests, id) {
+    Ok(Record(progress: AwaitingAgent(dialogue: d), ..) as rec) -> #(
+      record(
+        run,
+        id,
+        Record(
+          ..rec,
+          progress: AwaitingAgent(Dialogue(..d, checkpoint: Some(dialogue))),
+        ),
+      ),
+      [types.Checkpoint],
+    )
+    _ -> #(run, [types.Refuse(None, types.NodeNotRunning(id))])
+  }
+}
+
+fn note(run: Run, key: String, value: Value) -> Run {
+  Run(..run, facts: dict.insert(run.facts, key, value))
 }
 
 // --- Agent results -------------------------------------------------------------
@@ -1315,25 +1479,38 @@ fn restart(
   turns: Int,
 ) -> Result(#(Run, List(Effect)), Refusal) {
   let id = capability.live_id(node)
-  // A held failure: its journal entry is invalidated and the hold lifted;
-  // the call is then reissued like one in flight.
-  let run = case held(run, id), dict.get(run.requests, id) {
+  // A restart is a new attempt at the call's slot; the attempts before it,
+  // with their results, stay in the journal.
+  let retry = fn(run: Run) {
+    case dict.get(run.requests, id) {
+      Ok(rec) -> open_attempt(run, rec.digest, id)
+      Error(Nil) -> run
+    }
+  }
+  // A held failure: a new attempt, and the hold lifted; the call is then
+  // reissued like one in flight.
+  let was_held = held(run, id)
+  let run = case was_held, dict.get(run.requests, id) {
     True, Ok(rec) -> {
       let progress = case rec.kind {
-        AgentKind(..) -> AwaitingAgent(Dialogue([], None))
+        AgentKind(..) -> AwaitingAgent(Dialogue([], None, None))
         CommandKind(..) -> AwaitingCommand
         ToolKind(..) -> AwaitingTool
         OrchestratorKind(..) -> AwaitingOrchestrator
         // A refused call is never a failure the run is held on.
         RefusedKind -> rec.progress
       }
-      Run(
-        ..record(run, id, Record(..rec, progress:)),
-        journal: dict.delete(run.journal, rec.digest),
-        hold: None,
-      )
+      Run(..retry(record(run, id, Record(..rec, progress:))), hold: None)
     }
     _, _ -> run
+  }
+  // Not held: the restart itself opens the new attempt (an unknown outcome
+  // is retried within its attempt, so it opens none).
+  let retry = fn(run: Run) {
+    case was_held {
+      True -> run
+      False -> retry(run)
+    }
   }
   use _ <- result.try(case note, capability.live_kind(node) {
     Some(_), capability.LiveAgent(steerable: False) ->
@@ -1351,21 +1528,21 @@ fn restart(
         Record(kind: ToolKind(tool:, input:, ..), progress: ToolUnknown, ..) as rec,
       ) ->
       Ok(
-        #(record(run, id, Record(..rec, progress: AwaitingTool)), [
+        #(retry(record(run, id, Record(..rec, progress: AwaitingTool))), [
           types.Checkpoint,
           types.CallTool(id:, tool:, input:, digest: rec.digest),
         ]),
       )
     // An orchestrator node is asked again.
     Ok(Record(kind: OrchestratorKind(..), progress: AwaitingOrchestrator, ..)) ->
-      Ok(#(run, [types.Checkpoint]))
+      Ok(#(retry(run), [types.Checkpoint]))
     // A command reruns with the same input.
     Ok(Record(
       kind: CommandKind(command:, input:, ..),
       progress: AwaitingCommand,
       ..,
     )) -> {
-      let run = add_inbox(run, id, types.Restart, "")
+      let run = retry(add_inbox(run, id, types.Restart, ""))
       Ok(
         #(run, [
           types.Checkpoint,
@@ -1424,8 +1601,8 @@ fn restart(
               )
             _, _ -> rec
           }
-          let run = rewind(record(run, id, rec), rec.kind)
-          let d = Dialogue([], note)
+          let run = retry(rewind(record(run, id, rec), rec.kind))
+          let d = Dialogue([], note, None)
           case admit(run) {
             Error(reason) ->
               Ok(
@@ -1589,7 +1766,7 @@ fn unblock(run: Run) -> #(Run, List(Effect)) {
       ) as rec ->
         case admit(run) {
           Ok(Nil) -> {
-            let d = Dialogue([], note)
+            let d = Dialogue([], note, None)
             case call_effect(run, id, agent, input, rec.digest, d) {
               Ok(call) -> #(
                 record(run, id, Record(..rec, progress: AwaitingAgent(d))),
@@ -1674,12 +1851,9 @@ fn rewind(run: Run, kind: Kind) -> Run {
             False -> Error(Nil)
           }
         })
-      // Their slots go too, so a later request is a new call, not a stale record.
-      Run(
-        ..run,
-        journal: dict.drop(run.journal, later),
-        slots: dict.drop(run.slots, later),
-      )
+      // Each is forgotten (its attempts stay), so a later request is a new
+      // call, not a stale record.
+      list.fold(later, run, forget)
     }
     _ -> run
   }
@@ -1854,7 +2028,7 @@ pub fn nodes(run: RunState) -> List(Node) {
       sorted_requests(r)
       |> list.filter_map(fn(e) {
         let #(id, rec) = e
-        let entry = dict.get(r.journal, rec.digest)
+        let entry = live_entry(r, rec.digest)
         case rec.kind {
           AgentKind(agent:, inbox:, ..) -> {
             let declared = find_agent(r.workflow, agent)
@@ -2009,6 +2183,47 @@ pub fn nodes(run: RunState) -> List(Node) {
             }
         }
       })
+  }
+}
+
+/// The host facts the log noted (`Noted`), for `meta.json`: not part of the
+/// snapshot, since they are about the host, not the run.
+pub fn host_facts(run: RunState) -> json.Json {
+  case run {
+    NotYetStarted -> json.object([])
+    Active(r) -> sorted_object(r.facts, value.to_json)
+  }
+}
+
+/// The attempts at a request's slot, newest first, for tests and display:
+/// `open`, `forgotten`, or how it settled and by which model.
+pub fn attempts(run: RunState, id: String) -> List(String) {
+  case run {
+    NotYetStarted -> []
+    Active(r) ->
+      case dict.get(r.requests, id) {
+        Error(Nil) -> []
+        Ok(rec) ->
+          dict.get(r.journal, rec.digest)
+          |> result.unwrap([])
+          |> list.map(fn(attempt) {
+            case attempt {
+              Forgotten -> "forgotten"
+              Tried(settled: None, ..) -> "open"
+              Tried(settled: Some(settled), ..) -> {
+                let how = case settled.entry {
+                  Answered(_) -> "answered"
+                  Errored(_) -> "errored"
+                  Refused(_) -> "refused"
+                }
+                case settled.served {
+                  Some(model) -> how <> " by " <> model
+                  None -> how
+                }
+              }
+            }
+          })
+      }
   }
 }
 

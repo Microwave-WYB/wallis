@@ -25,6 +25,8 @@ export type Event =
 	| { type: "agent_asked"; id: string; message: string; usage: Usage; model: string }
 	| { type: "call_outcome_unknown"; id: string; tool: string; args: Json; usage: Usage; model: string }
 	| { type: "previous_dialogue_missing"; id: string }
+	/** A running agent call's dialogue so far: a blob written before this event. */
+	| { type: "agent_progressed"; id: string; dialogue: string }
 	| { type: "turn_interrupted"; id: string; usage: Usage; model: string }
 	| { type: "tool_recorded"; id: string; call: string; result: Json }
 	| { type: "input_rejected"; id: string; field: string | null; chars: number; limit: number }
@@ -48,6 +50,8 @@ export type Event =
 	| { type: "pause_requested"; by: string }
 	| { type: "resume_requested"; by: string }
 	| { type: "claimed"; owner: string }
+	/** A host fact (`meta.json` is derived from these); the latest value of a key wins. */
+	| { type: "noted"; key: string; value: Json }
 	| { type: "body_finished"; output: Json }
 	| { type: "body_failed"; reason: FailReason };
 
@@ -143,8 +147,10 @@ export type CallAgentEffect = {
 	digest: string;
 	transcript: Message[];
 	note: string | null;
-	/** The slot of the session's previous call: where this call's dialogue continues. */
-	previous: string | null;
+	/** The session's dialogue before this call (a blob digest): where a new attempt starts. */
+	history: string | null;
+	/** This attempt's newest dialogue (a blob digest): where a reissued attempt resumes. */
+	checkpoint: string | null;
 	/** MCP tool results already journaled for this call. */
 	recorded: { call: string; result: Json }[];
 };
@@ -175,6 +181,11 @@ export class Core {
 	/** JSON of status, nodes, observations, spend, budget and models. */
 	snapshotText(): string {
 		return gleam.snapshot_json(this.#state);
+	}
+
+	/** The host facts the log noted (`noted` events), by key. */
+	facts(): Record<string, Json> {
+		return JSON.parse(gleam.facts_json(this.#state)) as Record<string, Json>;
 	}
 
 	snapshot(): Snapshot {

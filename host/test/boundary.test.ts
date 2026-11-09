@@ -83,7 +83,8 @@ test("an invalid submit_result goes back to the model; the node completes on a v
 	assert.ok(!JSON.stringify(r.log).includes('"two"'));
 	// Replay is identical: a second run gives the same log, a resume executes nothing.
 	const again = await run("submit", { strict });
-	assert.deepEqual(again.log, r.log);
+	// Host facts (paths, times) are not the run: everything else is the same.
+	assert.deepEqual(again.log.filter((e) => e.type !== "noted"), r.log.filter((e) => e.type !== "noted"));
 	const executor = new FakeExecutor({});
 	const resumed = await runWorkflow({ workflow, dir: r.dir, executor, confine: "off", inboxPollMs: null });
 	assert.equal(resumed.snapshot, r.result.snapshot);

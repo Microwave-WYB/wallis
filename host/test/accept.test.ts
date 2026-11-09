@@ -17,7 +17,9 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { cli, cliEnv, onlyRun, runDir, tmp, wallis } from "./util.ts";
+import { blobPath } from "../src/host/artifacts.ts";
+import { readMeta, runPaths } from "../src/host/store.ts";
+import { cli, cliEnv, lines, onlyRun, runDir, tmp, wallis } from "./util.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const executor = resolve(here, "fixtures/accept-executor.ts");
@@ -175,7 +177,7 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	// The outside world: one search, the upload and the publish (each retried by its restart). Resumes replayed the journal.
 	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish", "publish"]);
 	// Preflight warnings, in run metadata: the upload tool may write outside; the fx server keeps only read-only tools.
-	const meta = JSON.parse(readFileSync(join(runDir(project.root, o.id()), "meta.json"), "utf8")) as { warnings: string[] };
+	const meta = readMeta(runPaths(runDir(project.root, o.id())))! as { warnings: string[] };
 	assert.ok(meta.warnings.some((w) => /agent poster: tool upload may write outside \(unannotated\)/.test(w)), meta.warnings.join("\n"));
 	assert.ok(meta.warnings.some((w) => /agent worker: from MCP server fx only tools annotated readOnlyHint are given; excluded: echo, other, wipe, post/.test(w)), meta.warnings.join("\n"));
 }
@@ -229,7 +231,9 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 			// A fork keeps the work dirs: the idle call's checkpoint and the session's scratch dir.
 			const forked = ok(w("fork", id));
 			const forkId = /into (\S+)\./.exec(forked)![1]!;
-			assert.ok(existsSync(join(runDir(project.root, forkId), "work", "_1_1", "session.json")), "the idle call's checkpoint is in the fork");
+			const forkDir = runDir(project.root, forkId);
+			const checkpoints = lines(join(forkDir, "log.jsonl")).filter((e) => e.type === "agent_progressed" && e.id === "#1:1");
+			assert.ok(checkpoints.length > 0 && existsSync(blobPath(forkDir, String(checkpoints.at(-1)!.dialogue))), "the idle call's checkpoint is in the fork");
 			// Node dirs only: a tool connection's scratch dir is its own (the live run keeps opening connections).
 			const nodeDirs = (run: string) => readdirSync(join(runDir(project.root, run), "work")).filter((d) => !/^(mcp|toolset)-/.test(d)).sort();
 			assert.deepEqual(nodeDirs(forkId), nodeDirs(id));
