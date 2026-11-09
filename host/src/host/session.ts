@@ -53,7 +53,7 @@ import { type Mount, MountError, mountDigest, resolveMounts } from "./mounts.ts"
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
-import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, type RunPaths, runPaths } from "./store.ts";
+import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, refusePending, type RunPaths, runPaths } from "./store.ts";
 
 export interface SessionOptions {
 	/** The run directory. A directory without a log starts a new run. */
@@ -151,6 +151,8 @@ export async function startSession(options: SessionOptions): Promise<Session> {
 		return session;
 	} catch (error) {
 		release();
+		// A refused boot answers the inbox entries waiting for this host.
+		if (error instanceof RunRefused) refusePending(paths, error.refusal);
 		throw error;
 	}
 }
@@ -404,7 +406,10 @@ export class Session {
 		this.#decl = decl;
 		this.#local = o.local ?? loadProfile(this.#root);
 		try {
-			this.#mounts = resolveMounts(decl.core.name, dirname(this.#workflow), decl.mounts, { root: this.#root, callTime: o.mounts, profile: this.#local.mounts });
+			// The caller's mounts of a new run are noted, and reused by every later host of the run.
+			const callTime = o.mounts ?? readMeta(this.paths)?.mounts;
+			this.#mounts = resolveMounts(decl.core.name, dirname(this.#workflow), decl.mounts, { root: this.#root, callTime, profile: this.#local.mounts });
+			if (callTime !== undefined && Object.keys(callTime).length > 0) this.#note("mounts", Object.fromEntries(Object.keys(callTime).map((n) => [n, this.#mounts[n]!.dir])));
 		} catch (error) {
 			if (error instanceof MountError) throw new RunRefused(error.refusal);
 			throw error;

@@ -84,6 +84,8 @@ const Facts = Type.Object({
 	warnings: Type.Optional(Type.Array(Type.String())),
 	/** Answer schemas of the workflow's orchestrator nodes, for pending items. */
 	answers: Type.Optional(Type.Record(Type.String(), Type.Unsafe<Json>({}))),
+	/** Host dirs the caller gave for mounts (`--mount`), by name: reused on resume. */
+	mounts: Type.Optional(Type.Record(Type.String(), Type.String())),
 	/** Each toolset's bundle digest (its module and the runner, as run), by path. */
 	toolsets: Type.Optional(Type.Record(Type.String(), Type.String())),
 });
@@ -245,6 +247,19 @@ export function readInbox(paths: RunPaths): InboxEntry[] {
 		.slice(0, -1)
 		.filter((l) => l.length > 0)
 		.map((l) => JSON.parse(l) as InboxEntry);
+}
+
+/**
+ * A host that cannot boot (its run is refused) refuses every inbox entry it
+ * has not taken, with that refusal: whoever handed it in learns why,
+ * instead of entries piling up unanswered.
+ */
+export function refusePending(paths: RunPaths, refusal: Refusal): void {
+	const done = new Set(existsSync(`${paths.inbox}.done`) ? readFileSync(`${paths.inbox}.done`, "utf8").split("\n") : []);
+	for (const entry of readInbox(paths)) {
+		if (done.has(entry.id) || refusedEntry(paths, entry.id) !== null) continue;
+		appendFileSync(`${paths.inbox}.refused`, `${JSON.stringify({ id: entry.id, refusal })}\n`);
+	}
 }
 
 /** The refusal the driver recorded for an inbox entry, if it refused it. */

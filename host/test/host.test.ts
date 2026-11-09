@@ -149,3 +149,23 @@ test("model aliases resolve call-time > workflow profile > global profile > work
 	assert.throws(() => resolveModels("w", { default: "" }), /default is unresolved/);
 });
 
+
+test("call-time mounts are noted and reused by every later host; a host whose boot is refused refuses the inbox entries waiting for it", async () => {
+	const { appendInbox, runPaths } = await import("../src/host/store.ts");
+	const { refusedEntry } = await import("../src/host/store.ts");
+	const workflow = resolve(here, "fixtures/mounted/workflow.ts");
+	const data = tmp();
+	const dir = join(tmp(), "run");
+	const first = await runWorkflow({ ...quiet, workflow, dir, executor: new FakeExecutor({}), input: null, mounts: { data } });
+	assert.equal(first.run.nodes[0]?.type, "orchestrator_pending");
+	// A later host, without --mount (as a resume or the detached host of `submit` is): no mount_unset.
+	appendInbox(runPaths(dir), { id: "s1", type: "submit", node: "#0", value: { ok: true }, by: "human" });
+	const done = await runWorkflow({ ...quiet, workflow, dir, executor: new FakeExecutor({}) });
+	assert.deepEqual(done.outcome, { type: "done", value: { ok: true } });
+	// A host whose boot is refused (here: another seed) answers what waits for it.
+	const second = join(tmp(), "run");
+	await runWorkflow({ ...quiet, workflow, dir: second, executor: new FakeExecutor({}), input: null, mounts: { data }, seed: 1 });
+	appendInbox(runPaths(second), { id: "s2", type: "submit", node: "#0", value: { ok: true }, by: "human" });
+	await assert.rejects(runWorkflow({ ...quiet, workflow, dir: second, executor: new FakeExecutor({}), seed: 2 }), (e: unknown) => e instanceof RunRefused);
+	assert.equal(refusedEntry(runPaths(second), "s2")?.type, "pin_mismatch");
+});

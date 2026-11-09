@@ -220,6 +220,7 @@ async function deliver(dir: string, entry: Parameters<typeof appendInbox>[1]): P
 	appendInbox(paths, entry);
 	const taken = () =>
 		(existsSync(`${paths.inbox}.done`) && readFileSync(`${paths.inbox}.done`, "utf8").split("\n").includes(entry.id)) ||
+		refusedEntry(paths, entry.id) !== null ||
 		new EventLog(paths.log).read().some((e) => (e.type === "sent" || e.type === "steered") && e.message_id === entry.id);
 	const deadline = Date.now() + 15_000;
 	let started = 0;
@@ -231,6 +232,8 @@ async function deliver(dir: string, entry: Parameters<typeof appendInbox>[1]): P
 		}
 		await new Promise((r) => setTimeout(r, 100));
 	}
+	// Not taken and not refused: say so (a non-zero exit), never return as if it were delivered.
+	if (!taken()) throw new Error(`no host of run ${paths.id} took the entry within 15 s; it stays in the inbox`);
 }
 
 async function main(): Promise<number> {
