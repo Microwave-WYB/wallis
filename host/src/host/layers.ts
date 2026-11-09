@@ -155,7 +155,9 @@ export function squash(runDir: string, layers: readonly string[]): string {
 		for (const path of Object.keys(manifest).sort()) {
 			const entry = manifest[path]!;
 			const under = (p: string) => p.startsWith(`${path}/`);
-			if (entry.type === "whiteout" || (entry.type === "dir" && entry.opaque)) for (const p of [...merged.keys()]) if (under(p)) merged.delete(p);
+			// Anything but a merged dir replaces what the layers below had under its path: a whiteout,
+			// an opaque dir, and a file or symlink over a dir (the kernel leaves no whiteout for those).
+			if (entry.type !== "dir" || entry.opaque) for (const p of [...merged.keys()]) if (under(p)) merged.delete(p);
 			if (entry.type === "whiteout") merged.delete(path);
 			else merged.set(path, { entry: entry.type === "dir" ? { type: "dir", opaque: false } : entry, from: layer });
 		}
@@ -182,7 +184,10 @@ export function squash(runDir: string, layers: readonly string[]): string {
 /** The session's layers after a call: its new layer on top, squashed into one beyond MAX_DEPTH. */
 export function layersAfter(runDir: string, before: readonly string[], committed: string | null): string[] {
 	const after = committed === null ? [...before] : [...before, committed];
-	return after.length > MAX_DEPTH ? [squash(runDir, after)] : after;
+	// One overlay may not name a dir twice: a layer already in the stack (content written back
+	// to an earlier state) squashes it, like a deep one.
+	const repeated = committed !== null && before.includes(committed);
+	return after.length > MAX_DEPTH || repeated ? [squash(runDir, after)] : after;
 }
 
 /** What a workspace path is, through the upper dir and the layers below it (as overlayfs resolves it). */
@@ -217,7 +222,15 @@ function hidden(root: string, parts: readonly string[]): boolean {
 	for (let n = 1; n < parts.length; n++) {
 		const p = join(root, ...parts.slice(0, n));
 		if (isWhiteout(p)) return true;
-		if (existsSync(p) && opaque(p)) return true;
+		let st;
+		try {
+			st = lstatSync(p);
+		} catch {
+			continue;
+		}
+		// A file or symlink over a dir hides the layers' children below it (ENOTDIR, as the kernel).
+		if (!st.isDirectory()) return true;
+		if (opaque(p)) return true;
 	}
 	return false;
 }

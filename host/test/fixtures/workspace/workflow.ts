@@ -39,7 +39,7 @@ export default workflow({
 	models,
 	agents: [worker, shell],
 	commands: [peek],
-	input: Type.Object({ mode: Type.Union([Type.Literal("branches"), Type.Literal("from"), Type.Literal("deep"), Type.Literal("big"), Type.Literal("restart"), Type.Literal("shell"), Type.Literal("tree")]) }),
+	input: Type.Object({ mode: Type.Union([Type.Literal("branches"), Type.Literal("from"), Type.Literal("deep"), Type.Literal("big"), Type.Literal("restart"), Type.Literal("shell"), Type.Literal("tree"), Type.Literal("rewrite")]) }),
 	output: Type.Any(),
 	run: async (ctx, input) => {
 		if (input.mode === "shell") {
@@ -48,6 +48,14 @@ export default workflow({
 			[, s] = await ctx.call(s, { script: "rm b.txt; cat a.txt" });
 			const [listed] = await ctx.call(s, { script: "ls -R" });
 			return { listed: listed.out };
+		}
+		if (input.mode === "rewrite") {
+			// a back to its first content: the third call's layer is the first one again.
+			let [, s] = await ctx.call(ctx.session(shell), { script: "echo x > a" });
+			[, s] = await ctx.call(s, { script: "echo y > a" });
+			[, s] = await ctx.call(s, { script: "echo x > a" });
+			const [read] = await ctx.call(s, { script: "cat a" });
+			return { read: read.out.trim(), layers: s.layers.length };
 		}
 		if (input.mode === "tree") {
 			// A one-layer Tree, to a command and to an exec agent.

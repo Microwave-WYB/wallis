@@ -5,13 +5,13 @@
 // upper dir and lists /w through the layers, as the host's file tools do.
 
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runSpawn } from "../src/host/confine.ts";
 import { appendInbox, bwrapAvailable, FakeExecutor, ProcessCommands, runPaths, runWorkflow } from "../src/host/index.ts";
-import { layerDir, listIn, readManifest } from "../src/host/layers.ts";
+import { commitLayer, layerDir, listIn, prepareWork, readManifest, resolveIn, squash } from "../src/host/layers.ts";
 import { tmp } from "./util.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -158,3 +158,40 @@ test("a one-layer Tree is mounted read-only for a command and for an exec agent"
 	assert.deepEqual(done.outcome, { type: "done", value: { layers: 1, command: "from-tree", agent: "from-tree" } });
 });
 
+test("a layer written back to an earlier state is not named twice in one overlay: the stack is squashed", bwrap, async () => {
+	const done = await runWorkflow({ ...real(join(tmp(), "run"), "rewrite"), executor: shell() });
+	assert.deepEqual(done.outcome, { type: "done", value: { read: "x", layers: 1 } });
+});
+
+/** A layer committed from an upper dir built by hand (as the kernel leaves it). */
+function layerOf(runDir: string, build: (upper: string) => void): string {
+	const root = join(runDir, "work", `hand-${Math.random().toString(16).slice(2)}`);
+	const work = prepareWork(runDir, root, []);
+	if ("missing" in work) throw new Error("no work");
+	build(work.upper);
+	return commitLayer(runDir, work, root)!;
+}
+
+test("a file or symlink over a lower layer's directory replaces it: squash and lookups drop what was under it", () => {
+	const dir = tmp();
+	const lower = layerOf(dir, (u) => {
+		mkdirSync(join(u, "a"));
+		writeFileSync(join(u, "a", "x"), "x");
+		mkdirSync(join(u, "b"));
+		writeFileSync(join(u, "b", "y"), "y");
+	});
+	// rm -rf a; echo f > a (and the same with a symlink): no whiteout, just the new entry.
+	const upper = layerOf(dir, (u) => {
+		writeFileSync(join(u, "a"), "f");
+		symlinkSync("a", join(u, "b"));
+	});
+	const stack = [lower, upper];
+	const work = { lowers: stack.map((l) => layerDir(dir, l)), upper: join(dir, "nothing"), ovl: "" };
+	assert.equal(resolveIn(work, "a/x"), null);
+	assert.equal(resolveIn(work, "b/y"), null);
+	assert.deepEqual(listIn(work, ""), ["a", "b"]);
+	const squashed = readManifest(dir, squash(dir, stack));
+	assert.deepEqual(Object.keys(squashed).sort(), ["a", "b"]);
+	assert.equal(squashed.a!.type, "file");
+	assert.equal(squashed.b!.type, "symlink");
+});
