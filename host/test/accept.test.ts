@@ -230,7 +230,9 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 			const forked = ok(w("fork", id));
 			const forkId = /into (\S+)\./.exec(forked)![1]!;
 			assert.ok(existsSync(join(runDir(project.root, forkId), "work", "_1_1", "session.json")), "the idle call's checkpoint is in the fork");
-			assert.deepEqual(readdirSync(join(runDir(project.root, forkId), "work")).sort(), readdirSync(join(runDir(project.root, id), "work")).sort());
+			// Node dirs only: a tool connection's scratch dir is its own (the live run keeps opening connections).
+			const nodeDirs = (run: string) => readdirSync(join(runDir(project.root, run), "work")).filter((d) => !/^(mcp|toolset)-/.test(d)).sort();
+			assert.deepEqual(nodeDirs(forkId), nodeDirs(id));
 			assert.deepEqual(status(forkId).attention.map(label), ["ended_without_result:#1:1"]);
 			ok(w("cancel", forkId));
 		},

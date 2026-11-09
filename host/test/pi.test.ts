@@ -280,7 +280,7 @@ function withSources(tools: readonly ToolDesc[], recorded = new Map<string, Json
 		decl: { mcp: { mcpServers: { fx: { command: process.execPath, args: [resolve(here, "fixtures/mcp-server.ts")], env: { TOKEN: "${TOKEN}", COUNT_FILE: "${COUNT_FILE}" } } } }, mcpServers: { fx: { sandbox: null, network: "full" } }, toolsets: {} } as never,
 		workflowDir: here,
 		runDir: tmp(),
-		boxes: null,
+		confinement: { type: "off" },
 		env: { TOKEN: "s3cret", COUNT_FILE: count },
 	});
 	const records: [string, Json][] = [];

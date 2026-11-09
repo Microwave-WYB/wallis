@@ -10,8 +10,10 @@
 //   never sees an agent's input artifacts or scratch dir, and wallis offers
 //   no MCP `roots`: tools that expect local file paths cannot work on agent
 //   files.
-// - Every connection gets its own scratch dir, so nothing a server keeps on
-//   disk crosses agent calls.
+// - Every connection gets its own scratch dir, its working directory, so
+//   nothing a server keeps on disk crosses agent calls.
+// - Without bubblewrap a local source is refused (`sandbox_unavailable`);
+//   it runs unconfined only when confinement is explicitly off.
 //
 // The client declares no capabilities, so servers cannot ask for sampling or
 // elicitation; resources and prompts are ignored.
@@ -30,7 +32,7 @@ import { McpClient, StdioTransport, StreamableHttpTransport } from "@earendil-wo
 import { build } from "esbuild";
 import type { Json, ToolAnnotations, ToolDesc } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
-import { LAYOUT, type Sandboxes } from "./confine.ts";
+import { LAYOUT, SandboxError, type Sandboxes } from "./confine.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const nodeModules = resolve(here, "../../node_modules");
@@ -143,20 +145,23 @@ function resolveSecrets(env: Readonly<Record<string, string>> | undefined, secre
 	return Object.fromEntries(Object.entries(env ?? {}).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_m, name: string) => secrets[name] ?? "")]));
 }
 
+/** How local sources run: in their sandboxes, unconfined because confinement is off, or not at all. */
+export type Confinement = { readonly type: "bwrap"; readonly boxes: Sandboxes } | { readonly type: "off" } | { readonly type: "unavailable" };
+
 /** Connects to tool sources: a new connection each time (an agent call, or the run's body). */
 export class ToolSources {
 	readonly #decl: Declarations;
 	readonly #workflowDir: string;
 	readonly #runDir: string;
-	readonly #boxes: Sandboxes | null;
+	readonly #confinement: Confinement;
 	readonly #env: Readonly<Record<string, string | undefined>>;
 	readonly #bundles = new Map<string, Promise<string>>();
 
-	constructor(options: { decl: Declarations; workflowDir: string; runDir: string; boxes: Sandboxes | null; env?: Readonly<Record<string, string | undefined>> }) {
+	constructor(options: { decl: Declarations; workflowDir: string; runDir: string; confinement: Confinement; env?: Readonly<Record<string, string | undefined>> }) {
 		this.#decl = options.decl;
 		this.#workflowDir = options.workflowDir;
 		this.#runDir = options.runDir;
-		this.#boxes = options.boxes;
+		this.#confinement = options.confinement;
 		this.#env = options.env ?? process.env;
 	}
 
@@ -194,27 +199,30 @@ export class ToolSources {
 		const env = resolveSecrets(config.env, this.#env);
 		const argv = [config.command!, ...(config.args ?? [])];
 		const overlay = this.#decl.mcpServers[server];
-		let sp: { command: string; args: readonly string[]; env: Readonly<Record<string, string>> };
-		if (this.#boxes) {
+		const c = this.#confinement;
+		if (c.type === "unavailable") throw new SandboxError({ type: "sandbox_unavailable", source: sourceKey({ kind: "mcp", server }) });
+		// Each connection gets its own scratch dir: server state never crosses agent calls.
+		const scratch = this.#scratch(`mcp-${server.replace(/[^A-Za-z0-9._-]/g, "_")}`);
+		let sp: { command: string; args: readonly string[]; env: Readonly<Record<string, string>>; cwd?: string };
+		if (c.type === "bwrap") {
 			if (!overlay?.sandbox) throw new Error(`MCP server ${server} has no sandbox in the workflow's mcp overlay`);
-			// Each connection gets its own scratch dir: server state never crosses agent calls.
-			const scratch = this.#scratch(`mcp-${server.replace(/[^A-Za-z0-9._-]/g, "_")}`);
-			sp = this.#boxes.spawn(overlay.sandbox, argv, { scratch, inputs: null }, { env, network: overlay.network });
-		} else sp = { command: argv[0]!, args: argv.slice(1), env: { PATH: process.env.PATH ?? "", ...env } };
-		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe" });
+			sp = c.boxes.spawn(overlay.sandbox, argv, { scratch, inputs: null }, { env, network: overlay.network });
+		} else sp = { command: argv[0]!, args: argv.slice(1), env: { PATH: process.env.PATH ?? "", ...env }, cwd: scratch };
+		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe", ...(sp.cwd ? { cwd: sp.cwd } : {}) });
 	}
 
 	async #toolsetTransport(path: string) {
 		const decl = this.#decl.toolsets[path];
 		if (!decl) throw new Error(`no toolset ${path}`);
+		const c = this.#confinement;
+		if (c.type === "unavailable") throw new SandboxError({ type: "sandbox_unavailable", source: sourceKey({ kind: "toolset", path }) });
 		const dir = await this.#bundle(path);
 		const secrets = Object.fromEntries(decl.secrets.flatMap((name) => (this.#env[name] === undefined ? [] : [[name, this.#env[name]!]])));
-		let sp: { command: string; args: readonly string[]; env: Readonly<Record<string, string>> };
-		if (this.#boxes) {
-			const scratch = this.#scratch(`toolset-${digest(path).slice(0, 12)}`);
-			sp = this.#boxes.spawn(decl.sandbox, ["node", `${LAYOUT.inputs}/runner.mjs`], { scratch, inputs: dir }, { env: secrets, network: decl.network });
-		} else sp = { command: process.execPath, args: [join(dir, "runner.mjs")], env: { PATH: process.env.PATH ?? "", ...secrets } };
-		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe" });
+		const scratch = this.#scratch(`toolset-${digest(path).slice(0, 12)}`);
+		let sp: { command: string; args: readonly string[]; env: Readonly<Record<string, string>>; cwd?: string };
+		if (c.type === "bwrap") sp = c.boxes.spawn(decl.sandbox, ["node", `${LAYOUT.inputs}/runner.mjs`], { scratch, inputs: dir }, { env: secrets, network: decl.network });
+		else sp = { command: process.execPath, args: [join(dir, "runner.mjs")], env: { PATH: process.env.PATH ?? "", ...secrets }, cwd: scratch };
+		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe", ...(sp.cwd ? { cwd: sp.cwd } : {}) });
 	}
 
 	/** A fresh scratch dir for one connection: `work/<prefix>-<random>`. */

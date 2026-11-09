@@ -39,7 +39,7 @@ import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
-import { resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
+import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
 import { bundleWorkflow } from "./bundle.ts";
 import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode, SubmittableNode } from "./capability.ts";
 import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
@@ -63,8 +63,9 @@ export interface SessionOptions {
 	/**
 	 * `auto` (default): bwrap sandboxes when bwrap works here; `require`:
 	 * refuse without bwrap; `off`: no sandbox preflight and no bwrap (tests
-	 * with fake commands; agents' `bash` reports it, MCP servers run unconfined
-	 * and the MCP containment preflight is skipped).
+	 * with fake commands; agents' `bash` reports it, toolsets and MCP servers
+	 * run unconfined). Under `auto` without bwrap a local tool source is
+	 * refused (`sandbox_unavailable`).
 	 */
 	readonly confine?: "auto" | "require" | "off";
 	/** New runs: call-time binary paths (`--bin name=path`), beating the profile and the PATH. */
@@ -541,9 +542,16 @@ export class Session {
 	 * and recorded in run metadata.
 	 */
 	async #preflightTools(): Promise<void> {
-		this.#sources = new ToolSources({ decl: this.#decl, workflowDir: dirname(this.#workflow), runDir: this.paths.dir, boxes: this.#boxes });
+		// Unconfined only when confinement is explicitly off; without bubblewrap a local source is refused.
+		const confinement: Confinement = this.#boxes ? { type: "bwrap", boxes: this.#boxes } : this.#options.confine === "off" ? { type: "off" } : { type: "unavailable" };
+		this.#sources = new ToolSources({ decl: this.#decl, workflowDir: dirname(this.#workflow), runDir: this.paths.dir, confinement });
 		if (this.#sources.sources().length === 0) return;
-		this.#listing = await this.#sources.listAll();
+		try {
+			this.#listing = await this.#sources.listAll();
+		} catch (error) {
+			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
+			throw error;
+		}
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
 			if (resolved.unknown !== null) throw new RunRefused({ type: "unknown_tool", name: resolved.unknown });

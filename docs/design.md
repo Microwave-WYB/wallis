@@ -149,10 +149,10 @@ defineAgent(env, { ..., workspace: { sandbox: py, access: "exec" }, tools: [ask,
   unless parsed. Body calls are external nodes: journaled, replayed from
   the journal, and the same definition serves agents and the body.
 - **Connection scope.** An agent gets one connection per source per agent
-  call (a session's `.call`), so server state never crosses agents and
+  call (each `ctx.call` of a session), so server state never crosses agents and
   nothing runs between calls; the body gets one per source per run (per
   host session). Every connection gets its own scratch dir
-  (`work/<source>-<random>`). The client declares no capabilities, so
+  (`work/<source>-<random>`), its working directory, confined or not. The client declares no capabilities, so
   sampling and elicitation are refused; resources and prompts are ignored.
 
 Prototype choices:
@@ -933,10 +933,12 @@ Prototype choices:
   server's spawn shares the host network when its overlay says `"full"`
   (the default), and `setup` always does.
 - A command whose sandbox cannot be built (no bwrap) fails as
-  `unrunnable`; agents' `bash` reports it. `confine: "off"` (tests,
-  development; an executor kit may set it) skips the sandbox preflight and
-  the MCP annotation check and runs MCP servers unconfined; binaries are
-  still resolved and recorded.
+  `unrunnable`; agents' `bash` reports it. A local tool source (a toolset,
+  an MCP server with a command) is refused at preflight
+  (`sandbox_unavailable`, round 7 fixes): it fails closed. `confine:
+  "off"` (tests, development; an executor kit may set it), and only it,
+  skips the sandbox preflight and runs toolsets and MCP servers
+  unconfined; binaries are still resolved and recorded.
 - Setup envs live in `$XDG_CACHE_HOME/wallis/envs/<digest>/`, ready once
   `.wallis-ready` is written. A setup step's argv is the same as a run's
   (`argv[0]` a required binary).

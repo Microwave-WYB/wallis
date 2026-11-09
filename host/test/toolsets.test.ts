@@ -1,13 +1,14 @@
-// Tool sources under bwrap: every connection to an MCP server gets its own
-// scratch dir (server state never crosses agent calls), and a custom tool
-// module is bundled and served under node from its own sandbox. Skipped
-// without bwrap.
+// Tool sources: every connection to an MCP server gets its own scratch dir
+// (server state never crosses agent calls), and a custom tool module is
+// bundled and served under node from its own sandbox (skipped without
+// bwrap). Without bwrap a local source is refused unless confinement is
+// off, and unconfined it still runs in its connection's scratch dir.
 
 import assert from "node:assert/strict";
-import { realpathSync, writeFileSync } from "node:fs";
+import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { bwrapAvailable, Sandboxes } from "../src/host/confine.ts";
+import { bwrapAvailable, SandboxError, Sandboxes } from "../src/host/confine.ts";
 import { ToolSources } from "../src/host/toolsets.ts";
 import { tmp } from "./util.ts";
 
@@ -53,7 +54,7 @@ test("each MCP connection gets its own scratch dir; a toolset runs bundled under
 		} as never,
 		workflowDir: work,
 		runDir: tmp(),
-		boxes,
+		confinement: { type: "bwrap", boxes },
 		env: { TOKEN: "s3cret", OTHER: "nope" },
 	});
 	const probe = async (client: Awaited<ReturnType<ToolSources["connect"]>>) => JSON.parse(((await client.callTool("probe", {})).content[0] as { text: string }).text) as { seen: boolean; cwd: string };
@@ -78,5 +79,53 @@ test("each MCP connection gets its own scratch dir; a toolset runs bundled under
 		assert.deepEqual(r.structuredContent, { cwd: "/w", secret: "s3cret", home: "/w" });
 	} finally {
 		await t.close();
+	}
+});
+
+/** The probe server as a local source, run by this node, under a confinement. */
+function probeSources(confinement: { type: "off" } | { type: "unavailable" }) {
+	const work = tmp();
+	writeFileSync(join(work, "server.mjs"), SERVER);
+	const runDir = tmp();
+	const sources = new ToolSources({
+		decl: { mcp: { mcpServers: { probe: { command: process.execPath, args: [join(work, "server.mjs")] } } }, mcpServers: { probe: { sandbox: null, network: "full" } }, toolsets: { "./lib.ts": { sandbox: "tools", secrets: [], network: "full" } } } as never,
+		workflowDir: work,
+		runDir,
+		confinement,
+	});
+	return { sources, runDir };
+}
+
+test("without bwrap a local tool source is refused (sandbox_unavailable), never run unconfined unless confinement is off", async () => {
+	const { sources } = probeSources({ type: "unavailable" });
+	for (const [source, key] of [
+		[{ kind: "mcp", server: "probe" }, "mcp:probe"],
+		[{ kind: "toolset", path: "./lib.ts" }, "toolset:./lib.ts"],
+	] as const) {
+		await assert.rejects(sources.connect(source), (e: unknown) => {
+			assert.ok(e instanceof SandboxError, String(e));
+			assert.deepEqual(e.refusal, { type: "sandbox_unavailable", source: key });
+			return true;
+		});
+	}
+});
+
+test("unconfined (confinement off), each connection still runs in its own scratch dir", async () => {
+	const { sources, runDir } = probeSources({ type: "off" });
+	const probe = async (client: Awaited<ReturnType<ToolSources["connect"]>>) => JSON.parse(((await client.callTool("probe", {})).content[0] as { text: string }).text) as { seen: boolean; cwd: string };
+	const a = await sources.connect({ kind: "mcp", server: "probe" });
+	const b = await sources.connect({ kind: "mcp", server: "probe" });
+	try {
+		const first = await probe(a);
+		assert.equal(first.seen, false);
+		assert.ok(first.cwd.startsWith(join(realpathSync(runDir), "work", "mcp-probe-")), first.cwd);
+		assert.equal((await probe(a)).seen, true);
+		const other = await probe(b);
+		assert.equal(other.seen, false);
+		assert.notEqual(other.cwd, first.cwd);
+		assert.ok(existsSync(join(first.cwd, "marker")));
+	} finally {
+		await a.close();
+		await b.close();
 	}
 });
