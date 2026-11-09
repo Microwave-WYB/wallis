@@ -294,7 +294,7 @@ const models = defineModels({ default: "fake/default" });
 const fx = defineMcp(m);
 const flaky = defineAgent({ models }, { name: "flaky", model: "default", prompt: "p", input: Type.Null(), output: Type.Object({ ok: Type.Boolean() }) });
 export default workflow({ name: "inflight", models, mcp: fx, agents: [flaky], input: Type.Null(), output: Type.Any(),
-	run: async (ctx) => ctx.parallel({ slow: (c) => c.call(fx.fx.slow, {}), flaky: (c) => c.session(flaky).call(null) }) });
+	run: async (ctx) => ctx.parallel({ slow: (c) => c.call(fx.fx.slow, {}), flaky: (c) => c.call(c.session(flaky), null) }) });
 `,
 	);
 	let calls = 0;

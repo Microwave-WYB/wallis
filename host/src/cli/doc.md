@@ -35,8 +35,8 @@ export default workflow({
   input: Type.Object({ sheet: Type.String() }), output: Type.Any(),
   run: async (ctx, input) => {
     const s = ctx.session(colorist);                    // agents only through sessions
-    let look = await s.call({ sheet: input.sheet });
-    look = await s.call({ sheet: "too yellow" });       // same conversation
+    let look = await ctx.call(s, { sheet: input.sheet });
+    look = await ctx.call(s, { sheet: "too yellow" });       // same conversation
     const { ok } = await ctx.call(confirm, look);       // asking first is code
     if (ok) await ctx.call(lib.upload, { look: look.look });   // the outward write, in the body
     return look;

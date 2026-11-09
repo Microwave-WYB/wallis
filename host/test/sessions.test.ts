@@ -80,9 +80,19 @@ test("a call made while the session's previous call is in flight waits for it: c
 	assert.deepEqual(forked.outcome, done.outcome);
 });
 
-test("a session called from a parallel branch is refused (foreign_session), deterministically; its own branch may call it", async () => {
-	const done = await runWorkflow({ ...opts(join(tmp(), "run")), executor: executor(), input: { mode: "foreign" } });
-	assert.deepEqual(done.outcome, { type: "done", value: { branch: "foreign_session", after: { heard: 1, saw_ask: false, reply: "" } } });
+test("a session called from a ctx that did not create it (a branch, a sibling branch) is refused (foreign_session), the same way on fork and replay", async () => {
+	const dir = join(tmp(), "run");
+	const done = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "foreign" } });
+	const expected = { type: "done", value: { branch: "foreign_session", sibling: "foreign_session", after: { heard: 1, saw_ask: false, reply: "" } } };
+	assert.deepEqual(done.outcome, expected);
+	// A fork re-executes the body against the journal: the same refusals, the same call ids.
+	const { forkRun } = await import("../src/host/query.ts");
+	const fork = forkRun(dir, join(tmp(), "fork"));
+	const forked = await runWorkflow({ ...opts(fork.dir), executor: executor() });
+	assert.deepEqual(forked.outcome, expected);
+	// A replay of the same run (a new host on the finished run) reports it unchanged.
+	const replayed = await runWorkflow({ ...opts(dir), executor: executor() });
+	assert.deepEqual(replayed.outcome, expected);
 });
 
 test("a call after a cancelled one continues the dialogue the cancelled call left", async () => {

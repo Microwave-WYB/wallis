@@ -78,7 +78,7 @@ test("a changed prompt misses; downstream misses when its input changes, hits wh
 
 test("an inserted node runs; its neighbours still hit under their new ids", async () => {
 	const { fork } = await finishedThenFork();
-	const workflow = variant(twoNode, (t) => t.replace("const plan = await ctx.session(planner).call({ topic: input.topic });", 'await ctx.session(planner).call({ topic: "warm-up" });\n\t\tconst plan = await ctx.session(planner).call({ topic: input.topic });'));
+	const workflow = variant(twoNode, (t) => t.replace("const plan = await ctx.call(ctx.session(planner), { topic: input.topic });", 'await ctx.call(ctx.session(planner), { topic: "warm-up" });\n\t\tconst plan = await ctx.call(ctx.session(planner), { topic: input.topic });'));
 	const executor = new FakeExecutor(responses());
 	const r = await runWorkflow({ ...quiet, workflow, dir: fork, executor });
 	assert.deepEqual(executor.calls.map((c) => [c.id, (c.input as { topic?: string }).topic]), [["#0:0", "warm-up"]]);
@@ -101,8 +101,8 @@ test("reordering two parallel branches still hits", async () => {
 	const fork = forkRun(dir, join(root, "fork")).dir;
 	const workflow = variant(fanout, (t) =>
 		t.replace(
-			'a: (c) => c.session(scout).call({ area: "a", known: errors }),\n\t\t\tb: (c) => c.session(scout).call({ area: "b", known: errors }),',
-			'b: (c) => c.session(scout).call({ area: "b", known: errors }),\n\t\t\ta: (c) => c.session(scout).call({ area: "a", known: errors }),',
+			'a: (c) => c.call(c.session(scout), { area: "a", known: errors }),\n\t\t\tb: (c) => c.call(c.session(scout), { area: "b", known: errors }),',
+			'b: (c) => c.call(c.session(scout), { area: "b", known: errors }),\n\t\t\ta: (c) => c.call(c.session(scout), { area: "a", known: errors }),',
 		),
 	);
 	const again = exec();

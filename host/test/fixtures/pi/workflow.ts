@@ -25,5 +25,5 @@ export default workflow({
 	agents: [reader],
 	input: Type.Object({ topic: Type.String(), notes: Type.Array(Type.String()) }),
 	output: Type.Any(),
-	run: async (ctx, input) => ctx.session(reader).call(input),
+	run: async (ctx, input) => ctx.call(ctx.session(reader), input),
 });

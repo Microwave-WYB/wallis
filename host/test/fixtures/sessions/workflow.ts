@@ -2,7 +2,7 @@
 // dialogue); a call made while the previous one is in flight (it waits);
 // a call from a parallel branch (refused); a call after a cancelled one.
 
-import { ask, AgentFailed, defineAgent, defineModels, Refused, Type, workflow } from "wallis";
+import { ask, AgentFailed, defineAgent, defineModels, Refused, type Session, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "faux/faux-1" });
 const chat = defineAgent(
@@ -29,22 +29,31 @@ export default workflow({
 		switch (input.mode) {
 			case "queued": {
 				// Made before the first returned: it waits for it, in the order the calls were made.
-				const first = s.call({ say: "one" });
-				const second = s.call({ say: "quiet" });
+				const first = ctx.call(s, { say: "one" });
+				const second = ctx.call(s, { say: "quiet" });
 				return { first: await first, second: await second };
 			}
 			case "foreign": {
-				const branches = await ctx.parallel({ a: () => s.call({ say: "one" }).then(() => "accepted", refusal) });
-				return { branch: branches.a, after: await s.call({ say: "one" }) };
+				// Only the ctx that made a session calls it: not a branch it started, not a sibling branch.
+				let made: Session | undefined;
+				const branches = await ctx.parallel({
+					a: (b) => b.call(s, { say: "one" }).then(() => "accepted", refusal),
+					x: async (b) => {
+						made = b.session(chat);
+						return "made";
+					},
+					y: (b) => (made === undefined ? Promise.resolve("not made") : b.call(made, { say: "one" }).then(() => "accepted", refusal)),
+				});
+				return { branch: branches.a, sibling: branches.y, after: await ctx.call(s, { say: "one" }) };
 			}
 			case "cancel": {
-				const one = await s.call({ say: "one" });
-				const two = await s.call({ say: "two" }).catch(refusal);
-				return { one, two, three: await s.call({ say: "quiet" }) };
+				const one = await ctx.call(s, { say: "one" });
+				const two = await ctx.call(s, { say: "two" }).catch(refusal);
+				return { one, two, three: await ctx.call(s, { say: "quiet" }) };
 			}
 			case "two": {
-				const one = await s.call({ say: "one" });
-				const two = await s.call({ say: "two" });
+				const one = await ctx.call(s, { say: "one" });
+				const two = await ctx.call(s, { say: "two" });
 				return { one, two };
 			}
 		}

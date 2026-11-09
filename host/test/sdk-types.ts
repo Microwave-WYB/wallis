@@ -112,7 +112,7 @@ export default workflow({
 	output: Type.Number(),
 	run: async (ctx) => {
 		// One `ctx.call` for every kind of node.
-		const out = await ctx.session(ok).call({ q: "?", papers: [] });
+		const out = await ctx.call(ctx.session(ok), { q: "?", papers: [] });
 		const trained = await ctx.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: 2 });
 		const n: number = await ctx.call(inner, null);
 		const answer: string = out.answer;
@@ -136,12 +136,14 @@ export default workflow({
 		void raw;
 		// A session is a handle: every call continues the same dialogue.
 		const s = ctx.session(ok);
+		await ctx.call(s, { q: "and then?", papers: [] });
+		// @ts-expect-error: a session is called through the ctx that created it, not by itself
 		await s.call({ q: "and then?", papers: [] });
 		void picked;
 		void pickedWrong;
 		void ids;
 		// @ts-expect-error: call input is typed by the node's input schema
-		await ctx.session(ok).call({ q: 1, papers: [] });
+		await ctx.call(ctx.session(ok), { q: 1, papers: [] });
 		// @ts-expect-error: outputs are typed too
 		const wrong: number = out.answer;
 		ctx.observe("answer", answer);

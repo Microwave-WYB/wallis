@@ -38,9 +38,9 @@ export default workflow({
 	input: Type.Object({ topic: Type.String() }),
 	output: Type.Object({ text: Type.String(), note: Type.String(), at: Type.Number(), roll: Type.Number() }),
 	run: async (ctx, input) => {
-		const plan = await ctx.session(planner).call({ topic: input.topic });
+		const plan = await ctx.call(ctx.session(planner), { topic: input.topic });
 		ctx.observe("outline", plan.outline);
-		const draft = await ctx.session(writer).call({ outline: plan.outline, notes: [plan.note] });
+		const draft = await ctx.call(ctx.session(writer), { outline: plan.outline, notes: [plan.note] });
 		ctx.observe("words", draft.words);
 		return { text: draft.text, note: plan.note, at: Date.now(), roll: Math.random() };
 	},

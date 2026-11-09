@@ -226,7 +226,7 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect))
 The workflow is a pure program over journaled calls. The body is
 deterministic, and its only interface to the world is `ctx.call(node,
 input)` on a node (a command, a nested workflow, an MCP tool or an
-orchestrator node), `ctx.session(agent).call(input)` for agents (round 6),
+orchestrator node), `ctx.call(ctx.session(agent), input)` for agents (round 6),
 plus `ctx.parallel` and `ctx.map` for concurrency. Each call affects the body
 only through its return value. **Run memory is the body's local
 variables**, rebuilt by re-executing the body against the journal. Agents
@@ -354,27 +354,29 @@ Prototype choices:
 An agent call is `(input, inbox) → dialogue → Submitted(output) | AgentFailure`.
 
 - **Sessions (round 6) are the only way to call an agent:**
-  `ctx.session(agent).call(input)`. `ctx.call(agent, …)` is a type error,
+  `ctx.call(ctx.session(agent), input)`. `ctx.call(agent, …)` is a type error,
   and a typed refusal (`session_required`) at run time. A one-off call is a
   session used once; a dialogue reuses the handle:
 
   ```ts
   const colorist = ctx.session(lookAgent);
-  let look = await colorist.call({ sheet, measure });
-  look = await colorist.call({ feedback: "too yellow" });   // same conversation
+  let look = await ctx.call(colorist, { sheet, measure });
+  look = await ctx.call(colorist, { feedback: "too yellow" });   // same conversation
   ```
 
-  - Each `.call` input is checked against the agent's input schema and
+  - Each call's input is checked against the agent's input schema and
     appended to the same conversation as a new message; each output is
     validated. Budgets and `maxTurns` are per call.
   - A session's identity is where it was created in the call tree, taken
     synchronously like a request id, so replay matches. Its calls are its
     children: `#3:0`, `#3:1`.
   - Calls run in the order they were made: a call made while the previous
-    one is in flight waits for it (its index is taken when it is made). A
-    call from a `ctx.parallel` or `ctx.map` branch started after the
-    session's creation is refused (`foreign_session`), deterministically:
-    across branches the order would depend on arrival.
+    one is in flight waits for it (its index is taken when it is made). Only
+    the ctx that created a session may call it: a call through any other
+    ctx (a `ctx.parallel` or `ctx.map` branch, a sibling branch, a nested
+    workflow) is refused (`foreign_session`), deterministically (round 7
+    fixes): across ctxs the order would depend on arrival. The handle is
+    opaque (an id and the agent's name); it has no `call` of its own.
   - A session is data, not a process: between calls nothing runs, and the
     next call rebuilds the agent from the dialogue its previous call left.
     There is no `close()`. Each call gets a fresh sandbox process
@@ -442,15 +444,18 @@ Prototype choices:
   later call is keyed by the whole dialogue before it. The core keeps the
   chain (`<session>:<index>` → slot) for the current execution of the body.
 - When a call ends, the host copies its checkpoint to
-  `sessions/<slot>.json`; the session's next call starts from it (a fork
-  copies `sessions/`). A restart discards the call's own checkpoint, so it
+  `sessions/<slot>.json` before it journals the end; the session's next
+  call starts from it (a fork copies `sessions/`). A missing one is
+  recovered from the previous call's work dir (`call.json` names its slot)
+  before the call is refused (`dialogue_missing`). A restart discards the call's own checkpoint, so it
   starts from its previous call's dialogue again. The session's scratch dir
   (`work/<session>/scratch`) is not rewound.
-- `foreign_session` is checked in the workflow VM: each ctx counts its
-  unsettled `parallel` and `map` (counted before their branches start).
-  A session called from a ctx's own concurrent code outside
-  `parallel`/`map`, after an `await`, has the caveat every concurrent call
-  has there (see Concurrency).
+- `foreign_session` is checked in the workflow VM, by identity: each
+  handle keeps the ctx that created it, and `ctx.call` compares it with
+  itself. A session called from a ctx's own concurrent code outside
+  `parallel`/`map`, after an `await` (or through the parent's ctx captured
+  in a branch), has the caveat every concurrent call has there (see
+  Concurrency).
 - `ask` ends the turn (pi's `finishTurn`) with a placeholder tool result
   marked in its details; the reply replaces it when it arrives, wherever
   it sits among the message's tool results. Later tool calls of that

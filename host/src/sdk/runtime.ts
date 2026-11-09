@@ -95,18 +95,12 @@ export function toolId(desc: { kind: "custom"; toolset: string; export: string }
 	return desc.kind === "custom" ? `custom:${desc.toolset}#${desc.export}` : `mcp:${desc.server}/${desc.tool}`;
 }
 
+/** Every session handle: the ctx that created it and its calls. A handle is opaque to the body. */
+const sessions = new WeakMap<object, { readonly id: string; readonly ctx: Ctx; call(input: unknown): Promise<unknown> }>();
+
 function makeCtx(path: string, seed: number): Ctx {
 	let counter = 0;
 	let observed = 0;
-	/** `parallel` and `map` of this ctx not settled yet: its sessions are not called meanwhile (only this branch may call them). */
-	let branching = 0;
-	// Counted before the branches start: their synchronous first steps are inside too.
-	const branch = <T>(start: () => Promise<T>): Promise<T> => {
-		branching++;
-		return start().finally(() => {
-			branching--;
-		});
-	};
 	const next = () => `${path}#${counter++}`;
 	const callAgent = async (id: string, agent: AgentDef, input: unknown, session: string, index: number) => {
 		const output = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json, session, index }));
@@ -148,7 +142,13 @@ function makeCtx(path: string, seed: number): Ctx {
 	const ctx: Ctx = {
 		seed,
 		// One implementation behind the typed overloads: nodes, then tool values.
-		call: ((node: CallableNode | Tool | undefined, input: unknown, schema?: TSchema) => {
+		call: ((node: CallableNode | Session | Tool | undefined, input: unknown, schema?: TSchema) => {
+			const session = node === undefined ? undefined : sessions.get(node);
+			if (session !== undefined) {
+				// Only the ctx that created it: its calls are numbered in one ctx's order, whatever arrives first.
+				if (session.ctx !== ctx) return Promise.reject(new Refused({ type: "foreign_session", session: session.id }));
+				return session.call(input) as never;
+			}
 			if (node === undefined || !("kind" in node)) {
 				const desc = toolDesc(node);
 				if (desc === null) return Promise.reject(new SchemaError("ctx.call", ["not a node or a tool"]));
@@ -177,12 +177,11 @@ function makeCtx(path: string, seed: number): Ctx {
 			let index = 0;
 			// Calls run in the order they are made: one made while another is in flight waits for it.
 			let tail: Promise<unknown> | null = null;
-			const session: Session = {
+			const session: Session = { id, agent: agent.name };
+			sessions.set(session, {
 				id,
-				agent: agent.name,
+				ctx,
 				call(input) {
-					// The call's index is taken when it is made; across branches that order would depend on arrival.
-					if (branching > 0) return Promise.reject(new Refused({ type: "foreign_session", session: id }));
 					const errors = schemaErrors(agent.input, input);
 					if (errors.length > 0) return Promise.reject(new SchemaError(`input of agent ${agent.name}`, errors));
 					const k = index++;
@@ -196,21 +195,21 @@ function makeCtx(path: string, seed: number): Ctx {
 					void settled.then(() => {
 						if (tail === settled) tail = null;
 					});
-					return run as never;
+					return run;
 				},
-			};
+			});
 			return session as never;
 		},
 		parallel(branches) {
 			const at = next();
 			const keys = Object.keys(branches);
-			return branch(() => Promise.all(keys.map((key) => branches[key]!(makeCtx(`${at}.${key}`, seed))))).then(
+			return Promise.all(keys.map((key) => branches[key]!(makeCtx(`${at}.${key}`, seed)))).then(
 				(results) => Object.fromEntries(keys.map((key, i) => [key, results[i]])) as never,
 			);
 		},
 		map(items, each) {
 			const at = next();
-			return branch(() => Promise.all(items.map((item, i) => each(makeCtx(`${at}.${i}`, seed), item, i))));
+			return Promise.all(items.map((item, i) => each(makeCtx(`${at}.${i}`, seed), item, i)));
 		},
 		observe(label, value) {
 			host().__wallis_send(JSON.stringify({ type: "observed", at: `${path}~${observed++}`, label, value }));

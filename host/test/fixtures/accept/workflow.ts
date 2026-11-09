@@ -57,11 +57,11 @@ export default workflow({
 	run: async (ctx) => {
 		const found = await ctx.call(fx.fx.search, { q: "looks" }, Type.Object({ hits: Type.Array(Type.String()) }));
 		const w = ctx.session(worker);
-		const asked = await w.call({ step: "ask" });
-		const implicit = await w.call({ step: "implicit" });
-		const limit = await ctx.session(slow).call({ step: "limit" });
-		const slowed = await ctx.session(worker).call({ step: "slow" });
-		const uploaded = await ctx.session(poster).call({ step: "upload" });
+		const asked = await ctx.call(w, { step: "ask" });
+		const implicit = await ctx.call(w, { step: "implicit" });
+		const limit = await ctx.call(ctx.session(slow), { step: "limit" });
+		const slowed = await ctx.call(ctx.session(worker), { step: "slow" });
+		const uploaded = await ctx.call(ctx.session(poster), { step: "upload" });
 		const picked = await ctx.call(pick, { question: "Look a (warm) or b (cool)?" });
 		let confirmed: string;
 		try {
@@ -70,10 +70,10 @@ export default workflow({
 			if (!(error instanceof OrchestratorCancelled)) throw error;
 			confirmed = "cancelled";
 		}
-		const flakyOk = await ctx.session(flaky).call({ step: "flaky" });
-		const fragileOk = await ctx.session(fragile).call({ step: "fragile" });
+		const flakyOk = await ctx.call(ctx.session(flaky), { step: "flaky" });
+		const fragileOk = await ctx.call(ctx.session(fragile), { step: "fragile" });
 		const published = await ctx.call(lib.publish, { text: `look ${picked.choice}` });
-		const last = await ctx.session(worker).call({ step: "last" });
+		const last = await ctx.call(ctx.session(worker), { step: "last" });
 		return { found: found.hits, asked: asked.ok, implicit: implicit.ok, limit: limit.ok, slowed: slowed.ok, uploaded: uploaded.ok, picked: picked.choice, confirmed, flaky: flakyOk.ok, fragile: fragileOk.ok, published: published.id, last: last.ok };
 	},
 });

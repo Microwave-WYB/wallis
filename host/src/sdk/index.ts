@@ -690,18 +690,20 @@ export type Node<I extends TSchema = TSchema, O extends TSchema = TSchema> = Age
 /** What `ctx.call` takes besides tools: every node but an agent. */
 export type CallableNode<I extends TSchema = TSchema, O extends TSchema = TSchema> = CommandDef<I, O> | WorkflowNode<I, O> | OrchestratorDef<I, O>;
 
+declare const SESSION_TYPES: unique symbol;
+
 /**
- * A conversation with one agent: each `call` appends its input to the same
- * dialogue as a new message and returns the agent's validated output. A
- * session is data, not a process; its identity is where it was created.
- * Calls run one after another, in the order they were made; a call made
- * before the previous one returned waits for it.
+ * A conversation with one agent: each `ctx.call(session, input)` appends its
+ * input to the same dialogue as a new message and returns the agent's
+ * validated output. A session is data, not a process; its identity is where
+ * it was created. Calls run one after another, in the order they were made;
+ * a call made before the previous one returned waits for it.
  */
 export interface Session<I extends TSchema = TSchema, O extends TSchema = TSchema> {
 	readonly id: string;
 	readonly agent: string;
-	/** Only from the branch that created the session: `Refused(foreign_session)` from a `parallel` or `map` branch it started. */
-	call(input: Static<I>): Promise<Static<O>>;
+	/** Types only: the agent's input and output. */
+	readonly [SESSION_TYPES]?: { readonly input: I; readonly output: O };
 }
 
 /**
@@ -726,6 +728,12 @@ export interface Ctx {
 	 * call instead.
 	 */
 	call<I extends TSchema, O extends TSchema>(node: CallableNode<I, O>, input: Static<I>): Promise<Static<O>>;
+	/**
+	 * Calls an agent through a session, only with the ctx that created it:
+	 * `Refused(foreign_session)` from any other (a `parallel` or `map` branch,
+	 * a nested workflow), so a session's calls are numbered in one ctx's order.
+	 */
+	call<I extends TSchema, O extends TSchema>(session: Session<I, O>, input: Static<I>): Promise<Static<O>>;
 	/**
 	 * Calls a tool from the body (journaled: replay never calls it again):
 	 * a toolset tool, typed by its parameters, returns its validated
