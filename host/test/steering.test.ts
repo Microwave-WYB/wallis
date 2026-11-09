@@ -205,7 +205,10 @@ test("pause issues no new calls (Idle(PausedByUser)); resume continues", async (
 	gated.open.get("#0:0")!({ type: "submitted", output: { outline: ["a"], note: "n" } });
 	const paused = await session.result;
 	assert.deepEqual(paused.status, { type: "idle", reason: { type: "paused_by_user" } });
-	assert.deepEqual(paused.run.nodes.map((n) => ("agent" in n ? n.agent : n.type)), ["planner"], "the writer was not issued");
+	assert.deepEqual(paused.run.nodes.map((n) => [n.type, "agent" in n ? n.agent : ""]), [["node_done", "planner"], ["node_held", "writer"]], "the writer is held back, not issued");
+	// A held-back call is live: the host's check lets the owner cancel it, as the core does.
+	const o = OwnedRun.check(paused.run, "human");
+	assert.ok(o instanceof OwnedRun && LiveNode.check(o, "#1:0") instanceof LiveNode);
 	const done = await runWorkflow({ ...base(dir, new Gated()), unpause: true });
 	assert.equal(done.outcome?.type, "done");
 });

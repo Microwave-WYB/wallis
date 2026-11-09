@@ -142,6 +142,17 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["node_failed:#8:0"]);
 	await o.restart("#8:0", "try again");
+	// The host dies during the body's publish call, which is not safe to repeat: after the
+	// resume its outcome is unknown, and the orchestrator sees it (the log has it).
+	for (let i = 0; i < 300 && !project.count().includes("publish"); i++) await new Promise((r) => setTimeout(r, 100));
+	await o.kill();
+	items = await o.wait();
+	assert.deepEqual(items.map(label), ["stopped:"]);
+	await o.resume();
+	items = await o.wait();
+	assert.deepEqual(items.map(label), ["outcome_unknown:#9"]);
+	assert.equal(items[0]!.tool, "custom:./tools/lib.ts#publish");
+	await o.restart("#9");
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["finished:"]);
 	assert.deepEqual(await o.outcome(), {
@@ -161,8 +172,8 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 			last: "done",
 		},
 	});
-	// The outside world: one search, the upload (retried by the restart), one publish. Resumes replayed the journal.
-	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish"]);
+	// The outside world: one search, the upload and the publish (each retried by its restart). Resumes replayed the journal.
+	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish", "publish"]);
 	// Preflight warnings, in run metadata: the upload tool may write outside; the fx server keeps only read-only tools.
 	const meta = JSON.parse(readFileSync(join(runDir(project.root, o.id()), "meta.json"), "utf8")) as { warnings: string[] };
 	assert.ok(meta.warnings.some((w) => /agent poster: tool upload may write outside \(unannotated\)/.test(w)), meta.warnings.join("\n"));
@@ -227,7 +238,7 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 	await scenario(o, project);
 	// A fork of the finished run re-executes against the copied journal: nothing outside is called again.
 	ok(w("fork", id));
-	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish"]);
+	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish", "publish"]);
 });
 
 test("acceptance through MCP: every attention kind, entered and resolved", { timeout: 300_000 }, async () => {

@@ -473,6 +473,9 @@ export type Refusal =
 	| { readonly type: "journal_missing"; readonly request: string }
 	| { readonly type: "foreign_session"; readonly session: string }
 	| { readonly type: "dialogue_missing"; readonly node: string }
+	| { readonly type: "retry_takes_no_note"; readonly node: string }
+	| { readonly type: "tool_name_taken"; readonly agent: string; readonly name: string }
+	| { readonly type: "sandbox_unavailable"; readonly source: string }
 	| { readonly type: "session_required"; readonly agent: string }
 	| { readonly type: "unknown_orchestrator"; readonly name: string }
 	| { readonly type: "unknown_tool"; readonly name: string }
@@ -488,7 +491,9 @@ export type Refusal =
 export type AgentFailure =
 	| { readonly type: "gave_up"; readonly error: string }
 	| { readonly type: "context_exhausted" }
-	| { readonly type: "cancelled_by_owner" };
+	| { readonly type: "cancelled_by_owner" }
+	/** Cancelled while a tool call's outcome was unknown: it may or may not have taken effect. */
+	| { readonly type: "unknown_outcome"; readonly tool: string; readonly args: Json };
 
 /** Why a command call failed. Mirrors `CommandFailure` in the core. */
 export type CommandFailure =
@@ -504,7 +509,9 @@ export type ToolFailure =
 	| { readonly type: "tool_error"; readonly message: string }
 	| { readonly type: "tool_output_mismatch"; readonly errors: readonly string[] }
 	| { readonly type: "tool_unreachable"; readonly error: string }
-	| { readonly type: "tool_cancelled" };
+	| { readonly type: "tool_cancelled" }
+	/** Cancelled after it was sent: it may or may not have taken effect. */
+	| { readonly type: "tool_unknown_outcome" };
 
 /** Why a run (or a nested workflow) failed. Mirrors `FailReason` in the core. */
 export type FailReason =
@@ -525,6 +532,10 @@ export function failureText(failure: AgentFailure | CommandFailure | ToolFailure
 			return `server unreachable: ${failure.error}`;
 		case "tool_cancelled":
 			return "cancelled by the owner";
+		case "tool_unknown_outcome":
+			return "cancelled by the owner after it was sent: whether it took effect is unknown";
+		case "unknown_outcome":
+			return `cancelled by the owner while the outcome of ${failure.tool} was unknown`;
 		case "gave_up":
 			return failure.error;
 		case "context_exhausted":

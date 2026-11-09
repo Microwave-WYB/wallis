@@ -125,6 +125,7 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		declaration: { model: "default", prompt: "p", input: {}, output: {}, tools: [], access: 3, skills: [], needs: {}, sandbox: null, steerable: true, compaction: true, max_turns: 6 },
 		history: null,
 		recorded: new Map(),
+		retryUnknown: false,
 		record: () => {},
 		model: "faux/faux-1",
 		prompt: "Input",

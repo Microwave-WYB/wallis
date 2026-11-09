@@ -296,6 +296,7 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       tool_recorded(run, id, call, result)
     types.ToolReturned(id:, output:) ->
       tool_settled(run, id, fn(_) { Answered(output) })
+    types.ToolCallUnknown(id:) -> tool_unknown(run, id)
     types.ToolFailed(id:, failure:) ->
       tool_settled(run, id, fn(name) {
         Errored(types.ToolCrashed(name, failure))
@@ -451,6 +452,8 @@ fn body_failed(run: Run, reason: FailReason) -> #(Run, List(Effect)) {
         types.AgentGaveUp(failure: types.CancelledByOwner, ..)
         | types.CommandCrashed(failure: types.CommandCancelled, ..)
         | types.ToolCrashed(failure: types.ToolCancelled, ..)
+        | types.AgentGaveUp(failure: types.UnknownOutcome(..), ..)
+        | types.ToolCrashed(failure: types.ToolUnknownOutcome, ..)
         | types.OrchestratorCancelled(..)
         | types.BodyError(..) -> finish(run, types.Failed(reason))
         failure ->
@@ -632,6 +635,7 @@ fn issued_slot(effect: Effect) -> Option(String) {
     | types.RunCommand(digest:, ..)
     | types.CallTool(digest:, ..) -> Some(digest)
     types.Checkpoint
+    | types.LogUnknownTool(..)
     | types.Deliver(..)
     | types.Fail(..)
     | types.Refuse(..)
@@ -652,18 +656,6 @@ fn reissue(
   case dict.has_key(run.issued, slot) {
     True -> #(run, [])
     False -> {
-      let run = case record.progress, record.kind {
-        AwaitingTool, ToolKind(replay: types.ReplayNever, ..) ->
-          Run(
-            ..run,
-            requests: dict.insert(
-              run.requests,
-              id,
-              Record(..record, progress: ToolUnknown),
-            ),
-          )
-        _, _ -> run
-      }
       let effects = case record.progress, record.kind {
         AwaitingAgent(dialogue:), AgentKind(agent:, input:, ..) ->
           case call_effect(run, id, agent, input, slot, dialogue) {
@@ -673,11 +665,24 @@ fn reissue(
         AwaitingCommand, CommandKind(command:, input:, ..) -> [
           command_effect(run, id, command, input, slot),
         ]
-        // A body tool call in flight at a crash: made again only if safe.
+        // A body tool call in flight at a crash: made again only if safe;
+        // otherwise its outcome is unknown, and that is logged.
         AwaitingTool, ToolKind(tool:, input:, replay: types.ReplaySafe) -> [
           types.CallTool(id:, tool:, input:, digest: slot),
         ]
-        _, _ -> []
+        AwaitingTool, ToolKind(replay: types.ReplayNever, ..) -> [
+          types.LogUnknownTool(id),
+        ]
+        // Waiting for an event that unblocks it, or settled: nothing to issue.
+        Blocked(..), _
+        | AgentWaiting(..), _
+        | Unavailable(..), _
+        | ToolUnknown, _
+        | AwaitingOrchestrator, _
+        | Completed(..), _
+        -> []
+        // An awaiting progress is only ever recorded with its own kind.
+        AwaitingAgent(..), _ | AwaitingCommand, _ | AwaitingTool, _ -> []
       }
       #(run, effects)
     }
@@ -1140,20 +1145,51 @@ fn agent_facts(run: Run, node: String) -> NodeFacts {
         AgentWaiting(..) -> capability.Waiting(steerable)
         Unavailable(..) -> capability.Faulted(steerable)
         Blocked(..) -> capability.Held(steerable)
-        AwaitingCommand
-        | AwaitingTool
-        | ToolUnknown
-        | AwaitingOrchestrator
-        | Completed(..) -> capability.Settled
+        Completed(..) -> capability.Settled
+        // Not an agent's progress: never recorded with an agent.
+        AwaitingCommand | AwaitingTool | ToolUnknown | AwaitingOrchestrator ->
+          capability.Settled
       }
     }
-    Ok(Record(kind: CommandKind(..), progress: AwaitingCommand, ..)) ->
-      capability.CommandWorking
-    Ok(Record(kind: ToolKind(..), progress: AwaitingTool, ..))
-    | Ok(Record(kind: ToolKind(..), progress: ToolUnknown, ..)) ->
-      capability.ToolWorking
-    Ok(Record(progress: AwaitingOrchestrator, ..)) -> capability.Pending
-    Ok(_) -> capability.Settled
+    // A command or a body tool call is live while it runs, waits for an
+    // unknown outcome, or is held back before it starts.
+    Ok(Record(kind: CommandKind(..), progress:, ..)) ->
+      case progress {
+        AwaitingCommand | Blocked(..) -> capability.CommandWorking
+        Completed(..) -> capability.Settled
+        // Not a command's progress: never recorded with a command.
+        AwaitingAgent(..)
+        | AgentWaiting(..)
+        | Unavailable(..)
+        | AwaitingTool
+        | ToolUnknown
+        | AwaitingOrchestrator -> capability.Settled
+      }
+    Ok(Record(kind: ToolKind(..), progress:, ..)) ->
+      case progress {
+        AwaitingTool | ToolUnknown | Blocked(..) -> capability.ToolWorking
+        Completed(..) -> capability.Settled
+        // Not a tool call's progress: never recorded with one.
+        AwaitingAgent(..)
+        | AgentWaiting(..)
+        | Unavailable(..)
+        | AwaitingCommand
+        | AwaitingOrchestrator -> capability.Settled
+      }
+    Ok(Record(kind: OrchestratorKind(..), progress:, ..)) ->
+      case progress {
+        AwaitingOrchestrator -> capability.Pending
+        Completed(..) -> capability.Settled
+        // Orchestrator nodes are never held back and never issued.
+        AwaitingAgent(..)
+        | AgentWaiting(..)
+        | Unavailable(..)
+        | Blocked(..)
+        | AwaitingCommand
+        | AwaitingTool
+        | ToolUnknown -> capability.Settled
+      }
+    Ok(Record(kind: RefusedKind, ..)) -> capability.Settled
     Error(Nil) -> capability.Absent
   }
 }
@@ -1284,9 +1320,12 @@ fn restart(
   let run = case held(run, id), dict.get(run.requests, id) {
     True, Ok(rec) -> {
       let progress = case rec.kind {
+        AgentKind(..) -> AwaitingAgent(Dialogue([], None))
         CommandKind(..) -> AwaitingCommand
         ToolKind(..) -> AwaitingTool
-        _ -> AwaitingAgent(Dialogue([], None))
+        OrchestratorKind(..) -> AwaitingOrchestrator
+        // A refused call is never a failure the run is held on.
+        RefusedKind -> rec.progress
       }
       Run(
         ..record(run, id, Record(..rec, progress:)),
@@ -1334,6 +1373,34 @@ fn restart(
         ]),
       )
     }
+    // An unknown outcome: the call continues where it stopped, its dialogue,
+    // turns and journaled tool results kept; only the unknown call is made
+    // again (the host retries it).
+    Ok(
+      Record(
+        kind: AgentKind(agent:, input:, ..),
+        progress: AgentWaiting(dialogue: d, cause: types.OutcomeUnknown(..), ..),
+        ..,
+      ) as rec,
+    ) ->
+      case note {
+        Some(_) -> Error(types.RetryTakesNoNote(id))
+        None -> {
+          let run = add_inbox(run, id, types.Restart, "")
+          use call <- result.map(call_effect(
+            run,
+            id,
+            agent,
+            input,
+            rec.digest,
+            d,
+          ))
+          #(record(run, id, Record(..rec, progress: AwaitingAgent(d))), [
+            types.Checkpoint,
+            call,
+          ])
+        }
+      }
     Ok(Record(kind: AgentKind(agent:, input:, ..), progress:, ..) as rec) ->
       case progress {
         AwaitingAgent(..) | AgentWaiting(..) | Unavailable(..) -> {
@@ -1418,13 +1485,25 @@ fn cancel_live(run: Run, id: String) -> #(Run, List(Effect)) {
         )
       #(run, [types.Checkpoint, ..effects])
     }
-    Ok(Record(kind: ToolKind(tool:, ..), ..) as rec) -> {
+    Ok(Record(kind: ToolKind(tool:, ..), progress:, ..) as rec) -> {
+      // Sent (running, or unknown after a crash): it may have taken effect.
+      let failure = case progress {
+        AwaitingTool | ToolUnknown -> types.ToolUnknownOutcome
+        Blocked(..) -> types.ToolCancelled
+        // Not live: check_live refuses these before a cancel.
+        Completed(..)
+        | AwaitingAgent(..)
+        | AgentWaiting(..)
+        | Unavailable(..)
+        | AwaitingCommand
+        | AwaitingOrchestrator -> types.ToolCancelled
+      }
       let #(run, effects) =
         settle(
           run,
           id,
           Record(..rec, progress: Completed(None)),
-          Errored(types.ToolCrashed(tool, types.ToolCancelled)),
+          Errored(types.ToolCrashed(tool, failure)),
         )
       #(run, [types.Checkpoint, ..effects])
     }
@@ -1438,13 +1517,27 @@ fn cancel_live(run: Run, id: String) -> #(Run, List(Effect)) {
         )
       #(run, [types.Checkpoint, ..effects])
     }
-    Ok(Record(kind: AgentKind(agent:, ..), ..) as rec) -> {
+    Ok(Record(kind: AgentKind(agent:, ..), progress:, ..) as rec) -> {
+      // Cancelled while a tool call's outcome was unknown: the body is told.
+      let failure = case progress {
+        AgentWaiting(cause: types.OutcomeUnknown(tool:, args:), ..) ->
+          types.UnknownOutcome(tool, args)
+        AgentWaiting(..)
+        | AwaitingAgent(..)
+        | Unavailable(..)
+        | Blocked(..)
+        | Completed(..)
+        | AwaitingCommand
+        | AwaitingTool
+        | ToolUnknown
+        | AwaitingOrchestrator -> types.CancelledByOwner
+      }
       let #(run, effects) =
         settle(
           run,
           id,
           Record(..rec, progress: Completed(None)),
-          Errored(types.AgentGaveUp(agent, types.CancelledByOwner)),
+          Errored(types.AgentGaveUp(agent, failure)),
         )
       #(run, [types.Checkpoint, ..effects])
     }
@@ -1662,6 +1755,19 @@ fn submit(
   }
 }
 
+/// A body tool call in flight at a crash and not safe to make again: it
+/// waits for its owner, its outcome unknown.
+fn tool_unknown(run: Run, id: String) -> #(Run, List(Effect)) {
+  case dict.get(run.requests, id) {
+    Ok(Record(kind: ToolKind(..), progress: AwaitingTool, ..) as rec) -> #(
+      record(run, id, Record(..rec, progress: ToolUnknown)),
+      [types.Checkpoint],
+    )
+    // Not a tool call in flight: nothing to record.
+    _ -> #(run, [])
+  }
+}
+
 fn run_digest(run: Run, id: String) -> String {
   case dict.get(run.requests, id) {
     Ok(rec) -> rec.digest
@@ -1695,7 +1801,7 @@ pub fn status(run: RunState) -> Option(RunStatus) {
       let reason =
         list.find_map(records, fn(p) {
           case p {
-            Blocked(reason:, ..) -> Ok(current(r, reason))
+            Blocked(reason:, ..) -> Ok(current_reason(r, reason))
             Unavailable(alias:, error:, ..) ->
               Ok(types.ExecutorUnavailable(alias, error))
             _ -> Error(Nil)
@@ -1727,7 +1833,7 @@ pub fn status(run: RunState) -> Option(RunStatus) {
 
 /// A held request's reason with the spend as it is now: calls in flight
 /// when the budget was reached may have added to it.
-fn current(run: Run, reason: IdleReason) -> IdleReason {
+fn current_reason(run: Run, reason: IdleReason) -> IdleReason {
   case reason {
     types.BudgetReached(kind: types.Turns, ..) ->
       budget_check(run) |> result.unwrap_error(reason)
@@ -1748,6 +1854,7 @@ pub fn nodes(run: RunState) -> List(Node) {
       sorted_requests(r)
       |> list.filter_map(fn(e) {
         let #(id, rec) = e
+        let entry = dict.get(r.journal, rec.digest)
         case rec.kind {
           AgentKind(agent:, inbox:, ..) -> {
             let declared = find_agent(r.workflow, agent)
@@ -1767,37 +1874,66 @@ pub fn nodes(run: RunState) -> List(Node) {
                 Ok(types.NodeRunning(id, agent, current(), steerable, inbox))
               AgentWaiting(model:, cause:, ..) ->
                 Ok(types.NodeIdle(id, agent, model, steerable, inbox, cause))
-              Completed(model:) ->
-                case dict.get(r.journal, rec.digest) {
-                  Ok(Answered(_)) ->
-                    Ok(types.NodeDone(
-                      id,
-                      agent,
-                      option.unwrap(model, ""),
-                      steerable,
-                      inbox,
-                      types.Submitted,
-                    ))
-                  Ok(Errored(types.AgentGaveUp(failure:, ..))) ->
-                    Ok(types.NodeDone(
-                      id,
-                      agent,
-                      option.unwrap(model, ""),
-                      steerable,
-                      inbox,
-                      types.NodeFailed(failure),
-                    ))
-                  _ -> Error(Nil)
+              Blocked(reason:, ..) ->
+                Ok(types.NodeHeld(
+                  id,
+                  agent,
+                  current(),
+                  steerable,
+                  inbox,
+                  current_reason(r, reason),
+                ))
+              Unavailable(alias:, error:, ..) ->
+                Ok(types.NodeHeld(
+                  id,
+                  agent,
+                  current(),
+                  steerable,
+                  inbox,
+                  types.ExecutorUnavailable(alias, error),
+                ))
+              Completed(model:) -> {
+                let done = fn(outcome) {
+                  Ok(types.NodeDone(
+                    id,
+                    agent,
+                    option.unwrap(model, ""),
+                    steerable,
+                    inbox,
+                    outcome,
+                  ))
                 }
-              _ -> Error(Nil)
+                case entry {
+                  Ok(Answered(_)) -> done(types.Submitted)
+                  Ok(Errored(types.AgentGaveUp(failure:, ..))) ->
+                    done(types.NodeFailed(failure))
+                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
+                  // An agent call fails only as AgentGaveUp.
+                  Ok(Errored(_)) -> Error(Nil)
+                  // Invalidated (a later call of a rewound session): not on the live path.
+                  Error(Nil) -> Error(Nil)
+                }
+              }
+              // Not an agent's progress: never recorded with an agent.
+              AwaitingCommand
+              | AwaitingTool
+              | ToolUnknown
+              | AwaitingOrchestrator -> Error(Nil)
             }
           }
           CommandKind(command:, inbox:, ..) -> {
             let inbox = list.reverse(inbox)
             case rec.progress {
               AwaitingCommand -> Ok(types.CommandRunning(id, command, inbox))
+              Blocked(reason:, ..) ->
+                Ok(types.CommandHeld(
+                  id,
+                  command,
+                  inbox,
+                  current_reason(r, reason),
+                ))
               Completed(..) ->
-                case dict.get(r.journal, rec.digest) {
+                case entry {
                   Ok(Answered(_)) ->
                     Ok(types.CommandDone(id, command, inbox, types.Succeeded))
                   Ok(Errored(types.CommandCrashed(failure:, ..))) ->
@@ -1807,32 +1943,70 @@ pub fn nodes(run: RunState) -> List(Node) {
                       inbox,
                       types.FailedWith(failure),
                     ))
-                  _ -> Error(Nil)
+                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
+                  // A command fails only as CommandCrashed; no entry: invalidated.
+                  Ok(Errored(_)) | Error(Nil) -> Error(Nil)
                 }
-              _ -> Error(Nil)
+              // Not a command's progress: never recorded with a command.
+              AwaitingAgent(..)
+              | AgentWaiting(..)
+              | Unavailable(..)
+              | AwaitingTool
+              | ToolUnknown
+              | AwaitingOrchestrator -> Error(Nil)
             }
           }
           ToolKind(tool:, input:, ..) ->
             case rec.progress {
               AwaitingTool -> Ok(types.ToolRunning(id, tool))
               ToolUnknown -> Ok(types.ToolOutcomeUnknown(id, tool, input))
+              Blocked(reason:, ..) ->
+                Ok(types.ToolHeld(id, tool, current_reason(r, reason)))
               Completed(..) ->
-                case dict.get(r.journal, rec.digest) {
+                case entry {
                   Ok(Answered(_)) ->
                     Ok(types.ToolDone(id, tool, types.ToolSucceeded))
                   Ok(Errored(types.ToolCrashed(failure:, ..))) ->
                     Ok(types.ToolDone(id, tool, types.ToolFailedWith(failure)))
-                  _ -> Error(Nil)
+                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
+                  // A tool call fails only as ToolCrashed; no entry: invalidated.
+                  Ok(Errored(_)) | Error(Nil) -> Error(Nil)
                 }
-              _ -> Error(Nil)
+              // Not a tool call's progress: never recorded with one.
+              AwaitingAgent(..)
+              | AgentWaiting(..)
+              | Unavailable(..)
+              | AwaitingCommand
+              | AwaitingOrchestrator -> Error(Nil)
             }
           OrchestratorKind(name:, input:) ->
             case rec.progress {
               AwaitingOrchestrator ->
                 Ok(types.OrchestratorPending(id, name, input))
-              _ -> Ok(types.OrchestratorDone(id, name))
+              Completed(..) ->
+                case entry {
+                  Ok(Answered(_)) -> Ok(types.OrchestratorDone(id, name))
+                  Ok(Errored(types.OrchestratorCancelled(..))) ->
+                    Ok(types.OrchestratorDropped(id, name))
+                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
+                  // An orchestrator node fails only as cancelled; no entry: invalidated.
+                  Ok(Errored(_)) | Error(Nil) -> Error(Nil)
+                }
+              // Orchestrator nodes are never held back and never issued.
+              AwaitingAgent(..)
+              | AgentWaiting(..)
+              | Unavailable(..)
+              | Blocked(..)
+              | AwaitingCommand
+              | AwaitingTool
+              | ToolUnknown -> Error(Nil)
             }
-          RefusedKind -> Error(Nil)
+          RefusedKind ->
+            case entry {
+              Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
+              // A refused request is settled with its refusal only.
+              Ok(Answered(_)) | Ok(Errored(_)) | Error(Nil) -> Error(Nil)
+            }
         }
       })
   }

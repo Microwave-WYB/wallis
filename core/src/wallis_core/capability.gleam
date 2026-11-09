@@ -156,7 +156,15 @@ pub fn check_submittable(
 ) -> Result(SubmittableNode, Refusal) {
   case facts {
     Pending -> Ok(SubmittableNode(node))
-    _ -> Error(NotPending(node))
+    Working(..)
+    | Waiting(..)
+    | Unsettled(..)
+    | Faulted(..)
+    | Held(..)
+    | CommandWorking
+    | ToolWorking
+    | Settled
+    | Absent -> Error(NotPending(node))
   }
 }
 

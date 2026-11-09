@@ -3,7 +3,8 @@
 // of the outside world.
 //   upload   unannotated (so: may write outside); not safe to repeat. The
 //            first call blocks until the host is killed; later ones return.
-//   publish  the body's outward write.
+//   publish  the body's outward write; not safe to repeat either. Its first
+//            call blocks too.
 
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { Type, type WallisTool } from "wallis";
@@ -37,8 +38,8 @@ export const publish = {
 	parameters: Publish,
 	outputSchema: Type.Object({ id: Type.String() }),
 	annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-	execute: async (_id, params) => {
-		count("publish");
+	execute: async (_id, params, signal) => {
+		if (count("publish") === 0) await new Promise((r) => (signal?.addEventListener("abort", r), setTimeout(r, 120_000)));
 		return { content: [{ type: "text", text: "published" }], details: undefined, structuredContent: { id: `note-${params.text.length}` } };
 	},
 } satisfies WallisTool<typeof Publish>;

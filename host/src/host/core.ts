@@ -32,6 +32,7 @@ export type Event =
 	| { type: "command_failed"; id: string; failure: CommandFailure; minutes: number }
 	| { type: "tool_returned"; id: string; output: Json }
 	| { type: "tool_failed"; id: string; failure: ToolFailure }
+	| { type: "tool_call_unknown"; id: string }
 	| { type: "result_submitted"; node: string; value: Json; by: string }
 	| { type: "observed"; at: string; label: string; value: Json }
 	| { type: "sent"; node: string; text: string; message_id: string; by: string; turns: number }
@@ -94,15 +95,25 @@ export type CommandNode = CommandRunning | CommandDone;
 /** A body MCP tool call. */
 export type ToolNode =
 	| { type: "tool_running"; id: string; tool: string }
+	| { type: "tool_held"; id: string; tool: string; reason: IdleReason }
 	/** In flight at a crash and not safe to reissue: restart (call it again) or cancel. */
 	| { type: "tool_outcome_unknown"; id: string; tool: string; input: Json }
 	| { type: "tool_done"; id: string; tool: string; outcome: { type: "tool_succeeded" } | { type: "tool_failed_with"; failure: ToolFailure } };
 /** An orchestrator node: completed by the orchestrator's `submit_result`. */
-export type OrchestratorNode = { type: "orchestrator_pending"; id: string; name: string; input: Json } | { type: "orchestrator_done"; id: string; name: string };
+export type OrchestratorNode =
+	| { type: "orchestrator_pending"; id: string; name: string; input: Json }
+	| { type: "orchestrator_done"; id: string; name: string }
+	/** Cancelled by its owner instead of answered. */
+	| { type: "orchestrator_dropped"; id: string; name: string };
+/** An agent call held back before it started: by a pause, the budget, or an executor fault. */
+export type HeldNode = NodeBase & { type: "node_held"; reason: IdleReason };
+export type CommandHeld = { type: "command_held"; id: string; command: string; inbox: InboxMessage[]; reason: IdleReason };
+/** A call refused before it ran: its input, a missing dialogue, an unknown node. */
+export type RefusedNode = { type: "node_refused"; id: string; refusal: Refusal };
 /** What cancel and restart reach. */
-export type LiveNodeState = RunningNode | IdleNodeState | CommandRunning | Exclude<ToolNode, { type: "tool_done" }> | Extract<OrchestratorNode, { type: "orchestrator_pending" }>;
+export type LiveNodeState = RunningNode | IdleNodeState | HeldNode | CommandRunning | CommandHeld | Exclude<ToolNode, { type: "tool_done" }> | Extract<OrchestratorNode, { type: "orchestrator_pending" }>;
 /** One call of an agent or a command; each variant carries only what is meaningful in that state. */
-export type Node = AgentNode | CommandNode | ToolNode | OrchestratorNode;
+export type Node = AgentNode | HeldNode | CommandNode | CommandHeld | ToolNode | OrchestratorNode | RefusedNode;
 
 export type Observation = { at: string; label: string; value: Json };
 
@@ -143,6 +154,8 @@ export type Effect =
 	| CallAgentEffect
 	| { type: "run_command"; id: string; command: string; input: Json; compute_minutes: number | null; digest: string }
 	| { type: "call_tool"; id: string; tool: string; input: Json; digest: string }
+	/** A body tool call in flight at a crash, not safe to repeat: step `tool_call_unknown`, so the log has it. */
+	| { type: "log_unknown_tool"; id: string }
 	| { type: "deliver"; id: string; value: Json }
 	| { type: "fail"; id: string; reason: FailReason }
 	| { type: "refuse"; id: string | null; refusal: Refusal }

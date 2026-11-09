@@ -45,5 +45,5 @@ test("an input over the model's window is refused as input_too_large, journaled,
 	const log = new EventLog(join(dir, "log.jsonl")).read();
 	const rejected = log.find((e) => e.type === "input_rejected");
 	assert.ok(rejected && rejected.type === "input_rejected" && rejected.field === "topic" && rejected.limit === 300);
-	assert.deepEqual(r.run.nodes, [], "never a node");
+	assert.deepEqual(r.run.nodes.map((n) => n.type), ["node_refused"], "a refused node, never sent");
 });

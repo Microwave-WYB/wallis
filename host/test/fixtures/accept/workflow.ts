@@ -13,7 +13,8 @@
 //   #6    confirm   an orchestrator node, asked again, cancelled    orchestrator_pending
 //   #7:0  flaky     a model the executor cannot serve               run_idle (executor_unavailable)
 //   #8:0  fragile   gives up until restarted with a note            node_failed
-//   #9    publish   the body's outward write, a custom tool
+//   #9    publish   the body's outward write, a custom tool; the host   stopped, then outcome_unknown
+//                   dies during it; a restart retries it
 //   #10:0 last                                                      finished
 
 import { defineAgent, defineMcp, defineModels, OrchestratorCancelled, orchestrator, ask, toolset, Type, workflow, defineSandbox } from "wallis";

@@ -45,6 +45,8 @@ generics or wrappers that add no proof.
   effect.
 - Model run state as explicit custom types and exhaustive `case`; no
   boolean flags for states.
+- In the core, a match over a union we define has no `_` arm: list every
+  arm, or say why the rest cannot occur.
 - Generate decoders and JSON encoders with the Gleam language server code
   actions rather than writing them by hand.
 - Every core behavior gets a test that replays a sequence of events; no test

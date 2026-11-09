@@ -118,7 +118,8 @@ pub fn an_input_too_large_for_the_window_is_a_journaled_refusal_test() {
   let refusal = InputTooLarge("worker", Some("papers"), 900_000, 384_000)
   assert last(events) == [Refuse(Some("#0"), refusal)]
   // Not a node: it never started a dialogue. A replay answers from the journal.
-  assert nodes_after(events) == []
+  // A refused call is a node too, with its refusal.
+  let assert [types.NodeRefused("#0", InputTooLarge(..))] = nodes_after(events)
   let #(s, _, _) = replay(events)
   let #(_, effects) = run.step(s, call("#0", "worker", JNull))
   assert effects == [Refuse(Some("#0"), refusal)]
@@ -1088,8 +1089,10 @@ pub fn a_body_tool_call_in_flight_at_a_crash_is_reissued_only_if_safe_test() {
   let assert [types.CallTool(id: "#1", ..)] =
     run.step(state, support.tool("#1", input(1))).1
   let #(state, _) = run.step(state, types.ToolReturned("#1", JString("p")))
-  let #(state, effects) = run.step(state, unsafe)
-  assert effects == []
+  // The unsafe one is not made again: the host is told to log its unknown outcome.
+  assert run.step(state, unsafe).1 == [types.LogUnknownTool("#0")]
+  let #(state, effects) = run.step(state, types.ToolCallUnknown("#0"))
+  assert effects == [Checkpoint]
   let assert [types.ToolOutcomeUnknown("#0", "upload", _)] =
     list.filter(run.nodes(state), fn(n) {
       case n {
@@ -1130,6 +1133,105 @@ pub fn a_body_tool_call_in_flight_is_not_issued_again_in_the_same_session_test()
   let #(state, effects) = run.step(state, unsafe)
   assert effects == []
   // Still running, not an unknown outcome.
-  let assert [types.ToolRunning("#0", "search"), types.ToolRunning("#1", "upload")] =
-    run.nodes(state)
+  let assert [
+    types.ToolRunning("#0", "search"),
+    types.ToolRunning("#1", "upload"),
+  ] = run.nodes(state)
+}
+
+pub fn a_body_tool_calls_unknown_outcome_is_rebuilt_from_the_log_test() {
+  let unsafe =
+    types.Requested(
+      "#0",
+      types.Tool("upload", input(1), types.ReplayNever),
+      "upload",
+      0,
+    )
+  let #(state, _, log) =
+    replay([started(basic()), unsafe, types.ToolCallUnknown("#0")])
+  // What the CLI and MCP see: a refold of the log, not the host's memory.
+  assert run.nodes(support.refold(log)) == run.nodes(state)
+  let assert [types.ToolOutcomeUnknown("#0", "upload", _)] = run.nodes(state)
+  // A cancel tells the body the outcome is unknown, not that it never ran.
+  assert run.step(state, types.NodeCancelled("#0", human)).1
+    == [
+      Checkpoint,
+      Fail("#0", types.ToolCrashed("upload", types.ToolUnknownOutcome)),
+    ]
+}
+
+pub fn held_back_calls_are_nodes_and_can_be_cancelled_test() {
+  let held = [
+    started(basic()),
+    types.PauseRequested(human),
+    call("#0", "worker", JNull),
+    command("#1", JNull),
+    support.tool("#2", input(1)),
+  ]
+  let #(state, _, _) = replay(held)
+  let assert [
+    types.NodeHeld(id: "#0", reason: types.PausedByUser, ..),
+    types.CommandHeld(id: "#1", reason: types.PausedByUser, ..),
+    types.ToolHeld(id: "#2", reason: types.PausedByUser, ..),
+  ] = run.nodes(state)
+  assert run.step(state, types.NodeCancelled("#0", human)).1
+    == [Checkpoint, Fail("#0", AgentGaveUp("worker", CancelledByOwner))]
+  assert run.step(state, types.NodeCancelled("#1", human)).1
+    == [
+      Checkpoint,
+      Fail("#1", types.CommandCrashed("train", types.CommandCancelled)),
+    ]
+  assert run.step(state, types.NodeCancelled("#2", human)).1
+    == [
+      Checkpoint,
+      Fail("#2", types.ToolCrashed("search", types.ToolCancelled)),
+    ]
+}
+
+pub fn a_cancelled_orchestrator_node_is_not_shown_as_answered_test() {
+  let #(state, _, _) =
+    replay([
+      started(basic()),
+      support.orchestrator("#0", input(1)),
+      types.NodeCancelled("#0", human),
+    ])
+  assert run.nodes(state) == [types.OrchestratorDropped("#0", "pick")]
+}
+
+fn unknown_agent_call() {
+  [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.ToolRecorded("#0", "0/c0", JString("posted")),
+    types.CallOutcomeUnknown(
+      "#0",
+      "upload",
+      value.object([#("file", JString("a.jpg"))]),
+      support.usage(),
+      "fake/model",
+    ),
+  ]
+}
+
+pub fn restarting_an_unknown_outcome_retries_where_it_stopped_test() {
+  let #(state, _, _) = replay(unknown_agent_call())
+  // The dialogue, the turns and the journaled tool results are kept.
+  let assert [
+    Checkpoint,
+    CallAgent(
+      turn: 1,
+      recorded: [types.ToolResult("0/c0", JString("posted"))],
+      ..,
+    ),
+  ] = run.step(state, types.Restarted("#0", None, human, 0)).1
+  assert run.step(state, types.Restarted("#0", Some("try"), human, 0)).1
+    == [Refuse(None, types.RetryTakesNoNote("#0"))]
+}
+
+pub fn cancelling_an_unknown_outcome_tells_the_body_test() {
+  let #(state, _, _) = replay(unknown_agent_call())
+  let assert [
+    Checkpoint,
+    Fail("#0", AgentGaveUp("worker", types.UnknownOutcome("upload", _))),
+  ] = run.step(state, types.NodeCancelled("#0", human)).1
 }

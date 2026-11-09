@@ -210,6 +210,8 @@ export class Session {
 	readonly #agentCalls = new Map<string, { digest: string; previous: string | null }>();
 	/** Interrupts that came before the call's executor session opened. */
 	readonly #interruptBeforeStart = new Set<string>();
+	/** Restarted agent calls whose unknown tool call is to be made again. */
+	readonly #retryUnknown = new Set<string>();
 	/** Aborts a command call in flight (restart, cancel). */
 	readonly #commandAborts = new Map<string, AbortController>();
 	#resumed = false;
@@ -332,13 +334,20 @@ export class Session {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
 		const held = this.#core.snapshot().held === id;
-		// The old session (or process) and dirs go first: the reissued call creates fresh ones.
-		this.#nodes.get(id)?.session.interrupt?.();
-		this.#commandAborts.get(id)?.abort();
-		this.#closeNode(id);
-		discardNode(this.paths.dir, id);
-		this.#transcriptLog(id)({ kind: "note", text: `restarted${note === undefined ? "" : `: ${note}`}` });
+		this.#interruptBeforeStart.delete(id);
+		// An unknown outcome is retried where it stopped: its checkpoint and journaled tool results stay.
+		const retry = node.node.type === "node_idle" && node.node.cause.type === "outcome_unknown";
+		if (retry) this.#retryUnknown.add(id);
+		else {
+			// The old session (or process) and dirs go first: the reissued call creates fresh ones.
+			this.#nodes.get(id)?.session.interrupt?.();
+			this.#commandAborts.get(id)?.abort();
+			this.#closeNode(id);
+			discardNode(this.paths.dir, id);
+		}
+		this.#transcriptLog(id)({ kind: "note", text: retry ? "restarted: the unknown call is made again" : `restarted${note === undefined ? "" : `: ${note}`}` });
 		const refusal = this.#feed({ type: "restarted", node: id, note: note ?? null, by: node.owned.by, turns })[0] ?? null;
+		if (refusal !== null) this.#retryUnknown.delete(id);
 		// A held failure: the body had stopped on it, so it runs again.
 		if (refusal === null && held) void this.#restartBody();
 		this.#pump();
@@ -794,6 +803,11 @@ export class Session {
 			case "call_tool":
 				this.#callTool(effect);
 				return;
+			case "log_unknown_tool":
+				// Stepped next, so the log (and every state rebuilt from it) has the unknown outcome.
+				this.#transcriptLog(effect.id)({ kind: "note", text: "in flight at a crash and not safe to make again: its outcome is unknown" });
+				this.#requests.push({ type: "tool_call_unknown", id: effect.id });
+				return;
 			case "deliver":
 				this.#deliveries.push([effect.id, { type: "deliver", value: effect.value }]);
 				return;
@@ -907,6 +921,7 @@ export class Session {
 			// An empty dialogue file: the previous call left nothing (it never started).
 			history: previous !== null && statSync(previous).size > 0 ? previous : null,
 			recorded: new Map(effect.recorded.map((r) => [r.call, r.result])),
+			retryUnknown: this.#retryUnknown.delete(id),
 			// Journaled before the model sees it; a result of a restarted call is dropped by the core.
 			record: (call, result) => {
 				if (current()) this.#later(() => this.#feed({ type: "tool_recorded", id, call, result }));

@@ -55,6 +55,7 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		transcript: [],
 		history: null,
 		recorded: new Map(),
+		retryUnknown: false,
 		record: () => {},
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
 		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", mounts: {}, spill: join(tmp(), "spill") },

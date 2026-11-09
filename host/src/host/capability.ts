@@ -123,8 +123,24 @@ export class LiveNode extends Capability {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
 		if (node === undefined) return { type: "not_live", node: id };
 		if (owned.snapshot.held === id && (node.type === "node_done" || node.type === "command_done" || node.type === "tool_done")) return new LiveNode(owned, node);
-		if (node.type === "node_running" || node.type === "node_idle" || node.type === "command_running" || node.type === "tool_running" || node.type === "tool_outcome_unknown" || node.type === "orchestrator_pending") {
-			return new LiveNode(owned, node);
+		switch (node.type) {
+			case "node_running":
+			case "node_idle":
+			case "node_held":
+			case "command_running":
+			case "command_held":
+			case "tool_running":
+			case "tool_held":
+			case "tool_outcome_unknown":
+			case "orchestrator_pending":
+				return new LiveNode(owned, node);
+			case "node_done":
+			case "command_done":
+			case "tool_done":
+			case "orchestrator_done":
+			case "orchestrator_dropped":
+			case "node_refused":
+				return { type: "not_live", node: id };
 		}
 		return { type: "not_live", node: id };
 	}

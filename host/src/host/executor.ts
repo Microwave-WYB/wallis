@@ -78,6 +78,8 @@ export interface NodeSpec {
 	readonly transcript: readonly Message[];
 	/** The session's dialogue after its previous call (the executor's checkpoint format), or null for its first call. */
 	readonly history: string | null;
+	/** The owner restarted an unknown outcome: make the unknown tool call again (once) instead of reporting it. */
+	readonly retryUnknown: boolean;
 	/** MCP tool results already journaled for this call, by tool call key. */
 	readonly recorded: ReadonlyMap<string, Json>;
 	/** Journals an MCP tool result of this call before the model sees it. */

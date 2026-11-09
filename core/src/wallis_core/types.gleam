@@ -223,6 +223,9 @@ pub type Event {
   CommandFailed(id: String, failure: CommandFailure, minutes: Float)
   /// A body MCP tool call returned (its output parsed and checked).
   ToolReturned(id: String, output: Value)
+  /// A body tool call in flight at a crash and not safe to make again: its
+  /// outcome is unknown (logged, so state rebuilt from the log has it).
+  ToolCallUnknown(id: String)
   ToolFailed(id: String, failure: ToolFailure)
   /// The orchestrator's result for an orchestrator node.
   ResultSubmitted(node: String, value: Value, by: String)
@@ -386,6 +389,11 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("type", json.string("tool_returned")),
         #("id", json.string(id)),
         #("output", json_value.to_json(output)),
+      ])
+    ToolCallUnknown(id:) ->
+      json.object([
+        #("type", json.string("tool_call_unknown")),
+        #("id", json.string(id)),
       ])
     ToolFailed(id:, failure:) ->
       json.object([
@@ -616,6 +624,10 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use output <- decode.field("output", json_value.decoder())
       decode.success(ToolReturned(id:, output:))
     }
+    "tool_call_unknown" -> {
+      use id <- decode.field("id", decode.string)
+      decode.success(ToolCallUnknown(id:))
+    }
     "tool_failed" -> {
       use id <- decode.field("id", decode.string)
       use failure <- decode.field("failure", tool_failure_decoder())
@@ -834,6 +846,9 @@ pub type ToolFailure {
   /// The server could not be reached or started.
   ToolUnreachable(error: String)
   ToolCancelled
+  /// The owner cancelled it after it was sent: it may or may not have taken
+  /// effect.
+  ToolUnknownOutcome
 }
 
 pub fn tool_failure_to_json(tool_failure: ToolFailure) -> json.Json {
@@ -857,6 +872,10 @@ pub fn tool_failure_to_json(tool_failure: ToolFailure) -> json.Json {
       json.object([
         #("type", json.string("tool_cancelled")),
       ])
+    ToolUnknownOutcome ->
+      json.object([
+        #("type", json.string("tool_unknown_outcome")),
+      ])
   }
 }
 
@@ -876,6 +895,7 @@ pub fn tool_failure_decoder() -> decode.Decoder(ToolFailure) {
       decode.success(ToolUnreachable(error:))
     }
     "tool_cancelled" -> decode.success(ToolCancelled)
+    "tool_unknown_outcome" -> decode.success(ToolUnknownOutcome)
     _ -> decode.failure(ToolCancelled, "ToolFailure")
   }
 }
@@ -946,6 +966,51 @@ pub type AgentFailure {
   /// The conversation outgrew the model's window and compaction is off.
   ContextExhausted
   CancelledByOwner
+  /// The owner cancelled it while a tool call's outcome was unknown (it may
+  /// or may not have taken effect).
+  UnknownOutcome(tool: String, args: Value)
+}
+
+pub fn agent_failure_to_json(agent_failure: AgentFailure) -> json.Json {
+  case agent_failure {
+    GaveUp(error:) ->
+      json.object([
+        #("type", json.string("gave_up")),
+        #("error", json.string(error)),
+      ])
+    ContextExhausted ->
+      json.object([
+        #("type", json.string("context_exhausted")),
+      ])
+    CancelledByOwner ->
+      json.object([
+        #("type", json.string("cancelled_by_owner")),
+      ])
+    UnknownOutcome(tool:, args:) ->
+      json.object([
+        #("type", json.string("unknown_outcome")),
+        #("tool", json.string(tool)),
+        #("args", json_value.to_json(args)),
+      ])
+  }
+}
+
+pub fn agent_failure_decoder() -> decode.Decoder(AgentFailure) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "gave_up" -> {
+      use error <- decode.field("error", decode.string)
+      decode.success(GaveUp(error:))
+    }
+    "context_exhausted" -> decode.success(ContextExhausted)
+    "cancelled_by_owner" -> decode.success(CancelledByOwner)
+    "unknown_outcome" -> {
+      use tool <- decode.field("tool", decode.string)
+      use args <- decode.field("args", json_value.decoder())
+      decode.success(UnknownOutcome(tool:, args:))
+    }
+    _ -> decode.failure(ContextExhausted, "AgentFailure")
+  }
 }
 
 /// Why a command call failed, as the body sees it.
@@ -1025,37 +1090,6 @@ pub fn command_failure_decoder() -> decode.Decoder(CommandFailure) {
   }
 }
 
-pub fn agent_failure_to_json(agent_failure: AgentFailure) -> json.Json {
-  case agent_failure {
-    GaveUp(error:) ->
-      json.object([
-        #("type", json.string("gave_up")),
-        #("error", json.string(error)),
-      ])
-    ContextExhausted ->
-      json.object([
-        #("type", json.string("context_exhausted")),
-      ])
-    CancelledByOwner ->
-      json.object([
-        #("type", json.string("cancelled_by_owner")),
-      ])
-  }
-}
-
-pub fn agent_failure_decoder() -> decode.Decoder(AgentFailure) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "gave_up" -> {
-      use error <- decode.field("error", decode.string)
-      decode.success(GaveUp(error:))
-    }
-    "context_exhausted" -> decode.success(ContextExhausted)
-    "cancelled_by_owner" -> decode.success(CancelledByOwner)
-    _ -> decode.failure(ContextExhausted, "AgentFailure")
-  }
-}
-
 // --- Effects (core to host) --------------------------------------------------
 
 pub type Effect {
@@ -1088,6 +1122,9 @@ pub type Effect {
     digest: String,
   )
   CallTool(id: String, tool: String, input: Value, digest: String)
+  /// Log that this body tool call's outcome is unknown: the host steps
+  /// `ToolCallUnknown(id)`.
+  LogUnknownTool(id: String)
   Deliver(id: String, value: Value)
   Fail(id: String, reason: FailReason)
   /// `Some(id)`: the body's request is refused. `None`: the event itself is
@@ -1154,6 +1191,11 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
         #("tool", json.string(tool)),
         #("input", json_value.to_json(input)),
         #("digest", json.string(digest)),
+      ])
+    LogUnknownTool(id:) ->
+      json.object([
+        #("type", json.string("log_unknown_tool")),
+        #("id", json.string(id)),
       ])
     Deliver(id:, value:) ->
       json.object([
@@ -1244,6 +1286,10 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
       use digest <- decode.field("digest", decode.string)
       decode.success(CallTool(id:, tool:, input:, digest:))
     }
+    "log_unknown_tool" -> {
+      use id <- decode.field("id", decode.string)
+      decode.success(LogUnknownTool(id:))
+    }
     "deliver" -> {
       use id <- decode.field("id", decode.string)
       use value <- decode.field("value", json_value.decoder())
@@ -1303,6 +1349,15 @@ pub type Refusal {
   NotPending(node: String)
   /// A session call whose previous call left no dialogue to continue.
   DialogueMissing(node: String)
+  /// A restart of an unknown outcome retries the call where it stopped: it
+  /// takes no note (the dialogue continues).
+  RetryTakesNoNote(node: String)
+  /// Two tools an agent is given have the same name, or one takes a
+  /// built-in's name.
+  ToolNameTaken(agent: String, name: String)
+  /// Tool processes run only in sandboxes, and none can be built here
+  /// (`confine: "off"` runs them unconfined).
+  SandboxUnavailable(source: String)
   InvalidDeclaration(message: String)
   InvalidEvent(message: String)
   NotStarted
@@ -1466,6 +1521,22 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
         #("type", json.string("dialogue_missing")),
         #("node", json.string(node)),
       ])
+    RetryTakesNoNote(node:) ->
+      json.object([
+        #("type", json.string("retry_takes_no_note")),
+        #("node", json.string(node)),
+      ])
+    ToolNameTaken(agent:, name:) ->
+      json.object([
+        #("type", json.string("tool_name_taken")),
+        #("agent", json.string(agent)),
+        #("name", json.string(name)),
+      ])
+    SandboxUnavailable(source:) ->
+      json.object([
+        #("type", json.string("sandbox_unavailable")),
+        #("source", json.string(source)),
+      ])
     InvalidDeclaration(message:) ->
       json.object([
         #("type", json.string("invalid_declaration")),
@@ -1614,6 +1685,19 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
     "dialogue_missing" -> {
       use node <- decode.field("node", decode.string)
       decode.success(DialogueMissing(node:))
+    }
+    "retry_takes_no_note" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(RetryTakesNoNote(node:))
+    }
+    "tool_name_taken" -> {
+      use agent <- decode.field("agent", decode.string)
+      use name <- decode.field("name", decode.string)
+      decode.success(ToolNameTaken(agent:, name:))
+    }
+    "sandbox_unavailable" -> {
+      use source <- decode.field("source", decode.string)
+      decode.success(SandboxUnavailable(source:))
     }
     "invalid_declaration" -> {
       use message <- decode.field("message", decode.string)
@@ -1909,6 +1993,27 @@ pub type Node {
   /// An orchestrator node waiting for its result.
   OrchestratorPending(id: String, name: String, input: Value)
   OrchestratorDone(id: String, name: String)
+  /// The owner cancelled it instead of answering.
+  OrchestratorDropped(id: String, name: String)
+  /// An agent call held back before it started: by a pause or the budget,
+  /// or after an executor fault (reissued after a fix).
+  NodeHeld(
+    id: String,
+    agent: String,
+    model: String,
+    steerable: Bool,
+    inbox: List(InboxMessage),
+    reason: IdleReason,
+  )
+  CommandHeld(
+    id: String,
+    command: String,
+    inbox: List(InboxMessage),
+    reason: IdleReason,
+  )
+  ToolHeld(id: String, tool: String, reason: IdleReason)
+  /// A call refused (its input, a missing dialogue, an unknown node).
+  NodeRefused(id: String, refusal: Refusal)
 }
 
 pub fn node_to_json(node: Node) -> json.Json {
@@ -1990,6 +2095,43 @@ pub fn node_to_json(node: Node) -> json.Json {
         #("id", json.string(id)),
         #("name", json.string(name)),
       ])
+    OrchestratorDropped(id:, name:) ->
+      json.object([
+        #("type", json.string("orchestrator_dropped")),
+        #("id", json.string(id)),
+        #("name", json.string(name)),
+      ])
+    NodeHeld(id:, agent:, model:, steerable:, inbox:, reason:) ->
+      json.object([
+        #("type", json.string("node_held")),
+        #("id", json.string(id)),
+        #("agent", json.string(agent)),
+        #("model", json.string(model)),
+        #("steerable", json.bool(steerable)),
+        #("inbox", json.array(inbox, inbox_message_to_json)),
+        #("reason", idle_reason_to_json(reason)),
+      ])
+    CommandHeld(id:, command:, inbox:, reason:) ->
+      json.object([
+        #("type", json.string("command_held")),
+        #("id", json.string(id)),
+        #("command", json.string(command)),
+        #("inbox", json.array(inbox, inbox_message_to_json)),
+        #("reason", idle_reason_to_json(reason)),
+      ])
+    ToolHeld(id:, tool:, reason:) ->
+      json.object([
+        #("type", json.string("tool_held")),
+        #("id", json.string(id)),
+        #("tool", json.string(tool)),
+        #("reason", idle_reason_to_json(reason)),
+      ])
+    NodeRefused(id:, refusal:) ->
+      json.object([
+        #("type", json.string("node_refused")),
+        #("id", json.string(id)),
+        #("refusal", refusal_to_json(refusal)),
+      ])
   }
 }
 
@@ -2062,6 +2204,38 @@ pub fn node_decoder() -> decode.Decoder(Node) {
       use id <- decode.field("id", decode.string)
       use name <- decode.field("name", decode.string)
       decode.success(OrchestratorDone(id:, name:))
+    }
+    "orchestrator_dropped" -> {
+      use id <- decode.field("id", decode.string)
+      use name <- decode.field("name", decode.string)
+      decode.success(OrchestratorDropped(id:, name:))
+    }
+    "node_held" -> {
+      use id <- decode.field("id", decode.string)
+      use agent <- decode.field("agent", decode.string)
+      use model <- decode.field("model", decode.string)
+      use steerable <- decode.field("steerable", decode.bool)
+      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
+      use reason <- decode.field("reason", idle_reason_decoder())
+      decode.success(NodeHeld(id:, agent:, model:, steerable:, inbox:, reason:))
+    }
+    "command_held" -> {
+      use id <- decode.field("id", decode.string)
+      use command <- decode.field("command", decode.string)
+      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
+      use reason <- decode.field("reason", idle_reason_decoder())
+      decode.success(CommandHeld(id:, command:, inbox:, reason:))
+    }
+    "tool_held" -> {
+      use id <- decode.field("id", decode.string)
+      use tool <- decode.field("tool", decode.string)
+      use reason <- decode.field("reason", idle_reason_decoder())
+      decode.success(ToolHeld(id:, tool:, reason:))
+    }
+    "node_refused" -> {
+      use id <- decode.field("id", decode.string)
+      use refusal <- decode.field("refusal", refusal_decoder())
+      decode.success(NodeRefused(id:, refusal:))
     }
     _ -> decode.failure(ToolRunning(id: "", tool: ""), "Node")
   }

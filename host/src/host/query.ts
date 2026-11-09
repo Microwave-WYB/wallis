@@ -459,19 +459,28 @@ export function renderTree(v: RunView): string {
 		const inbox = "inbox" in node && node.inbox.length > 0 ? `  inbox: ${node.inbox.map((m) => `${m.kind}@${m.step}`).join(",")}` : "";
 		switch (node.type) {
 			case "command_running":
+			case "command_held":
 			case "command_done":
-				lines.push(`${indent}${node.id}  ${node.command}  command  ${node.type === "command_done" ? `done (${node.outcome.type})` : "running"}${inbox}`);
+				lines.push(`${indent}${node.id}  ${node.command}  command  ${node.type === "command_done" ? `done (${node.outcome.type})` : node.type === "command_held" ? `held (${node.reason.type})` : "running"}${inbox}`);
 				break;
 			case "tool_running":
+			case "tool_held":
 			case "tool_outcome_unknown":
 			case "tool_done":
-				lines.push(`${indent}${node.id}  ${node.tool}  tool  ${node.type === "tool_done" ? `done (${node.outcome.type})` : node.type === "tool_running" ? "running" : "outcome unknown"}`);
+				lines.push(`${indent}${node.id}  ${node.tool}  tool  ${node.type === "tool_done" ? `done (${node.outcome.type})` : node.type === "tool_running" ? "running" : node.type === "tool_held" ? `held (${node.reason.type})` : "outcome unknown"}`);
 				break;
 			case "orchestrator_pending":
 			case "orchestrator_done":
-				lines.push(`${indent}${node.id}  ${node.name}  orchestrator  ${node.type === "orchestrator_done" ? "done" : "pending"}`);
+			case "orchestrator_dropped":
+				lines.push(`${indent}${node.id}  ${node.name}  orchestrator  ${node.type === "orchestrator_done" ? "done" : node.type === "orchestrator_dropped" ? "cancelled" : "pending"}`);
 				break;
-			default: {
+			case "node_refused":
+				lines.push(`${indent}${node.id}  refused (${node.refusal.type})`);
+				break;
+			case "node_running":
+			case "node_idle":
+			case "node_held":
+			case "node_done": {
 				// A session is the parent of its calls (`#3` of `#3:0`, `#3:1`).
 				const session = node.id.slice(0, node.id.lastIndexOf(":"));
 				if (!sessions.has(session)) {
@@ -480,19 +489,21 @@ export function renderTree(v: RunView): string {
 				}
 				const cause = node.type === "node_idle" ? node.cause : null;
 				const status =
-					cause === null
-						? node.type === "node_done"
-							? `done (${node.outcome.type})`
-							: "running"
-						: cause.type === "question"
-							? `idle (question): ${truncate(cause.message, 80)}`
-							: cause.type === "ended_without_result"
-								? `idle (ended without result): ${truncate(cause.text, 80)}`
-								: cause.type === "turn_limit"
-									? `idle: turn limit ${cause.used}/${cause.limit}`
-									: cause.type === "outcome_unknown"
-										? `idle: outcome of ${cause.tool} unknown`
-										: "idle: interrupted";
+					node.type === "node_held"
+						? `held (${node.reason.type})`
+						: cause === null
+							? node.type === "node_done"
+								? `done (${node.outcome.type})`
+								: "running"
+							: cause.type === "question"
+								? `idle (question): ${truncate(cause.message, 80)}`
+								: cause.type === "ended_without_result"
+									? `idle (ended without result): ${truncate(cause.text, 80)}`
+									: cause.type === "turn_limit"
+										? `idle: turn limit ${cause.used}/${cause.limit}`
+										: cause.type === "outcome_unknown"
+											? `idle: outcome of ${cause.tool} unknown`
+											: "idle: interrupted";
 				lines.push(`${indent}${node.id}  ${node.agent}  ${node.model}  ${status}${node.steerable ? "" : "  (not steerable)"}${inbox}`);
 			}
 		}
