@@ -1,8 +1,11 @@
 // Who owns a run: the harness that started it, or the human.
 //
-// - A run started over MCP is owned by the harness process: the parent of
-//   `wallis serve`.
+// - A run started over MCP is owned by the harness that runs `wallis serve`:
+//   its nearest harness ancestor (the server is often started through a
+//   wrapper: `npx`, `sh -c`, `mise exec`), else its parent.
 // - A CLI caller is its nearest harness ancestor, or the human if it has none.
+// So an orchestrator's MCP calls and its shell's `npx wallis wait` resolve
+// to the same harness process.
 // - The human at a terminal with no harness ancestor owns everything.
 // Identities are `human` or `harness:<name>:<pid>:<start time>`; the start
 // time (from /proc) makes a reused pid a different owner. `WALLIS_OWNER`
@@ -50,24 +53,29 @@ function identity(p: Proc): Owner {
 	return `harness:${p.name}:${p.pid}:${p.start}`;
 }
 
-/** The caller: `WALLIS_OWNER`, else the nearest harness ancestor, else the human. */
-export function callerIdentity(): Owner {
-	if (process.env.WALLIS_OWNER) return process.env.WALLIS_OWNER;
+function nearestHarness(): Proc | null {
 	const names = harnesses();
 	let pid = process.ppid;
 	for (let depth = 0; depth < 64 && pid > 1; depth++) {
 		const p = proc(pid);
 		if (!p) break;
-		if (names.includes(p.name)) return identity(p);
+		if (names.includes(p.name)) return p;
 		pid = p.ppid;
 	}
-	return HUMAN;
+	return null;
 }
 
-/** The harness that runs `wallis serve`: its parent process, whatever it is called. */
+/** The caller: `WALLIS_OWNER`, else the nearest harness ancestor, else the human. */
+export function callerIdentity(): Owner {
+	if (process.env.WALLIS_OWNER) return process.env.WALLIS_OWNER;
+	const p = nearestHarness();
+	return p ? identity(p) : HUMAN;
+}
+
+/** The harness that runs `wallis serve`: its nearest harness ancestor, else its parent, whatever it is called. */
 export function serverOwner(): Owner {
 	if (process.env.WALLIS_OWNER) return process.env.WALLIS_OWNER;
-	const p = proc(process.ppid);
+	const p = nearestHarness() ?? proc(process.ppid);
 	return p ? identity(p) : HUMAN;
 }
 

@@ -25,9 +25,20 @@ export function project(): string {
 	return root;
 }
 
+/**
+ * The environment of a CLI call, the same inside and outside a harness:
+ * no inherited identity, and a harness list nothing matches, so the
+ * caller is the human unless a test sets `WALLIS_OWNER` (or its own
+ * `WALLIS_HARNESSES`). Plain detached hosts: SIGKILL tests must not be
+ * restarted by systemd.
+ */
+export function cliEnv(env: Record<string, string> = {}): Record<string, string> {
+	const { WALLIS_OWNER: _owner, WALLIS_HARNESSES: _harnesses, ...rest } = process.env;
+	return { ...(rest as Record<string, string>), WALLIS_HOST: "plain", WALLIS_HARNESSES: "no-harness-in-tests", ...env };
+}
+
 export function wallis(root: string, args: string[], env: Record<string, string> = {}) {
-	// Plain detached hosts by default: SIGKILL tests must not be restarted by systemd.
-	return spawnSync(process.execPath, [cli, ...args, "--root", root], { encoding: "utf8", env: { ...process.env, WALLIS_HOST: "plain", ...env }, timeout: 60_000 });
+	return spawnSync(process.execPath, [cli, ...args, "--root", root], { encoding: "utf8", env: cliEnv(env), timeout: 60_000 });
 }
 
 export function onlyRun(root: string): string {

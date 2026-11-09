@@ -58,3 +58,28 @@ test("pending mentions runs whose owner is gone, and they can be claimed", () =>
 	assert.equal(wallis(root, ["claim", id], as("harness:beta")).status, 0);
 	assert.match(wallis(root, ["pending"], as("harness:beta")).stdout, /Who is the audience/);
 });
+
+test("under a harness, wallis serve behind a wrapper and the harness's own CLI calls resolve to the same owner", async () => {
+	const { mkdirSync, writeFileSync } = await import("node:fs");
+	const { spawnSync } = await import("node:child_process");
+	const { join, resolve } = await import("node:path");
+	const { fileURLToPath } = await import("node:url");
+	const { cliEnv, tmp } = await import("./util.ts");
+	const dir = tmp();
+	const owner = resolve(fileURLToPath(new URL(".", import.meta.url)), "../src/host/owner.ts");
+	// What `wallis serve` and a CLI call compute, each started through `sh -c` (as `npx` or `mise exec` would).
+	writeFileSync(join(dir, "probe.ts"), `import { callerIdentity, serverOwner } from ${JSON.stringify(owner)};\nconsole.log(process.argv[2] === "server" ? serverOwner() : callerIdentity());\n`);
+	mkdirSync(join(dir, "bin"));
+	const harness = join(dir, "bin", "fakeharness.mjs");
+	writeFileSync(
+		harness,
+		`import { execFileSync } from "node:child_process";
+const run = (kind) => execFileSync("sh", ["-c", \`"\${process.execPath}" ${join(dir, "probe.ts")} \${kind}; true\`], { encoding: "utf8" }).trim();
+console.log(JSON.stringify({ server: run("server"), caller: run("caller") }));\n`,
+	);
+	const r = spawnSync(process.execPath, [harness], { encoding: "utf8", env: cliEnv({ WALLIS_HARNESSES: "fakeharness" }) });
+	assert.equal(r.status, 0, r.stderr);
+	const ids = JSON.parse(r.stdout) as { server: string; caller: string };
+	assert.match(ids.server, /^harness:fakeharness:\d+:\d+$/);
+	assert.equal(ids.caller, ids.server, "the orchestrator's MCP runs are its own for its CLI");
+});
