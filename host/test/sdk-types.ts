@@ -1,7 +1,7 @@
 // Compile-time checks of the SDK's and the host's typing. `tsc --noEmit`
 // fails if any `@ts-expect-error` line stops being an error.
 
-import { type Session as SessionValue, ask, command, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
+import { type Session as SessionValue, ask, command, done, next, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
 import { IdleNode, LiveNode, OwnedRun, SteerableNode, SubmittableNode } from "../src/host/capability.ts";
 import type { CommandRunning, IdleNodeState, Node, RunningNode, Snapshot } from "../src/host/core.ts";
 import type { Session } from "../src/host/session.ts";
@@ -136,15 +136,15 @@ export default workflow({
 		void raw;
 		// A session is a value: the call returns the next one; the value called is unchanged,
 		// so calling it again is a branch.
-		const [, next] = await ctx.call(after, { q: "and then?", papers: [] });
+		const [, following] = await ctx.call(after, { q: "and then?", papers: [] });
 		const [again] = await ctx.call(after, { q: "or else?", papers: [] });
-		const s: SessionValue<typeof ok.input, typeof ok.output> = next;
+		const s: SessionValue<typeof ok.input, typeof ok.output> = following;
 		const said: string = again.answer;
 		void said;
 		// @ts-expect-error: a session value has no call of its own
 		await s.call({ q: "and then?", papers: [] });
 		// @ts-expect-error: the next session is the same agent's, typed the same
-		await ctx.call(next, { q: 1, papers: [] });
+		await ctx.call(following, { q: 1, papers: [] });
 		void picked;
 		void pickedWrong;
 		void ids;
@@ -153,6 +153,27 @@ export default workflow({
 		// @ts-expect-error: outputs are typed too
 		const wrong: number = out.answer;
 		ctx.observe("answer", answer);
+		// ctx.loop: the state is the init's type; the output is the union of the done(...) values.
+		const ending = await ctx.loop({ s: ctx.session(ok), round: 0 }, async (c, state) => {
+			const [out, s] = await c.call(state.s, { q: "again?", papers: [] });
+			if (out.answer === "yes") return done({ type: "approved" as const, answer: out.answer });
+			if (state.round > 3) return done({ type: "abandoned" as const, rounds: state.round });
+			return next({ s, round: state.round + 1 });
+		});
+		if (ending.type === "approved") {
+			const approved: string = ending.answer;
+			void approved;
+		} else {
+			const rounds: number = ending.rounds;
+			void rounds;
+		}
+		// @ts-expect-error: the result is a union: an ending's fields need narrowing first
+		void ending.answer;
+		// @ts-expect-error: the body must go round with the init's state type
+		await ctx.loop({ round: 0 }, async (_c, state) => next({ round: String(state.round) }));
+		// The explicit form, as written in the API.
+		const explicit: string = await ctx.loop<number, string>(0, async (_c, n) => (n > 2 ? done("ok") : next(n + 1)));
+		void explicit;
 		const each: number[] = await ctx.map([1, 2], async (c, i) => (await c.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: i })).score);
 		// @ts-expect-error: ctx has no state-writing API
 		await ctx.emit("total", 3);

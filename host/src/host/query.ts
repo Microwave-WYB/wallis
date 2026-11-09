@@ -502,8 +502,23 @@ export function renderTree(v: RunView): string {
 			}
 		}
 	}
+	// Loops (`ctx.loop`): the loop, then each iteration with its state; the rest are plain observations.
+	const loops = new Map<string, { at: string; iteration: number; state: Json }[]>();
+	const finished = new Map<string, number>();
 	for (const o of v.run.observations) {
-		lines.push(`${"  ".repeat(depthOf(o.at) + 1)}${o.at}  observe ${o.label} = ${truncate(JSON.stringify(o.value), 120)}`);
+		if (!o.label.startsWith("loop ")) {
+			lines.push(`${"  ".repeat(depthOf(o.at) + 1)}${o.at}  observe ${o.label} = ${truncate(JSON.stringify(o.value), 120)}`);
+			continue;
+		}
+		const at = o.label.slice("loop ".length);
+		const value = o.value as { iteration?: number; state?: Json; done?: boolean };
+		if (value.done) finished.set(at, (value.iteration ?? 0) + 1);
+		else loops.set(at, [...(loops.get(at) ?? []), { at: o.at, iteration: value.iteration ?? 0, state: value.state ?? null }]);
+	}
+	for (const [at, iterations] of loops) {
+		const total = finished.get(at);
+		lines.push(`${"  ".repeat(depthOf(at) + 1)}${at}  loop  ${total === undefined ? `iteration ${iterations.length - 1} (current)` : `done after ${total} iteration${total === 1 ? "" : "s"}`}`);
+		for (const it of iterations) lines.push(`${"  ".repeat(depthOf(it.at) + 1)}${it.at}  iteration ${it.iteration}  state = ${truncate(JSON.stringify(it.state), 120)}`);
 	}
 	// Session values, as a tree of branches: each is the session after a call of its parent.
 	const sessions = v.run.sessions ?? [];

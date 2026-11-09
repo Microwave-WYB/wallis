@@ -373,6 +373,37 @@ Prototype choices:
   driven by `tools/gleam-codegen.mjs`; the recursive `Value` decoder is
   hand-written. The recursive `FailReason` decoder is generated and lazy.
 
+## Loops: `ctx.loop` (decided, foundation round)
+
+`ctx.loop(init, async (ctx, state) => next(state2) | done(value))` is a
+typed fold: `S` is inferred from `init`, `O` is the union of the `done(...)`
+values. State and output are separate, so an ending (approved, abandoned)
+lives only in the output and loop internals (sessions, counters) stay
+inside.
+
+```ts
+const ending = await ctx.loop({ s: ctx.session(colorist), round: 0 }, async (c, st) => {
+  const [look, s] = await c.call(st.s, { sheet, round: st.round });
+  if (look.ok) return done({ type: "approved" as const, look });
+  if (st.round >= 5) return done({ type: "abandoned" as const });
+  return next({ s, round: st.round + 1 });
+});
+```
+
+- Each iteration is its own branch (`<loop>.<i>`: its own ctx and request
+  ids, like a `ctx.map` item), so replay, fork and resume are stable. State
+  is plain data; sessions in it are values.
+- The runtime shows the loop: each iteration's state is observed (label
+  `loop <position>`, truncated to 2000 characters; monitoring only, never
+  returned or matched), so `wallis tree` lists the loop, its iterations and
+  the current one, and `status` the current iteration.
+- No iteration cap: the budget governs long loops. A body exception fails
+  the run like any body error; a node failure inside an iteration is held
+  as usual (its restart recomputes from that iteration; earlier ones hit).
+- Prefer `ctx.loop` to `let` plus `for` for loops that call nodes: the
+  runtime can then show the iterations, and each one's request ids do not
+  depend on how many calls the iterations before it made.
+
 ## Concurrency (decided, round 5)
 
 - `ctx.call` takes its request id synchronously, when invoked, so

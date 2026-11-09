@@ -59,6 +59,11 @@ export default workflow({
   session value returns `[output, next]`; `s` is unchanged, so calling it
   again (anywhere, in any branch) is a branch from the same dialogue. A
   line starting with `[` needs a `;` at the end of the line before it.
+- Loops that call nodes: `ctx.loop(init, async (c, state) => next(state2) or
+  done(value))` (import `next`, `done` from "wallis"), rather than `let` plus
+  `for`. Each iteration is its own branch with its own ids; `wallis tree` and
+  `status` show the iterations and the current one. The output is the union of
+  the `done` values (narrow it, e.g. on `ending.type`); the state stays inside.
 - MCP servers never see the agent's files: use the workspace or custom
   tools for files.
 

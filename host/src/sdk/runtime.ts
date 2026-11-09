@@ -95,6 +95,9 @@ export function toolId(desc: { kind: "custom"; toolset: string; export: string }
 	return desc.kind === "custom" ? `custom:${desc.toolset}#${desc.export}` : `mcp:${desc.server}/${desc.tool}`;
 }
 
+/** An iteration's state, as observed for monitoring: at most this many characters of its JSON. */
+const LOOP_STATE_CHARS = 2000;
+
 /** The workflow's agents, by name: a session value names its agent. */
 const agents = new Map<string, AgentDef>();
 
@@ -212,6 +215,28 @@ function makeCtx(path: string, seed: number): Ctx {
 			const at = next();
 			return Promise.all(items.map((item, i) => each(makeCtx(`${at}.${i}`, seed), item, i)));
 		},
+		loop: ((init: unknown, body: (ctx: Ctx, state: unknown) => Promise<unknown>) => {
+			// The loop's position, taken now like a request id; iteration i is branch `<at>.<i>`.
+			const at = next();
+			const label = `loop ${at}`;
+			const show = (value: unknown): Json => {
+				const text = JSON.stringify(value) ?? "null";
+				return text.length <= LOOP_STATE_CHARS ? (JSON.parse(text) as Json) : { truncated: text.slice(0, LOOP_STATE_CHARS) };
+			};
+			const iterate = async (state: unknown, i: number): Promise<unknown> => {
+				// Monitoring only: the iteration and its state (truncated), never returned or matched.
+				host().__wallis_send(JSON.stringify({ type: "observed", at: `${at}.${i}`, label, value: { iteration: i, state: show(state) } }));
+				const step: unknown = await body(makeCtx(`${at}.${i}`, seed), state);
+				const s = step as { type?: unknown; state?: unknown; value?: unknown } | null;
+				if (s !== null && typeof s === "object" && s.type === "next" && "state" in s) return iterate(s.state, i + 1);
+				if (s !== null && typeof s === "object" && s.type === "done" && "value" in s) {
+					host().__wallis_send(JSON.stringify({ type: "observed", at: `${at}.done`, label, value: { iteration: i, done: true } }));
+					return s.value;
+				}
+				throw new SchemaError(`step ${i} of loop ${at}`, ["the body must return next(state) or done(value)"]);
+			};
+			return iterate(init, 0);
+		}) as Ctx["loop"],
 		observe(label, value) {
 			host().__wallis_send(JSON.stringify({ type: "observed", at: `${path}~${observed++}`, label, value }));
 		},

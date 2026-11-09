@@ -792,8 +792,35 @@ export interface Ctx {
 	): Promise<{ -readonly [K in keyof B]: Awaited<ReturnType<B[K]>> }>;
 	/** One branch per item, concurrently, each with its own request ids; results in item order. */
 	map<T, U>(items: readonly T[], each: (ctx: Ctx, item: T, index: number) => Promise<U>): Promise<U[]>;
+	/**
+	 * A typed fold: runs `body` on the state until it returns `done(value)`;
+	 * `next(state)` goes round again. The state (`S`, from `init`) and the
+	 * output (`O`, the union of the `done` values) are separate, so loop
+	 * internals (sessions, counters) stay inside. Each iteration is its own
+	 * branch (its own ctx and request ids, keyed by the loop's position and
+	 * the iteration), so replay, fork and resume are stable; the runtime shows
+	 * the loop and its iterations (`tree`, `status`). There is no iteration
+	 * cap: the budget governs long loops.
+	 */
+	loop<S, O>(init: S, body: (ctx: Ctx, state: S) => Promise<Step<NoInfer<S>, O>>): Promise<O>;
+	// The same, inferred: O is the union of the `done(...)` values (TS infers one candidate for O
+	// from several object types, so the step type is inferred and its endings extracted).
+	loop<S, R extends Step<NoInfer<S>, unknown>>(init: S, body: (ctx: Ctx, state: S) => Promise<R>): Promise<Extract<R, { readonly type: "done" }>["value"]>;
 	/** Monitoring only: logged for `status`, `tree` and `show`, never returned, never matched on replay. */
 	observe(label: string, value: Json): void;
+}
+
+/** One iteration's result in `ctx.loop`: go round again with a new state, or end with the output. */
+export type Step<S, O> = { readonly type: "next"; readonly state: S } | { readonly type: "done"; readonly value: O };
+
+/** Goes round `ctx.loop` again with this state. */
+export function next<S>(state: S): Step<S, never> {
+	return { type: "next", state };
+}
+
+/** Ends `ctx.loop` with this output. */
+export function done<O>(value: O): Step<never, O> {
+	return { type: "done", value };
 }
 
 /** A nested workflow: a node whose body runs inside the caller's run. */
