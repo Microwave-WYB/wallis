@@ -1,5 +1,29 @@
 # wallis
 
+## Everything is a value
+
+The only mutation is appending an event to the run log. Every side file is
+either a content-addressed blob (or layer) that an event names, written
+before that event, or a cache derivable from the log (`meta.json`). The
+journal only grows: a restart, a rewind or a forget adds an attempt. The
+host executes effects and feeds events back; it decides nothing (crash
+policy, attempts, retries are core state).
+
+- **Sessions are values.** `ctx.call(s, input)` returns `[output, next]`;
+  `s` is unchanged, so calling it again is a branch. Values are plain data
+  and may go to any branch. A call is keyed by (node digest, parent
+  session, input, occurrence per branch); the next session is a hash chain
+  over the call's slot and attempt. Dialogues are blobs (deltas from the
+  parent session's).
+- **Workspaces are layers.** A session's `/w` is an overlay of immutable
+  layers; a call's changes become a new layer (rename, no copy) before
+  `agent_returned` names it; squashed beyond 16. `ctx.files(s)` is a Tree;
+  `ctx.session(agent, { from })` seeds one copy-on-write.
+- **Identity is structural.** Journal keys come from digests (node
+  definition, canonical input, parent session, occurrence), never from
+  display names or request ids; inside the core they are opaque types
+  (`Slot`, `RequestId`, `SessionId`, `Digest`).
+
 ## Governing principle
 
 Types make illegal states unrepresentable. Where types cannot reach (time,
