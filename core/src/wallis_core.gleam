@@ -45,6 +45,11 @@ pub fn snapshot_json(state: RunState) -> String {
   json.to_string(run.snapshot(state))
 }
 
+/// The whole state as text, for the differential check.
+pub fn full_state(state: RunState) -> String {
+  run.full_state(state)
+}
+
 /// JSON of the host facts the log noted.
 pub fn facts_json(state: RunState) -> String {
   json.to_string(run.host_facts(state))

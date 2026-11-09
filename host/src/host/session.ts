@@ -705,8 +705,8 @@ export class Session {
 	 */
 	#differential(event: Event): void {
 		if (process.env.WALLIS_DIFFERENTIAL !== "1" || this.#settled) return;
-		const rebuilt = Core.refold(this.#log.read()).snapshotText();
-		const live = this.#core.snapshotText();
+		const rebuilt = Core.refold(this.#log.read()).fullState();
+		const live = this.#core.fullState();
 		if (rebuilt === live) return;
 		const error = new Error(`differential check: after ${event.type}, the state rebuilt from the log differs from the live state\nlive:    ${live}\nrebuilt: ${rebuilt}`);
 		process.stderr.write(`wallis: ${error.message}\n`);

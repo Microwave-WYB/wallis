@@ -2727,6 +2727,18 @@ fn node_of(r: Run, call: Call) -> Result(Node, Nil) {
   }
 }
 
+/// The whole state, as text: every field of the run (calls with all their
+/// attempts, sessions, layers, dialogue and checkpoint digests, retries,
+/// recorded tool results, hold, spend, facts), except whether a running call
+/// was issued in this host session, which a fold of the log cannot know.
+/// For the differential check: the live state must equal the log's fold.
+pub fn full_state(run: RunState) -> String {
+  case run {
+    NotYetStarted -> "not yet started"
+    Active(r) -> string.inspect(Active(unissued(r)))
+  }
+}
+
 /// The host facts the log noted (`Noted`), for `meta.json`: not part of the
 /// snapshot, since they are about the host, not the run.
 pub fn host_facts(run: RunState) -> json.Json {

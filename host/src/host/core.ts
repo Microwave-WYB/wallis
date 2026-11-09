@@ -209,6 +209,11 @@ export class Core {
 		return gleam.snapshot_json(this.#state);
 	}
 
+	/** The whole state as text (all but what was issued in this host session), for the differential check. */
+	fullState(): string {
+		return gleam.full_state(this.#state);
+	}
+
 	/** The host facts the log noted (`noted` events), by key. */
 	facts(): Record<string, Json> {
 		return JSON.parse(gleam.facts_json(this.#state)) as Record<string, Json>;
