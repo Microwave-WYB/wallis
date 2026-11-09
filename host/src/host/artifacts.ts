@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
-import { layerDir, prepareWork, removeWork, resolveIn, type Work } from "./layers.ts";
+import { layerDir, locate, prepareWork, removeWork, ViewError, type ViewEntry, type Work, workRoot } from "./layers.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
@@ -124,9 +124,18 @@ export function resolveDrafts(value: Json, runDir: string, scratch: string | Wor
 		const base = typeof scratch === "string" ? scratch : scratch.upper;
 		const rel = relative(base, resolve(base, value.artifact));
 		if (rel.startsWith("..") || rel.startsWith(sep) || rel === "") throw new ArtifactError(`artifact ${value.artifact} is outside the node's scratch dir`);
-		// An agent's workspace: the file may be in any of its session's layers.
-		const path = typeof scratch === "string" ? join(scratch, rel) : (resolveIn(scratch, rel)?.path ?? join(scratch.upper, rel));
-		if (!existsSync(path) || !lstatSync(path).isFile()) throw new ArtifactError(`artifact ${value.artifact} is not a file in the node's scratch dir`, value.artifact);
+		// Resolved in the sandbox view (an agent's file may be in any of its session's layers), never
+		// through a host symlink: a link out of /w is refused.
+		const root = typeof scratch === "string" ? { at: "/w", stack: [scratch], upper: scratch } : workRoot(scratch);
+		let entry: ViewEntry | null;
+		try {
+			entry = locate([root], `/w/${rel}`, true).entry;
+		} catch (error) {
+			if (!(error instanceof ViewError)) throw error;
+			throw new ArtifactError(`artifact ${value.artifact}: ${error.message}`);
+		}
+		if (entry === null || entry.kind !== "file") throw new ArtifactError(`artifact ${value.artifact} is not a file in the node's scratch dir`, value.artifact);
+		const path = entry.host;
 		return storeFile(runDir, path, value.media, value.name ?? basename(path)) as unknown as Json;
 	}
 	if (Array.isArray(value)) return value.map((v) => resolveDrafts(v, runDir, scratch));

@@ -379,3 +379,48 @@ test("pi: a reissued call whose checkpoint ends in an unsafe external tool call 
 	assert.deepEqual(r, { type: "outcome_unknown", tool: "mcp__fx__post", args: {}, usage: { usd: 0, tokens: 0, turns: 0 } });
 	assert.deepEqual(count(), [], "not called again");
 });
+
+test("the file tools never follow a symlink out of the sandbox: escapes are refused, links inside it resolve through the overlay", async () => {
+	const { commitLayer, layerDir, prepareWork, readManifest } = await import("../src/host/layers.ts");
+	const { createHash } = await import("node:crypto");
+	const { symlinkSync } = await import("node:fs");
+	const runDir = tmp();
+	// A lower layer with a.txt, as an earlier call of the session left it.
+	const seed = prepareWork(runDir, join(runDir, "work", "seed"), []);
+	if ("missing" in seed) throw new Error("no work");
+	writeFileSync(join(seed.upper, "a.txt"), "from the layer");
+	const layer = commitLayer(runDir, seed, join(runDir, "work", "seed"))!;
+	const root = join(runDir, "work", "_1");
+	const work = prepareWork(runDir, root, [layer]);
+	if ("missing" in work) throw new Error("no work");
+	// What bash in the sandbox can leave in the upper dir.
+	const outside = join(tmp(), "bashrc");
+	writeFileSync(outside, "the user's own file");
+	symlinkSync(outside, join(work.upper, "abs"));
+	symlinkSync(`../../../layers/${layer.slice(7)}/a.txt`, join(work.upper, "rel"));
+	symlinkSync("a.txt", join(work.upper, "inner"));
+	symlinkSync("/w/a.txt", join(work.upper, "absolute-inside"));
+	const ws = { root, inputs: join(root, "inputs"), scratch: work.upper, work, trees: [], mounts: {}, spill: join(root, "spill") };
+	const s = spec({ declaration: { ...spec().declaration, access: 3 }, workspace: ws, sandbox: { type: "unavailable", name: "shell", reason: "test" } });
+	const tools = await buildNodeTools(s);
+	const run = (name: string, args: Record<string, unknown>) => tools.invoke(name, args as never, false, undefined, "0/t1");
+	for (const path of ["/w/abs", "/w/rel", "abs", "rel"]) {
+		const read = await run("read", { path });
+		assert.equal(read.isError, true, `read ${path}: ${read.text}`);
+		assert.match(read.text, /outside this node's sandbox/);
+		const write = await run("write", { path, content: "overwritten" });
+		assert.equal(write.isError, true, `write ${path}: ${write.text}`);
+		assert.equal((await run("edit", { path, oldText: "the", newText: "a" })).isError, true);
+	}
+	assert.equal(readFileSync(outside, "utf8"), "the user's own file");
+	// The layer's file is untouched: its hash still matches its manifest.
+	const entry = readManifest(runDir, layer)["a.txt"] as { sha256: string };
+	assert.equal(createHash("sha256").update(readFileSync(join(layerDir(runDir, layer), "a.txt"))).digest("hex"), entry.sha256);
+	// Links inside the sandbox resolve through the overlay; a write lands in the upper dir.
+	assert.equal((await run("read", { path: "/w/inner" })).text, "from the layer");
+	assert.equal((await run("read", { path: "absolute-inside" })).text, "from the layer");
+	assert.equal((await run("write", { path: "inner", content: "changed" })).isError, undefined);
+	assert.equal(readFileSync(join(work.upper, "a.txt"), "utf8"), "changed");
+	assert.equal(readFileSync(join(layerDir(runDir, layer), "a.txt"), "utf8"), "from the layer");
+	assert.deepEqual((await run("ls", {})).value, ["a.txt", "abs", "absolute-inside", "inner", "rel"]);
+});

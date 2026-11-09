@@ -164,7 +164,7 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		slot: "d",
 		transcript: [],
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer" } } },
-		workspace: { root: dir, inputs: dir, scratch: dir, mounts: {}, spill: join(dir, "spill") },
+		workspace: { root: dir, inputs: dir, scratch: dir, work: null, trees: [], mounts: {}, spill: join(dir, "spill") },
 		sandbox: { type: "none" },
 		exportArtifact: () => {
 			throw new Error("no");

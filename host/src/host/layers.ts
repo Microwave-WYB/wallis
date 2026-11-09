@@ -20,8 +20,8 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { chmodSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, join, posix } from "node:path";
 import { crashPoint } from "./artifacts.ts";
 
 export const MAX_DEPTH = 16;
@@ -190,22 +190,23 @@ export function layersAfter(runDir: string, before: readonly string[], committed
 	return after.length > MAX_DEPTH || repeated ? [squash(runDir, after)] : after;
 }
 
-/** What a workspace path is, through the upper dir and the layers below it (as overlayfs resolves it). */
+/** A workspace as a view root: `/w`, its upper dir over its layers. */
+export function workRoot(work: Work): ViewRoot {
+	return { at: "/w", stack: [work.upper, ...[...work.lowers].reverse()], upper: work.upper };
+}
+
+/** The host file a workspace path names, through the layers (null: none, or a link out of `/w`). */
 export function resolveIn(work: Work, rel: string): { readonly path: string; readonly writable: boolean } | null {
-	const parts = rel.split("/").filter((p) => p !== "" && p !== ".");
-	const stack = [work.upper, ...[...work.lowers].reverse()];
-	for (let i = 0; i < stack.length; i++) {
-		const root = stack[i]!;
-		const path = join(root, ...parts);
-		if (!existsSync(path) && !isWhiteout(path)) {
-			// An opaque dir or a whiteout above the path hides the layers below.
-			if (hidden(root, parts)) return null;
-			continue;
-		}
-		if (isWhiteout(path)) return null;
-		return { path, writable: i === 0 };
+	try {
+		const located = locate([workRoot(work)], `/w/${rel}`, true);
+		const entry = located.entry;
+		if (entry === null) return null;
+		const path = entry.kind === "dir" ? entry.dirs[0]! : entry.host;
+		return { path, writable: path === work.upper || path.startsWith(`${work.upper}/`) };
+	} catch (error) {
+		if (error instanceof ViewError) return null;
+		throw error;
 	}
-	return null;
 }
 
 function isWhiteout(path: string): boolean {
@@ -217,35 +218,169 @@ function isWhiteout(path: string): boolean {
 	}
 }
 
-/** Whether a parent of `parts` in this layer is a whiteout or an opaque dir (so lower layers are hidden). */
-function hidden(root: string, parts: readonly string[]): boolean {
-	for (let n = 1; n < parts.length; n++) {
-		const p = join(root, ...parts.slice(0, n));
-		if (isWhiteout(p)) return true;
+/** A merged directory listing through the layers (names, sorted); null when it is not a dir. */
+export function listIn(work: Work, rel: string): string[] | null {
+	try {
+		return listView(locate([workRoot(work)], `/w/${rel}`, true), rel);
+	} catch (error) {
+		if (error instanceof ViewError) return null;
+		throw error;
+	}
+}
+
+// --- The sandbox view, for the host's own file tools -------------------------------
+
+/**
+ * A root of the view the host's file tools see: a sandbox path and the
+ * host dirs that make it, top first (an overlay's upper dir, then its
+ * layers; a mount or the inputs: one dir). `upper` is where writes land
+ * (null: read-only).
+ */
+export interface ViewRoot {
+	readonly at: string;
+	readonly stack: readonly string[];
+	readonly upper: string | null;
+}
+
+/** A path the view does not allow: outside its roots, through a non-directory, or a loop. */
+export class ViewError extends Error {
+	override readonly name = "ViewError";
+}
+
+/** What a sandbox path names: a merged directory (its dirs, top first) or one host entry. */
+export type ViewEntry =
+	| { readonly kind: "dir"; readonly dirs: readonly string[] }
+	| { readonly kind: "file" | "symlink" | "other"; readonly host: string };
+
+/** The entry `name` of a merged directory, as overlayfs resolves it, with lstat only. */
+function childOf(dirs: readonly string[], name: string): ViewEntry | null {
+	const found: string[] = [];
+	for (const dir of dirs) {
+		const path = join(dir, name);
 		let st;
 		try {
-			st = lstatSync(p);
+			st = lstatSync(path);
 		} catch {
 			continue;
 		}
-		// A file or symlink over a dir hides the layers' children below it (ENOTDIR, as the kernel).
-		if (!st.isDirectory()) return true;
-		if (opaque(p)) return true;
+		if (st.isCharacterDevice() && st.rdev === 0) break;
+		if (st.isDirectory()) {
+			found.push(path);
+			if (opaque(path)) break;
+			continue;
+		}
+		// A non-directory under a directory above is hidden by it.
+		if (found.length > 0) break;
+		return { kind: st.isSymbolicLink() ? "symlink" : st.isFile() ? "file" : "other", host: path };
 	}
-	return false;
+	return found.length > 0 ? { kind: "dir", dirs: found } : null;
 }
 
-/** A merged directory listing through the layers (names, sorted). */
-export function listIn(work: Work, rel: string): string[] | null {
-	const names = new Map<string, boolean>();
-	let found = false;
-	for (const root of [work.upper, ...[...work.lowers].reverse()]) {
-		const dir = join(root, ...rel.split("/").filter((p) => p !== ""));
-		if (!existsSync(dir)) continue;
-		if (!lstatSync(dir).isDirectory()) break;
-		found = true;
-		for (const name of readdirSync(dir)) if (!names.has(name)) names.set(name, !isWhiteout(join(dir, name)));
-		if (opaque(dir)) break;
+/** Where a sandbox path is: its root, its path inside the root, and what is there (null: nothing). */
+export interface Located {
+	readonly root: ViewRoot;
+	readonly rel: readonly string[];
+	readonly entry: ViewEntry | null;
+}
+
+/**
+ * Resolves a sandbox path one component at a time, never following a host
+ * symlink: a symlink is followed (when not last, or with `follow`) by
+ * resolving its target again inside the view, so a link that points out of
+ * the sandbox roots is refused.
+ */
+export function locate(roots: readonly ViewRoot[], path: string, follow: boolean): Located {
+	let target = posix.normalize(path);
+	for (let hops = 0; hops <= 40; hops++) {
+		const root = roots.filter((r) => target === r.at || target.startsWith(`${r.at}/`)).sort((a, b) => b.at.length - a.at.length)[0];
+		if (!root) throw new ViewError(`${path} is outside this node's sandbox`);
+		const parts = target.slice(root.at.length).split("/").filter((p) => p !== "");
+		let current: ViewEntry = { kind: "dir", dirs: root.stack.filter((d) => existsSync(d) && lstatSync(d).isDirectory()) };
+		let relinked = false;
+		for (let i = 0; i < parts.length; i++) {
+			if (current.kind !== "dir") throw new ViewError(`${path}: not a directory`);
+			const entry = childOf(current.dirs, parts[i]!);
+			const last = i === parts.length - 1;
+			if (entry === null) {
+				if (last) return { root, rel: parts, entry: null };
+				throw new ViewError(`${path}: no such file or directory`);
+			}
+			if (entry.kind === "symlink" && (!last || follow)) {
+				const link = readlinkSync(entry.host);
+				const here = posix.join(root.at, ...parts.slice(0, i));
+				target = posix.normalize(posix.join(link.startsWith("/") ? link : posix.join(here, link), ...parts.slice(i + 1)));
+				relinked = true;
+				break;
+			}
+			current = entry;
+		}
+		if (!relinked) return { root, rel: parts, entry: current };
 	}
-	return found ? [...names].filter(([, live]) => live).map(([n]) => n).sort() : null;
+	throw new ViewError(`${path}: too many levels of symbolic links`);
+}
+
+/** A file's content through the view: opened without following a symlink. */
+export function readViewFile(located: Located, path: string): Buffer {
+	const entry = located.entry;
+	if (entry === null) throw new ViewError(`${path}: no such file`);
+	if (entry.kind !== "file") throw new ViewError(`${path} is not a file`);
+	const fd = openSync(entry.host, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		return readFileSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** The names in a directory of the view, merged through its layers (whiteouts and opaque dirs honoured). */
+export function listView(located: Located, path: string): string[] {
+	const entry = located.entry;
+	if (entry === null || entry.kind !== "dir") throw new ViewError(`${path} is not a directory`);
+	const names = new Set<string>();
+	for (const dir of entry.dirs) for (const name of readdirSync(dir)) names.add(name);
+	return [...names].filter((n) => childOf(entry.dirs, n) !== null).sort();
+}
+
+/**
+ * Writes a file through the view: into its root's upper dir, never through
+ * a symlink. Parent dirs are made in the upper dir; a whiteout there (a
+ * file or dir the call deleted) is replaced, and a dir made over a deleted
+ * one is marked opaque, as overlayfs does.
+ */
+export function writeViewFile(located: Located, path: string, content: string | Buffer): void {
+	const upper = located.root.upper;
+	if (upper === null) throw new ViewError(`${path} is read-only: only your workspace (/w) is writable`);
+	if (located.entry !== null && located.entry.kind !== "file") throw new ViewError(`${path} is not a file`);
+	const rel = located.rel;
+	if (rel.length === 0) throw new ViewError(`${path} is not a file`);
+	let dir = upper;
+	for (const part of rel.slice(0, -1)) {
+		dir = join(dir, part);
+		let st;
+		try {
+			st = lstatSync(dir);
+		} catch {
+			mkdirSync(dir);
+			continue;
+		}
+		if (st.isCharacterDevice() && st.rdev === 0) {
+			// Deleted in this call: a new dir, opaque, so the layers' old one stays hidden.
+			unlinkSync(dir);
+			mkdirSync(dir);
+			markOpaque(dir);
+		} else if (!st.isDirectory()) throw new ViewError(`${path}: not a directory`);
+	}
+	const file = join(dir, rel.at(-1)!);
+	if (isWhiteout(file)) unlinkSync(file);
+	const fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+	try {
+		writeSync(fd, typeof content === "string" ? Buffer.from(content) : content);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function markOpaque(dir: string): void {
+	const r = spawnSync("setfattr", ["-n", "user.overlay.opaque", "-v", "y", dir], { encoding: "utf8" });
+	if (r.status !== 0) throw new ViewError(`cannot mark ${dir} opaque: ${r.stderr.trim()}`);
 }

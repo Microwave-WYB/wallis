@@ -36,7 +36,7 @@ import { type Json, Type } from "../sdk/index.ts";
 import Value from "typebox/value";
 import { LAYOUT, runSpawn } from "./confine.ts";
 import type { InFlightCall } from "./core.ts";
-import { listIn, resolveIn } from "./layers.ts";
+import { listView, locate, readViewFile, ViewError, type ViewRoot, writeViewFile } from "./layers.ts";
 import { type NodeSpec, validateSubmission } from "./executor.ts";
 import { canonical } from "./render.ts";
 import { resolveAgentTools, type Source, sourceKey, type ToolInfo, toolInfos } from "./toolsets.ts";
@@ -323,36 +323,18 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 	if (access > 0) {
 		const box = spec.sandbox;
 		/**
-		 * A path as the agent sees it (`/w/...`, `/in/...`, `/in/trees/<hex>/...`,
-		 * `/mnt/<name>/...`) mapped to the host: for reading, through the
-		 * workspace's layers; `upper` is where a write to it lands.
+		 * The sandbox view the agent's paths resolve in (`/w`, `/in`,
+		 * `/in/trees/<hex>`, `/mnt/<name>`): one component at a time, never
+		 * through a host symlink; a symlink is followed inside the view, and one
+		 * that leads out of it is refused (`ViewError`, an error for the model).
 		 */
-		const toHost = (path: string): { abs: string; writable: boolean; upper: string | null; rest: string } => {
-			const p = posix.normalize(path.startsWith("/") ? path : `${LAYOUT.work}/${path}`);
-			const under = (root: string) => p === root || p.startsWith(`${root}/`);
-			const after = (root: string) => p.slice(root.length).replace(/^\//, "");
-			for (const t of ws.trees) {
-				if (!under(t.at)) continue;
-				const found = resolveIn({ lowers: t.lowers, upper: join(ws.root, ".no-upper"), ovl: "" }, after(t.at));
-				return { abs: found?.path ?? join(ws.root, ".missing", after(t.at)), writable: false, upper: null, rest: after(t.at) };
-			}
-			if (under(LAYOUT.mounts)) {
-				const [first, ...more] = after(LAYOUT.mounts).split("/");
-				if (!first || !(first in ws.mounts)) throw new Error(`${path} is not a mount of this node`);
-				return { abs: join(ws.mounts[first]!, ...more), writable: false, upper: null, rest: "" };
-			}
-			if (under(LAYOUT.inputs)) return { abs: join(ws.inputs, after(LAYOUT.inputs)), writable: false, upper: null, rest: "" };
-			if (!under(LAYOUT.work)) throw new Error(`${path} is outside this node's sandbox`);
-			const rest = after(LAYOUT.work);
-			const upper = join(ws.scratch, rest);
-			if (ws.work === null) return { abs: upper, writable: true, upper, rest };
-			return { abs: resolveIn(ws.work, rest)?.path ?? upper, writable: true, upper, rest };
-		};
-		const writable = (path: string) => {
-			const target = toHost(path);
-			if (!target.writable || target.upper === null || !within([ws.scratch], target.upper)) throw new Error(`${path} is read-only: only your workspace (${LAYOUT.work}) is writable`);
-			return target.upper;
-		};
+		const roots: ViewRoot[] = [
+			{ at: LAYOUT.work, stack: ws.work === null ? [ws.scratch] : [ws.work.upper, ...[...ws.work.lowers].reverse()], upper: ws.scratch },
+			{ at: LAYOUT.inputs, stack: [ws.inputs], upper: null },
+			...ws.trees.map((t) => ({ at: t.at, stack: [...t.lowers].reverse(), upper: null })),
+			...Object.entries(ws.mounts).map(([m, dir]) => ({ at: `${LAYOUT.mounts}/${m}`, stack: [dir], upper: null })),
+		];
+		const view = (path: string) => locate(roots, path.startsWith("/") ? path : `${LAYOUT.work}/${path}`, true);
 		const mounts = Object.keys(ws.mounts).map((m) => `${LAYOUT.mounts}/${m}`).join(", ") || "none";
 		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files) and the mounts ${mounts} are read-only`;
 		const builtins: Record<string, WallisToolRun> = {
@@ -362,10 +344,11 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				parameters: { type: "object", required: ["path"], properties: { path: { type: "string" }, offset: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1 } } },
 				run: async (args) => {
 					const { path, offset, limit } = args as { path: string; offset?: number; limit?: number };
-					const abs = toHost(path).abs;
-					const mimeType = IMAGES[extname(abs).toLowerCase()];
-					if (mimeType) return { text: `image ${path}`, images: [{ data: readFileSync(abs).toString("base64"), mimeType }] };
-					const lines = readFileSync(abs, "utf8").split("\n");
+					const located = view(path);
+					const mimeType = IMAGES[extname(located.rel.at(-1) ?? "").toLowerCase()];
+					const content = readViewFile(located, path);
+					if (mimeType) return { text: `image ${path}`, images: [{ data: content.toString("base64"), mimeType }] };
+					const lines = content.toString("utf8").split("\n");
 					const from = (offset ?? 1) - 1;
 					const text = lines.slice(from, limit === undefined ? undefined : from + limit).join("\n").slice(0, FILE_CAP);
 					return { text, value: text };
@@ -377,9 +360,7 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				parameters: { type: "object", required: ["path", "content"], properties: { path: { type: "string" }, content: { type: "string" } } },
 				run: async (args) => {
 					const { path, content } = args as { path: string; content: string };
-					const abs = writable(path);
-					mkdirSync(dirname(abs), { recursive: true });
-					writeFileSync(abs, content);
+					writeViewFile(view(path), path, content);
 					return { text: `wrote ${content.length} characters to ${path}` };
 				},
 			},
@@ -389,13 +370,13 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				parameters: { type: "object", required: ["path", "oldText", "newText"], properties: { path: { type: "string" }, oldText: { type: "string" }, newText: { type: "string" } } },
 				run: async (args) => {
 					const { path, oldText, newText } = args as { path: string; oldText: string; newText: string };
-					const abs = writable(path);
 					// Read through the layers (the file may be from an earlier call); written to the upper dir.
-					const text = readFileSync(toHost(path).abs, "utf8");
+					const located = view(path);
+					if (located.root.upper === null) throw new ViewError(`${path} is read-only: only your workspace (${LAYOUT.work}) is writable`);
+					const text = readViewFile(located, path).toString("utf8");
 					const count = oldText === "" ? 0 : text.split(oldText).length - 1;
 					if (count !== 1) return { text: `oldText occurs ${count} times in ${path}; it must occur exactly once`, isError: true };
-					mkdirSync(dirname(abs), { recursive: true });
-					writeFileSync(abs, text.replace(oldText, () => newText));
+					writeViewFile(located, path, text.replace(oldText, () => newText));
 					return { text: `edited ${path}` };
 				},
 			},
@@ -405,13 +386,18 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				parameters: { type: "object", properties: { path: { type: "string" }, limit: { type: "integer", minimum: 1 } } },
 				run: async (args) => {
 					const { path, limit } = args as { path?: string; limit?: number };
-					const target = toHost(path ?? LAYOUT.work);
-					const dir = target.abs;
-					const merged = target.upper !== null && ws.work !== null ? listIn(ws.work, target.rest) : null;
-					const entries = (merged ?? readdirSync(dir))
-						.sort()
+					const at = path ?? LAYOUT.work;
+					const isDir = (name: string) => {
+						try {
+							return view(posix.join(at, name)).entry?.kind === "dir";
+						} catch {
+							// A link out of the sandbox: listed, never followed.
+							return false;
+						}
+					};
+					const entries = listView(view(at), at)
 						.slice(0, limit ?? LS_LIMIT)
-						.map((name) => (statSync(toHost(posix.join(path ?? LAYOUT.work, name)).abs).isDirectory() ? `${name}/` : name));
+						.map((name) => (isDir(name) ? `${name}/` : name));
 					return { text: entries.join("\n"), value: entries };
 				},
 			},
@@ -437,7 +423,9 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			parameters: { type: "object", required: ["path", "media"], properties: { path: { type: "string" }, media: { type: "string" }, name: { type: "string" } } },
 			run: async (args) => {
 				const { path, media, name } = args as { path: string; media: string; name?: string };
-				const ref = spec.exportArtifact(relative(ws.scratch, toHost(path).abs), media, name);
+				const located = view(path);
+				if (located.root.at !== LAYOUT.work) throw new ViewError(`${path}: only files in your workspace (${LAYOUT.work}) are exported`);
+				const ref = spec.exportArtifact(located.rel.join("/"), media, name);
 				return { text: JSON.stringify(ref), value: ref as unknown as Json };
 			},
 		});
