@@ -235,3 +235,52 @@ test("interventions need the owner: another caller is refused, typed", async () 
 	session.cancel(mine);
 	assert.equal((await session.result).outcome?.type, "cancelled");
 });
+
+test("an interrupt made while a restarted call starts reaches that call, not the attempt it replaced", async () => {
+	// Every start waits until the test lets it open; every turn waits until interrupted.
+	const starts: { id: string; open: () => void; interrupted: boolean }[] = [];
+	const executor: Executor = {
+		id: "slow-start",
+		start: (spec) =>
+			new Promise<NodeSession>((resolveStart) => {
+				const entry = { id: spec.id, interrupted: false, open: () => {} };
+				let endTurn: ((r: TurnResult) => void) | null = null;
+				entry.open = () =>
+					resolveStart({
+						// An interrupt before the turn ends it as it starts.
+						turn: () => (entry.interrupted ? Promise.resolve<TurnResult>({ type: "interrupted" }) : new Promise<TurnResult>((r) => (endTurn = r))),
+						interrupt: () => {
+							entry.interrupted = true;
+							endTurn?.({ type: "interrupted" });
+						},
+						close: () => {},
+					});
+				starts.push(entry);
+			}),
+	};
+	const dir = join(tmp(), "run");
+	const session = await startSession({ workflow: twoNode, dir, executor, inboxPollMs: null, input: { topic: "x" } });
+	const started = async (n: number) => {
+		for (let i = 0; i < 200 && starts.length < n; i++) await new Promise((r) => setTimeout(r, 10));
+		assert.equal(starts.length, n);
+	};
+	await started(1);
+	assert.equal(session.restart(live(session, "#0:0")), null);
+	await started(2);
+	assert.equal(session.interrupt(steerable(session, "#0:0")), null);
+	// The replaced attempt opens late: it must neither take the interrupt nor become the node's session.
+	starts[0]!.open();
+	await new Promise((r) => setTimeout(r, 20));
+	starts[1]!.open();
+	for (let i = 0; i < 200 && !starts[1]!.interrupted; i++) await new Promise((r) => setTimeout(r, 10));
+	assert.deepEqual(
+		starts.map((s) => s.interrupted),
+		[false, true],
+	);
+	const planner = () => inspectRun(dir).run.nodes.find((n) => n.id === "#0:0")!;
+	for (let i = 0; i < 200 && planner().type !== "node_idle"; i++) await new Promise((r) => setTimeout(r, 10));
+	const node = planner();
+	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "interrupted" }, JSON.stringify(node));
+	session.cancel(owned(session));
+	await session.result;
+});

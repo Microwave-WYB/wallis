@@ -365,6 +365,9 @@ export class Session {
 		this.#saveDialogue(id);
 		const refusal = this.#feed({ type: "node_cancelled", node: id, by: node.owned.by })[0];
 		if (refusal) return refusal;
+		this.#interruptBeforeStart.delete(id);
+		// A start still pending is superseded: its session is closed when it opens.
+		this.#generation.set(id, (this.#generation.get(id) ?? 0) + 1);
 		this.#nodes.get(id)?.session.interrupt?.();
 		this.#commandAborts.get(id)?.abort();
 		this.#closeNode(id);
@@ -886,6 +889,8 @@ export class Session {
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error }, usage: NO_USAGE })));
 
 		this.#agentCalls.set(id, { digest: effect.digest, previous: effect.previous });
+		// An interrupt is for the turn it was made against; one left by an earlier attempt is not this call's.
+		this.#interruptBeforeStart.delete(id);
 		// A session call continues its previous call's dialogue; a missing one is recovered from the
 		// previous call's work dir (a crash after its result was journaled), else refused, never a fresh start.
 		const previous = effect.previous === null ? null : this.#dialogue(effect.previous);
@@ -974,6 +979,11 @@ export class Session {
 			}
 			this.#closeNode(id);
 			const started = await this.#options.executor.start(spec);
+			// Restarted or cancelled while it started: it is not the node's session, and takes no interrupt.
+			if (!current()) {
+				started.close();
+				throw new Error("superseded while starting");
+			}
 			this.#nodes.set(id, { session: started, model: effect.model });
 			return started;
 		};
@@ -990,6 +1000,7 @@ export class Session {
 							log({ kind: "note", text: `discarded the ${turn.type} turn of a call that was restarted or cancelled` });
 							return;
 						}
+						this.#interruptBeforeStart.delete(id);
 						if (turn.type === "executor_error") {
 							this.#closeNode(id);
 							log({ kind: "turn", result: `executor_error: ${turn.error}` });
@@ -1031,6 +1042,7 @@ export class Session {
 				(error: unknown) =>
 					this.#later(() => {
 						if (!current()) return;
+						this.#interruptBeforeStart.delete(id);
 						this.#closeNode(id);
 						this.#feed({ type: "executor_failed", id, error: errorText(error) });
 					}),
