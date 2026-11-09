@@ -20,6 +20,8 @@ import { appendInbox, type InboxEntry, newMessageId, newRunId, readMeta, refused
 export interface ExecutorKit {
 	readonly executor: Executor;
 	readonly commands?: CommandRunner;
+	/** Test and development kits only: `off` runs MCP servers and commands unconfined (see `SessionOptions.confine`). */
+	readonly confine?: "auto" | "require" | "off";
 }
 
 /** Loads an executor module: its default export returns `{ executor, scripts? }`. */
@@ -110,9 +112,9 @@ export class Runs {
 	}
 
 	/** Without a command runner from the executor module: sandboxed processes with machine-wide slots, as the CLI does. */
-	#options(dir: string): Pick<SessionOptions, "dir" | "executor" | "commands" | "executorModule" | "root" | "by"> {
+	#options(dir: string): Pick<SessionOptions, "dir" | "executor" | "commands" | "executorModule" | "root" | "by" | "confine"> {
 		const commands = this.#kit.commands ?? new ProcessCommands({ slots: new MachineSlots(loadProfile(this.root).slots) });
-		return { dir, executor: this.#kit.executor, commands, executorModule: this.#executorModule, root: this.root, by: this.owner };
+		return { dir, executor: this.#kit.executor, commands, executorModule: this.#executorModule, root: this.root, by: this.owner, ...(this.#kit.confine ? { confine: this.#kit.confine } : {}) };
 	}
 
 	async start(request: StartRun): Promise<Session> {

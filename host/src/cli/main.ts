@@ -204,6 +204,7 @@ async function drive(dir: string, options: Partial<SessionOptions>): Promise<voi
 		executorModule: module,
 		root: meta?.root ?? root,
 		by: caller,
+		...(kit.confine ? { confine: kit.confine } : {}),
 		...(fresh ? start : {}),
 		...options,
 	});
@@ -496,7 +497,7 @@ async function main(): Promise<number> {
 			const module = values.executor ? resolve(values.executor) : (process.env.WALLIS_EXECUTOR ?? DEFAULT_EXECUTOR);
 			const kit = await loadExecutor(module);
 			const local = loadProfile(root);
-			const server = await createMcpServer(new Runs(root, { executor: limitProviders(kit.executor, local.providers ?? {}), commands: kit.commands }, module));
+			const server = await createMcpServer(new Runs(root, { ...kit, executor: limitProviders(kit.executor, local.providers ?? {}) }, module));
 			await server.connect(new StdioServerTransport());
 			return new Promise<number>(() => {});
 		}
