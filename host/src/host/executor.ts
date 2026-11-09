@@ -19,12 +19,11 @@
 // - A node is one call of a session. `NodeSpec.history` is where the
 //   session's previous call left the dialogue: the call continues it.
 // - `asked`: the agent called its `ask` tool; the reply arrives as the next
-//   `turn(message)` and becomes that tool call's result. `approval`: it
-//   called an `ask`-mode MCP tool; the next `turn(message)` carries the
-//   orchestrator's decision (canonical JSON of `Decision`). `interrupted`:
-//   the owner's interrupt aborted the turn.
-// - `ended`: the turn ended without a result; the node goes idle and the
-//   message is its question (an implicit ask). `turn_limit`: the node used its turns without
+//   `turn(message)` and becomes that tool call's result. `interrupted`: the
+//   owner's interrupt aborted the turn. `outcome_unknown`: a reissued call
+//   found a tool call in flight at a crash that is not safe to make again.
+// - `ended`: the turn ended with neither a result nor a question; the node
+//   goes idle with its final text (`Idle(ended_without_result)`). `turn_limit`: the node used its turns without
 //   submitting; it goes idle, progress kept, until its owner grants more
 //   turns, restarts or cancels it. Every turn the model sees "Turn k of N".
 //   `agent_error` (gave up, context exhausted) reaches the body as a typed
@@ -40,7 +39,8 @@ import { schemaErrors } from "../sdk/validate.ts";
 import type { NodeDirs } from "./artifacts.ts";
 import type { CommandCall, CommandRun, CommandRunner } from "./commands.ts";
 import type { Spawn } from "./confine.ts";
-import type { McpSpawn } from "./tools.ts";
+import type { McpClient } from "@earendil-works/pi-mcp";
+import type { Source } from "./toolsets.ts";
 import type { Message, Usage } from "./core.ts";
 
 export type AgentDeclaration = Declarations["agents"][string];
@@ -90,10 +90,10 @@ export interface NodeSpec {
 	readonly sandbox: AgentSandbox;
 	/** The `export_artifact` tool: stores a file from the node's scratch dir and returns its ref for `submit_result`. */
 	readonly exportArtifact: (path: string, media: string, name?: string) => ArtifactRef;
-	/** Configs of the MCP servers this agent selected (from the workflow's mcp.json). */
-	readonly mcp: Json | null;
-	/** How a stdio MCP server starts in its sandbox; absent with confinement off. */
-	readonly mcpSpawn?: McpSpawn;
+	/** A new connection to one of the agent's tool sources (a toolset or an MCP server), for this call. */
+	readonly connect: (source: Source) => Promise<McpClient>;
+	/** Reports a preflight-style warning (a tool that may write outside, tools left out): run metadata and the transcript. */
+	readonly warn: (text: string) => void;
 	/** Appends to the node's observational transcript. */
 	readonly log: (entry: TranscriptEntry) => void;
 }
@@ -115,8 +115,8 @@ export type TurnResult =
 	| { readonly type: "ended"; readonly message: string; readonly usage?: Usage }
 	/** The agent called `ask`: it waits for its caller's reply. */
 	| { readonly type: "asked"; readonly message: string; readonly usage?: Usage }
-	/** The agent called an `ask`-mode MCP tool: it waits for the orchestrator's decision. */
-	| { readonly type: "approval"; readonly server: string; readonly tool: string; readonly args: Json; readonly usage?: Usage }
+	/** A tool call in flight at a crash, not safe to make again: whether it took effect is unknown. */
+	| { readonly type: "outcome_unknown"; readonly tool: string; readonly args: Json; readonly usage?: Usage }
 	/** The owner's interrupt aborted the turn; progress is kept. */
 	| { readonly type: "interrupted"; readonly usage?: Usage }
 	| { readonly type: "agent_error"; readonly failure: AgentFailure; readonly usage?: Usage }

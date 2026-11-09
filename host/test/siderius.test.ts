@@ -129,7 +129,7 @@ function scripts() {
 
 const mountsOf = (root: string) => ({ data: join(root, "data"), config: join(root, "siderius") });
 /** Commands are scripted here: no sandbox preflight (bins are still resolved and recorded). */
-const offline = { confine: "off", bins: { uv: "/bin/true", sh: "/bin/sh", python3: "/bin/true", bash: "/bin/bash", uvx: "/bin/true" } } as const;
+const offline = { confine: "off", bins: { uv: "/bin/true", sh: "/bin/sh", python3: "/bin/true", bash: "/bin/bash" } } as const;
 const local = {};
 
 function projectRoot(): string {
@@ -235,7 +235,7 @@ test("JudgeStop request_input: the stop-check orchestrator node asks the orchest
 	// The pending item carries the answer schema, from run metadata.
 	const { attention, inspectRun } = await import("../src/host/query.ts");
 	const item = attention(inspectRun(dir)).find((i) => i.kind === "orchestrator_pending")!;
-	assert.deepEqual(item.actions.map((a) => a.verb), ["submit_result"]);
+	assert.deepEqual(item.actions.map((a) => a.verb), ["submit_result", "restart", "cancel"]);
 
 	// Submitted through the run's inbox, as the CLI does: an answer that does not match the schema is refused.
 	const { appendInbox, refusedEntry, runPaths } = await import("../src/host/store.ts");

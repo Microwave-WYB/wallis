@@ -58,7 +58,7 @@ const writer = defineAgent(
 		prompt: "write a report",
 		input: Type.Object({ checkpoint: Artifact("application/octet-stream") }),
 		output: Type.Object({ report: Artifact("text/markdown") }),
-		sandbox: writing,
+		workspace: { access: "write", sandbox: writing },
 	},
 );
 

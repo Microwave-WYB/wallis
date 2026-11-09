@@ -24,10 +24,10 @@ export const WAIT_CAP_SECONDS = 30;
 
 const INSTRUCTIONS = `wallis runs declarative agent workflows committed under .agents/workflows/. You are their orchestrator.
 - "describe" shows a workflow's input, its agents and the questions it may ask you (orchestrator nodes, with their answer schemas). Start a run with "run"; it continues in the background.
-- To be notified, run \`npx wallis wait <run_id>\` as a background shell command. It exits with a summary when something needs you: an agent asks, an orchestrator node or a tool approval waits, the run pauses (budget, executor) or finishes.
+- To be notified, run \`npx wallis wait <run_id>\` as a background shell command. It exits with a summary when something needs you: an agent asks or ends its turn without a result, an orchestrator node waits, a tool call's outcome is unknown after a crash, the run pauses (budget, executor) or finishes.
 - Every pending item ("pending", "wait" and "get_run" return them as JSON) has a kind and its actions: the verbs that resolve it, with their argument schemas.
-- "send" gives an agent node a message: the reply to its question if it is idle, or a steer after its current turn if it is running; the result says which. "submit_result" completes an orchestrator node or decides a tool approval ({"type":"approve"} or {"type":"reject","reason":"..."}). "interrupt" stops a running node's turn; then "send" redirects it.
-- "restart" discards a node's progress and reissues its call. The MCP tools and approvals it uses reach the outside again: that is not reproduction.
+- "send" gives an agent node a message: the reply to its question if it is idle, or a steer after its current turn if it is running; the result says which. "submit_result" completes an orchestrator node. "interrupt" stops a running node's turn; then "send" redirects it.
+- "restart" discards a node's progress and reissues its call. The tools it uses reach the outside again: that is not reproduction.
 - Questions reach you without context: answer from the item alone. Forks of a run share you as their orchestrator, so an answer can leak between ablations.
 Every tool result ends with the items pending in this project.`;
 
@@ -119,7 +119,7 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 		},
 		async ({ workflow }) => {
 			try {
-				return reply(`Workflow ${workflow}.`, json(await describeWorkflow(resolveWorkflow(runs.root, workflow))));
+				return reply(`Workflow ${workflow}.`, json(await describeWorkflow(resolveWorkflow(runs.root, workflow), runs.root)));
 			} catch (error) {
 				return failure(error);
 			}
@@ -149,7 +149,7 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 		"submit_result",
 		{
 			description:
-				'Complete an orchestrator node with a value that matches its answer schema, or decide a tool approval: {"type":"approve"} or {"type":"reject","reason":"<why>"}. A mismatch returns the errors and the node stays pending.',
+				'Complete an orchestrator node with a value that matches its answer schema. A mismatch returns the errors and the node stays pending.',
 			inputSchema: { run_id: z.string(), node_id: z.string(), value: z.any() },
 		},
 		async ({ run_id, node_id, value }) => {
@@ -191,14 +191,14 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 		"restart",
 		{
 			description:
-				"Discard a node's progress and reissue its call with the original input plus an operator note (no note for non-steerable agents, commands or tools); `turns` sets its turn allowance. A session call rewinds its session to before that call. A failed node the run is held on is restarted the same way, and the workflow then continues. Logged. The MCP tools and approvals the node uses reach the outside world again: that is not reproduction.",
+				"Discard a node's progress and reissue its call with the original input plus an operator note (no note for non-steerable agents, commands or tools); `turns` sets its turn allowance. A session call rewinds its session to before that call. A failed node the run is held on is restarted the same way, and the workflow then continues. Logged. The tools the node uses reach the outside world again: that is not reproduction.",
 			inputSchema: { run_id: z.string(), node_id: z.string(), note: z.string().optional(), turns: z.number().int().positive().optional() },
 		},
 		async ({ run_id, node_id, note, turns }) => {
 			try {
 				const { run, node } = ids(run_id, node_id);
 				await runs.restart(run, node, note, turns ?? 0);
-				return reply(`Restarted ${node}; the MCP tools and approvals it uses reach the outside again.\n\n${summary(runs.view(run))}`);
+				return reply(`Restarted ${node}; the tools it uses reach the outside again.\n\n${summary(runs.view(run))}`);
 			} catch (error) {
 				return failure(error);
 			}

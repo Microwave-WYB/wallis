@@ -15,12 +15,12 @@ import {
 	AgentFailed,
 	Artifact,
 	defineAgent,
-	defineMcp,
 	defineModels,
 	command,
 	defineMounts,
 	defineSandbox,
 	Foldable,
+	toolset,
 	orchestrator,
 	type Ctx,
 	type Static,
@@ -28,7 +28,6 @@ import {
 	Type,
 	workflow,
 } from "wallis";
-import mcpConfig from "./mcp.json" with { type: "json" };
 import consolidatePrompt from "./prompts/consolidate-findings.md" with { type: "text" };
 import dataAnalysisPrompt from "./prompts/data-analysis.md" with { type: "text" };
 import evidenceJudgePrompt from "./prompts/evidence-judge.md" with { type: "text" };
@@ -191,10 +190,9 @@ const readingBox = defineSandbox({ mounts }, { name: "reading", requires: ["bash
 /** The LLM validator reviews the plugin, an input artifact; it sees nothing else. */
 const reviewBox = defineSandbox({ mounts }, { name: "review", requires: ["bash"] });
 
-/** MCP servers run in their own sandboxes; they are the run's only channel outside (network "full", the overlay default). */
-const arxivBox = defineSandbox({}, { name: "arxiv-mcp", requires: ["uvx"] });
-const scholarBox = defineSandbox({}, { name: "scholar-mcp", requires: ["uvx"] });
-const mcp = defineMcp(mcpConfig, { arxiv: { sandbox: arxivBox }, semantic_scholar: { sandbox: scholarBox } });
+/** The literature tools run under node in their own sandbox, with the network; only S2_API_KEY reaches them. */
+const literatureBox = defineSandbox({}, { name: "literature-tools", requires: ["node"] });
+const lit = toolset<typeof import("./tools/literature.ts")>("./tools/literature.ts", { sandbox: literatureBox, secrets: ["S2_API_KEY"] });
 
 /** The default protocol: input JSON on stdin, output JSON (with artifact drafts) on stdout. */
 const trainerRun = (script: string) => ["sh", "-c", `UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" exec uv run --offline --no-sync --project trainer python trainer/${script}`] as const;
@@ -329,7 +327,7 @@ const PredictionMemory = Type.Object({
 
 // --- Agents: SIDERIUS nodes ----------------------------------------------------
 
-const env = { models, mcp };
+const env = { models };
 
 const interpreter = defineAgent(env, {
 	name: "interpret",
@@ -349,7 +347,7 @@ const interpreter = defineAgent(env, {
 		analysis_brief: Type.String(),
 	}),
 	// advice.md is read from the config mount.
-	sandbox: readingBox,
+	workspace: { access: "read", sandbox: readingBox },
 	maxTurns: 4,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -360,7 +358,7 @@ const dataAnalyst = defineAgent(env, {
 	prompt: dataAnalysisPrompt,
 	input: Type.Object({ at: Type.String(), analysis_brief: Type.String(), resource_minutes: Type.Number(), recent_runs: Type.Array(RunSummary) }),
 	output: Type.Object({ evidence: Type.Array(Evidence) }),
-	sandbox: analysisBox,
+	workspace: { access: "exec", sandbox: analysisBox },
 	maxTurns: 24,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -376,8 +374,8 @@ const literature = defineAgent(env, {
 		knowledge_cache: Foldable(Type.Array(CacheEntry), { maxChars: 6000 }),
 	}),
 	output: Type.Object({ evidence: Type.Array(Evidence), search_rounds_used: Type.Integer() }),
-	// MCP only: no sandbox, so no filesystem.
-	mcp: { arxiv: ["search_papers", "download_paper", "read_paper"], semantic_scholar: "*" },
+	// Search tools only: no workspace, so no filesystem.
+	tools: [lit.searchArxiv, lit.searchScholar],
 	maxTurns: 32,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -413,7 +411,7 @@ const proposer = defineAgent(env, {
 		history: History,
 	}),
 	output: Proposal,
-	sandbox: readingBox,
+	workspace: { access: "read", sandbox: readingBox },
 	maxTurns: 6,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
 });
@@ -425,7 +423,7 @@ const implementor = defineAgent(env, {
 	input: Type.Object({ proposal: Proposal, previous_validation_failure: Type.Union([Type.String(), Type.Null()]), probe_seed: Type.Integer() }),
 	// The plugin is exported from the node's scratch dir as an artifact.
 	output: Type.Object({ model: ModelPlugin, capability_metadata: Type.Record(Type.String(), Type.String()) }),
-	sandbox: codingBox,
+	workspace: { access: "exec", sandbox: codingBox },
 	maxTurns: 40,
 	needs: { structuredOutput: true, toolCalls: true },
 });
@@ -436,7 +434,7 @@ const validator = defineAgent(env, {
 	prompt: validatePrompt,
 	input: Type.Object({ model: ModelPlugin, deterministic_report: validateScript.output }),
 	output: Type.Object({ passed: Type.Boolean(), error: Type.Union([Type.String(), Type.Null()]), error_signatures: Type.Array(RawSignature) }),
-	sandbox: reviewBox,
+	workspace: { access: "read", sandbox: reviewBox },
 	maxTurns: 4,
 	needs: { structuredOutput: true },
 });
@@ -812,7 +810,7 @@ type StopReason =
 export default workflow({
 	name: "siderius",
 	models,
-	mcp,
+	toolsets: [lit],
 	mounts,
 	agents: [interpreter, dataAnalyst, literature, evidenceJudge, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
 	orchestrators: [stopCheck],

@@ -10,6 +10,8 @@ import type { NodeSpec, TranscriptEntry } from "../src/host/executor.ts";
 import { runWorkflow } from "../src/host/index.ts";
 import { parseModel, PiExecutor } from "../src/host/pi.ts";
 import { buildNodeTools } from "../src/host/tools.ts";
+import { ToolSources } from "../src/host/toolsets.ts";
+import type { Json, ToolDesc } from "../src/sdk/index.ts";
 import { tmp } from "./util.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -33,7 +35,8 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 			prompt: "Answer.",
 			input: {},
 			output: {},
-			mcp: {},
+			tools: [],
+			access: 0,
 			skills: [],
 			needs: {},
 			sandbox: null,
@@ -60,7 +63,8 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		exportArtifact: () => {
 			throw new Error("no scratch");
 		},
-		mcp: null,
+		connect: () => Promise.reject(new Error("no tool sources")),
+		warn: (text) => entries.push({ kind: "note", text: `warning: ${text}` }),
 		log: (e) => entries.push(e),
 		...overrides,
 		entries,
@@ -122,7 +126,7 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	const { provider, executor } = faux();
 	const prompts: string[] = [];
 	provider.setResponses([
-		fauxAssistantMessage("Who is the audience?"),
+		call("ask", { message: "Who is the audience?" }),
 		(ctx) => {
 			prompts.push(JSON.stringify(ctx.messages));
 			return call("submit_result", { outline: ["what", "why"], note: "for newcomers" });
@@ -136,11 +140,10 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	assert.equal(node.type === "node_idle" && node.cause.type === "question" && node.cause.message, "Who is the audience?");
 	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0:0", text: "newcomers" }] });
 	assert.equal(done.outcome?.type, "done", JSON.stringify(done.status));
-	// The new session resumed from the node's checkpoint: the real conversation, with the quota on each newest message.
-	assert.match(prompts[0]!, /"role":"assistant","content":\[\{"type":"text","text":"Who is the audience\?"/);
-	assert.match(prompts[0]!, /newcomers\\n\\n\[Turn 2 of 16\]/);
+	// The new session resumed from the node's checkpoint: the reply is the ask's result, with the quota on it.
+	assert.match(prompts[0]!, /"toolName":"ask","content":\[\{"type":"text","text":"newcomers\\n\\n\[Turn 2 of 16\]/);
 	const transcript = readFileSync(join(dir, "nodes", "_0_0.jsonl"), "utf8");
-	assert.match(transcript, /"kind":"assistant","text":"Who is the audience\?"/);
+	assert.match(transcript, /"kind":"tool_call","tool":"ask","args":\{"message":"Who is the audience\?"\}/);
 	assert.match(transcript, /"kind":"user","text":"newcomers"/);
 	assert.match(transcript, /"kind":"tool_call","tool":"submit_result"/);
 });
@@ -234,49 +237,141 @@ test("pi: a provider error is an executor error: the run pauses, a resume reissu
 	assert.deepEqual(resumed.outcome, { type: "done", value: { summary: "fine now" } });
 });
 
-test("the tool layer: a sandboxed agent gets bash and file tools mapped onto its sandbox; disallowed names are refused and logged", async () => {
+test("the tool layer: workspace access gives pi's file tools on the sandbox's paths; unknown names are refused and logged", async () => {
 	const dir = tmp();
 	const mount = tmp();
-	writeFileSync(join(mount, "notes.txt"), "from the mount");
-	const s = spec({
-		workspace: { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), mounts: { data: mount }, spill: join(dir, "spill") },
-		sandbox: { type: "unavailable", name: "shell", reason: "test" },
-	});
+	writeFileSync(join(mount, "notes.txt"), "from the mount\nline 2");
+	writeFileSync(join(mount, "dot.png"), Buffer.from("89504e470d0a1a0a", "hex"));
+	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), mounts: { data: mount }, spill: join(dir, "spill") };
 	mkdirSync(join(dir, "scratch"), { recursive: true });
+	const at = (access: 0 | 1 | 2 | 3) => spec({ declaration: { ...spec().declaration, access }, workspace: ws, sandbox: { type: "unavailable", name: "shell", reason: "test" } });
+	const names = async (access: 0 | 1 | 2 | 3) => (await buildNodeTools(at(access))).agentTools().map((t) => t.name).sort();
+	assert.deepEqual(await names(0), ["codemode", "read_spill", "submit_result"]);
+	assert.deepEqual(await names(1), ["codemode", "ls", "read", "read_spill", "submit_result"]);
+	assert.deepEqual(await names(2), ["codemode", "edit", "export_artifact", "ls", "read", "read_spill", "submit_result", "write"]);
+	assert.deepEqual(await names(3), ["bash", "codemode", "edit", "export_artifact", "ls", "read", "read_spill", "submit_result", "write"]);
+	const s = at(3);
 	const tools = await buildNodeTools(s);
-	assert.deepEqual(tools.agentTools().map((t) => t.name).sort(), ["ask", "bash", "codemode", "export_artifact", "list_dir", "read_file", "read_spill", "submit_result", "write_file"]);
+	const run = (name: string, args: Record<string, unknown>) => tools.invoke(name, args as never, false, undefined, "0/t1");
 	// Paths are the sandbox's: /w is scratch, /w/<mount> is the mount (read-only).
-	assert.equal((await tools.invoke("read_file", { path: "/w/data/notes.txt" }, false, undefined, "t1")).text, "from the mount");
-	assert.equal((await tools.invoke("write_file", { path: "data/x", content: "no" }, false, undefined, "t1")).isError, true);
-	assert.equal((await tools.invoke("write_file", { path: "out.txt", content: "yes" }, false, undefined, "t1")).text, "wrote out.txt");
-	assert.equal(readFileSync(join(dir, "scratch", "out.txt"), "utf8"), "yes");
-	assert.equal((await tools.invoke("read_file", { path: "/etc/passwd" }, false, undefined, "t1")).isError, true);
+	assert.equal((await run("read", { path: "/w/data/notes.txt", offset: 2 })).text, "line 2");
+	assert.equal((await run("write", { path: "data/x", content: "no" })).isError, true);
+	assert.equal((await run("write", { path: "out.txt", content: "yes yes" })).text, "wrote 7 characters to out.txt");
+	assert.equal((await run("edit", { path: "out.txt", oldText: "yes", newText: "no" })).isError, true, "oldText must occur once");
+	assert.equal((await run("edit", { path: "out.txt", oldText: "yes yes", newText: "no" })).text, "edited out.txt");
+	assert.equal(readFileSync(join(dir, "scratch", "out.txt"), "utf8"), "no");
+	assert.deepEqual((await run("ls", {})).value, ["out.txt"]);
+	assert.equal((await run("read", { path: "/etc/passwd" })).isError, true);
+	// read returns images as image content.
+	assert.deepEqual((await run("read", { path: "/w/data/dot.png" })).images, [{ data: Buffer.from("89504e470d0a1a0a", "hex").toString("base64"), mimeType: "image/png" }]);
 	// Declared but not buildable here: bash says so, typed as an error for the model.
-	assert.match((await tools.invoke("bash", { command: "id" }, false, undefined, "t1")).text, /no sandbox: test/);
-	const refused = await tools.invoke("exec", { command: "id" }, true, undefined, "t1");
+	assert.match((await run("bash", { command: "id" })).text, /no sandbox: test/);
+	const refused = await tools.invoke("exec", { command: "id" }, true, undefined, "0/t1");
 	assert.equal(refused.isError, true);
-	assert.match(refused.text, /not allowed/);
+	assert.match(refused.text, /not available/);
 	assert.ok(s.entries.some((e) => e.kind === "tool_call" && e.tool === "exec"));
-	// An agent without a sandbox gets codemode too, and no filesystem at all.
-	const none = await buildNodeTools(spec());
-	assert.deepEqual(none.agentTools().map((t) => t.name).sort(), ["ask", "codemode", "read_spill", "submit_result"]);
 });
 
-test("upstream MCP through pi-mcp: only allowlisted tools, secrets only in the server process", async () => {
-	const server = resolve(here, "fixtures/mcp-server.ts");
-	const s = spec({
-		declaration: { ...(spec().declaration as object), mcp: { fx: { direct: ["echo"], ask: [] } } } as never,
-		mcp: { fx: { command: process.execPath, args: [server], env: { TOKEN: "${TOKEN}", PATH: process.env.PATH ?? "" } } },
+/** A spec whose tool sources are the fixture MCP server (counting its calls) and a fixture toolset. */
+function withSources(tools: readonly ToolDesc[], recorded = new Map<string, Json>()) {
+	const count = join(tmp(), "count.txt");
+	const sources = new ToolSources({
+		decl: { mcp: { mcpServers: { fx: { command: process.execPath, args: [resolve(here, "fixtures/mcp-server.ts")], env: { TOKEN: "${TOKEN}", COUNT_FILE: "${COUNT_FILE}" } } } }, mcpServers: { fx: { sandbox: null, network: "full" } }, toolsets: {} } as never,
+		workflowDir: here,
+		runDir: tmp(),
+		boxes: null,
+		env: { TOKEN: "s3cret", COUNT_FILE: count },
 	});
-	const tools = await buildNodeTools(s, { secrets: { TOKEN: "s3cret" } });
+	const records: [string, Json][] = [];
+	const s = spec({ declaration: { ...spec().declaration, tools }, connect: (source) => sources.connect(source), recorded, record: (call, result) => void records.push([call, result]) });
+	return { s, records, count: () => (existsSync(count) ? readFileSync(count, "utf8").trim().split("\n") : []) };
+}
+
+test("MCP tools through pi-mcp: a tool ref, a whole server (read-only tools only, the rest in a warning), secrets only in the server process", async () => {
+	const { s } = withSources([{ kind: "mcp_tool", server: "fx", tool: "echo" }, { kind: "mcp_server", server: "fx" }]);
+	const tools = await buildNodeTools(s);
 	try {
-		assert.ok(tools.names.includes("mcp__fx__echo"));
-		assert.ok(!tools.names.includes("mcp__fx__other"));
-		const r = await tools.invoke("mcp__fx__echo", { text: "hi" }, false, undefined, "t1");
+		assert.deepEqual(tools.names.filter((n) => n.startsWith("mcp__")).sort(), ["mcp__fx__echo", "mcp__fx__search"]);
+		const r = await tools.invoke("mcp__fx__echo", { text: "hi" }, false, undefined, "0/t1");
 		assert.equal(r.text, "hi; token=present");
+		const notes = s.entries.filter((e) => e.kind === "note").map((e) => (e as { text: string }).text);
+		assert.ok(notes.some((n) => /only tools annotated readOnlyHint are given; excluded: echo, other, wipe, post/.test(n)), notes.join("\n"));
+		assert.ok(notes.some((n) => /tool mcp__fx__echo may write outside \(unannotated\)/.test(n)), "the write rule applies when the tool list is built");
 		assert.ok(!JSON.stringify(s.entries).includes("s3cret"), "the secret never reaches the transcript");
-		assert.ok(!JSON.stringify(s).includes("s3cret"), "nor the node spec");
 	} finally {
 		await tools.close();
 	}
+});
+
+test("external results are journaled as { tool, args, outcome } under <turn>/<call id>; a reissue answers from the journal only on a match; codemode keys nest", async () => {
+	const first = withSources([{ kind: "mcp_tool", server: "fx", tool: "search" }]);
+	const tools = await buildNodeTools(first.s);
+	tools.agentTools();
+	try {
+		await tools.invoke("mcp__fx__search", { q: "a" }, false, undefined, tools.key("call_0"));
+		await tools.invoke("codemode", { code: "await tools.mcp__fx__search({ q: 'b' }); await tools.mcp__fx__search({ q: 'c' }); return 1;" }, false, undefined, tools.key("call_1"));
+	} finally {
+		await tools.close();
+	}
+	assert.deepEqual(first.records.map(([k]) => k), ["0/call_0", "0/call_1/0", "0/call_1/1"]);
+	assert.deepEqual(first.records[0]![1], { tool: "mcp:fx/search", args: { q: "a" }, outcome: { text: JSON.stringify({ hits: ["a-1", "a-2"] }), value: { hits: ["a-1", "a-2"] }, isError: false } });
+	assert.equal(first.count().length, 3);
+	// Reissued with the journal: matching calls hit it; a reused id with other arguments is a miss (logged), and called.
+	const again = withSources([{ kind: "mcp_tool", server: "fx", tool: "search" }], new Map(first.records));
+	const reissued = await buildNodeTools(again.s);
+	reissued.agentTools();
+	try {
+		assert.equal((await reissued.invoke("mcp__fx__search", { q: "a" }, false, undefined, "0/call_0")).text, JSON.stringify({ hits: ["a-1", "a-2"] }));
+		await reissued.invoke("codemode", { code: "await tools.mcp__fx__search({ q: 'b' }); await tools.mcp__fx__search({ q: 'c' }); return 1;" }, false, undefined, "0/call_1");
+		assert.deepEqual(again.count(), [], "nothing called again");
+		await reissued.invoke("mcp__fx__search", { q: "z" }, false, undefined, "0/call_0");
+		assert.deepEqual(again.count(), ["search"]);
+		assert.ok(again.s.entries.some((e) => e.kind === "note" && /journaled result 0\/call_0 is for another call/.test((e as { text: string }).text)));
+		// A record that does not parse is a miss too.
+		const bad = withSources([{ kind: "mcp_tool", server: "fx", tool: "search" }], new Map([["0/call_0", "garbage"]]));
+		const t3 = await buildNodeTools(bad.s);
+		await t3.invoke("mcp__fx__search", { q: "a" }, false, undefined, "0/call_0");
+		await t3.close();
+		assert.deepEqual(bad.count(), ["search"]);
+	} finally {
+		await reissued.close();
+	}
+});
+
+test("pi: an ask that is not the last tool call of its message still pauses; later calls in the message are not run; the reply reaches it after a host restart", async () => {
+	const checkpoint = join(tmp(), "session.json");
+	const s = () => spec({ declaration: { ...spec().declaration, tools: [{ kind: "ask" }] }, checkpoint });
+	const first = faux();
+	first.provider.setResponses([fauxAssistantMessage([fauxToolCall("ask", { message: "Louder?" }), fauxToolCall("codemode", { code: "return 1" })], { stopReason: "toolUse" })]);
+	const asked = await (await first.executor.start(s())).turn();
+	assert.deepEqual(asked.type === "asked" && asked.message, "Louder?");
+	// A new executor rebuilds the dialogue from the checkpoint; the reply replaces the ask's placeholder.
+	const second = faux();
+	let seen = "";
+	second.provider.setResponses([
+		(ctx) => {
+			seen = JSON.stringify(ctx.messages);
+			return call("submit_result", { answer: 2 });
+		},
+	]);
+	const done = await (await second.executor.start({ ...s(), turn: 1 })).turn("yes, louder");
+	assert.equal(done.type, "submitted", JSON.stringify(done));
+	assert.match(seen, /"toolName":"ask","content":\[\{"type":"text","text":"yes, louder/);
+	assert.match(seen, /not run: this turn waits for the reply/);
+});
+
+test("pi: a reissued call whose checkpoint ends in an unsafe external tool call reports outcome_unknown and runs nothing", async () => {
+	const { s, count } = withSources([{ kind: "mcp_tool", server: "fx", tool: "post" }]);
+	const checkpoint = join(tmp(), "session.json");
+	const messages = [
+		{ role: "user", content: "Input", timestamp: 1 },
+		{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "mcp__fx__post", arguments: {} }], stopReason: "toolUse", timestamp: 2, api: "faux", provider: "faux", model: "faux-1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } },
+	];
+	writeFileSync(checkpoint, JSON.stringify({ messages, turns: 0, compacted: null }));
+	const { executor } = faux();
+	const session = await executor.start({ ...s, checkpoint });
+	const r = await session.turn();
+	await session.close();
+	assert.deepEqual(r, { type: "outcome_unknown", tool: "mcp__fx__post", args: {}, usage: { usd: 0, tokens: 0, turns: 0 } });
+	assert.deepEqual(count(), [], "not called again");
 });

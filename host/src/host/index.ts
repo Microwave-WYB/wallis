@@ -36,4 +36,5 @@ export { AppendNotifier, type Notifier, TextNotifier } from "./notify.ts";
 export { callerIdentity, HUMAN, mayControl, NotOwner, type Owner, ownerAlive, serverOwner } from "./owner.ts";
 export { applyControl, claimable, waitForOwn } from "./query.ts";
 export { PiExecutor, parseModel } from "./pi.ts";
-export { buildNodeTools, checkContainment, NodeTools } from "./tools.ts";
+export { buildNodeTools, NodeTools } from "./tools.ts";
+export { ToolSources, writesOutside } from "./toolsets.ts";

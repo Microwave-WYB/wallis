@@ -1,7 +1,7 @@
 // Compile-time checks of the SDK's and the host's typing. `tsc --noEmit`
 // fails if any `@ts-expect-error` line stops being an error.
 
-import { command, Decision, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, mcpTool, orchestrator, subWorkflow, Type, workflow } from "wallis";
+import { ask, command, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
 import { IdleNode, LiveNode, OwnedRun, SteerableNode, SubmittableNode } from "../src/host/capability.ts";
 import type { CommandRunning, IdleNodeState, Node, RunningNode, Snapshot } from "../src/host/core.ts";
 import type { Session } from "../src/host/session.ts";
@@ -11,6 +11,8 @@ const mcp = defineMcp({ mcpServers: { arxiv: { command: "uvx", args: ["arxiv-mcp
 const mounts = defineMounts({ kb: "./knowledge", data: "" });
 
 const py = defineSandbox({ mounts }, { name: "py", requires: ["uv", { name: "bash", check: ["bash", "--version"] }], mounts: ["kb"] });
+const nodeBox = defineSandbox({}, { name: "tools", requires: ["node"] });
+const lib = toolset<typeof import("./fixtures/accept/tools/lib.ts")>("./tools/lib.ts", { sandbox: nodeBox, secrets: ["COUNT_FILE"] });
 
 const train = command({
 	name: "train",
@@ -23,27 +25,46 @@ const train = command({
 });
 
 const ok = defineAgent(
-	{ models, mcp },
+	{ models },
 	{
 		name: "ok",
 		model: "judge",
 		prompt: "p",
 		input: Type.Object({ q: Type.String(), papers: Foldable(Type.Array(Type.String()), { maxChars: 4000 }) }),
 		output: Type.Object({ answer: Type.String(), n: Type.Number() }),
-		mcp: { arxiv: ["search"] },
-		sandbox: py,
+		// Tools beyond the workspace: ask, a toolset tool, an MCP tool, a whole MCP server.
+		tools: [ask, lib.upload, mcp.arxiv.search, mcp.arxiv],
+		workspace: { access: "exec", sandbox: py },
 		steerable: false,
 	},
 );
 
+// A workspace without a sandbox: read or write on a minimal one (the inputs and a scratch dir).
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), workspace: { access: "write" } });
+
+// @ts-expect-error: exec runs commands, so it needs a declared sandbox
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), workspace: { access: "exec" } });
+
+// @ts-expect-error: there is no separate sandbox field on an agent: it is part of the workspace
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), sandbox: py });
+
 // @ts-expect-error: model must be an alias in the table
 defineAgent({ models }, { name: "x", model: "nope", prompt: "", input: Type.Null(), output: Type.Null() });
 
-// @ts-expect-error: MCP server must exist in mcp.json
-defineAgent({ models, mcp }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { scholar: "*" } });
+// @ts-expect-error: an MCP server must exist in mcp.json
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), tools: [mcp.scholar] });
 
 // @ts-expect-error: a command cannot be handed to an agent as a tool; only workflow code calls it
 defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), tools: [train] });
+
+// @ts-expect-error: tools takes only values wallis made: not a look-alike object
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), tools: [{ kind: "ask" }] });
+
+// @ts-expect-error: nor a pi AgentTool directly: custom tools come through a toolset
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), tools: [{ name: "t", label: "t", description: "", parameters: {}, execute: async () => ({ content: [], details: undefined }) }] });
+
+// @ts-expect-error: the old agent `mcp` selection is gone
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { arxiv: ["search"] } });
 
 // @ts-expect-error: a sandbox mount must be in the mount table
 defineSandbox({ mounts }, { name: "s", mounts: ["ghost"] });
@@ -57,27 +78,14 @@ defineSandbox({ mounts }, { name: "s", mounts: ["kb"], writable: ["kb"] });
 // @ts-expect-error: agents and commands never have network: a sandbox has no network option
 defineSandbox({ mounts }, { name: "s", network: ["arxiv.org"] });
 
-// An MCP tool is direct, or waits for the orchestrator's approval (`ask`).
-defineAgent({ models, mcp }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { arxiv: { direct: ["search"], ask: ["download"] } } });
-
-// @ts-expect-error: a mode is `direct` or `ask`; there is no allowlist of writes
-defineAgent({ models, mcp }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { arxiv: { writes: ["download"] } } });
-
 // @ts-expect-error: the overlay declares a server's network, "none" or "full", not domains
 defineMcp({ mcpServers: { arxiv: {} } }, { arxiv: { network: ["arxiv.org"] } });
 
 // @ts-expect-error: nor tools allowed to write outside
 defineMcp({ mcpServers: { arxiv: {} } }, { arxiv: { allowWrites: ["download"] } });
 
-// @ts-expect-error: a body MCP tool node names a server in mcp.json
-mcpTool({ mcp }, { server: "scholar", tool: "search", input: Type.Null(), output: Type.Null() });
-
-// @ts-expect-error: a decision to reject carries its reason
-const noReason: Decision = { type: "reject" };
-void noReason;
-
 // @ts-expect-error: a sandbox is a declared value, not a name
-defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), sandbox: "py" });
+defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), workspace: { access: "read", sandbox: "py" } });
 
 command({
 	name: "bad",
@@ -90,7 +98,6 @@ command({
 
 const inner = subWorkflow({ name: "inner", input: Type.Null(), output: Type.Number(), run: async () => 1 });
 const pick = orchestrator({ name: "pick", input: Type.Object({ question: Type.String() }), output: Type.Object({ choice: Type.Union([Type.Literal("a"), Type.Literal("b")]) }) });
-const search = mcpTool({ mcp }, { server: "arxiv", tool: "search_papers", input: Type.Object({ query: Type.String() }), output: Type.Object({ ids: Type.Array(Type.String()) }) });
 
 export default workflow({
 	name: "types",
@@ -99,7 +106,8 @@ export default workflow({
 	agents: [ok],
 	commands: [train],
 	orchestrators: [pick],
-	mcpTools: [search],
+	mcp,
+	toolsets: [lib],
 	input: Type.Null(),
 	output: Type.Number(),
 	run: async (ctx) => {
@@ -116,7 +124,16 @@ export default workflow({
 		const pickedWrong: number = (await ctx.call(pick, { question: "a or b?" })).choice;
 		// @ts-expect-error: its question is typed by its input schema
 		await ctx.call(pick, { prompt: "a or b?" });
-		const ids: string[] = (await ctx.call(search, { query: "folds" })).ids;
+		// A toolset tool from the body: input typed by its parameters, output by its outputSchema.
+		const url: string = (await ctx.call(lib.upload, { name: "sheet.jpg" })).url;
+		// @ts-expect-error: a wrong input to a toolset tool
+		await ctx.call(lib.upload, { file: "sheet.jpg" });
+		// An MCP tool's result is unknown unless a schema parses it.
+		const ids: string[] = (await ctx.call(mcp.arxiv.search_papers, { query: "folds" }, Type.Object({ ids: Type.Array(Type.String()) }))).ids;
+		// @ts-expect-error: unparsed, it is unknown
+		const raw: number = await ctx.call(mcp.arxiv.search_papers, { query: "folds" });
+		void url;
+		void raw;
 		// A session is a handle: every call continues the same dialogue.
 		const s = ctx.session(ok);
 		await s.call({ q: "and then?", papers: [] });

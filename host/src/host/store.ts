@@ -72,6 +72,8 @@ export interface RunMeta {
 	readonly base?: { readonly distro: string; readonly kernel: string };
 	/** Whether the run's sandboxes were built with bwrap. */
 	readonly confined?: boolean;
+	/** Preflight warnings: agent tools that may write outside, tools a server leaves out. */
+	readonly warnings?: readonly string[];
 	/** Answer schemas of the workflow's orchestrator nodes, for pending items. */
 	readonly answers?: Readonly<Record<string, Json>>;
 	/** Parameters for the first session of a run started detached. */

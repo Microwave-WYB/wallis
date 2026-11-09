@@ -1,8 +1,8 @@
-// Two nodes, the first of which asks the human a question: it ends its turn
-// without submitting, its node goes idle with the question, and an answer
-// continues the same dialogue.
+// Two nodes, the first of which asks a question with its `ask` tool: its
+// node goes idle with the question, and the reply becomes the tool's result
+// in the same dialogue.
 
-import { defineAgent, defineModels, Type, workflow } from "wallis";
+import { ask, defineAgent, defineModels, Type, workflow } from "wallis";
 import scoutPrompt from "./scout.md" with { type: "text" };
 import writerPrompt from "./writer.md" with { type: "text" };
 
@@ -16,6 +16,7 @@ const scout = defineAgent(
 		prompt: scoutPrompt,
 		input: Type.Object({ topic: Type.String() }),
 		output: Type.Object({ outline: Type.Array(Type.String(), { minItems: 1 }), note: Type.String() }),
+		tools: [ask],
 	},
 );
 

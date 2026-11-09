@@ -129,6 +129,8 @@ test("send reports how it was delivered: a steer to a running node, a reply to a
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" } });
 	await untilOpen(gated, "#0:0");
+	// More turns go only to an idle node: with a running one they are refused, not ignored.
+	assert.deepEqual(session.send(owned(session), "#0:0", "go left", "m0", 2), { refusal: { type: "not_idle", node: "#0:0" } });
 	assert.deepEqual(session.send(owned(session), "#0:0", "go left", "m1"), { delivered: "steer" });
 	await session.result;
 	const { deliveryOf } = await import("../src/host/query.ts");

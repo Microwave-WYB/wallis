@@ -15,7 +15,7 @@ const reader = defineAgent(
 		prompt: "Read your input and summarize it.",
 		input: Type.Object({ topic: Type.String(), notes: Foldable(Type.Array(Type.String()), { maxChars: 40 }) }),
 		output: Type.Object({ summary: Type.String({ minLength: 1 }) }),
-		sandbox: shell,
+		workspace: { access: "exec", sandbox: shell },
 	},
 );
 

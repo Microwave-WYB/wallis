@@ -14,7 +14,7 @@ export const responses: ConstructorParameters<typeof FakeExecutor>[0] = {
 	scout: (call: AgentCall) =>
 		"area" in (call.input as object)
 			? { submit: { errors: [`E-${(call.input as { area: string }).area}`] } }
-			: conversation({ idle: "Who is the audience: experts or newcomers?" }, { submit: { outline: ["what a product is", "why it folds"], note: "for newcomers" } }),
+			: conversation({ ask: "Who is the audience: experts or newcomers?" }, { submit: { outline: ["what a product is", "why it folds"], note: "for newcomers" } }),
 	writer: { submit: { text: "Why. How. So what.", words: 4 } },
 	// The fanout fixture.
 	judge: { submit: { findings: [{ content: "f", confidence: 0.5 }] } },

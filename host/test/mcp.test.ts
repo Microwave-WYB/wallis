@@ -50,7 +50,7 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 		const runId = started.data.run_id as string;
 		assert.match(started.text, new RegExp(`run in the background: npx wallis wait ${runId}`));
 		const asked = await call("wait", { run_id: runId, timeout_s: 10 });
-		assert.match(asked.text, /ended its turn with a question/);
+		assert.match(asked.text, /\(scout\) asks:/);
 		// Every result appends what is pending: here, the question.
 		const status = await call("get_run", { run_id: runId });
 		assert.match(status.text, /Pending in this project:[\s\S]*Who is the audience/);
@@ -65,8 +65,8 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 		const notRunning = await call("interrupt", { run_id: runId, node_id: "#0:0", agent: "scout" });
 		assert.deepEqual(notRunning.data.refusal, { type: "node_not_running", node: "#0:0" });
 		// The pending item, structured: its kind, question and actions.
-		const items = (await call("pending", {})).data as unknown as { kind: string; via: string; question: string; actions: { verb: string }[] }[];
-		assert.deepEqual(items.map((i) => [i.kind, i.via, i.question, i.actions.map((a) => a.verb)]), [["agent_ask", "end_of_turn", "Who is the audience: experts or newcomers?", ["send", "restart", "cancel"]]]);
+		const items = (await call("pending", {})).data as unknown as { kind: string; question: string; actions: { verb: string }[] }[];
+		assert.deepEqual(items.map((i) => [i.kind, i.question, i.actions.map((a) => a.verb)]), [["agent_ask", "Who is the audience: experts or newcomers?", ["send", "restart", "cancel"]]]);
 
 		const sent = await call("send", { run_id: runId, node_id: "#0:0", text: "newcomers" });
 		assert.equal(sent.isError, false, sent.text);

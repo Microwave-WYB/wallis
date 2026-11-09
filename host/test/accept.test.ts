@@ -1,26 +1,28 @@
 // State-coverage acceptance: a faux-driven run (fixtures/accept) enters
 // every attention kind and the orchestrator resolves each, once through
-// the CLI (detached hosts) and once through the MCP server (stdio):
-// explicit and implicit asks, turn_limit, interrupted, an orchestrator node
-// (an invalid submit, then a valid one), a tool approval (approve, and
-// reject with a reason), budget_reached, executor_unavailable (a rebind),
-// paused, a held node failure (restart), stopped (the host is killed,
-// resume) and finished. The fixture MCP server counts its calls: replay,
-// resume and fork never call it again.
+// the CLI (detached hosts) and once through the MCP server (stdio): an ask,
+// an end of turn without a result, turn_limit, paused and interrupted, the
+// host killed during a tool call that is not safe to repeat (stopped, then
+// outcome_unknown, then a restart that retries it), orchestrator nodes (an
+// invalid submit then a valid one; one asked again, then cancelled),
+// budget_reached, executor_unavailable (a rebind), a held node failure
+// (restart) and finished. The fixture tools count their calls: resume,
+// replay and fork never call the outside world again; through the CLI the
+// run is also forked mid-run, and the fork keeps its work dirs.
 
 import assert from "node:assert/strict";
-import { cpSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { cli, cliEnv, onlyRun, tmp, wallis } from "./util.ts";
+import { cli, cliEnv, onlyRun, runDir, tmp, wallis } from "./util.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const executor = resolve(here, "fixtures/accept-executor.ts");
 
-type Item = { kind: string; node?: string; via?: string; question?: string; reason?: { type: string; alias?: string }; server?: string; tool?: string; actions: { verb: string; args: Record<string, unknown> }[] };
+type Item = { kind: string; node?: string; question?: string; text?: string; tool?: string; reason?: { type: string; alias?: string }; actions: { verb: string; args: Record<string, unknown> }[] };
 
 /** A project with the acceptance workflow; its mcp.json points at the fixture server. */
 function acceptProject() {
@@ -29,12 +31,29 @@ function acceptProject() {
 	cpSync(resolve(here, "fixtures/accept"), dir, { recursive: true });
 	const mcp = { mcpServers: { fx: { command: process.execPath, args: [resolve(here, "fixtures/mcp-server.ts")], env: { COUNT_FILE: "${COUNT_FILE}" } } } };
 	writeFileSync(join(dir, "mcp.json"), JSON.stringify(mcp));
-	const env = { COUNT_FILE: join(root, "count.txt"), ACCEPT_KILL_FILE: join(root, "kill.flag") };
-	return { root, env, count: () => (existsSync(env.COUNT_FILE) ? readFileSync(env.COUNT_FILE, "utf8").trim().split("\n") : []), kill: () => writeFileSync(env.ACCEPT_KILL_FILE, "") };
+	// The tools module is bundled by wallis: it resolves `wallis` itself.
+	const env = { COUNT_FILE: join(root, "count.txt") };
+	return { root, env, count: () => (existsSync(env.COUNT_FILE) ? readFileSync(env.COUNT_FILE, "utf8").trim().split("\n") : []) };
 }
+
+/** Kills the process driving the run (its lock holder). */
+function killHost(root: string, id: string) {
+	const pid = Number(readFileSync(join(runDir(root, id), "lock"), "utf8").trim());
+	process.kill(pid, "SIGKILL");
+	for (let i = 0; i < 100; i++) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return;
+		}
+		spinSleep(50);
+	}
+}
+const spinSleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /** What the scenario needs from an orchestrator: the verbs, and the run's pending items. */
 interface Orchestrator {
+	readonly id: () => string;
 	start(): Promise<void>;
 	items(): Promise<Item[]>;
 	/** Waits for the next attention, then returns every pending item. */
@@ -46,35 +65,38 @@ interface Orchestrator {
 	interrupt(node: string, agent: string): Promise<void>;
 	pause(): Promise<void>;
 	resume(options?: { budget?: { turns: number }; models?: Record<string, string> }): Promise<void>;
-	/** May lose its host on the way (the fixture kills it at the last step). */
-	restart(node: string, note: string): Promise<void>;
+	restart(node: string, note?: string): Promise<void>;
+	cancelNode(node: string): Promise<void>;
+	/** The host dies; the orchestrator reconnects if it must. */
+	kill(): Promise<void>;
 	outcome(): Promise<{ type: string; value?: Record<string, unknown> }>;
+	/** At the ended-without-result step (CLI only). */
+	midway?(): Promise<void>;
 }
 
-const label = (i: Item) => [i.kind, i.via ?? (i.kind === "run_idle" ? i.reason?.type : i.node) ?? ""].join(":");
+const label = (i: Item) => [i.kind, i.kind === "run_idle" ? i.reason?.type : (i.node ?? "")].join(":");
 
 async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProject>) {
 	await o.start();
-	// An explicit ask, through the ask tool.
+	// An ask, through the ask tool.
 	let items = await o.items();
-	assert.deepEqual(items.map(label), ["agent_ask:ask_tool"]);
+	assert.deepEqual(items.map(label), ["agent_ask:#1:0"]);
 	assert.equal(items[0]!.question, "Which colour should the sheet use?");
 	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["send", "restart", "cancel"]);
 	assert.match(await o.send("#1:0", "blue"), /delivered to #1:0 as the reply to: Which colour should the sheet use\?/);
 	// The turn budget (2) holds the next call.
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["run_idle:budget_reached"]);
-	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["resume"]);
 	await o.resume({ budget: { turns: 100 } });
-	// An implicit ask: the turn ended with a question, in the same session.
+	// The turn ended with neither a result nor a question, in the same session.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["agent_ask:end_of_turn"]);
-	assert.equal(items[0]!.node, "#1:1");
-	assert.match(await o.send("#1:1", "the cool one"), /as the reply to: Do you mean the warm or the cool variant\?/);
+	assert.deepEqual(items.map(label), ["ended_without_result:#1:1"]);
+	assert.equal(items[0]!.text, "I could not decide between the warm and the cool variant.");
+	await o.midway?.();
+	assert.match(await o.send("#1:1", "the cool one"), /delivered to #1:1 as the reply to: I could not decide/);
 	// The turn limit: more turns with the message.
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["turn_limit:#2:0"]);
-	assert.deepEqual(items[0]!.actions[0]!.args.required, ["turns"]);
 	assert.match(await o.send("#2:0", "finish", 2), /with 2 more turns/);
 	// Paused while a node runs, then the node is interrupted.
 	for (let i = 0; i < 300 && !(await o.nodes()).some((n) => n.id === "#3:0" && n.type === "node_running"); i++) await new Promise((r) => setTimeout(r, 100));
@@ -84,24 +106,33 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	assert.deepEqual(items.map(label).sort(), ["interrupted:#3:0", "run_idle:paused_by_user"]);
 	await o.resume();
 	assert.match(await o.send("#3:0", "carry on"), /delivered to #3:0 after its interrupt/);
-	// A tool approval: a rejection needs a reason; then approve.
+	// The host dies while the upload tool runs: the run is stopped; on resume the call is not
+	// safe to repeat, so its outcome is unknown; a restart retries it.
+	for (let i = 0; i < 300 && !project.count().includes("upload"); i++) await new Promise((r) => setTimeout(r, 100));
+	await o.kill();
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["approval_pending:#4:0"]);
-	assert.deepEqual([items[0]!.server, items[0]!.tool], ["fx", "post"]);
-	assert.equal((await o.submit("#4:0", { type: "reject", reason: "" }))?.type, "invalid_answer");
-	assert.equal(await o.submit("#4:0", { type: "approve" }), null);
-	// The next approval, rejected with a reason.
+	assert.deepEqual(items.map(label), ["stopped:"]);
+	await o.resume();
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["approval_pending:#5:0"]);
-	assert.equal(await o.submit("#5:0", { type: "reject", reason: "not today" }), null);
+	assert.deepEqual(items.map(label), ["outcome_unknown:#4:0"]);
+	assert.equal(items[0]!.tool, "upload");
+	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["restart", "cancel"]);
+	await o.restart("#4:0");
 	// An orchestrator node: an invalid submit is refused and it stays pending; then a valid one.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["orchestrator_pending:#6"]);
+	assert.deepEqual(items.map(label), ["orchestrator_pending:#5"]);
 	const answer = items[0]!.actions[0]!.args as { properties: { value: { properties: { choice: unknown } } } };
 	assert.ok(answer.properties.value.properties.choice, "the action carries the answer schema");
-	assert.equal((await o.submit("#6", { choice: "c" }))?.type, "invalid_answer");
+	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["submit_result", "restart", "cancel"]);
+	assert.equal((await o.submit("#5", { choice: "c" }))?.type, "invalid_answer");
+	assert.deepEqual((await o.items()).map(label), ["orchestrator_pending:#5"]);
+	assert.equal(await o.submit("#5", { choice: "a" }), null);
+	// Another one is asked again (restart), then cancelled: the body catches the typed failure.
+	items = await o.wait();
+	assert.deepEqual(items.map(label), ["orchestrator_pending:#6"]);
+	await o.restart("#6");
 	assert.deepEqual((await o.items()).map(label), ["orchestrator_pending:#6"]);
-	assert.equal(await o.submit("#6", { choice: "a" }), null);
+	await o.cancelNode("#6");
 	// The executor cannot serve an alias: rebind it.
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["run_idle:executor_unavailable"]);
@@ -110,12 +141,7 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	// A failure the body does not handle holds the run; a restart with a note fixes it.
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["node_failed:#8:0"]);
-	// The host dies at the last step: the run is stopped; resume finishes it.
-	project.kill();
 	await o.restart("#8:0", "try again");
-	items = await o.wait();
-	assert.deepEqual(items.map(label), ["stopped:"]);
-	await o.resume();
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["finished:"]);
 	assert.deepEqual(await o.outcome(), {
@@ -126,19 +152,24 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 			implicit: "the cool one",
 			limit: "finished",
 			slowed: "carry on",
-			approved: "posted",
-			rejected: "The orchestrator rejected this call: not today",
+			uploaded: "https://example.test/sheet.jpg",
 			picked: "a",
+			confirmed: "cancelled",
 			flaky: "served",
 			fragile: "recovered",
+			published: "note-6",
 			last: "done",
 		},
 	});
-	// The outside world was called once per call: the resume replayed the journal.
-	assert.deepEqual(project.count(), ["search", "post"]);
+	// The outside world: one search, the upload (retried by the restart), one publish. Resumes replayed the journal.
+	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish"]);
+	// Preflight warnings, in run metadata: the upload tool may write outside; the fx server keeps only read-only tools.
+	const meta = JSON.parse(readFileSync(join(runDir(project.root, o.id()), "meta.json"), "utf8")) as { warnings: string[] };
+	assert.ok(meta.warnings.some((w) => /agent poster: tool upload may write outside \(unannotated\)/.test(w)), meta.warnings.join("\n"));
+	assert.ok(meta.warnings.some((w) => /agent worker: from MCP server fx only tools annotated readOnlyHint are given; excluded: echo, other, wipe, post/.test(w)), meta.warnings.join("\n"));
 }
 
-test("acceptance through the CLI: every attention kind, entered and resolved", { timeout: 240_000 }, async () => {
+test("acceptance through the CLI: every attention kind, entered and resolved", { timeout: 300_000 }, async () => {
 	const project = acceptProject();
 	const w = (...args: string[]) => wallis(project.root, args, project.env);
 	let id = "";
@@ -146,8 +177,9 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 		assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
 		return r.stdout;
 	};
-	const status = () => JSON.parse(ok(w("status", id, "--json"))) as { attention: Item[]; nodes: { id: string; type: string }[]; status: { outcome?: { type: string; value?: Record<string, unknown> } } };
+	const status = (run = id) => JSON.parse(ok(w("status", run, "--json"))) as { attention: Item[]; nodes: { id: string; type: string }[]; status: { outcome?: { type: string; value?: Record<string, unknown> } } };
 	const o: Orchestrator = {
+		id: () => id,
 		start: async () => {
 			ok(w("run", "accept", "--input", "null", "--executor", executor));
 			id = onlyRun(project.root);
@@ -178,19 +210,27 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 					...Object.entries(options.models ?? {}).flatMap(([a, m]) => ["--model", `${a}=${m}`]),
 				),
 			),
-		restart: async (node, note) => {
-			const r = w("restart", id, node, note);
-			assert.ok(r.status === 0 || r.signal !== null, `${r.stdout}\n${r.stderr}`);
-		},
+		restart: async (node, note) => void ok(w("restart", id, node, ...(note ? [note] : []))),
+		cancelNode: async (node) => void ok(w("cancel", id, "--node", node)),
+		kill: async () => killHost(project.root, id),
 		outcome: async () => status().status.outcome!,
+		midway: async () => {
+			// A fork keeps the work dirs: the idle call's checkpoint and the session's scratch dir.
+			const forked = ok(w("fork", id));
+			const forkId = /into (\S+)\./.exec(forked)![1]!;
+			assert.ok(existsSync(join(runDir(project.root, forkId), "work", "_1_1", "session.json")), "the idle call's checkpoint is in the fork");
+			assert.deepEqual(readdirSync(join(runDir(project.root, forkId), "work")).sort(), readdirSync(join(runDir(project.root, id), "work")).sort());
+			assert.deepEqual(status(forkId).attention.map(label), ["ended_without_result:#1:1"]);
+			ok(w("cancel", forkId));
+		},
 	};
 	await scenario(o, project);
-	// A fork re-executes against the copied journal: nothing outside is called again.
+	// A fork of the finished run re-executes against the copied journal: nothing outside is called again.
 	ok(w("fork", id));
-	assert.deepEqual(project.count(), ["search", "post"]);
+	assert.deepEqual(project.count(), ["search", "upload", "upload", "publish"]);
 });
 
-test("acceptance through MCP: every attention kind, entered and resolved", { timeout: 240_000 }, async () => {
+test("acceptance through MCP: every attention kind, entered and resolved", { timeout: 300_000 }, async () => {
 	const project = acceptProject();
 	let client: Client | null = null;
 	let id = "";
@@ -206,6 +246,7 @@ test("acceptance through MCP: every attention kind, entered and resolved", { tim
 	};
 	const run = async () => (await call("get_run", { run_id: id })).data as { attention: Item[]; nodes: { id: string; type: string }[]; status: { outcome?: { type: string; value?: Record<string, unknown> } } };
 	const o: Orchestrator = {
+		id: () => id,
 		start: async () => {
 			await connect();
 			const started = await call("run", { workflow: "accept", input: null });
@@ -241,21 +282,16 @@ test("acceptance through MCP: every attention kind, entered and resolved", { tim
 			assert.equal(r.isError, false, r.text);
 		},
 		restart: async (node, note) => {
-			// The server is the host: it dies at the last step, perhaps before it answers.
-			await call("restart", { run_id: id, node_id: node, note }).catch(() => null);
-			for (let i = 0; i < 100; i++) {
-				const pid = Number(readFileSync(join(project.root, ".wallis", "runs", id, "lock"), "utf8").trim() || 0);
-				const alive = (() => {
-					try {
-						process.kill(pid, 0);
-						return true;
-					} catch {
-						return false;
-					}
-				})();
-				if (!alive) break;
-				await new Promise((r) => setTimeout(r, 100));
-			}
+			const r = await call("restart", { run_id: id, node_id: node, ...(note ? { note } : {}) });
+			assert.equal(r.isError, false, r.text);
+		},
+		cancelNode: async (node) => {
+			const r = await call("cancel", { run_id: id, node_id: node });
+			assert.equal(r.isError, false, r.text);
+		},
+		kill: async () => {
+			// The server is the host.
+			killHost(project.root, id);
 			await client!.close().catch(() => {});
 			await connect();
 		},

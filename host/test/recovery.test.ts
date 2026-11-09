@@ -12,7 +12,8 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type { NodeSpec, TranscriptEntry } from "../src/host/executor.ts";
-import { appendInbox, checkContainment, EventLog, FakeCommands, FakeExecutor, PiExecutor, runPaths, runWorkflow } from "../src/host/index.ts";
+import { appendInbox, EventLog, FakeCommands, FakeExecutor, PiExecutor, runPaths, runWorkflow } from "../src/host/index.ts";
+import { writesOutside } from "../src/host/toolsets.ts";
 import { transientError } from "../src/host/pi.ts";
 import { tmp } from "./util.ts";
 
@@ -121,7 +122,7 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 	const spec = {
 		id: "#0:0",
 		agent: "a",
-		declaration: { model: "default", prompt: "p", input: {}, output: {}, mcp: {}, skills: [], needs: {}, sandbox: null, steerable: true, compaction: true, max_turns: 6 },
+		declaration: { model: "default", prompt: "p", input: {}, output: {}, tools: [], access: 3, skills: [], needs: {}, sandbox: null, steerable: true, compaction: true, max_turns: 6 },
 		history: null,
 		recorded: new Map(),
 		record: () => {},
@@ -141,7 +142,8 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		exportArtifact: () => {
 			throw new Error("no");
 		},
-		mcp: null,
+		connect: () => Promise.reject(new Error("no tool sources")),
+		warn: () => {},
 		log: (e: TranscriptEntry) => entries.push(e),
 	} as unknown as NodeSpec;
 	const session = await executor.start(spec);
@@ -181,7 +183,7 @@ test("pi: reaching the turn limit stops the node (turn_limit) with its progress;
 	const workflow = resolve(here, "fixtures/pi/workflow.ts");
 	const { writeFileSync } = await import("node:fs");
 	const limited = join(tmp(), "workflow.ts");
-	writeFileSync(limited, readFileSync(workflow, "utf8").replace('sandbox: shell,', "sandbox: shell,\n\t\tmaxTurns: 2,"));
+	writeFileSync(limited, readFileSync(workflow, "utf8").replace('workspace: { access: "exec", sandbox: shell },', 'workspace: { access: "exec", sandbox: shell },\n\t\tmaxTurns: 2,'));
 	const first = await runWorkflow({ workflow: limited, dir, executor, confine: "off", input: { topic: "t", notes: [] }, inboxPollMs: null });
 	const node = first.run.nodes[0]!;
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "turn_limit", used: 2, limit: 2 });
@@ -264,16 +266,12 @@ test("R3: a failed command is held the same way and a restart reruns it", async 
 	assert.equal(fixed.calls[0]!.id, held);
 });
 
-// --- Containment ---
+// --- The write rule ---
 
-test("containment: a direct MCP tool whose annotations say it writes outside is refused; in ask mode it is fine", async () => {
-	const server = resolve(here, "fixtures/mcp-server.ts");
-	const configs = { fx: { command: process.execPath, args: [server] } };
-	const direct = (tools: string[]) => new Map([["fx", new Set(tools)]]);
-	assert.equal(await checkContainment(direct(["echo"]), configs, process.env, undefined), null);
-	assert.deepEqual(await checkContainment(direct(["echo", "wipe"]), configs, process.env, undefined), { server: "fx", tool: "wipe" });
-	assert.deepEqual(await checkContainment(direct(["post"]), configs, process.env, undefined), { server: "fx", tool: "post" });
-	assert.deepEqual(await checkContainment(new Map([["fx", "*" as const]]), configs, process.env, undefined), { server: "fx", tool: "wipe" });
-	// The session puts only direct tools in the check; `ask` tools wait for the orchestrator.
-	assert.equal(await checkContainment(new Map(), configs, process.env, undefined), null);
+test("the write rule: a tool may write outside unless annotated read-only, or neither destructive nor open-world; unannotated counts as a write", () => {
+	assert.equal(writesOutside({}), true);
+	assert.equal(writesOutside({ readOnlyHint: true }), false);
+	assert.equal(writesOutside({ readOnlyHint: false, destructiveHint: false, openWorldHint: false }), false);
+	assert.equal(writesOutside({ readOnlyHint: false, destructiveHint: false }), true);
+	assert.equal(writesOutside({ destructiveHint: true }), true);
 });

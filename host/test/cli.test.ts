@@ -32,7 +32,7 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	const execLog = join(tmp(), "exec.jsonl");
 	const started = wallis(root, ask, { WALLIS_FAKE_EXEC_LOG: execLog });
 	assert.equal(started.status, 0, started.stderr);
-	assert.match(started.stdout, /node #0:0 \(scout\) ended its turn with a question:\n  > Who is the audience: experts or newcomers\?/);
+	assert.match(started.stdout, /node #0:0 \(scout\) asks:\n  > Who is the audience: experts or newcomers\?/);
 	assert.match(started.stdout, /npx wallis send .* '#0:0' "<message>"/);
 	const id = onlyRun(root);
 	assert.deepEqual(status(root, id).status, { type: "idle", reason: null });
@@ -65,7 +65,7 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	assert.equal(sentEvents.length, 1);
 	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0:0", text: "newcomers", message_id: "<id>", by: sentEvents[0]!.by, turns: 0 });
 	assert.match(String(sentEvents[0]!.by), /^(human|harness:.+)$/, "the sender's identity is logged");
-	assert.ok(log.some((e) => e.type === "agent_idle" && e.message === "Who is the audience: experts or newcomers?"));
+	assert.ok(log.some((e) => e.type === "agent_asked" && e.message === "Who is the audience: experts or newcomers?"));
 	// The idle turn was not replayed: the reply continued the conversation.
 	assert.deepEqual(lines(execLog).map((e) => [e.agent, e.replies]), [["scout", 0], ["scout", 1], ["writer", 0]]);
 });

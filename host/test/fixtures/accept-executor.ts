@@ -3,17 +3,16 @@
 // call order), so it behaves the same in every host process. It answers
 // the steps of fixtures/accept/workflow.ts:
 //   ask       calls `ask`, then submits the reply
-//   implicit  ends its turn with a question, then submits the answer
+//   implicit  ends its turn without a result, then submits the message it gets
 //   limit     runs codemode until a message says "finish"
 //   slow      waits until the turn is aborted (interrupt), then submits the message
-//   post      calls the ask-mode tool fx/post, then submits its result
+//   upload    calls the custom tool upload, then submits its result
 //   flaky     submits (on a model the executor can serve)
 //   fragile   gives up (an empty reply) unless restarted with a note
-//   last      submits; if the file ACCEPT_KILL_FILE exists, deletes it and SIGKILLs the host
+//   last      submits
 // The model faux/broken fails as an executor error (HTTP 412). Unconfined
-// (confine "off"): the fixture MCP server runs as a plain process.
+// (confine "off"): the fixture's tool processes run as plain processes.
 
-import { existsSync, rmSync } from "node:fs";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { PiExecutor } from "../../src/host/pi.ts";
 
@@ -37,7 +36,7 @@ function respond(context: { messages: Msg[] }, options: { signal?: AbortSignal }
 		case "ask":
 			return results.length === 0 ? call("ask", { message: "Which colour should the sheet use?" }) : submit(clean(text(results.at(-1))));
 		case "implicit":
-			return replies.length === 0 ? fauxAssistantMessage("Do you mean the warm or the cool variant?") : submit(clean(text(replies.at(-1))));
+			return replies.length === 0 ? fauxAssistantMessage("I could not decide between the warm and the cool variant.") : submit(clean(text(replies.at(-1))));
 		case "limit":
 			return replies.some((m) => text(m).includes("finish")) ? submit("finished") : call("codemode", { code: "return 1" });
 		case "slow": {
@@ -51,20 +50,14 @@ function respond(context: { messages: Msg[] }, options: { signal?: AbortSignal }
 				setTimeout(done, 60_000);
 			});
 		}
-		case "post":
-			return results.length === 0 ? call("mcp__fx__post", {}) : submit(clean(text(results.at(-1))));
+		case "upload":
+			return results.length === 0 ? call("upload", { name: "sheet.jpg" }) : submit(clean(text(results.at(-1))));
 		case "flaky":
 			return submit("served");
 		case "fragile":
 			return text(messages[start]).includes("Operator note") ? submit("recovered") : fauxAssistantMessage("");
-		case "last": {
-			const flag = process.env.ACCEPT_KILL_FILE;
-			if (flag && existsSync(flag)) {
-				rmSync(flag);
-				process.kill(process.pid, "SIGKILL");
-			}
+		case "last":
 			return submit("done");
-		}
 		default:
 			return submit(`unknown step ${step}`);
 	}

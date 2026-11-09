@@ -7,10 +7,10 @@
 // session's dialogue after its previous call (`NodeSpec.history`, a
 // checkpoint) and adds its input as a new user message.
 //
-// Pausing: `ask` and `ask`-mode MCP tools end the turn with a placeholder
-// result (marked in its details). The reply, or the orchestrator's decision,
-// replaces the placeholder when it arrives, also after a host restart, and
-// the dialogue continues in the same loop.
+// Pausing: `ask` (when the agent has it) ends the turn with a placeholder
+// result (marked in its details). The reply replaces the placeholder when it
+// arrives, also after a host restart, and the dialogue continues in the
+// same loop. Later tool calls of the same message are not run.
 //
 // Durability: after every completed step the node's whole conversation
 // (messages, tool calls, results) is checkpointed in its work dir, so a
@@ -30,8 +30,7 @@ import { dirname } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { estimateTokens, generateSummary } from "@earendil-works/pi-coding-agent";
-import { Decision, type Json } from "../sdk/index.ts";
-import { parseWith } from "../sdk/validate.ts";
+import type { Json } from "../sdk/index.ts";
 import type { Usage } from "./core.ts";
 import type { Capabilities, Executor, NodeSession, NodeSpec, TurnResult } from "./executor.ts";
 import { CHARS_PER_TOKEN } from "./render.ts";
@@ -67,9 +66,8 @@ export function parseModel(text: string): { provider: string; id: string; thinki
 	return { provider: text.slice(0, slash), id: rest, thinking };
 }
 
-const SYSTEM = `You are one node of a wallis workflow. Work only with the tools you are given; codemode runs a script that can call them all, and sees your full input as \`input\`.
-When you are done, call submit_result with a result that matches its schema; if it does not match, you get the errors and may resubmit.
-If you cannot continue without an answer from your caller, call ask with a self-contained question; the reply is its result.`;
+const SYSTEM = `Work only with the tools you are given; codemode runs a script that can call them all, and sees your full input as \`input\`.
+When you are done, call submit_result with a result that matches its schema; if it does not match, you get the errors and may resubmit.`;
 
 function firstPrompt(spec: NodeSpec): string {
 	const parts = [spec.prompt];
@@ -99,15 +97,13 @@ function textOf(message: AgentMessage | undefined): string {
 		.trim();
 }
 
-/** Tools whose call is safe to run again after a crash: they only read (codemode's MCP calls are journaled). */
-const REPLAYABLE = new Set(["read_file", "list_dir", "read_spill", "codemode"]);
-
-/** The placeholder result of a call the turn paused on, if the dialogue ends with one. */
+/** The placeholder result of the call the turn paused on: any tool result after the last assistant message. */
 function pendingResult(messages: readonly AgentMessage[]): { index: number; call: string; pending: Pending } | null {
-	const index = messages.length - 1;
-	const last = messages[index] as { role: string; toolCallId?: string; details?: { wallis_pending?: Pending } } | undefined;
-	if (last?.role !== "toolResult" || last.details?.wallis_pending === undefined) return null;
-	return { index, call: last.toolCallId!, pending: last.details.wallis_pending };
+	for (let index = messages.length - 1; index >= 0 && messages[index]!.role !== "assistant"; index--) {
+		const m = messages[index] as { role: string; toolCallId?: string; details?: { wallis_pending?: Pending } };
+		if (m.role === "toolResult" && m.details?.wallis_pending !== undefined) return { index, call: m.toolCallId!, pending: m.details.wallis_pending };
+	}
+	return null;
 }
 
 /** Provider errors worth retrying (rate limits, overload, 5xx, timeouts, the network); never auth, billing or a missing model. */
@@ -153,6 +149,11 @@ class PiNodeSession implements NodeSession {
 		const saved = this.#load(spec.checkpoint);
 		// A new call of a session starts from where its previous call left the dialogue.
 		const history = saved === null && spec.history !== null ? this.#load(spec.history) : null;
+		// A question the previous call left unanswered (it was cancelled) is closed, not inherited.
+		const open = history ? pendingResult(history.messages) : null;
+		if (history && open) {
+			history.messages[open.index] = { ...(history.messages[open.index] as object), content: [{ type: "text", text: "(no reply: that call ended without one)" }], details: undefined } as never;
+		}
 		this.#turns = Math.max(spec.turn, saved?.turns ?? 0);
 		this.#compacted = saved?.compacted ?? history?.compacted ?? null;
 		this.#started = saved !== null && saved.messages.length > 0;
@@ -164,9 +165,13 @@ class PiNodeSession implements NodeSession {
 			streamFn,
 			getApiKey: options.getApiKey,
 			toolExecution: "sequential",
-			// A submitted result, a question or an approval request ends the run here.
+			// A submitted result or a question ends the run here.
 			finishTurn: async () => (tools.submitted !== undefined || tools.pending !== null ? { action: "end" } : undefined),
-			transformContext: (messages, signal) => this.#fit(system, messages, streamFn, signal).then((m) => this.#quota(m)),
+			transformContext: (messages, signal) => {
+				// Tool calls of the coming reply are journaled under the turns completed before it.
+				tools.turn = this.#turns;
+				return this.#fit(system, messages, streamFn, signal).then((m) => this.#quota(m));
+			},
 		});
 		if (saved) spec.log({ kind: "note", text: `resumed from its checkpoint after turn ${saved.turns} (${saved.messages.length} messages)` });
 		if (history) spec.log({ kind: "note", text: `continues its session after ${history.messages.length} messages` });
@@ -282,22 +287,28 @@ class PiNodeSession implements NodeSession {
 
 	/**
 	 * After a crash the checkpoint may end with an assistant message whose
-	 * tool calls never returned. Reads (and codemode) run again; any other
-	 * call's result becomes an error the model sees, since it may or may not
-	 * have taken effect.
+	 * tool calls never returned. Reads, asks, safe or journaled external
+	 * calls run again; a call that worked only on the sandbox becomes an
+	 * error the model sees; any other call's outcome is unknown: nothing is
+	 * run, and the node waits for its owner (`outcome_unknown`).
 	 */
-	async #settleInterrupted(): Promise<void> {
+	async #settleInterrupted(): Promise<{ tool: string; args: Json } | null> {
 		const messages = this.#agent.state.messages;
 		const last = messages.at(-1);
-		if (last?.role !== "assistant") return;
-		for (const call of last.content) {
-			if (call.type !== "toolCall") continue;
+		if (last?.role !== "assistant") return null;
+		this.#tools.turn = this.#turns;
+		const calls = last.content.filter((c) => c.type === "toolCall");
+		const unknown = calls.find((c) => this.#tools.crashPolicy(c.name, this.#tools.key(c.id), c.arguments as Json) === "unknown");
+		if (unknown) {
+			this.#spec.log({ kind: "note", text: `${unknown.name} was in flight at a crash and is not safe to make again: its outcome is unknown` });
+			return { tool: unknown.name, args: unknown.arguments as Json };
+		}
+		for (const call of calls) {
 			let text: string;
 			let isError: boolean;
 			let details: { wallis_pending: Pending } | undefined;
-			// Reads, journaled MCP calls and pausing calls (they only ask) run again.
-			if (REPLAYABLE.has(call.name) || this.#tools.pausing.has(call.name) || this.#spec.recorded.has(call.id)) {
-				const r = await this.#tools.invoke(call.name, call.arguments as Json, false, undefined, call.id);
+			if (this.#tools.crashPolicy(call.name, this.#tools.key(call.id), call.arguments as Json) === "rerun") {
+				const r = await this.#tools.invoke(call.name, call.arguments as Json, false, undefined, this.#tools.key(call.id));
 				text = this.#tools.cap(r.text);
 				isError = r.isError === true;
 				if (r.pending !== undefined) details = { wallis_pending: r.pending };
@@ -310,6 +321,7 @@ class PiNodeSession implements NodeSession {
 			messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text }], details, isError, timestamp: Date.now() } as never);
 		}
 		this.#agent.state.messages = messages;
+		return null;
 	}
 
 	/** One request round, with backoff for transient provider errors (logged); others are reported at once. */
@@ -337,38 +349,11 @@ class PiNodeSession implements NodeSession {
 		}
 	}
 
-	/**
-	 * The reply to a paused call replaces its placeholder: a question's reply
-	 * verbatim; an approval runs the tool (journaled) or carries the
-	 * rejection's reason.
-	 */
-	async #resolvePending(at: { index: number; call: string; pending: Pending }, message: string): Promise<void> {
-		let text = message;
-		let isError = false;
-		if (at.pending.type === "approval") {
-			const parsed = parseWith(Decision, (() => {
-				try {
-					return JSON.parse(message) as unknown;
-				} catch {
-					return null;
-				}
-			})());
-			const decision = parsed.ok ? (parsed.value as Decision) : null;
-			if (decision?.type === "approve") {
-				const run = this.#tools.approved.get(`${at.pending.server}/${at.pending.tool}`);
-				const r = run ? await run(at.pending.args, undefined, at.call) : { text: `tool ${at.pending.tool} is unavailable`, isError: true };
-				text = this.#tools.cap(r.text);
-				isError = r.isError === true;
-				this.#spec.log({ kind: "note", text: `approved: ${at.pending.server}/${at.pending.tool}` });
-			} else {
-				text = `The orchestrator rejected this call: ${decision?.type === "reject" ? decision.reason : `unreadable decision ${message}`}`;
-				isError = true;
-				this.#spec.log({ kind: "note", text: `rejected: ${at.pending.server}/${at.pending.tool}` });
-			}
-		}
+	/** The reply to a paused call replaces its placeholder, verbatim. */
+	#resolvePending(at: { index: number; call: string; pending: Pending }, message: string): void {
 		const messages = [...this.#agent.state.messages];
 		const old = messages[at.index] as object;
-		messages[at.index] = { ...old, content: [{ type: "text", text }], details: undefined, isError } as never;
+		messages[at.index] = { ...old, content: [{ type: "text", text: message }], details: undefined, isError: false } as never;
 		this.#agent.state.messages = messages;
 		this.#save();
 	}
@@ -376,13 +361,21 @@ class PiNodeSession implements NodeSession {
 	async turn(message?: string, turnLimit?: number): Promise<TurnResult> {
 		if (turnLimit !== undefined) this.#limit = turnLimit;
 		this.#limitHit = false;
-		this.#interrupted = false;
+		// An interrupt may come before the turn starts: it is kept until the turn ends.
+		try {
+			return await this.#turn(message);
+		} finally {
+			this.#interrupted = false;
+		}
+	}
+
+	async #turn(message: string | undefined): Promise<TurnResult> {
 		const before = this.#agent.state.messages.length;
 		let start: () => Promise<void>;
 		const paused = pendingResult(this.#agent.state.messages);
 		if (paused !== null && message !== undefined) {
-			// The reply or decision for the call the turn paused on: the same loop continues.
-			await this.#resolvePending(paused, message);
+			// The reply to the call the turn paused on: the same loop continues.
+			this.#resolvePending(paused, message);
 			start = () => this.#agent.continue();
 		} else if (paused !== null) {
 			// Reissued while still waiting (a host restart): it waits again.
@@ -392,7 +385,8 @@ class PiNodeSession implements NodeSession {
 			// A reissued or resumed call: continue from the last completed step.
 			const last = this.#agent.state.messages.at(-1);
 			if (last?.role === "assistant" && last.content.every((c) => c.type !== "toolCall")) return this.#result(before, last);
-			await this.#settleInterrupted();
+			const unknown = await this.#settleInterrupted();
+			if (unknown !== null) return { type: "outcome_unknown", ...unknown, usage: { usd: 0, tokens: 0, turns: 0 } };
 			if (this.#tools.pending !== null) return this.#result(before, undefined);
 			start = () => this.#agent.continue();
 		} else {
@@ -400,6 +394,7 @@ class PiNodeSession implements NodeSession {
 			start = () => this.#agent.prompt(prompt);
 		}
 		this.#started = true;
+		if (this.#interrupted) return this.#result(before, undefined);
 		const failed = await this.#run(start);
 		// Our own abort (context exhausted, turn limit, the owner's interrupt) is not an executor error.
 		if (failed && !this.#exhausted && !this.#limitHit && !this.#interrupted) return { type: "executor_error", error: failed.error };
@@ -420,13 +415,17 @@ class PiNodeSession implements NodeSession {
 			this.#tools.submitted = undefined;
 			return { type: "submitted", output, usage };
 		}
+		// An interrupt wins over a question asked in the same turn: the placeholder stays, and the next message answers it.
+		if (this.#interrupted) {
+			this.#tools.pending = null;
+			return { type: "interrupted", usage };
+		}
 		if (this.#tools.pending !== null) {
 			const { pending } = this.#tools.pending;
 			this.#tools.pending = null;
-			return pending.type === "ask" ? { type: "asked", message: pending.message, usage } : { type: "approval", server: pending.server, tool: pending.tool, args: pending.args, usage };
+			return { type: "asked", message: pending.message, usage };
 		}
 		if (this.#exhausted) return { type: "agent_error", failure: { type: "context_exhausted" }, usage };
-		if (this.#interrupted) return { type: "interrupted", usage };
 		if (this.#limitHit) return { type: "turn_limit", used: this.#turns, limit: this.#limit, usage };
 		const last = settledLast ?? fresh.filter((m) => m.role === "assistant").at(-1);
 		const said = textOf(last);

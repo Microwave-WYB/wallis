@@ -1,66 +1,72 @@
-// The wallis tool layer: every tool an agent can call, built per node and
-// handed to an executor. It enforces the agent's allowlist, logs every call
-// to the node's transcript, counts calls against the node's tool budget,
-// caps every result that enters the model's context, and injects secrets
-// only into MCP server processes.
+// The wallis tool layer: every tool an agent can call, built per agent call
+// and handed to an executor. It gives the agent exactly the tools it was
+// declared with, logs every call to the node's transcript, counts calls
+// against the node's tool budget, caps every result that enters the
+// model's context, and journals every external result.
 //
-// Every agent gets `codemode`, `ask` and `submit_result`, plus its
-// allowlisted MCP tools, callable directly and from codemode (`ask` and
-// `ask`-mode tools only directly: they pause the turn). `ask` puts a question
-// to the agent's caller; the reply becomes its result. An `ask`-mode MCP
-// tool waits for the orchestrator's approval; a rejection's reason is its
-// result. Every MCP result is journaled before the model sees it, so a
-// reissued call never calls the outside world again. An agent with a sandbox also
-// gets `bash` (run in that sandbox) and file tools confined to its scratch
-// dir (`/w`), its sandbox's mounts (`/w/<mount>`, read-only) and its input
-// artifacts (`/run/wallis/inputs`, read-only). Without a sandbox it has no
-// filesystem at all. Codemode runs in QuickJS with no fs or network, so it
-// adds no capability. Inside codemode the full input is the `input` variable.
-// Agents cannot be handed commands: custom tools mean an MCP server.
+// Every agent gets `codemode`, `submit_result` and `read_spill`; then its
+// declared tools:
+// - file tools from its workspace access, named as in pi: `read` gives
+//   read and ls, `write` adds write, edit and export_artifact, `exec` adds
+//   bash (in its sandbox). `/w` is the scratch dir; mounts and
+//   `/run/wallis/inputs` are read-only. `read` returns images as image
+//   content;
+// - `ask(message)`, opt-in: the turn ends and the reply becomes its result;
+// - custom tools and MCP tools, from their sources (toolsets.ts), over one
+//   connection per agent call. Their results are journaled (`{ tool, args,
+//   outcome }` under `<turn>/<tool call id>`, nested codemode calls under
+//   `<key>/<n>`) before the model sees them; a reissued call answers a
+//   journaled call from the journal when tool and arguments match.
+// Every tool is callable directly and from codemode, except `ask`, which
+// pauses the turn. Once a call has paused a turn, later calls in the same
+// message are not run.
 //
-// MCP servers run in the sandbox the workflow's overlay gives them, with
-// the network it declares; `${VAR}` secrets go into the server process's
-// environment only. A direct tool whose annotations say it writes outside
-// (`destructiveHint`, or not read-only and open-world) is refused in
-// preflight: it must be in `ask` mode.
-//
-// Context protection: a direct tool result or a codemode output longer than
-// the cap is cut, and its full text is spilled to the node's spill dir with
-// an explicit marker; the next script pages it with `read_spill`. Nothing
-// is dropped silently.
+// Context protection: a result longer than the cap is cut, and its full
+// text is spilled to the node's spill dir with an explicit marker; the next
+// script pages it with `read_spill`. Nothing is dropped silently.
 
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, posix, relative, resolve, sep } from "node:path";
+import { dirname, extname, join, posix, relative, resolve, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { CodemodeSandbox, type CodemodeTool, renderDeclarations, toCodemodeIdentifier } from "@earendil-works/pi-codemode";
-import { McpClient, StdioTransport, StreamableHttpTransport, toLlmContent } from "@earendil-works/pi-mcp";
-import type { Json, ServerTools } from "../sdk/index.ts";
-import { LAYOUT, runSpawn, type Spawn } from "./confine.ts";
+import { type McpClient, toLlmContent } from "@earendil-works/pi-mcp";
+import { type Json, Type } from "../sdk/index.ts";
+import Value from "typebox/value";
+import { LAYOUT, runSpawn } from "./confine.ts";
 import { type NodeSpec, validateSubmission } from "./executor.ts";
+import { canonical } from "./render.ts";
+import { resolveAgentTools, type Source, sourceKey, type ToolInfo, toolInfos } from "./toolsets.ts";
 
 /** A tool as wallis runs it, before it is adapted to an executor. */
-export interface WallisTool {
+export interface WallisToolRun {
 	readonly name: string;
 	readonly description: string;
 	readonly parameters: Json;
-	/** `call` names the tool call (the model's tool call id, or `<codemode call>/<n>` nested): MCP results are journaled under it. */
+	/** `call` is the journal key of the call: `<turn>/<tool call id>`, or `<key>/<n>` nested in codemode. */
 	run(args: Json, signal: AbortSignal | undefined, call: string): Promise<ToolOutcome>;
 }
 
-/** What pauses a turn: a question to the caller, or an `ask`-mode tool call waiting for approval. */
-export type Pending = { readonly type: "ask"; readonly message: string } | { readonly type: "approval"; readonly server: string; readonly tool: string; readonly args: Json };
+/** What pauses a turn: a question to the caller. */
+export type Pending = { readonly type: "ask"; readonly message: string };
 
 export interface ToolOutcome {
 	readonly text: string;
 	readonly value?: Json;
 	readonly isError?: boolean;
-	/** Set by `ask` and `ask`-mode tools: the turn ends here and waits. */
+	/** Set by `ask`: the turn ends here and waits. */
 	readonly pending?: Pending;
+	/** Image content for the model (direct calls only; codemode sees the text). */
+	readonly images?: readonly { readonly data: string; readonly mimeType: string }[];
 }
 
+const Outcome = Type.Object({ text: Type.String(), value: Type.Optional(Type.Unknown()), isError: Type.Optional(Type.Boolean()) });
+/** A journaled external result, parsed when it is read back. */
+const Recorded = Type.Object({ tool: Type.String(), args: Type.Unknown(), outcome: Outcome });
+
+/** What a tool call in flight at a crash does when the call is reissued. */
+export type CrashPolicy = "rerun" | "sandbox" | "unknown";
+
 export interface ToolLayerOptions {
-	/** Where `${VAR}` secret references in MCP server env are resolved. Default: process.env. */
-	readonly secrets?: Readonly<Record<string, string | undefined>>;
 	/** Tool calls one node may make, nested calls included. Default: 10 per allowed turn. */
 	readonly maxCalls?: number;
 	/** Characters of one tool result or codemode output that enter the context. */
@@ -73,6 +79,11 @@ export const RESULT_CAP = 16_000;
 export const OUTPUT_CAP = 100_000;
 const FILE_CAP = 100_000;
 const SPILL_PAGE = 8_000;
+const LS_LIMIT = 500;
+const IMAGES: Readonly<Record<string, string>> = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
+
+/** Run again after a crash: they only read, only ask, or only record. */
+const RERUN = new Set(["read", "ls", "read_spill", "ask", "submit_result"]);
 
 export class NodeTools {
 	readonly spec: NodeSpec;
@@ -80,11 +91,11 @@ export class NodeTools {
 	/** The tool call the turn waits on, if any: at most one per turn. */
 	pending: { readonly call: string; readonly pending: Pending } | null = null;
 	calls = 0;
-	/** Tools that pause the turn (`ask` and `ask`-mode MCP tools): calling them again only asks again. */
-	readonly pausing = new Set<string>(["ask"]);
-	/** How an approved `ask`-mode tool runs, by `<server>/<tool>`. */
-	readonly approved = new Map<string, (args: Json, signal: AbortSignal | undefined, call: string) => Promise<ToolOutcome>>();
-	readonly #tools = new Map<string, WallisTool>();
+	/** Completed model turns when the current turn's tools run: the first part of their journal keys. */
+	turn = 0;
+	/** External tools by agent-visible name. */
+	readonly external = new Map<string, ToolInfo>();
+	readonly #tools = new Map<string, WallisToolRun>();
 	readonly #maxCalls: number;
 	readonly #cap: number;
 	readonly #clients: McpClient[] = [];
@@ -99,7 +110,7 @@ export class NodeTools {
 		this.#cap = cap;
 	}
 
-	add(tool: WallisTool): void {
+	add(tool: WallisToolRun): void {
 		this.#tools.set(tool.name, tool);
 	}
 
@@ -111,12 +122,43 @@ export class NodeTools {
 		return [...this.#tools.keys()];
 	}
 
+	/** The journal key of a direct call. */
+	key(callId: string): string {
+		return `${this.turn}/${callId}`;
+	}
+
+	/** The journaled result of this external call, if one matches its tool and arguments. A mismatch is a miss, logged. */
+	recorded(key: string, info: ToolInfo, args: Json): ToolOutcome | null {
+		const raw = this.spec.recorded.get(key);
+		if (raw === undefined) return null;
+		// Parsed, not cast: a record that does not match its schema is a miss.
+		const rec = Value.Check(Recorded, raw) ? raw : null;
+		if (rec !== null && rec.tool === info.id && canonical(rec.args as Json) === canonical(args)) return { text: rec.outcome.text, value: rec.outcome.value as Json, isError: rec.outcome.isError === true };
+		this.spec.log({ kind: "note", text: `journaled result ${key} is for another call (${rec ? `${rec.tool} ${canonical(rec.args as Json)}` : "unreadable"}): calling ${info.id}` });
+		return null;
+	}
+
+	/**
+	 * A call in flight at a crash: run it again if it only reads, asks or
+	 * records, if it is an external tool that is safe or already journaled,
+	 * or if it is codemode and every external tool is safe; give the model an
+	 * error if it worked only on the sandbox; else its outcome is unknown.
+	 */
+	crashPolicy(name: string, key: string, args: Json): CrashPolicy {
+		if (RERUN.has(name)) return "rerun";
+		const info = this.external.get(name);
+		if (info) return info.replay === "safe" || this.recorded(key, info, args) !== null ? "rerun" : "unknown";
+		if (name === "codemode") return [...this.external.values()].every((t) => t.replay === "safe") ? "rerun" : "unknown";
+		return "sandbox";
+	}
+
 	/** Every call, direct or nested, goes through here. */
 	async invoke(name: string, args: Json, nested: boolean, signal: AbortSignal | undefined, call: string): Promise<ToolOutcome> {
 		const tool = this.#tools.get(name);
 		this.spec.log({ kind: "tool_call", tool: name, args, nested });
 		let outcome: ToolOutcome;
-		if (!tool) outcome = { text: `tool ${name} is not allowed for agent ${this.spec.agent}`, isError: true };
+		if (!tool) outcome = { text: `tool ${name} is not available to agent ${this.spec.agent}`, isError: true };
+		else if (this.pending !== null && !nested) outcome = { text: `not run: this turn waits for the reply to ${this.pending.call}`, isError: true };
 		else if (++this.calls > this.#maxCalls) outcome = { text: `tool budget exhausted (${this.#maxCalls} calls)`, isError: true };
 		else {
 			try {
@@ -127,7 +169,6 @@ export class NodeTools {
 		}
 		if (outcome.pending !== undefined) {
 			if (nested) outcome = { text: `${name} pauses the turn, so it cannot run from codemode: call it directly`, isError: true };
-			else if (this.pending !== null) outcome = { text: `this turn already waits on ${this.pending.pending.type === "ask" ? "a question" : "an approval"}: one at a time`, isError: true };
 			else this.pending = { call, pending: outcome.pending };
 		}
 		this.spec.log({ kind: "tool_result", tool: name, result: outcome.value ?? outcome.text, isError: outcome.isError === true, nested });
@@ -159,18 +200,19 @@ export class NodeTools {
 				description: tool.description,
 				parameters: tool.parameters as object,
 				execute: async (id: string, params: unknown, signal?: AbortSignal) => {
-					const r = await this.invoke(tool.name, params as Json, false, signal, id);
-					// A pausing call's result is a placeholder, replaced by the reply or the decision when it arrives.
+					const r = await this.invoke(tool.name, params as Json, false, signal, this.key(id));
+					// A pausing call's result is a placeholder, replaced by the reply when it arrives.
 					const details = r.pending === undefined ? undefined : { wallis_pending: r.pending as unknown as Json };
-					return { content: [{ type: "text" as const, text: this.cap(r.text) }], details, isError: r.isError === true, terminate: this.submitted !== undefined };
+					const images = (r.images ?? []).map((i) => ({ type: "image" as const, data: i.data, mimeType: i.mimeType }));
+					return { content: [{ type: "text" as const, text: this.cap(r.text) }, ...images], details, isError: r.isError === true, terminate: this.submitted !== undefined };
 				},
 			};
 		});
 	}
 
-	#codemodeTool(): WallisTool {
+	#codemodeTool(): WallisToolRun {
 		const nestedTools: CodemodeTool[] = this.names
-			.filter((n) => n !== "codemode")
+			.filter((n) => n !== "codemode" && n !== "ask")
 			.map((name) => {
 				const tool = this.#tools.get(name)!;
 				return {
@@ -228,17 +270,10 @@ function within(roots: readonly string[], path: string): boolean {
 	});
 }
 
-function text(value: unknown): string {
-	return typeof value === "string" ? value : JSON.stringify(value);
-}
-
-function resolveSecrets(env: Readonly<Record<string, string>> | undefined, secrets: Readonly<Record<string, string | undefined>>): Record<string, string> {
-	return Object.fromEntries(Object.entries(env ?? {}).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_m, name: string) => secrets[name] ?? "")]));
-}
-
 export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions = {}): Promise<NodeTools> {
 	const tools = new NodeTools(spec, options.maxCalls ?? Math.max(16, spec.turnLimit * 10), options.resultCap ?? RESULT_CAP);
 	const ws = spec.workspace;
+	const declared = spec.declaration.tools;
 
 	tools.add({
 		name: "submit_result",
@@ -254,24 +289,9 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 	});
 
 	tools.add({
-		name: "ask",
-		description:
-			"Ask your caller a question in plain language and wait for the reply, which becomes this tool's result. Make the question self-contained: the reader sees only it.",
-		parameters: { type: "object", required: ["message"], properties: { message: { type: "string", minLength: 1 } } },
-		run: async (args) => {
-			const message = String((args as { message?: unknown }).message ?? "");
-			return { text: "(waiting for the caller's reply)", pending: { type: "ask", message } };
-		},
-	});
-
-	tools.add({
 		name: "read_spill",
 		description: "Read a page of output that was cut at the context cap and spilled (the marker names it).",
-		parameters: {
-			type: "object",
-			required: ["name"],
-			properties: { name: { type: "string" }, offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } },
-		},
+		parameters: { type: "object", required: ["name"], properties: { name: { type: "string" }, offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } } },
 		run: async (args) => {
 			const { name, offset, limit } = args as { name: string; offset?: number; limit?: number };
 			const path = resolve(ws.spill, name);
@@ -283,7 +303,17 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 		},
 	});
 
-	if (spec.sandbox.type !== "none") {
+	if (declared.some((d) => d.kind === "ask")) {
+		tools.add({
+			name: "ask",
+			description: "Ask a question in plain language and wait for the reply, which becomes this tool's result. Make the question self-contained.",
+			parameters: { type: "object", required: ["message"], properties: { message: { type: "string", minLength: 1 } } },
+			run: async (args) => ({ text: "(waiting for the reply)", pending: { type: "ask", message: String((args as { message?: unknown }).message ?? "") } }),
+		});
+	}
+
+	const access = spec.declaration.access;
+	if (access > 0) {
 		const box = spec.sandbox;
 		/** A path as the agent sees it (`/w/...`, `/w/<mount>/...`, `/run/wallis/inputs/...`) mapped to the host. */
 		const toHost = (path: string): { abs: string; writable: boolean } => {
@@ -296,51 +326,86 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			if (first && first in ws.mounts) return { abs: join(ws.mounts[first]!, ...more), writable: false };
 			return { abs: join(ws.scratch, rest), writable: true };
 		};
+		const writable = (path: string) => {
+			const target = toHost(path);
+			if (!target.writable || !within([ws.scratch], target.abs)) throw new Error(`${path} is read-only: only your scratch dir (${LAYOUT.work}) is writable`);
+			return target.abs;
+		};
 		const mounts = Object.keys(ws.mounts).map((m) => `${LAYOUT.work}/${m}`).join(", ") || "none";
-		tools.add({
-			name: "bash",
-			description: `Run a bash command in your sandbox (${box.name}): cwd ${LAYOUT.work} is your scratch dir; mounts ${mounts} and ${LAYOUT.inputs} are read-only. 120 s limit.`,
-			parameters: { type: "object", required: ["command"], properties: { command: { type: "string" } } },
-			run: async (args, signal) => {
-				if (box.type === "unavailable") return { text: `no sandbox: ${box.reason}`, isError: true };
-				const r = await runSpawn(box.spawn(["bash", "-c", String((args as { command: string }).command)]), "", { timeoutMs: 120_000, signal });
-				const out = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
-				return { text: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}\n${out}`, value: { exit: r.exit, stdout: r.stdout, stderr: r.stderr }, isError: r.exit !== 0 };
+		const where = `${LAYOUT.work} is your scratch dir (writable, the working directory); mounts ${mounts} and ${LAYOUT.inputs} are read-only`;
+		const builtins: Record<string, WallisToolRun> = {
+			read: {
+				name: "read",
+				description: `Read a file: text, with offset (1-based line) and limit (lines) for large files; images (jpg, png, gif, webp) as images. ${where}.`,
+				parameters: { type: "object", required: ["path"], properties: { path: { type: "string" }, offset: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1 } } },
+				run: async (args) => {
+					const { path, offset, limit } = args as { path: string; offset?: number; limit?: number };
+					const abs = toHost(path).abs;
+					const mimeType = IMAGES[extname(abs).toLowerCase()];
+					if (mimeType) return { text: `image ${path}`, images: [{ data: readFileSync(abs).toString("base64"), mimeType }] };
+					const lines = readFileSync(abs, "utf8").split("\n");
+					const from = (offset ?? 1) - 1;
+					const text = lines.slice(from, limit === undefined ? undefined : from + limit).join("\n").slice(0, FILE_CAP);
+					return { text, value: text };
+				},
 			},
-		});
-		tools.add({
-			name: "read_file",
-			description: `Read a text file in your sandbox: ${LAYOUT.work} (scratch), mounts ${mounts}, inputs ${LAYOUT.inputs}.`,
-			parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
-			run: async (args) => {
-				const content = readFileSync(toHost(String((args as { path: string }).path)).abs, "utf8");
-				return { text: content.slice(0, FILE_CAP), value: content.slice(0, FILE_CAP) };
+			write: {
+				name: "write",
+				description: `Write a file, creating parent directories; it replaces the file's content. ${where}.`,
+				parameters: { type: "object", required: ["path", "content"], properties: { path: { type: "string" }, content: { type: "string" } } },
+				run: async (args) => {
+					const { path, content } = args as { path: string; content: string };
+					const abs = writable(path);
+					mkdirSync(dirname(abs), { recursive: true });
+					writeFileSync(abs, content);
+					return { text: `wrote ${content.length} characters to ${path}` };
+				},
 			},
-		});
-		tools.add({
-			name: "list_dir",
-			description: "List a directory in your sandbox (scratch, mounts or inputs).",
-			parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
-			run: async (args) => {
-				const dir = toHost(String((args as { path: string }).path)).abs;
-				const entries = readdirSync(dir).map((name) => (statSync(resolve(dir, name)).isDirectory() ? `${name}/` : name));
-				return { text: entries.join("\n"), value: entries };
+			edit: {
+				name: "edit",
+				description: `Edit a file by replacing oldText, which must occur exactly once, with newText. ${where}.`,
+				parameters: { type: "object", required: ["path", "oldText", "newText"], properties: { path: { type: "string" }, oldText: { type: "string" }, newText: { type: "string" } } },
+				run: async (args) => {
+					const { path, oldText, newText } = args as { path: string; oldText: string; newText: string };
+					const abs = writable(path);
+					const text = readFileSync(abs, "utf8");
+					const count = oldText === "" ? 0 : text.split(oldText).length - 1;
+					if (count !== 1) return { text: `oldText occurs ${count} times in ${path}; it must occur exactly once`, isError: true };
+					writeFileSync(abs, text.replace(oldText, () => newText));
+					return { text: `edited ${path}` };
+				},
 			},
-		});
-		tools.add({
-			name: "write_file",
-			description: `Write a text file in your scratch dir (${LAYOUT.work}). Only exported artifacts outlive this node.`,
-			parameters: { type: "object", required: ["path", "content"], properties: { path: { type: "string" }, content: { type: "string" } } },
-			run: async (args) => {
-				const { path, content } = args as { path: string; content: string };
-				const target = toHost(path);
-				if (!target.writable || !within([ws.scratch], target.abs)) return { text: `${path} is read-only: only your scratch dir is writable`, isError: true };
-				mkdirSync(dirname(target.abs), { recursive: true });
-				writeFileSync(target.abs, content);
-				return { text: `wrote ${relative(ws.scratch, target.abs)}` };
+			ls: {
+				name: "ls",
+				description: `List a directory (default ${LAYOUT.work}); directories end with /. ${where}.`,
+				parameters: { type: "object", properties: { path: { type: "string" }, limit: { type: "integer", minimum: 1 } } },
+				run: async (args) => {
+					const { path, limit } = args as { path?: string; limit?: number };
+					const dir = toHost(path ?? LAYOUT.work).abs;
+					const entries = readdirSync(dir)
+						.sort()
+						.slice(0, limit ?? LS_LIMIT)
+						.map((name) => (statSync(resolve(dir, name)).isDirectory() ? `${name}/` : name));
+					return { text: entries.join("\n"), value: entries };
+				},
 			},
-		});
-		tools.add({
+			bash: {
+				name: "bash",
+				description: `Run a bash command in your sandbox${box.type === "none" ? "" : ` (${box.name})`}, no network. ${where}. timeout in seconds (default 120).`,
+				parameters: { type: "object", required: ["command"], properties: { command: { type: "string" }, timeout: { type: "number", exclusiveMinimum: 0 } } },
+				run: async (args, signal) => {
+					if (box.type === "unavailable") return { text: `no sandbox: ${box.reason}`, isError: true };
+					if (box.type === "none") return { text: "no sandbox", isError: true };
+					const { command, timeout } = args as { command: string; timeout?: number };
+					const r = await runSpawn(box.spawn(["bash", "-c", command]), "", { timeoutMs: (timeout ?? 120) * 1000, signal });
+					const out = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
+					return { text: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}\n${out}`, value: { exit: r.exit, stdout: r.stdout, stderr: r.stderr }, isError: r.exit !== 0 };
+				},
+			},
+		};
+		const granted = [["read", "ls"], ["write", "edit"], ["bash"]].slice(0, access).flat();
+		for (const name of granted) tools.add(builtins[name]!);
+		if (access >= 2) tools.add({
 			name: "export_artifact",
 			description: "Export a file from your scratch dir as an artifact; put the returned ref in submit_result.",
 			parameters: { type: "object", required: ["path", "media"], properties: { path: { type: "string" }, media: { type: "string" }, name: { type: "string" } } },
@@ -352,98 +417,42 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 		});
 	}
 
-	// Upstream MCP servers, through pi-mcp, each in its own sandbox. Secrets reach the server process only.
-	for (const [server, selected] of Object.entries(spec.declaration.mcp)) {
-		const client = await connectServer(server, spec.mcp, options.secrets ?? process.env, spec.mcpSpawn);
-		if (!client) continue;
+	// Custom and MCP tools: one connection per source for this agent call; the write rule is applied again.
+	const sources = new Map<string, Source>();
+	for (const d of declared) {
+		if (d.kind === "custom") sources.set(sourceKey({ kind: "toolset", path: d.toolset }), { kind: "toolset", path: d.toolset });
+		if (d.kind === "mcp_server" || d.kind === "mcp_tool") sources.set(sourceKey({ kind: "mcp", server: d.server }), { kind: "mcp", server: d.server });
+	}
+	const clients = new Map<string, McpClient>();
+	const listing = new Map<string, ToolInfo[]>();
+	for (const [key, source] of sources) {
+		const client = await spec.connect(source);
 		tools.addClient(client);
-		for (const t of await client.listTools()) {
-			const mode = toolMode(selected, t.name);
-			if (mode === null) continue;
-			// Journaled: a call already recorded (a reissued call after a crash) is answered from the journal.
-			const execute = async (args: Json, signal: AbortSignal | undefined, call: string): Promise<ToolOutcome> => {
-				const recorded = spec.recorded.get(call);
-				if (recorded !== undefined) return recorded as unknown as ToolOutcome;
-				const r = await client.callTool(t.name, args as Record<string, unknown>, { signal });
-				const content = toLlmContent(r)
+		clients.set(key, client);
+		listing.set(key, toolInfos(source, (await client.listTools()) as never));
+	}
+	const resolved = resolveAgentTools(spec.agent, declared, listing);
+	for (const w of resolved.warnings) spec.warn(w);
+	if (resolved.unknown !== null) spec.warn(`agent ${spec.agent}: tool ${resolved.unknown} is not offered by its source`);
+	for (const info of resolved.tools) {
+		const client = clients.get(sourceKey(info.source))!;
+		tools.external.set(info.name, info);
+		tools.add({
+			name: info.name,
+			description: info.description,
+			parameters: { ...(info.inputSchema as object), type: "object", properties: (info.inputSchema as { properties?: Json }).properties ?? {} } as unknown as Json,
+			run: async (args, signal, call) => {
+				const recorded = tools.recorded(call, info, args);
+				if (recorded !== null) return recorded;
+				const r = await client.callTool(info.remote, args as Record<string, unknown>, { signal });
+				const text = toLlmContent(r)
 					.map((c) => (c.type === "text" ? c.text : "[image]"))
 					.join("\n");
-				const outcome: ToolOutcome = { text: content, value: (r.structuredContent ?? content) as Json, isError: r.isError === true };
-				spec.record(call, outcome as unknown as Json);
+				const outcome: ToolOutcome = { text, value: (r.structuredContent ?? text) as Json, isError: r.isError === true };
+				spec.record(call, { tool: info.id, args, outcome } as unknown as Json);
 				return outcome;
-			};
-			tools.approved.set(`${server}/${t.name}`, execute);
-			const name = `mcp__${server}__${t.name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
-			if (mode === "ask") tools.pausing.add(name);
-			tools.add({
-				name,
-				description: mode === "ask" ? `${t.description ?? t.name}\n(Runs only after the orchestrator approves this call; a rejection's reason is the result.)` : (t.description ?? t.name),
-				parameters: { ...t.inputSchema, type: "object", properties: t.inputSchema.properties ?? {} } as unknown as Json,
-				run: async (args, signal, call) =>
-					mode === "ask" ? { text: "(waiting for the orchestrator's approval)", pending: { type: "approval", server, tool: t.name, args } } : execute(args, signal, call),
-			});
-		}
+			},
+		});
 	}
 	return tools;
-}
-
-/** How an agent selected a server's tool: direct, `ask`, or not at all. */
-export function toolMode(selected: ServerTools, tool: string): "direct" | "ask" | null {
-	if (selected.ask.includes(tool)) return "ask";
-	if (selected.direct === "*" || selected.direct.includes(tool)) return "direct";
-	return null;
-}
-
-type ServerConfig = { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> };
-
-/** How a stdio MCP server process starts: in its sandbox (argv[0] a required binary), with exactly this env. */
-export type McpSpawn = (server: string, argv: readonly string[], env: Readonly<Record<string, string>>) => Spawn;
-
-/** Connects to one server of mcp.json; null when the config has no such server. */
-export async function connectServer(
-	server: string,
-	configs: Json | null,
-	secrets: Readonly<Record<string, string | undefined>>,
-	sandboxed: McpSpawn | undefined,
-): Promise<McpClient | null> {
-	const config = ((configs ?? {}) as Record<string, ServerConfig>)[server];
-	if (!config) return null;
-	let transport;
-	if (config.url) transport = new StreamableHttpTransport({ url: config.url, headers: resolveSecrets(config.headers, secrets) });
-	else {
-		const env = resolveSecrets(config.env, secrets);
-		const sp = sandboxed ? sandboxed(server, [config.command!, ...(config.args ?? [])], env) : { command: config.command!, args: config.args ?? [], env: { PATH: process.env.PATH ?? "", ...env } };
-		transport = new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe" });
-	}
-	const client = new McpClient({ name: "wallis", version: "0.0.0" });
-	await client.connect(transport);
-	return client;
-}
-
-/**
- * The containment check: a run's outward effects go only through `ask`-mode
- * tools the orchestrator approves, so a tool used directly (by an agent, or
- * by the body as a node) whose annotations say it writes outside
- * (`destructiveHint`, or not read-only and open-world) is refused.
- */
-export async function checkContainment(
-	direct: ReadonlyMap<string, ReadonlySet<string> | "*">,
-	configs: Json | null,
-	secrets: Readonly<Record<string, string | undefined>>,
-	sandboxed: McpSpawn | undefined,
-): Promise<{ server: string; tool: string } | null> {
-	for (const [server, allow] of direct) {
-		const client = await connectServer(server, configs, secrets, sandboxed);
-		if (!client) continue;
-		try {
-			for (const t of await client.listTools()) {
-				if (allow !== "*" && !allow.has(t.name)) continue;
-				const a = (t as { annotations?: { destructiveHint?: boolean; readOnlyHint?: boolean; openWorldHint?: boolean } }).annotations ?? {};
-				if (a.destructiveHint === true || (a.readOnlyHint === false && a.openWorldHint === true)) return { server, tool: t.name };
-			}
-		} finally {
-			await client.close();
-		}
-	}
-	return null;
 }

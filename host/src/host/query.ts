@@ -1,7 +1,7 @@
 // Reading runs without driving them: status from a refold of the log, the
 // derived `stopped`, what needs attention, and agent-readable summaries.
 
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { constants, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
 import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
@@ -63,12 +63,14 @@ export type ArtifactView = { readonly ref: ArtifactRef; readonly path: string; r
 
 /** What needs the orchestrator, in a stable order; every item lists the verbs that resolve it. */
 export type Attention =
-	/** An agent's question to its caller: through its `ask` tool, or by ending its turn without a result. */
-	| { readonly kind: "agent_ask"; readonly runId: string; readonly node: string; readonly agent: string; readonly via: "ask_tool" | "end_of_turn"; readonly question: string; readonly steerable: boolean; readonly actions: readonly Action[] }
+	/** An agent's question to its caller, through its `ask` tool. */
+	| { readonly kind: "agent_ask"; readonly runId: string; readonly node: string; readonly agent: string; readonly question: string; readonly steerable: boolean; readonly actions: readonly Action[] }
+	/** An agent ended its turn with neither a result nor a question: its final text. */
+	| { readonly kind: "ended_without_result"; readonly runId: string; readonly node: string; readonly agent: string; readonly text: string; readonly steerable: boolean; readonly actions: readonly Action[] }
 	| { readonly kind: "turn_limit"; readonly runId: string; readonly node: string; readonly agent: string; readonly used: number; readonly limit: number; readonly steerable: boolean; readonly actions: readonly Action[] }
 	| { readonly kind: "interrupted"; readonly runId: string; readonly node: string; readonly agent: string; readonly steerable: boolean; readonly actions: readonly Action[] }
-	/** An agent called an `ask`-mode MCP tool: approve it, or reject it with a reason. */
-	| { readonly kind: "approval_pending"; readonly runId: string; readonly node: string; readonly agent: string; readonly server: string; readonly tool: string; readonly args: Json; readonly actions: readonly Action[] }
+	/** A tool call in flight at a crash, not safe to make again (in an agent call, or the body's): did it take effect? Restart retries it. */
+	| { readonly kind: "outcome_unknown"; readonly runId: string; readonly node: string; readonly tool: string; readonly args: Json; readonly actions: readonly Action[] }
 	/** An orchestrator node: submit a result that matches its answer schema. */
 	| { readonly kind: "orchestrator_pending"; readonly runId: string; readonly node: string; readonly name: string; readonly input: Json; readonly artifacts: readonly ArtifactView[]; readonly actions: readonly Action[] }
 	| { readonly kind: "run_idle"; readonly runId: string; readonly reason: IdleReason; readonly actions: readonly Action[] }
@@ -78,22 +80,9 @@ export type Attention =
 	| { readonly kind: "node_failed"; readonly runId: string; readonly node: string; readonly reason: FailReason; readonly actions: readonly Action[] };
 
 /** The kinds that mean a node waits for its owner. */
-const NODE_KINDS: ReadonlySet<Attention["kind"]> = new Set(["agent_ask", "turn_limit", "interrupted", "approval_pending", "orchestrator_pending"]);
+const NODE_KINDS: ReadonlySet<Attention["kind"]> = new Set(["agent_ask", "ended_without_result", "turn_limit", "interrupted", "outcome_unknown", "orchestrator_pending"]);
 
 const TEXT = { type: "object", required: ["text"], properties: { text: { type: "string", minLength: 1 } }, additionalProperties: false } as const;
-const DECISION: Json = {
-	type: "object",
-	required: ["value"],
-	properties: {
-		value: {
-			anyOf: [
-				{ type: "object", required: ["type"], properties: { type: { const: "approve" } }, additionalProperties: false },
-				{ type: "object", required: ["type", "reason"], properties: { type: { const: "reject" }, reason: { type: "string", minLength: 1 } }, additionalProperties: false },
-			],
-		},
-	},
-	additionalProperties: false,
-};
 const q = (text: string) => `'${text.replace(/'/g, "'\\''")}'`;
 
 function nodeActions(runId: string, node: string, steerable: boolean): Action[] {
@@ -124,8 +113,15 @@ export function attention(view: RunView): Attention[] {
 				name: node.name,
 				input: node.input,
 				artifacts: artifactViews(runId, view.dir, node.input),
-				actions: [{ verb: "submit_result", args: { type: "object", required: ["value"], properties: { value: schema }, additionalProperties: false }, cli: `npx wallis submit ${runId} ${q(node.id)} '<json>'` }],
+				actions: [
+					{ verb: "submit_result", args: { type: "object", required: ["value"], properties: { value: schema }, additionalProperties: false }, cli: `npx wallis submit ${runId} ${q(node.id)} '<json>'` },
+					...nodeActions(runId, node.id, false),
+				],
 			});
+			continue;
+		}
+		if (node.type === "tool_outcome_unknown") {
+			items.push({ kind: "outcome_unknown", runId, node: node.id, tool: node.tool, args: node.input, actions: nodeActions(runId, node.id, false) });
 			continue;
 		}
 		if (node.type !== "node_idle") continue;
@@ -134,8 +130,10 @@ export function attention(view: RunView): Attention[] {
 		const others = nodeActions(runId, node.id, node.steerable);
 		switch (node.cause.type) {
 			case "question":
-			case "asked":
-				items.push({ kind: "agent_ask", ...base, via: node.cause.type === "asked" ? "ask_tool" : "end_of_turn", question: node.cause.message, steerable: node.steerable, actions: node.steerable ? [send, ...others] : others });
+				items.push({ kind: "agent_ask", ...base, question: node.cause.message, steerable: node.steerable, actions: node.steerable ? [send, ...others] : others });
+				break;
+			case "ended_without_result":
+				items.push({ kind: "ended_without_result", ...base, text: node.cause.text, steerable: node.steerable, actions: node.steerable ? [send, ...others] : others });
 				break;
 			case "turn_limit":
 				items.push({
@@ -155,15 +153,8 @@ export function attention(view: RunView): Attention[] {
 			case "interrupted":
 				items.push({ kind: "interrupted", ...base, steerable: node.steerable, actions: node.steerable ? [send, ...others] : others });
 				break;
-			case "approval":
-				items.push({
-					kind: "approval_pending",
-					...base,
-					server: node.cause.server,
-					tool: node.cause.tool,
-					args: node.cause.args,
-					actions: [{ verb: "submit_result", args: DECISION, cli: `npx wallis submit ${runId} ${q(node.id)} '{"type":"approve"}' | '{"type":"reject","reason":"..."}'` }, ...others],
-				});
+			case "outcome_unknown":
+				items.push({ kind: "outcome_unknown", runId, node: node.id, tool: node.cause.tool, args: node.cause.args, actions: others });
 				break;
 		}
 	}
@@ -202,8 +193,9 @@ export function attentionKey(item: Attention): string {
 			return `${item.runId} node ${item.node} ask ${item.question}`;
 		case "turn_limit":
 			return `${item.runId} node ${item.node} limit ${item.used}/${item.limit}`;
+		case "ended_without_result":
 		case "interrupted":
-		case "approval_pending":
+		case "outcome_unknown":
 		case "orchestrator_pending":
 			return `${item.runId} node ${item.node} ${item.kind}`;
 		case "node_failed":
@@ -279,20 +271,18 @@ export function describe(items: readonly Attention[]): string {
 			const how = [...("steerable" in item && !item.steerable ? ["  Its agent is not steerable: it takes no messages; restart or cancel it."] : []), ...item.actions.map((a) => `  ${a.verb}: ${a.cli}`)];
 			switch (item.kind) {
 				case "agent_ask":
-					return [
-						`Run ${item.runId}: node ${item.node} (${item.agent}) ${item.via === "ask_tool" ? "asks" : "ended its turn with a question"}:`,
-						...quoted(item.question),
-						...how,
-					].join("\n");
+					return [`Run ${item.runId}: node ${item.node} (${item.agent}) asks:`, ...quoted(item.question), ...how].join("\n");
+				case "ended_without_result":
+					return [`Run ${item.runId}: node ${item.node} (${item.agent}) ended its turn without a result. Its last words:`, ...quoted(item.text), ...how].join("\n");
 				case "turn_limit":
 					return [`Run ${item.runId}: node ${item.node} (${item.agent}) used ${item.used} of ${item.limit} turns without submitting; its progress is kept.`, ...how].join("\n");
 				case "interrupted":
 					return [`Run ${item.runId}: node ${item.node} (${item.agent}) was interrupted; its progress is kept. Send it a message to continue.`, ...how].join("\n");
-				case "approval_pending":
+				case "outcome_unknown":
 					return [
-						`Run ${item.runId}: node ${item.node} (${item.agent}) asks to call ${item.server}/${item.tool} with:`,
+						`Run ${item.runId}: node ${item.node} was calling ${item.tool} when the host stopped, and that call is not safe to make again. Whether it took effect is unknown. Its arguments:`,
 						...quoted(JSON.stringify(item.args, null, 2)),
-						"Approve it, or reject it with a reason (the agent sees the reason).",
+						"Check the outside world; restart to retry the call, or cancel.",
 						...how,
 					].join("\n");
 				case "orchestrator_pending":
@@ -308,7 +298,7 @@ export function describe(items: readonly Attention[]): string {
 				case "node_failed":
 					return [
 						`Run ${item.runId}: node ${item.node} failed and the workflow did not handle it: ${truncate(JSON.stringify(item.reason), RESULT_CAP)}`,
-						"Other branches go on. Restart it (completed work is kept; MCP tools and approvals it uses reach the outside again), or cancel it to accept the failure.",
+						"Other branches go on. Restart it (completed work is kept; the tools it uses reach the outside again), or cancel it to accept the failure.",
 						...how,
 					].join("\n");
 				case "finished":
@@ -342,8 +332,8 @@ export async function waitForAttention(dir: string, options: { timeoutMs?: numbe
 }
 
 /**
- * Copies a run into a new one: its whole journal (a cache), blobs and
- * session dialogues, so
+ * Copies a run into a new one: its whole journal (a cache), blobs,
+ * session dialogues and work dirs, so
  * the fork re-executes the body and every unchanged call hits. Only the
  * events that ended the source are left out. The cache is per run and its
  * forks; it is never shared implicitly with other runs.
@@ -358,8 +348,12 @@ export function forkRun(source: string, target: string): RunPaths {
 	const meta = readMeta(from);
 	if (meta) writeMeta(to, { ...meta, run_id: to.id, created: new Date().toISOString(), forked_from: { run_id: from.id, at: events.length } });
 	shareBlobs(from.dir, to.dir);
-	// Sessions' dialogues, by slot: a fork's later session calls continue from them.
-	if (existsSync(join(from.dir, "sessions"))) cpSync(join(from.dir, "sessions"), join(to.dir, "sessions"), { recursive: true });
+	// Sessions' dialogues, by slot, and the work dirs (node checkpoints, session scratch dirs):
+	// in-flight calls continue from their checkpoints and later session calls see their /w.
+	// Reflinked where the filesystem can, else copied.
+	for (const dir of ["sessions", "work"]) {
+		if (existsSync(join(from.dir, dir))) cpSync(join(from.dir, dir), join(to.dir, dir), { recursive: true, mode: constants.COPYFILE_FICLONE });
+	}
 	return to;
 }
 
@@ -469,8 +463,9 @@ export function renderTree(v: RunView): string {
 				lines.push(`${indent}${node.id}  ${node.command}  command  ${node.type === "command_done" ? `done (${node.outcome.type})` : "running"}${inbox}`);
 				break;
 			case "tool_running":
+			case "tool_outcome_unknown":
 			case "tool_done":
-				lines.push(`${indent}${node.id}  ${node.tool}  mcp tool  ${node.type === "tool_done" ? `done (${node.outcome.type})` : "running"}`);
+				lines.push(`${indent}${node.id}  ${node.tool}  tool  ${node.type === "tool_done" ? `done (${node.outcome.type})` : node.type === "tool_running" ? "running" : "outcome unknown"}`);
 				break;
 			case "orchestrator_pending":
 			case "orchestrator_done":
@@ -489,13 +484,15 @@ export function renderTree(v: RunView): string {
 						? node.type === "node_done"
 							? `done (${node.outcome.type})`
 							: "running"
-						: cause.type === "question" || cause.type === "asked"
-							? `idle (${cause.type}): ${truncate(cause.message, 80)}`
-							: cause.type === "turn_limit"
-								? `idle: turn limit ${cause.used}/${cause.limit}`
-								: cause.type === "approval"
-									? `idle: approval of ${cause.server}/${cause.tool}`
-									: "idle: interrupted";
+						: cause.type === "question"
+							? `idle (question): ${truncate(cause.message, 80)}`
+							: cause.type === "ended_without_result"
+								? `idle (ended without result): ${truncate(cause.text, 80)}`
+								: cause.type === "turn_limit"
+									? `idle: turn limit ${cause.used}/${cause.limit}`
+									: cause.type === "outcome_unknown"
+										? `idle: outcome of ${cause.tool} unknown`
+										: "idle: interrupted";
 				lines.push(`${indent}${node.id}  ${node.agent}  ${node.model}  ${status}${node.steerable ? "" : "  (not steerable)"}${inbox}`);
 			}
 		}

@@ -7,7 +7,7 @@
 //   wallis describe <workflow>               its input, agents and the questions it may ask (JSON)
 //   wallis doc                               how to write and orchestrate workflows
 //   wallis send <run> <node> <text> [--turns n]   idle: delivered; running: queued as a steer
-//   wallis submit <run> <node> '<json>'      complete an orchestrator node, or decide an approval
+//   wallis submit <run> <node> '<json>'      complete an orchestrator node (checked against its schema)
 //   wallis restart <run> <node> [note]       discard the node's progress, reissue with the note
 //   wallis cancel <run>
 //   wallis status <run> [--json]
@@ -277,7 +277,7 @@ async function main(): Promise<number> {
 			return 0;
 		}
 		case "describe": {
-			out(JSON.stringify(await describeWorkflow(resolveWorkflow(root, args[0] ?? "")), null, 2));
+			out(JSON.stringify(await describeWorkflow(resolveWorkflow(root, args[0] ?? ""), root), null, 2));
 			return 0;
 		}
 		case "doc": {
@@ -344,7 +344,7 @@ async function main(): Promise<number> {
 			}
 			const entry = { id: newMessageId(), type: "restart" as const, node, by: caller, ...(words.length > 0 ? { note: words.join(" ") } : {}), ...(turns > 0 ? { turns } : {}) };
 			await deliver(dir, entry);
-			out(`Restarted ${node} of run ${runPaths(dir).id}; the MCP tools and approvals it uses reach the outside again. To be notified: npx wallis wait ${runPaths(dir).id}`);
+			out(`Restarted ${node} of run ${runPaths(dir).id}; the tools it uses reach the outside again. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
 		case "cancel": {
@@ -354,11 +354,11 @@ async function main(): Promise<number> {
 				// One node: an agent failure for the body to handle.
 				const node = parseNodeId(values.node);
 				must(LiveNode.check(owned, node), refused);
-				if (lockHolder(runPaths(dir)) !== null) await deliver(dir, { id: newMessageId(), type: "cancel_node", node, by: caller });
-				else {
-					const refusal = applyControl(dir, { type: "node_cancelled", node, by: caller });
-					if (refusal) throw new RunRefused(refusal);
-				}
+				// Through the driver (one is started if none runs): the body goes on with the typed failure.
+				const entry = { id: newMessageId(), type: "cancel_node" as const, node, by: caller };
+				await deliver(dir, entry);
+				const refusal = refusedEntry(runPaths(dir), entry.id);
+				if (refusal) throw new RunRefused(refusal);
 				out(`Cancelled node ${node} of run ${runPaths(dir).id}.`);
 				return 0;
 			}

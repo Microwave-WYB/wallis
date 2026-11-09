@@ -47,7 +47,7 @@ test("a session's second call continues its first call's dialogue; a pending ask
 	const dir = join(tmp(), "run");
 	const asking = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "two" } });
 	const node = asking.run.nodes.find((n) => n.id === "#0:1")!;
-	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "asked", message: "Louder?" });
+	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "question", message: "Louder?" });
 	// A new host, a new executor: the dialogue is rebuilt from the checkpoint and the reply is the ask's result.
 	const done = await runWorkflow({ ...opts(dir), executor: executor(), sends: [{ node: "#0:1", text: "yes, louder" }] });
 	assert.deepEqual(done.outcome, {
@@ -69,7 +69,42 @@ test("restarting a session call rewinds the session to before that call", async 
 	});
 });
 
-test("a second call of a session while its first is in flight is refused: session_busy", async () => {
-	const done = await runWorkflow({ ...opts(join(tmp(), "run")), executor: executor(), input: { mode: "busy" } });
-	assert.deepEqual(done.outcome, { type: "done", value: { second: "session_busy" } });
+test("a call made while the session's previous call is in flight waits for it: calls run in the order they were made", async () => {
+	const dir = join(tmp(), "run");
+	const done = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "queued" } });
+	assert.deepEqual(done.outcome, { type: "done", value: { first: { heard: 1, saw_ask: false, reply: "" }, second: { heard: 2, saw_ask: false, reply: "" } } });
+	// A fork re-executes against the journal: the same ids and slots, every call a hit.
+	const { forkRun } = await import("../src/host/query.ts");
+	const fork = forkRun(dir, join(tmp(), "fork"));
+	const forked = await runWorkflow({ ...opts(fork.dir), executor: executor() });
+	assert.deepEqual(forked.outcome, done.outcome);
+});
+
+test("a session called from a parallel branch is refused (foreign_session), deterministically; its own branch may call it", async () => {
+	const done = await runWorkflow({ ...opts(join(tmp(), "run")), executor: executor(), input: { mode: "foreign" } });
+	assert.deepEqual(done.outcome, { type: "done", value: { branch: "foreign_session", after: { heard: 1, saw_ask: false, reply: "" } } });
+});
+
+test("a call after a cancelled one continues the dialogue the cancelled call left", async () => {
+	const dir = join(tmp(), "run");
+	await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "cancel" } });
+	const { appendInbox, runPaths } = await import("../src/host/store.ts");
+	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#0:1", by: "human" });
+	const done = await runWorkflow({ ...opts(dir), executor: executor() });
+	assert.deepEqual(done.outcome, {
+		type: "done",
+		value: { one: { heard: 1, saw_ask: false, reply: "" }, two: "cancelled_by_owner", three: { heard: 3, saw_ask: true, reply: "" } },
+	});
+});
+
+test("a session call whose previous dialogue is missing is refused (dialogue_missing), never started fresh", async () => {
+	const dir = join(tmp(), "run");
+	await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "two" } });
+	const { readdirSync, rmSync } = await import("node:fs");
+	for (const f of readdirSync(join(dir, "sessions"))) rmSync(join(dir, "sessions", f));
+	const { appendInbox, runPaths } = await import("../src/host/store.ts");
+	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0:1", by: "human" });
+	const done = await runWorkflow({ ...opts(dir), executor: executor() });
+	assert.equal(done.outcome?.type, "failed");
+	assert.match(JSON.stringify(done.outcome), /refused: dialogue_missing/);
 });

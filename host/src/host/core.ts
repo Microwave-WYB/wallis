@@ -23,7 +23,8 @@ export type Event =
 	| { type: "turn_limit_reached"; id: string; used: number; limit: number; usage: Usage; model: string }
 	| { type: "executor_failed"; id: string; error: string }
 	| { type: "agent_asked"; id: string; message: string; usage: Usage; model: string }
-	| { type: "approval_requested"; id: string; server: string; tool: string; args: Json; usage: Usage; model: string }
+	| { type: "call_outcome_unknown"; id: string; tool: string; args: Json; usage: Usage; model: string }
+	| { type: "previous_dialogue_missing"; id: string }
 	| { type: "turn_interrupted"; id: string; usage: Usage; model: string }
 	| { type: "tool_recorded"; id: string; call: string; result: Json }
 	| { type: "input_rejected"; id: string; field: string | null; chars: number; limit: number }
@@ -69,14 +70,14 @@ type NodeBase = { id: string; agent: string; model: string; inbox: InboxMessage[
 export type RunningNode = NodeBase & { type: "node_running" };
 /** Why an agent node waits for its owner. */
 export type IdleCause =
-	/** It ended its turn without a result: an implicit ask. */
-	| { type: "question"; message: string }
 	/** It called its `ask` tool; the reply becomes the tool's result. */
-	| { type: "asked"; message: string }
+	| { type: "question"; message: string }
+	/** It ended its turn with neither a result nor a question. */
+	| { type: "ended_without_result"; text: string }
 	| { type: "turn_limit"; used: number; limit: number }
 	| { type: "interrupted" }
-	/** It called an MCP tool in `ask` mode: the orchestrator approves or rejects it. */
-	| { type: "approval"; server: string; tool: string; args: Json };
+	/** After a crash, a tool call in flight that is not safe to make again: restart or cancel. */
+	| { type: "outcome_unknown"; tool: string; args: Json };
 export type IdleNodeState = NodeBase & { type: "node_idle"; cause: IdleCause };
 export type DoneNode = NodeBase & { type: "node_done"; outcome: { type: "submitted" } | { type: "node_failed"; failure: AgentFailure } };
 export type AgentNode = RunningNode | IdleNodeState | DoneNode;
@@ -91,11 +92,15 @@ export type CommandDone = {
 };
 export type CommandNode = CommandRunning | CommandDone;
 /** A body MCP tool call. */
-export type ToolNode = { type: "tool_running"; id: string; tool: string } | { type: "tool_done"; id: string; tool: string; outcome: { type: "tool_succeeded" } | { type: "tool_failed_with"; failure: ToolFailure } };
+export type ToolNode =
+	| { type: "tool_running"; id: string; tool: string }
+	/** In flight at a crash and not safe to reissue: restart (call it again) or cancel. */
+	| { type: "tool_outcome_unknown"; id: string; tool: string; input: Json }
+	| { type: "tool_done"; id: string; tool: string; outcome: { type: "tool_succeeded" } | { type: "tool_failed_with"; failure: ToolFailure } };
 /** An orchestrator node: completed by the orchestrator's `submit_result`. */
 export type OrchestratorNode = { type: "orchestrator_pending"; id: string; name: string; input: Json } | { type: "orchestrator_done"; id: string; name: string };
 /** What cancel and restart reach. */
-export type LiveNodeState = RunningNode | IdleNodeState | CommandRunning | Extract<ToolNode, { type: "tool_running" }>;
+export type LiveNodeState = RunningNode | IdleNodeState | CommandRunning | Exclude<ToolNode, { type: "tool_done" }> | Extract<OrchestratorNode, { type: "orchestrator_pending" }>;
 /** One call of an agent or a command; each variant carries only what is meaningful in that state. */
 export type Node = AgentNode | CommandNode | ToolNode | OrchestratorNode;
 
