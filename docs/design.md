@@ -788,10 +788,16 @@ Prototype choices:
   and the session, workspace and identity changes below; round 7 was
   opt-in ask, ended without result, unknown outcomes, body tool replay,
   orchestrator restart and cancel). Logs of earlier versions are not read.
-- The core's "issued in this session" set is filled from every effect that
-  issues a call (an exhaustive match), so a call in flight is not issued
-  again when the body runs again in the same session (round 7 fix: body
-  tool calls were missing from it).
+- The core keeps each call by its slot, as a per-kind state union
+  (`AgentCall` with `AgentHeld | AgentRunning | AgentWaiting |
+  AgentUnavailable | AgentSettled`, and likewise for commands, tools and
+  orchestrator nodes), so a state is only ever paired with its kind. A
+  running state says whether it was issued in this host session
+  (`Resumed` resets it), so a call in flight is issued again once after a
+  crash and not again when the body re-executes in the same session. Ids
+  are opaque inside the core (`RequestId`, `SessionId`, `Slot`, `Digest`);
+  a slot is made only by hashing a call. On the wire they are strings, and
+  effects name the journal key `slot`.
 - Resume order: refold; `Resumed` (pinned fields compared); `CodeChanged`
   if the bundle differs; `ExecutorChanged`, `AliasRebound`; re-execute the
   body; `BudgetRaised`, `RetryUnavailable`, answers, the inbox.

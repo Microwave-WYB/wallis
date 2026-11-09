@@ -51,7 +51,7 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		contextTokens: undefined,
 		turn: 0,
 		turnLimit: 6,
-		digest: "d",
+		slot: "d",
 		transcript: [],
 		history: null,
 		recorded: new Map(),

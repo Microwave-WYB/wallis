@@ -144,7 +144,8 @@ export type CallAgentEffect = {
 	input: Json;
 	turn: number;
 	turn_limit: number;
-	digest: string;
+	/** The call's journal slot. */
+	slot: string;
 	transcript: Message[];
 	note: string | null;
 	/** The session's dialogue before this call (a blob digest): where a new attempt starts. */
@@ -158,8 +159,8 @@ export type CallAgentEffect = {
 export type Effect =
 	| { type: "checkpoint" }
 	| CallAgentEffect
-	| { type: "run_command"; id: string; command: string; input: Json; compute_minutes: number | null; digest: string }
-	| { type: "call_tool"; id: string; tool: string; input: Json; digest: string }
+	| { type: "run_command"; id: string; command: string; input: Json; compute_minutes: number | null; slot: string }
+	| { type: "call_tool"; id: string; tool: string; input: Json; slot: string }
 	/** A body tool call in flight at a crash, not safe to repeat: step `tool_call_unknown`, so the log has it. */
 	| { type: "log_unknown_tool"; id: string }
 	| { type: "deliver"; id: string; value: Json }

@@ -2,18 +2,24 @@
 ////
 //// A run is a fold of the workflow body over its journal. The body is a
 //// deterministic program whose only interface to the world is typed
-//// requests (agent and command calls); each request affects the body only
-//// through its answer. Run memory is the body's local variables, rebuilt
-//// on replay, so the core holds no workflow state: it keeps the journal,
-//// replay matching, budget, pin, status, ownership and the interventions.
+//// requests (agent, command, tool and orchestrator calls); each request
+//// affects the body only through its answer. Run memory is the body's local
+//// variables, rebuilt on replay, so the core holds no workflow state: it
+//// keeps the calls (the journal), budget, pin, status, ownership and the
+//// interventions.
 ////
-//// Request ids are assigned by the host from the body's branch path and a
-//// per-branch counter, so they are stable across replays. A request whose
-//// id is already recorded is a replay: it must carry the same digest (else
-//// the event is refused as a path divergence) and is answered from the
-//// journal, or, if it was still in flight when the host stopped, its effect
-//// is emitted again. Replays emit no `Checkpoint`, so a resumed run's log
-//// equals an uninterrupted one.
+//// Every call the body made is kept by its slot (node, input, occurrence),
+//// with its attempts, newest first. The journal only grows: a restart opens
+//// a new attempt, a rewind adds a `Forgotten` mark, and the newest attempt
+//// is the live one. A request for a slot whose live attempt settled is a
+//// hit, answered from the journal; one whose live attempt is open is the
+//// same call (reissued after a crash if it is not issued in this host
+//// session); anything else is a new attempt. Hits emit no `Checkpoint`, so
+//// a resumed run's log equals an uninterrupted one.
+////
+//// Each kind of call has its own state union, so a state is only ever
+//// paired with its kind. Ids are typed (`ids.gleam`): strings on the wire,
+//// opaque inside the core.
 ////
 //// Interventions (answer, steer, interrupt, restart, cancel, pause) are
 //// re-checked here when they are applied, through the capabilities in
@@ -31,7 +37,7 @@ import wallis_core/capability.{
   type IdleNode, type LiveNode, type NodeFacts, type OwnedRun, type ResumableRun,
   type SteerableNode,
 }
-import wallis_core/digest
+import wallis_core/ids.{type Digest, type RequestId, type SessionId, type Slot}
 import wallis_core/types.{
   type Agent, type Effect, type Event, type FailReason, type IdleReason,
   type InboxKind, type InboxMessage, type Message, type Node, type Observation,
@@ -70,20 +76,17 @@ type Run {
     executor: Option(String),
     owner: Option(String),
     admission: Admission,
-    /// By request id (display and interventions only).
-    requests: Dict(String, Record),
-    /// The journal: a cache from slot (node, input, occurrence) to its
-    /// attempts, newest first. It only grows: a restart, a rewind or a
-    /// forget adds an attempt, and the newest is the live one.
-    journal: Dict(String, List(Attempt)),
+    /// Every call the body made, by slot: the journal and the live state.
+    calls: Dict(Slot, Call),
+    /// The slot each request id named. A call that moved to a new id keeps
+    /// the old one here; `lookup` answers only for the call's current id.
+    ids: Dict(RequestId, Slot),
     /// The slot of each session call (`<session>:<index>`) in this
     /// execution of the body: call k's slot includes call k-1's, so a
     /// session's later calls are keyed by everything before them.
-    chain: Dict(String, String),
-    /// Slots whose call was issued in this session (not logged).
-    issued: Dict(String, Nil),
-    /// A failed node the body did not handle: its id and the body's reason.
-    hold: Option(#(String, FailReason)),
+    chain: Dict(String, Slot),
+    /// A failed call the body did not handle: its slot and the body's reason.
+    hold: Option(#(Slot, FailReason)),
     spent: Spent,
     /// Newest first.
     observations: List(Observation),
@@ -92,49 +95,108 @@ type Run {
   )
 }
 
-/// One attempt at a slot. `Forgotten`: a rewind (or a forget) left the
-/// slot without a live attempt, so its next request is a new call.
-type Attempt {
-  Forgotten
-  /// Made by request `id`: open while it runs, settled with its result.
-  Tried(id: String, settled: Option(Settled))
-}
-
-/// A settled attempt: its result, the model that served it (agent calls),
-/// and the digest of the session's dialogue after it (agent calls).
-type Settled {
-  Settled(entry: Entry, served: Option(String), dialogue: Option(String))
-}
-
 type Spent {
   Spent(usd: Float, tokens: Int, turns: Int, compute_minutes: Float)
 }
 
-type Record {
-  Record(digest: String, kind: Kind, progress: Progress)
-}
-
-type Kind {
-  /// `inbox` (newest first) and `steps` (model turns so far) outlive the
-  /// call: they are what its journal entry records about its dialogue.
-  /// `allowed`: the turns this node may use (its agent's maxTurns plus the
-  /// turns granted with answers).
-  /// `session` and `index` place the call in its session; `tools` are the
-  /// MCP results journaled during the call.
-  AgentKind(
+/// A call of the body, by kind. `inbox` (newest first) lists the
+/// interventions it received. `attempts` are newest first and never empty.
+type Call {
+  /// Call `index` of the session created at `session`.
+  AgentCall(
+    id: RequestId,
     agent: String,
     input: Value,
+    session: SessionId,
+    index: Int,
     inbox: List(InboxMessage),
+    attempts: List(Attempt(AgentAttempt)),
+  )
+  CommandCall(
+    id: RequestId,
+    command: String,
+    input: Value,
+    inbox: List(InboxMessage),
+    attempts: List(Attempt(CommandState)),
+  )
+  /// A tool called by the body; `replay` says whether a call in flight at a
+  /// crash may be made again.
+  ToolCall(
+    id: RequestId,
+    tool: String,
+    input: Value,
+    replay: types.Replay,
+    attempts: List(Attempt(ToolState)),
+  )
+  OrchestratorCall(
+    id: RequestId,
+    name: String,
+    input: Value,
+    attempts: List(Attempt(OrchestratorState)),
+  )
+  /// Refused before it started (an unknown node): settled with its refusal.
+  RefusedCall(id: RequestId, refusal: Refusal)
+}
+
+/// One attempt at a call. `Forgotten`: a rewind left the slot without a
+/// live attempt, so its next request is a new attempt.
+type Attempt(state) {
+  Forgotten
+  Tried(state)
+}
+
+/// An agent attempt: the model turns it used, the turns it may use (its
+/// agent's maxTurns plus the turns granted with answers), the MCP results
+/// journaled during it, and where it is.
+type AgentAttempt {
+  AgentAttempt(
     steps: Int,
     allowed: Int,
-    session: String,
-    index: Int,
     tools: List(types.ToolResult),
+    state: AgentState,
   )
-  CommandKind(command: String, input: Value, inbox: List(InboxMessage))
-  ToolKind(tool: String, input: Value, replay: types.Replay)
-  OrchestratorKind(name: String, input: Value)
-  RefusedKind
+}
+
+type AgentState {
+  /// Held back by a pause or the budget before it is issued; `note` is the
+  /// operator note of the restart that opened it.
+  AgentHeld(reason: IdleReason, note: Option(String))
+  AgentRunning(dialogue: Dialogue, issued: Issued)
+  /// The agent asked, ended its turn, hit its turn limit, was interrupted,
+  /// or a tool call's outcome is unknown: waiting for its owner.
+  AgentWaiting(dialogue: Dialogue, model: String, cause: types.IdleCause)
+  /// The executor could not serve the call; reissued after a fix.
+  AgentUnavailable(dialogue: Dialogue, alias: String, error: String)
+  /// Its result, the model that served it, and the session's dialogue
+  /// after it (a blob digest).
+  AgentSettled(entry: Entry, served: Option(String), dialogue: Option(Digest))
+}
+
+type CommandState {
+  CommandHeld(reason: IdleReason)
+  CommandRunning(issued: Issued)
+  CommandSettled(entry: Entry)
+}
+
+type ToolState {
+  ToolHeld(reason: IdleReason)
+  ToolRunning(issued: Issued)
+  /// In flight at a crash and not safe to make again: its outcome is
+  /// unknown until its owner restarts (calls it again) or cancels it.
+  ToolInDoubt
+  ToolSettled(entry: Entry)
+}
+
+type OrchestratorState {
+  OrchestratorWaiting
+  OrchestratorSettled(entry: Entry)
+}
+
+/// Whether a running call's effect was emitted in this host session: a
+/// call in flight when the host stopped is issued again, once.
+type Issued {
+  NotIssued
+  IssuedNow
 }
 
 /// An agent call's dialogue after its input: the messages so far, the
@@ -144,26 +206,8 @@ type Dialogue {
   Dialogue(
     transcript: List(Message),
     note: Option(String),
-    checkpoint: Option(String),
+    checkpoint: Option(Digest),
   )
-}
-
-type Progress {
-  /// Held back by a pause or the budget before it is issued.
-  Blocked(reason: IdleReason, note: Option(String))
-  AwaitingAgent(dialogue: Dialogue)
-  /// The agent asked something: waiting for an answer.
-  AgentWaiting(dialogue: Dialogue, model: String, cause: types.IdleCause)
-  /// The executor could not serve the call; reissued after a fix.
-  Unavailable(dialogue: Dialogue, alias: String, error: String)
-  AwaitingCommand
-  AwaitingTool
-  /// A body tool call in flight at a crash and not safe to reissue: it waits
-  /// for its owner (restart: call it again; cancel).
-  ToolUnknown
-  /// An orchestrator node: waiting for `ResultSubmitted`.
-  AwaitingOrchestrator
-  Completed(model: Option(String))
 }
 
 type Entry {
@@ -180,6 +224,7 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
   case run, event {
     NotYetStarted, types.Started(workflow:, pin:, input:) ->
       start(workflow, pin, input)
+    // Before `Started` every event is refused: there is no run to apply it to.
     NotYetStarted, _ -> #(run, [types.Refuse(None, types.NotStarted)])
     Active(_), types.Started(..) -> #(run, [
       types.Refuse(None, types.AlreadyStarted),
@@ -187,10 +232,7 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
     Active(r), types.Resumed(pin:) ->
       case capability.check_pin(r.pin, pin) {
         Error(refusal) -> #(run, [types.Refuse(None, refusal)])
-        Ok(resumable) -> #(
-          Active(Run(..r, issued: dict.new())),
-          resume(r, resumable),
-        )
+        Ok(resumable) -> #(Active(unissued(r)), resume(r, resumable))
       }
     // Ownership and host facts change even on a finished run.
     Active(r), types.Claimed(owner:) -> #(Active(Run(..r, owner: Some(owner))), [
@@ -199,10 +241,12 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
     Active(r), types.Noted(key:, value:) -> #(Active(note(r, key, value)), [
       types.Checkpoint,
     ])
+    // Every other event of a live run: `live_event` matches each one.
     Active(Run(lifecycle: Live, ..) as r), _ -> {
       let #(r, effects) = live_event(r, event)
-      #(Active(issued(r, effects)), effects)
+      #(Active(r), effects)
     }
+    // A finished run takes only ownership and host facts (above).
     Active(_), _ -> #(run, [types.Refuse(None, types.NotRunning)])
   }
 }
@@ -231,27 +275,24 @@ fn start(
       types.Refuse(None, types.InvalidDeclaration(reason)),
     ])
     Ok(Nil) -> #(
-      Active(
-        Run(
-          lifecycle: Live,
-          workflow:,
-          pin:,
-          input:,
-          models: pin.models,
-          budget: workflow.budget,
-          executor: None,
-          owner: None,
-          admission: Admitting,
-          requests: dict.new(),
-          journal: dict.new(),
-          chain: dict.new(),
-          issued: dict.new(),
-          hold: None,
-          spent: Spent(0.0, 0, 0, 0.0),
-          observations: [],
-          facts: dict.new(),
-        ),
-      ),
+      Active(Run(
+        lifecycle: Live,
+        workflow:,
+        pin:,
+        input:,
+        models: pin.models,
+        budget: workflow.budget,
+        executor: None,
+        owner: None,
+        admission: Admitting,
+        calls: dict.new(),
+        ids: dict.new(),
+        chain: dict.new(),
+        hold: None,
+        spent: Spent(0.0, 0, 0, 0.0),
+        observations: [],
+        facts: dict.new(),
+      )),
       [types.Checkpoint],
     )
   }
@@ -277,12 +318,50 @@ fn resume(run: Run, _resumable: ResumableRun) -> List(Effect) {
   }
 }
 
+/// A new host session: nothing in flight has been issued by it yet.
+fn unissued(run: Run) -> Run {
+  let calls =
+    dict.map_values(run.calls, fn(_, call) {
+      case call {
+        AgentCall(attempts: [Tried(a), ..older], ..) ->
+          case a.state {
+            AgentRunning(dialogue:, ..) ->
+              AgentCall(..call, attempts: [
+                Tried(
+                  AgentAttempt(..a, state: AgentRunning(dialogue, NotIssued)),
+                ),
+                ..older
+              ])
+            AgentHeld(..)
+            | AgentWaiting(..)
+            | AgentUnavailable(..)
+            | AgentSettled(..) -> call
+          }
+        CommandCall(attempts: [Tried(CommandRunning(_)), ..older], ..) ->
+          CommandCall(..call, attempts: [
+            Tried(CommandRunning(NotIssued)),
+            ..older
+          ])
+        ToolCall(attempts: [Tried(ToolRunning(_)), ..older], ..) ->
+          ToolCall(..call, attempts: [Tried(ToolRunning(NotIssued)), ..older])
+        // Nothing in flight: nothing to issue again.
+        AgentCall(..)
+        | CommandCall(..)
+        | ToolCall(..)
+        | OrchestratorCall(..)
+        | RefusedCall(..) -> call
+      }
+    })
+  Run(..run, calls:)
+}
+
 // --- Events on a live run ------------------------------------------------------
 
 fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
+  let rid = ids.request_id
   case event {
     types.Requested(id:, request:, node_digest:, occurrence:) ->
-      requested(run, id, request, node_digest, occurrence)
+      requested(run, rid(id), request, ids.digest(node_digest), occurrence)
     types.CodeChanged(from:, to:) -> #(
       Run(
         ..run,
@@ -295,77 +374,80 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       [types.Checkpoint],
     )
     types.AgentReturned(id:, output:, usage:, model:) ->
-      agent_settled(run, id, usage, model, fn(_) { Answered(output) })
+      agent_settled(run, rid(id), usage, model, fn(_) { Answered(output) })
     types.AgentFailed(id:, failure:, usage:, model:) ->
-      agent_settled(run, id, usage, model, fn(name) {
+      agent_settled(run, rid(id), usage, model, fn(name) {
         Errored(types.AgentGaveUp(name, failure))
       })
     types.AgentAsked(id:, message:, usage:, model:) ->
-      agent_idle(run, id, fn(_) { types.Question(message) }, usage, model)
+      agent_idle(
+        run,
+        rid(id),
+        fn(_, _) { types.Question(message) },
+        usage,
+        model,
+      )
     types.CallOutcomeUnknown(id:, tool:, args:, usage:, model:) ->
       agent_idle(
         run,
-        id,
-        fn(_) { types.OutcomeUnknown(tool, args) },
+        rid(id),
+        fn(_, _) { types.OutcomeUnknown(tool, args) },
         usage,
         model,
       )
     types.PreviousDialogueMissing(id:) ->
-      agent_settled(run, id, types.Usage(0.0, 0, 0), "", fn(_) {
+      agent_settled(run, rid(id), no_usage(), "", fn(_) {
         Refused(types.DialogueMissing(id))
       })
+    types.AgentProgressed(id:, dialogue:) ->
+      progressed(run, rid(id), ids.digest(dialogue))
     types.TurnInterrupted(id:, usage:, model:) ->
-      agent_idle(run, id, fn(_) { types.Interrupted }, usage, model)
+      agent_idle(run, rid(id), fn(_, _) { types.Interrupted }, usage, model)
     types.ToolRecorded(id:, call:, result:) ->
-      tool_recorded(run, id, call, result)
+      tool_recorded(run, rid(id), call, result)
     types.ToolReturned(id:, output:) ->
-      tool_settled(run, id, fn(_) { Answered(output) })
-    types.ToolCallUnknown(id:) -> tool_unknown(run, id)
+      tool_settled(run, rid(id), fn(_) { Answered(output) })
+    types.ToolCallUnknown(id:) -> tool_unknown(run, rid(id))
     types.ToolFailed(id:, failure:) ->
-      tool_settled(run, id, fn(name) {
+      tool_settled(run, rid(id), fn(name) {
         Errored(types.ToolCrashed(name, failure))
       })
     types.ResultSubmitted(node:, value:, by:) ->
       intervene(run, by, fn(owned) {
         use node <- result.try(capability.check_submittable(
           owned,
-          node,
-          facts(run, node),
+          rid(node),
+          node_facts(run, rid(node)),
         ))
         submit(run, node, value)
       })
     types.InputRejected(id:, field:, chars:, limit:) ->
-      agent_settled(run, id, types.Usage(0.0, 0, 0), "", fn(name) {
+      agent_settled(run, rid(id), no_usage(), "", fn(name) {
         Refused(types.InputTooLarge(name, field, chars, limit))
       })
     types.AgentIdle(id:, message:, usage:, model:) ->
       agent_idle(
         run,
-        id,
-        fn(_) { types.EndedWithoutResult(message) },
+        rid(id),
+        fn(_, _) { types.EndedWithoutResult(message) },
         usage,
         model,
       )
     types.TurnLimitReached(id:, usage:, model:, ..) ->
       agent_idle(
         run,
-        id,
-        fn(kind) {
-          case kind {
-            AgentKind(steps:, allowed:, ..) -> types.TurnLimit(steps, allowed)
-            _ -> types.TurnLimit(0, 0)
-          }
-        },
+        rid(id),
+        fn(steps, allowed) { types.TurnLimit(steps, allowed) },
         usage,
         model,
       )
-    types.ExecutorFailed(id:, error:) -> executor_failed(run, id, error)
+    types.ExecutorFailed(id:, error:) -> executor_failed(run, rid(id), error)
     types.CommandReturned(id:, output:, minutes:) ->
-      command_settled(run, id, fn(_) { Answered(output) }, minutes)
+      command_settled(run, rid(id), fn(_) { Answered(output) }, minutes)
     types.CommandFailed(id:, failure:, minutes:) ->
       command_settled(
         run,
-        id,
+        rid(id),
         fn(name) { Errored(types.CommandCrashed(name, failure)) },
         minutes,
       )
@@ -374,8 +456,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       intervene(run, by, fn(owned) {
         use idle <- result.map(capability.check_idle(
           owned,
-          node,
-          facts(run, node),
+          rid(node),
+          node_facts(run, rid(node)),
         ))
         answer(run, idle, text, turns)
       })
@@ -383,8 +465,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       intervene(run, by, fn(owned) {
         use node <- result.map(capability.check_steerable(
           owned,
-          node,
-          facts(run, node),
+          rid(node),
+          node_facts(run, rid(node)),
         ))
         steer(run, node, text)
       })
@@ -392,8 +474,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       intervene(run, by, fn(owned) {
         use node <- result.map(capability.check_steerable(
           owned,
-          node,
-          facts(run, node),
+          rid(node),
+          node_facts(run, rid(node)),
         ))
         let id = capability.steerable_id(node)
         #(add_inbox(run, id, types.Interrupt, ""), [types.Checkpoint])
@@ -402,8 +484,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       intervene(run, by, fn(owned) {
         use node <- result.try(capability.check_live(
           owned,
-          node,
-          facts(run, node),
+          rid(node),
+          node_facts(run, rid(node)),
         ))
         restart(run, node, note, turns)
       })
@@ -411,8 +493,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       intervene(run, by, fn(owned) {
         use node <- result.map(capability.check_live(
           owned,
-          node,
-          facts(run, node),
+          rid(node),
+          node_facts(run, rid(node)),
         ))
         cancel_node(run, node)
       })
@@ -446,11 +528,19 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       types.Checkpoint,
     ])
     types.Noted(key:, value:) -> #(note(run, key, value), [types.Checkpoint])
-    types.AgentProgressed(id:, dialogue:) -> progressed(run, id, dialogue)
     types.BodyFinished(output:) -> finish(run, types.Done(output))
     types.BodyFailed(reason:) -> body_failed(run, reason)
+    // Handled by `step` before a live run sees them.
     types.Started(..) | types.Resumed(..) -> #(run, [])
   }
+}
+
+fn no_usage() -> Usage {
+  types.Usage(0.0, 0, 0)
+}
+
+fn note(run: Run, key: String, value: Value) -> Run {
+  Run(..run, facts: dict.insert(run.facts, key, value))
 }
 
 /// Applies an intervention only with an `OwnedRun`; any failed check is the
@@ -473,8 +563,9 @@ fn intervene(
 fn body_failed(run: Run, reason: FailReason) -> #(Run, List(Effect)) {
   case run.hold {
     Some(_) -> #(run, [])
-    None ->
-      case leaf(reason) {
+    None -> {
+      let failure = leaf(reason)
+      case failure {
         types.AgentGaveUp(failure: types.CancelledByOwner, ..)
         | types.CommandCrashed(failure: types.CommandCancelled, ..)
         | types.ToolCrashed(failure: types.ToolCancelled, ..)
@@ -482,29 +573,37 @@ fn body_failed(run: Run, reason: FailReason) -> #(Run, List(Effect)) {
         | types.ToolCrashed(failure: types.ToolUnknownOutcome, ..)
         | types.OrchestratorCancelled(..)
         | types.BodyError(..) -> finish(run, types.Failed(reason))
-        failure ->
-          case failed_node(run, failure) {
-            Ok(id) -> #(Run(..run, hold: Some(#(id, reason))), [
+        types.AgentGaveUp(..)
+        | types.CommandCrashed(..)
+        | types.ToolCrashed(..)
+        | types.WorkflowFailed(..) ->
+          case failed_call(run, failure) {
+            Ok(slot) -> #(Run(..run, hold: Some(#(slot, reason))), [
               types.Checkpoint,
             ])
             Error(Nil) -> finish(run, types.Failed(reason))
           }
       }
+    }
   }
 }
 
 fn leaf(reason: FailReason) -> FailReason {
   case reason {
     types.WorkflowFailed(reason:, ..) -> leaf(reason)
-    _ -> reason
+    types.BodyError(..)
+    | types.AgentGaveUp(..)
+    | types.CommandCrashed(..)
+    | types.ToolCrashed(..)
+    | types.OrchestratorCancelled(..) -> reason
   }
 }
 
-/// The first node, by id, that failed with this reason.
-fn failed_node(run: Run, failure: FailReason) -> Result(String, Nil) {
-  sorted_requests(run)
+/// The first call, by request id, whose live attempt failed with this reason.
+fn failed_call(run: Run, failure: FailReason) -> Result(Slot, Nil) {
+  sorted_calls(run)
   |> list.find_map(fn(e) {
-    case live_entry(run, { e.1 }.digest) {
+    case live_entry(e.1) {
       Ok(Errored(f)) if f == failure -> Ok(e.0)
       Ok(Errored(_)) | Ok(Answered(_)) | Ok(Refused(_)) | Error(Nil) ->
         Error(Nil)
@@ -539,251 +638,322 @@ fn observe(
   }
 }
 
+// --- Calls and the journal -----------------------------------------------------
+
+fn call_id(call: Call) -> RequestId {
+  case call {
+    AgentCall(id:, ..)
+    | CommandCall(id:, ..)
+    | ToolCall(id:, ..)
+    | OrchestratorCall(id:, ..)
+    | RefusedCall(id:, ..) -> id
+  }
+}
+
+fn with_id(call: Call, id: RequestId) -> Call {
+  case call {
+    AgentCall(..) -> AgentCall(..call, id:)
+    CommandCall(..) -> CommandCall(..call, id:)
+    ToolCall(..) -> ToolCall(..call, id:)
+    OrchestratorCall(..) -> OrchestratorCall(..call, id:)
+    RefusedCall(..) -> RefusedCall(..call, id:)
+  }
+}
+
+/// Where a call's live attempt is, whatever its kind.
+type Live {
+  /// Settled: a request for its slot is answered from the journal.
+  LiveSettled(Entry)
+  /// Not settled: in flight, waiting or held back.
+  LiveOpen
+  /// Forgotten (or never tried): its next request is a new attempt.
+  LiveForgotten
+}
+
+fn live_of(
+  attempts: List(Attempt(state)),
+  settled: fn(state) -> Option(Entry),
+) -> Live {
+  case attempts {
+    [Tried(state), ..] ->
+      case settled(state) {
+        Some(entry) -> LiveSettled(entry)
+        None -> LiveOpen
+      }
+    [Forgotten, ..] | [] -> LiveForgotten
+  }
+}
+
+fn live(call: Call) -> Live {
+  case call {
+    AgentCall(attempts:, ..) ->
+      live_of(attempts, fn(a) {
+        case a.state {
+          AgentSettled(entry:, ..) -> Some(entry)
+          AgentHeld(..)
+          | AgentRunning(..)
+          | AgentWaiting(..)
+          | AgentUnavailable(..) -> None
+        }
+      })
+    CommandCall(attempts:, ..) ->
+      live_of(attempts, fn(s) {
+        case s {
+          CommandSettled(entry) -> Some(entry)
+          CommandHeld(..) | CommandRunning(..) -> None
+        }
+      })
+    ToolCall(attempts:, ..) ->
+      live_of(attempts, fn(s) {
+        case s {
+          ToolSettled(entry) -> Some(entry)
+          ToolHeld(..) | ToolRunning(..) | ToolInDoubt -> None
+        }
+      })
+    OrchestratorCall(attempts:, ..) ->
+      live_of(attempts, fn(s) {
+        case s {
+          OrchestratorSettled(entry) -> Some(entry)
+          OrchestratorWaiting -> None
+        }
+      })
+    RefusedCall(refusal:, ..) -> LiveSettled(Refused(refusal))
+  }
+}
+
+fn live_entry(call: Call) -> Result(Entry, Nil) {
+  case live(call) {
+    LiveSettled(entry) -> Ok(entry)
+    LiveOpen | LiveForgotten -> Error(Nil)
+  }
+}
+
+/// Records a call at its slot, under its current request id.
+fn put(run: Run, slot: Slot, call: Call) -> Run {
+  Run(
+    ..run,
+    calls: dict.insert(run.calls, slot, call),
+    ids: dict.insert(run.ids, call_id(call), slot),
+  )
+}
+
+/// The call a request id names now (an id a call moved away from names none).
+fn lookup(run: Run, id: RequestId) -> Result(#(Slot, Call), Nil) {
+  use slot <- result.try(dict.get(run.ids, id))
+  use call <- result.try(dict.get(run.calls, slot))
+  case call_id(call) == id {
+    True -> Ok(#(slot, call))
+    False -> Error(Nil)
+  }
+}
+
+fn sorted_calls(run: Run) -> List(#(Slot, Call)) {
+  run.calls
+  |> dict.to_list
+  |> list.sort(fn(a, b) { ids.compare_requests(call_id(a.1), call_id(b.1)) })
+}
+
+/// The live attempt of an agent call, changed.
+fn update_agent(call: Call, f: fn(AgentAttempt) -> AgentAttempt) -> Call {
+  case call {
+    AgentCall(attempts: [Tried(a), ..older], ..) ->
+      AgentCall(..call, attempts: [Tried(f(a)), ..older])
+    // Nothing live to change.
+    AgentCall(attempts: [Forgotten, ..], ..)
+    | AgentCall(attempts: [], ..)
+    | CommandCall(..)
+    | ToolCall(..)
+    | OrchestratorCall(..)
+    | RefusedCall(..) -> call
+  }
+}
+
+/// The live attempt of an agent call.
+fn agent_attempt(call: Call) -> Result(AgentAttempt, Nil) {
+  case call {
+    AgentCall(attempts: [Tried(a), ..], ..) -> Ok(a)
+    AgentCall(attempts: [Forgotten, ..], ..)
+    | AgentCall(attempts: [], ..)
+    | CommandCall(..)
+    | ToolCall(..)
+    | OrchestratorCall(..)
+    | RefusedCall(..) -> Error(Nil)
+  }
+}
+
+/// The live attempt settles (a forgotten head gets a settled attempt).
+fn replace_head(attempts: List(Attempt(s)), state: s) -> List(Attempt(s)) {
+  case attempts {
+    [Tried(_), ..older] -> [Tried(state), ..older]
+    [Forgotten, ..] | [] -> [Tried(state), ..attempts]
+  }
+}
+
 // --- Requests ------------------------------------------------------------------
 
-/// The journal slot of a call: the node's definition digest, the request
-/// and its canonical input, and its occurrence in this execution of the
-/// body. A session call's slot also includes its previous call's slot, so
-/// it depends on the whole dialogue before it.
-fn slot_of(
-  node_digest: String,
-  request: Request,
-  previous: Option(String),
-  occurrence: Int,
-) -> String {
+fn chain_key(session: SessionId, index: Int) -> String {
+  ids.session_text(session) <> ":" <> int.to_string(index)
+}
+
+/// The slot of the previous call in a session call's session.
+fn previous_of(run: Run, request: Request) -> Option(Slot) {
+  case request {
+    types.Call(session:, index:, ..) if index > 0 ->
+      dict.get(run.chain, chain_key(ids.session_id(session), index - 1))
+      |> option.from_result
+    types.Call(..)
+    | types.Command(..)
+    | types.Tool(..)
+    | types.Orchestrator(..) -> None
+  }
+}
+
+/// The journal slot of a request: see `ids.slot`. A session call's slot
+/// includes its previous call's slot, so it depends on the whole dialogue
+/// before it.
+fn slot_of(run: Run, node: Digest, request: Request, occurrence: Int) -> Slot {
   let #(kind, name, body) = case request {
     types.Call(agent:, input:, ..) -> #("call", agent, input)
     types.Command(command:, input:) -> #("command", command, input)
     types.Tool(tool:, input:, ..) -> #("tool", tool, input)
     types.Orchestrator(name:, input:) -> #("orchestrator", name, input)
   }
-  digest.hex(string.join(
-    [
-      node_digest,
-      kind,
-      name,
-      value.canonical(body),
-      option.unwrap(previous, ""),
-    ],
-    "\n",
-  ))
-  <> "#"
-  <> int.to_string(occurrence)
+  ids.slot(node, kind, name, body, previous_of(run, request), occurrence)
 }
 
-fn chain_key(session: String, index: Int) -> String {
-  session <> ":" <> int.to_string(index)
-}
-
-/// The slot of the previous call in a session call's session.
-fn previous_of(run: Run, request: Request) -> Option(String) {
-  case request {
-    types.Call(session:, index:, ..) if index > 0 ->
-      dict.get(run.chain, chain_key(session, index - 1)) |> option.from_result
-    _ -> None
-  }
-}
-
-/// The journal is a cache. A slot with a result is a hit: answered, not
-/// logged. A slot with a call in flight or waiting is the same call (its
-/// record moves to this request id, and that move is logged). Anything
-/// else is a new call.
+/// The journal is a cache. A slot whose live attempt settled is a hit:
+/// answered, not logged. A slot whose live attempt is open is the same call
+/// (it moves to this request id, and that move is logged). Anything else is
+/// a new attempt.
 fn requested(
   run: Run,
-  id: String,
+  id: RequestId,
   request: Request,
-  node_digest: String,
+  node: Digest,
   occurrence: Int,
 ) -> #(Run, List(Effect)) {
-  let slot =
-    slot_of(node_digest, request, previous_of(run, request), occurrence)
+  let slot = slot_of(run, node, request, occurrence)
   let run = case request {
     types.Call(session:, index:, ..) ->
-      Run(..run, chain: dict.insert(run.chain, chain_key(session, index), slot))
-    _ -> run
+      Run(
+        ..run,
+        chain: dict.insert(
+          run.chain,
+          chain_key(ids.session_id(session), index),
+          slot,
+        ),
+      )
+    types.Command(..) | types.Tool(..) | types.Orchestrator(..) -> run
   }
-  case live_attempt(run, slot) {
-    Tried(settled: Some(settled), ..) -> #(run, [
-      answer_effect(id, settled.entry),
-    ])
-    Tried(id: old, settled: None) ->
-      case dict.get(run.requests, old) {
-        Ok(record) -> {
-          let moved = old != id
-          let run = case moved {
-            False -> run
-            True ->
-              Run(
-                ..run,
-                requests: run.requests
-                  |> dict.delete(old)
-                  |> dict.insert(id, record),
-                journal: rebind_attempt(run.journal, slot, id),
-              )
-          }
-          let #(run, effects) = reissue(run, id, slot, record)
+  case dict.get(run.calls, slot) {
+    Error(Nil) -> new_attempt(run, id, slot, request, [])
+    Ok(call) ->
+      case live(call) {
+        LiveSettled(entry) -> #(run, [answer_effect(id, entry)])
+        LiveOpen -> {
+          let moved = call_id(call) != id
+          let run = put(run, slot, with_id(call, id))
+          let #(run, effects) = reissue(run, slot)
           case moved {
             True -> #(run, [types.Checkpoint, ..effects])
             False -> #(run, effects)
           }
         }
-        Error(Nil) -> new_request(run, id, slot, request)
+        LiveForgotten -> new_attempt(run, id, slot, request, [call])
       }
-    Forgotten -> new_request(run, id, slot, request)
   }
 }
 
-fn new_request(
+fn new_attempt(
   run: Run,
-  id: String,
-  slot: String,
+  id: RequestId,
+  slot: Slot,
   request: Request,
+  prior: List(Call),
 ) -> #(Run, List(Effect)) {
-  let run = open_attempt(run, slot, id)
-  let #(run, effects) = live_request(run, id, slot, request)
+  let #(run, effects) = begin(run, id, slot, request, prior)
   #(run, [types.Checkpoint, ..effects])
 }
 
-// --- The journal ---------------------------------------------------------------
-
-/// The newest attempt at a slot; a slot never tried is like a forgotten one.
-fn live_attempt(run: Run, slot: String) -> Attempt {
-  case dict.get(run.journal, slot) {
-    Ok([newest, ..]) -> newest
-    Ok([]) | Error(Nil) -> Forgotten
+/// A call in flight and requested again: re-emitted only if it was not
+/// issued in this host session (it was in flight at a crash). Waiting calls
+/// wait for the events that unblock them (`Sent`, `BudgetRaised`,
+/// `RetryUnavailable`).
+fn reissue(run: Run, slot: Slot) -> #(Run, List(Effect)) {
+  case dict.get(run.calls, slot) {
+    Error(Nil) -> #(run, [])
+    Ok(call) ->
+      case call {
+        AgentCall(
+          attempts: [
+            Tried(AgentAttempt(state: AgentRunning(d, NotIssued), ..)),
+            ..
+          ],
+          ..,
+        ) ->
+          case call_effect(run, slot, call, d) {
+            Ok(effect) -> #(put(run, slot, mark_issued(call)), [effect])
+            Error(_) -> #(run, [])
+          }
+        CommandCall(attempts: [Tried(CommandRunning(NotIssued)), ..older], ..) -> #(
+          put(
+            run,
+            slot,
+            CommandCall(..call, attempts: [
+              Tried(CommandRunning(IssuedNow)),
+              ..older
+            ]),
+          ),
+          [command_effect(run, slot, call)],
+        )
+        // A body tool call in flight at a crash: made again only if safe;
+        // otherwise its outcome is unknown, and that is logged.
+        ToolCall(
+          attempts: [Tried(ToolRunning(NotIssued)), ..older],
+          replay:,
+          ..,
+        ) -> {
+          let run =
+            put(
+              run,
+              slot,
+              ToolCall(..call, attempts: [
+                Tried(ToolRunning(IssuedNow)),
+                ..older
+              ]),
+            )
+          case replay {
+            types.ReplaySafe -> #(run, [tool_effect(slot, call)])
+            types.ReplayNever -> #(run, [
+              types.LogUnknownTool(ids.request_text(call.id)),
+            ])
+          }
+        }
+        // Issued in this session, waiting, held back or settled: nothing to issue.
+        AgentCall(..)
+        | CommandCall(..)
+        | ToolCall(..)
+        | OrchestratorCall(..)
+        | RefusedCall(..) -> #(run, [])
+      }
   }
 }
 
-/// The live result of a slot, if its newest attempt settled.
-fn live_entry(run: Run, slot: String) -> Result(Entry, Nil) {
-  case live_attempt(run, slot) {
-    Tried(settled: Some(settled), ..) -> Ok(settled.entry)
-    Tried(settled: None, ..) | Forgotten -> Error(Nil)
-  }
-}
-
-fn push_attempt(run: Run, slot: String, attempt: Attempt) -> Run {
-  let attempts = dict.get(run.journal, slot) |> result.unwrap([])
-  Run(..run, journal: dict.insert(run.journal, slot, [attempt, ..attempts]))
-}
-
-/// A new attempt at a slot, made by request `id`.
-fn open_attempt(run: Run, slot: String, id: String) -> Run {
-  push_attempt(run, slot, Tried(id, None))
-}
-
-/// A rewind: the slot keeps its attempts, and has no live one.
-fn forget(run: Run, slot: String) -> Run {
-  case live_attempt(run, slot) {
-    Forgotten -> run
-    Tried(..) -> push_attempt(run, slot, Forgotten)
-  }
-}
-
-/// The open attempt moves to the request id that asked for it now.
-fn rebind_attempt(
-  journal: Dict(String, List(Attempt)),
-  slot: String,
-  id: String,
-) -> Dict(String, List(Attempt)) {
-  case dict.get(journal, slot) {
-    Ok([Tried(settled: None, ..), ..older]) ->
-      dict.insert(journal, slot, [Tried(id, None), ..older])
-    // Only an open attempt moves; `requested` checked that it is one.
-    Ok([Tried(settled: Some(_), ..), ..]) | Ok([Forgotten, ..]) | Ok([]) | Error(
-      Nil,
-    ) -> journal
-  }
-}
-
-/// The newest attempt settles; a slot without an open attempt gets one.
-fn close_attempt(run: Run, slot: String, id: String, settled: Settled) -> Run {
-  let attempts = dict.get(run.journal, slot) |> result.unwrap([])
-  let attempts = case attempts {
-    [Tried(settled: None, ..), ..older] -> [Tried(id, Some(settled)), ..older]
-    [Tried(settled: Some(_), ..), ..] | [Forgotten, ..] | [] -> [
-      Tried(id, Some(settled)),
-      ..attempts
-    ]
-  }
-  Run(..run, journal: dict.insert(run.journal, slot, attempts))
-}
-
-/// Every call issued by these effects, so a replay in the same session does
-/// not issue it again.
-fn issued(run: Run, effects: List(Effect)) -> Run {
-  list.fold(effects, run, fn(run, e) {
-    case issued_slot(e) {
-      Some(slot) -> Run(..run, issued: dict.insert(run.issued, slot, Nil))
-      None -> run
+fn mark_issued(call: Call) -> Call {
+  update_agent(call, fn(a) {
+    case a.state {
+      AgentRunning(dialogue:, ..) ->
+        AgentAttempt(..a, state: AgentRunning(dialogue, IssuedNow))
+      AgentHeld(..)
+      | AgentWaiting(..)
+      | AgentUnavailable(..)
+      | AgentSettled(..) -> a
     }
   })
 }
 
-/// The journal slot a call effect issues. Every effect is listed: a new kind
-/// must say here whether it issues a call. (An effect's `digest` field is
-/// its slot.)
-fn issued_slot(effect: Effect) -> Option(String) {
-  case effect {
-    types.CallAgent(digest:, ..)
-    | types.RunCommand(digest:, ..)
-    | types.CallTool(digest:, ..) -> Some(digest)
-    types.Checkpoint
-    | types.LogUnknownTool(..)
-    | types.Deliver(..)
-    | types.Fail(..)
-    | types.Refuse(..)
-    | types.Finish(..) -> None
-  }
-}
-
-/// A call already recorded and requested again: re-emitted only if it was in
-/// flight and not yet issued in this session (after a crash); waiting calls
-/// wait for the events that unblock them (`Sent`, `BudgetRaised`,
-/// `RetryUnavailable`).
-fn reissue(
-  run: Run,
-  id: String,
-  slot: String,
-  record: Record,
-) -> #(Run, List(Effect)) {
-  case dict.has_key(run.issued, slot) {
-    True -> #(run, [])
-    False -> {
-      let effects = case record.progress, record.kind {
-        AwaitingAgent(dialogue:), AgentKind(agent:, input:, ..) ->
-          case call_effect(run, id, agent, input, slot, dialogue) {
-            Ok(call) -> [call]
-            Error(_) -> []
-          }
-        AwaitingCommand, CommandKind(command:, input:, ..) -> [
-          command_effect(run, id, command, input, slot),
-        ]
-        // A body tool call in flight at a crash: made again only if safe;
-        // otherwise its outcome is unknown, and that is logged.
-        AwaitingTool, ToolKind(tool:, input:, replay: types.ReplaySafe) -> [
-          types.CallTool(id:, tool:, input:, digest: slot),
-        ]
-        AwaitingTool, ToolKind(replay: types.ReplayNever, ..) -> [
-          types.LogUnknownTool(id),
-        ]
-        // Waiting for an event that unblocks it, or settled: nothing to issue.
-        Blocked(..), _
-        | AgentWaiting(..), _
-        | Unavailable(..), _
-        | ToolUnknown, _
-        | AwaitingOrchestrator, _
-        | Completed(..), _
-        -> []
-        // An awaiting progress is only ever recorded with its own kind.
-        AwaitingAgent(..), _ | AwaitingCommand, _ | AwaitingTool, _ -> []
-      }
-      #(run, effects)
-    }
-  }
-}
-
-fn answer_effect(id: String, entry: Entry) -> Effect {
+fn answer_effect(id: RequestId, entry: Entry) -> Effect {
+  let id = ids.request_text(id)
   case entry {
     Answered(v) -> types.Deliver(id, v)
     Errored(reason) -> types.Fail(id, reason)
@@ -791,99 +961,168 @@ fn answer_effect(id: String, entry: Entry) -> Effect {
   }
 }
 
-fn live_request(
+fn refuse_call(
   run: Run,
-  id: String,
-  d: String,
+  id: RequestId,
+  slot: Slot,
+  refusal: Refusal,
+) -> #(Run, List(Effect)) {
+  #(put(run, slot, RefusedCall(id, refusal)), [
+    answer_effect(id, Refused(refusal)),
+  ])
+}
+
+/// The attempts of an earlier call at the slot, of this kind.
+fn prior_agent(prior: List(Call)) -> List(Attempt(AgentAttempt)) {
+  case prior {
+    [AgentCall(attempts:, ..), ..] -> attempts
+    [CommandCall(..), ..]
+    | [ToolCall(..), ..]
+    | [OrchestratorCall(..), ..]
+    | [RefusedCall(..), ..]
+    | [] -> []
+  }
+}
+
+fn prior_command(prior: List(Call)) -> List(Attempt(CommandState)) {
+  case prior {
+    [CommandCall(attempts:, ..), ..] -> attempts
+    [AgentCall(..), ..]
+    | [ToolCall(..), ..]
+    | [OrchestratorCall(..), ..]
+    | [RefusedCall(..), ..]
+    | [] -> []
+  }
+}
+
+fn prior_tool(prior: List(Call)) -> List(Attempt(ToolState)) {
+  case prior {
+    [ToolCall(attempts:, ..), ..] -> attempts
+    [AgentCall(..), ..]
+    | [CommandCall(..), ..]
+    | [OrchestratorCall(..), ..]
+    | [RefusedCall(..), ..]
+    | [] -> []
+  }
+}
+
+fn prior_orchestrator(prior: List(Call)) -> List(Attempt(OrchestratorState)) {
+  case prior {
+    [OrchestratorCall(attempts:, ..), ..] -> attempts
+    [AgentCall(..), ..]
+    | [CommandCall(..), ..]
+    | [ToolCall(..), ..]
+    | [RefusedCall(..), ..]
+    | [] -> []
+  }
+}
+
+/// A new attempt at a slot (`prior`: the call there, if a rewind left it).
+fn begin(
+  run: Run,
+  id: RequestId,
+  slot: Slot,
   request: Request,
+  prior: List(Call),
 ) -> #(Run, List(Effect)) {
   case request {
     types.Call(agent: name, input:, session:, index:) ->
       case find_agent(run.workflow, name) {
-        Error(Nil) ->
-          settle(
-            run,
-            id,
-            Record(d, RefusedKind, Completed(None)),
-            Refused(types.UnknownAgent(name)),
-          )
+        Error(Nil) -> refuse_call(run, id, slot, types.UnknownAgent(name))
         Ok(agent) -> {
-          let kind =
-            AgentKind(name, input, [], 0, agent.max_turns, session, index, [])
+          let call = fn(state) {
+            AgentCall(
+              id:,
+              agent: name,
+              input:,
+              session: ids.session_id(session),
+              index:,
+              inbox: [],
+              attempts: [
+                Tried(AgentAttempt(0, agent.max_turns, [], state)),
+                ..prior_agent(prior)
+              ],
+            )
+          }
           case admit(run) {
             Error(reason) -> #(
-              record(run, id, Record(d, kind, Blocked(reason, None))),
+              put(run, slot, call(AgentHeld(reason, None))),
               [],
             )
             Ok(Nil) -> {
-              let dialogue = Dialogue([], None, None)
+              let d = Dialogue([], None, None)
               // Recorded first: the effect reads the call's place in its session.
-              let run =
-                record(run, id, Record(d, kind, AwaitingAgent(dialogue)))
-              case call_effect(run, id, name, input, d, dialogue) {
+              let call = call(AgentRunning(d, IssuedNow))
+              let run = put(run, slot, call)
+              case call_effect(run, slot, call, d) {
                 Error(refusal) ->
-                  settle(
+                  settle_agent(
                     run,
-                    id,
-                    Record(d, kind, Completed(None)),
+                    slot,
+                    call,
                     Refused(refusal),
+                    None,
+                    no_usage(),
                   )
-                Ok(call) -> #(run, [call])
+                Ok(effect) -> #(run, [effect])
               }
             }
           }
         }
       }
-    types.Command(command:, input:) -> {
-      let kind = CommandKind(command, input, [])
+    types.Command(command:, input:) ->
       case
         list.contains(run.workflow.commands, command),
         result.try(admission(run), fn(_) { compute_check(run) })
       {
-        False, _ ->
-          settle(
-            run,
-            id,
-            Record(d, RefusedKind, Completed(None)),
-            Refused(types.UnknownCommand(command)),
-          )
-        True, Error(reason) -> #(
-          record(run, id, Record(d, kind, Blocked(reason, None))),
-          [],
-        )
-        True, Ok(Nil) -> #(record(run, id, Record(d, kind, AwaitingCommand)), [
-          command_effect(run, id, command, input, d),
-        ])
+        False, _ -> refuse_call(run, id, slot, types.UnknownCommand(command))
+        True, admitted -> {
+          let state = case admitted {
+            Error(reason) -> CommandHeld(reason)
+            Ok(Nil) -> CommandRunning(IssuedNow)
+          }
+          let call =
+            CommandCall(id:, command:, input:, inbox: [], attempts: [
+              Tried(state),
+              ..prior_command(prior)
+            ])
+          let run = put(run, slot, call)
+          case admitted {
+            Error(_) -> #(run, [])
+            Ok(Nil) -> #(run, [command_effect(run, slot, call)])
+          }
+        }
       }
-    }
     // The host checked that the tool exists (its sources are listed at preflight).
     types.Tool(tool:, input:, replay:) -> {
-      let kind = ToolKind(tool, input, replay)
-      case admission(run) {
-        Error(reason) -> #(
-          record(run, id, Record(d, kind, Blocked(reason, None))),
-          [],
-        )
-        Ok(Nil) -> #(record(run, id, Record(d, kind, AwaitingTool)), [
-          types.CallTool(id:, tool:, input:, digest: d),
+      let admitted = admission(run)
+      let state = case admitted {
+        Error(reason) -> ToolHeld(reason)
+        Ok(Nil) -> ToolRunning(IssuedNow)
+      }
+      let call =
+        ToolCall(id:, tool:, input:, replay:, attempts: [
+          Tried(state),
+          ..prior_tool(prior)
         ])
+      let run = put(run, slot, call)
+      case admitted {
+        Error(_) -> #(run, [])
+        Ok(Nil) -> #(run, [tool_effect(slot, call)])
       }
     }
     // Orchestrator nodes cost nothing and are never held back.
     types.Orchestrator(name:, input:) ->
       case list.contains(run.workflow.orchestrators, name) {
-        False ->
-          settle(
-            run,
-            id,
-            Record(d, RefusedKind, Completed(None)),
-            Refused(types.UnknownOrchestrator(name)),
-          )
+        False -> refuse_call(run, id, slot, types.UnknownOrchestrator(name))
         True -> #(
-          record(
+          put(
             run,
-            id,
-            Record(d, OrchestratorKind(name, input), AwaitingOrchestrator),
+            slot,
+            OrchestratorCall(id:, name:, input:, attempts: [
+              Tried(OrchestratorWaiting),
+              ..prior_orchestrator(prior)
+            ]),
           ),
           [],
         )
@@ -895,64 +1134,78 @@ fn live_request(
 /// rebinding reaches every call issued or continued after it.
 fn call_effect(
   run: Run,
-  id: String,
-  name: String,
-  input: Value,
-  d: String,
+  slot: Slot,
+  call: Call,
   dialogue: Dialogue,
 ) -> Result(Effect, Refusal) {
-  use agent <- result.try(
-    find_agent(run.workflow, name)
-    |> result.replace_error(types.UnknownAgent(name)),
-  )
-  use model <- result.try(
-    resolve_model(run.models, agent.model)
-    |> result.replace_error(types.UnknownAlias(agent.model)),
-  )
-  // The node's turns so far and its allowance (a new call has neither
-  // yet), the previous call of its session and its journaled tool results.
-  let #(turn, turn_limit, history, recorded) = case
-    dict.get(run.requests, id)
-  {
-    Ok(Record(kind: AgentKind(steps:, allowed:, tools:, ..), ..) as rec) -> #(
-      steps,
-      allowed,
-      history_of(run, rec),
-      list.reverse(tools),
-    )
-    _ -> #(0, agent.max_turns, None, [])
+  case call, agent_attempt(call) {
+    AgentCall(id:, agent: name, input:, ..), Ok(a) -> {
+      use agent <- result.try(
+        find_agent(run.workflow, name)
+        |> result.replace_error(types.UnknownAgent(name)),
+      )
+      use model <- result.try(
+        resolve_model(run.models, agent.model)
+        |> result.replace_error(types.UnknownAlias(agent.model)),
+      )
+      Ok(types.CallAgent(
+        id: ids.request_text(id),
+        agent: agent.name,
+        model:,
+        input:,
+        turn: a.steps,
+        turn_limit: a.allowed,
+        slot: ids.slot_text(slot),
+        transcript: dialogue.transcript,
+        note: dialogue.note,
+        history: history_of(run, call) |> option.map(ids.digest_text),
+        checkpoint: dialogue.checkpoint |> option.map(ids.digest_text),
+        recorded: list.reverse(a.tools),
+      ))
+    }
+    // Only an agent call with a live attempt is issued as one.
+    AgentCall(agent:, ..), Error(Nil) -> Error(types.UnknownAgent(agent))
+    CommandCall(command:, ..), _ -> Error(types.NotAnAgent(command))
+    ToolCall(tool:, ..), _ -> Error(types.NotAnAgent(tool))
+    OrchestratorCall(name:, ..), _ -> Error(types.NotAnAgent(name))
+    RefusedCall(id:, ..), _ -> Error(types.NotAnAgent(ids.request_text(id)))
   }
-  Ok(types.CallAgent(
-    id:,
-    agent: agent.name,
-    model:,
-    input:,
-    turn:,
-    turn_limit:,
-    digest: d,
-    transcript: dialogue.transcript,
-    note: dialogue.note,
-    history:,
-    checkpoint: dialogue.checkpoint,
-    recorded:,
-  ))
 }
 
-fn command_effect(
-  run: Run,
-  id: String,
-  command: String,
-  input: Value,
-  d: String,
-) -> Effect {
+fn command_effect(run: Run, slot: Slot, call: Call) -> Effect {
+  let #(id, command, input) = case call {
+    CommandCall(id:, command:, input:, ..) -> #(id, command, input)
+    // Only command calls are run as commands.
+    AgentCall(id:, input:, ..)
+    | ToolCall(id:, input:, ..)
+    | OrchestratorCall(id:, input:, ..) -> #(id, "", input)
+    RefusedCall(id:, ..) -> #(id, "", value.JNull)
+  }
   types.RunCommand(
-    id:,
+    id: ids.request_text(id),
     command:,
     input:,
     compute_minutes: option.map(run.budget.compute_minutes, fn(limit) {
       limit -. run.spent.compute_minutes
     }),
-    digest: d,
+    slot: ids.slot_text(slot),
+  )
+}
+
+fn tool_effect(slot: Slot, call: Call) -> Effect {
+  let #(id, tool, input) = case call {
+    ToolCall(id:, tool:, input:, ..) -> #(id, tool, input)
+    // Only tool calls are made as tool calls.
+    AgentCall(id:, input:, ..)
+    | CommandCall(id:, input:, ..)
+    | OrchestratorCall(id:, input:, ..) -> #(id, "", input)
+    RefusedCall(id:, ..) -> #(id, "", value.JNull)
+  }
+  types.CallTool(
+    id: ids.request_text(id),
+    tool:,
+    input:,
+    slot: ids.slot_text(slot),
   )
 }
 
@@ -978,7 +1231,7 @@ fn budget_check(run: Run) -> Result(Nil, IdleReason) {
         int.to_float(run.spent.turns),
         int.to_float(limit),
       ))
-    _ -> Ok(Nil)
+    Some(_) | None -> Ok(Nil)
   }
 }
 
@@ -990,104 +1243,8 @@ fn compute_check(run: Run) -> Result(Nil, IdleReason) {
         run.spent.compute_minutes,
         limit,
       ))
-    _ -> Ok(Nil)
+    Some(_) | None -> Ok(Nil)
   }
-}
-
-fn record(run: Run, id: String, rec: Record) -> Run {
-  Run(..run, requests: dict.insert(run.requests, id, rec))
-}
-
-/// Completes a request with a journal entry and answers it.
-fn settle(
-  run: Run,
-  id: String,
-  rec: Record,
-  entry: Entry,
-) -> #(Run, List(Effect)) {
-  let served = case rec.progress {
-    Completed(model:) -> model
-    Blocked(..)
-    | AwaitingAgent(..)
-    | AgentWaiting(..)
-    | Unavailable(..)
-    | AwaitingCommand
-    | AwaitingTool
-    | ToolUnknown
-    | AwaitingOrchestrator -> None
-  }
-  // Read before the record is replaced: the dialogue the attempt reached.
-  let settled = Settled(entry:, served:, dialogue: dialogue_after(run, id))
-  let run = close_attempt(record(run, id, rec), rec.digest, id, settled)
-  #(run, [answer_effect(id, entry)])
-}
-
-/// The session's dialogue after an agent call ends: its newest checkpoint,
-/// else the dialogue it started from (it never took a step).
-fn dialogue_after(run: Run, id: String) -> Option(String) {
-  case dict.get(run.requests, id) {
-    Ok(Record(kind: AgentKind(..), progress:, ..) as rec) ->
-      case progress {
-        AwaitingAgent(dialogue: d)
-        | AgentWaiting(dialogue: d, ..)
-        | Unavailable(dialogue: d, ..) ->
-          option.or(d.checkpoint, history_of(run, rec))
-        Blocked(..)
-        | Completed(..)
-        | AwaitingCommand
-        | AwaitingTool
-        | ToolUnknown
-        | AwaitingOrchestrator -> history_of(run, rec)
-      }
-    Ok(Record(kind: CommandKind(..), ..))
-    | Ok(Record(kind: ToolKind(..), ..))
-    | Ok(Record(kind: OrchestratorKind(..), ..))
-    | Ok(Record(kind: RefusedKind, ..))
-    | Error(Nil) -> None
-  }
-}
-
-/// The session's dialogue before an agent call: what its previous call
-/// left (`None` for a session's first call).
-fn history_of(run: Run, rec: Record) -> Option(String) {
-  case rec.kind {
-    AgentKind(session:, index:, ..) if index > 0 ->
-      case dict.get(run.chain, chain_key(session, index - 1)) {
-        Ok(previous) ->
-          case live_attempt(run, previous) {
-            Tried(settled: Some(settled), ..) -> settled.dialogue
-            Tried(settled: None, ..) | Forgotten -> None
-          }
-        Error(Nil) -> None
-      }
-    AgentKind(..)
-    | CommandKind(..)
-    | ToolKind(..)
-    | OrchestratorKind(..)
-    | RefusedKind -> None
-  }
-}
-
-/// A checkpoint of a running agent call: a reissued attempt resumes there.
-fn progressed(run: Run, id: String, dialogue: String) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(Record(progress: AwaitingAgent(dialogue: d), ..) as rec) -> #(
-      record(
-        run,
-        id,
-        Record(
-          ..rec,
-          progress: AwaitingAgent(Dialogue(..d, checkpoint: Some(dialogue))),
-        ),
-      ),
-      [types.Checkpoint],
-    )
-    _ -> #(run, [types.Refuse(None, types.NodeNotRunning(id))])
-  }
-}
-
-fn note(run: Run, key: String, value: Value) -> Run {
-  Run(..run, facts: dict.insert(run.facts, key, value))
 }
 
 // --- Agent results -------------------------------------------------------------
@@ -1105,48 +1262,72 @@ fn spend(run: Run, usage: Usage) -> Run {
   )
 }
 
-/// An agent call that is running or was cut off by an executor fault.
-fn in_flight(record: Record) -> Option(#(String, Dialogue)) {
-  case record.kind, record.progress {
-    AgentKind(agent:, ..), AwaitingAgent(dialogue:)
-    | AgentKind(agent:, ..), Unavailable(dialogue:, ..)
-    -> Some(#(agent, dialogue))
-    _, _ -> None
+/// An agent call that is running or was cut off by an executor fault: its
+/// dialogue.
+fn in_flight(call: Call) -> Result(Dialogue, Nil) {
+  case agent_attempt(call) {
+    Ok(AgentAttempt(state: AgentRunning(dialogue:, ..), ..))
+    | Ok(AgentAttempt(state: AgentUnavailable(dialogue:, ..), ..)) ->
+      Ok(dialogue)
+    Ok(AgentAttempt(state: AgentHeld(..), ..))
+    | Ok(AgentAttempt(state: AgentWaiting(..), ..))
+    | Ok(AgentAttempt(state: AgentSettled(..), ..))
+    | Error(Nil) -> Error(Nil)
   }
 }
 
-fn add_steps(kind: Kind, usage: Usage) -> Kind {
-  case kind {
-    AgentKind(..) -> AgentKind(..kind, steps: kind.steps + usage.turns)
-    _ -> kind
+fn call_name(call: Call) -> String {
+  case call {
+    AgentCall(agent:, ..) -> agent
+    CommandCall(command:, ..) -> command
+    ToolCall(tool:, ..) -> tool
+    OrchestratorCall(name:, ..) -> name
+    RefusedCall(id:, ..) -> ids.request_text(id)
   }
+}
+
+/// Settles an agent call's live attempt with its result, the model that
+/// served it and the dialogue it reached, and answers the body.
+fn settle_agent(
+  run: Run,
+  slot: Slot,
+  call: Call,
+  entry: Entry,
+  served: Option(String),
+  usage: Usage,
+) -> #(Run, List(Effect)) {
+  let dialogue = dialogue_after(run, call)
+  let call =
+    update_agent(call, fn(a) {
+      AgentAttempt(
+        ..a,
+        steps: a.steps + usage.turns,
+        state: AgentSettled(entry, served, dialogue),
+      )
+    })
+  #(put(spend(run, usage), slot, call), [answer_effect(call_id(call), entry)])
 }
 
 /// A result, a failure or a rejected input completes the call. Results for
 /// a call that is not in flight (cancelled, already settled) are ignored.
 fn agent_settled(
   run: Run,
-  id: String,
+  id: RequestId,
   usage: Usage,
   model: String,
   entry: fn(String) -> Entry,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(rec) ->
-      case in_flight(rec) {
-        None -> #(run, [])
-        Some(#(name, _)) -> {
-          let model = case model {
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case in_flight(call) {
+        Error(Nil) -> #(run, [])
+        Ok(_) -> {
+          let served = case model {
             "" -> None
             m -> Some(m)
           }
-          let rec =
-            Record(
-              ..rec,
-              kind: add_steps(rec.kind, usage),
-              progress: Completed(model),
-            )
-          let #(run, effects) = settle(spend(run, usage), id, rec, entry(name))
+          let #(run, effects) =
+            settle_agent(run, slot, call, entry(call_name(call)), served, usage)
           #(run, [types.Checkpoint, ..effects])
         }
       }
@@ -1158,41 +1339,43 @@ fn agent_settled(
 /// dialogue), or at its turn limit (progress kept, nothing added).
 fn agent_idle(
   run: Run,
-  id: String,
-  cause: fn(Kind) -> types.IdleCause,
+  id: RequestId,
+  cause: fn(Int, Int) -> types.IdleCause,
   usage: Usage,
   model: String,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(rec) ->
-      case in_flight(rec) {
-        Some(#(_, d)) -> {
-          let kind = add_steps(rec.kind, usage)
-          let cause = cause(kind)
-          let d = case cause {
-            types.Question(message:) ->
-              Dialogue(
-                ..d,
-                transcript: list.append(d.transcript, [
-                  types.Message(types.Assistant, message),
-                ]),
-              )
-            types.EndedWithoutResult(text:) ->
-              Dialogue(
-                ..d,
-                transcript: list.append(d.transcript, [
-                  types.Message(types.Assistant, text),
-                ]),
-              )
-            types.TurnLimit(..)
-            | types.Interrupted
-            | types.OutcomeUnknown(..) -> d
-          }
-          let rec =
-            Record(..rec, kind:, progress: AgentWaiting(d, model, cause))
-          #(record(spend(run, usage), id, rec), [types.Checkpoint])
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case in_flight(call) {
+        Ok(d) -> {
+          let call =
+            update_agent(call, fn(a) {
+              let steps = a.steps + usage.turns
+              let cause = cause(steps, a.allowed)
+              let d = case cause {
+                types.Question(message:) ->
+                  Dialogue(
+                    ..d,
+                    transcript: list.append(d.transcript, [
+                      types.Message(types.Assistant, message),
+                    ]),
+                  )
+                types.EndedWithoutResult(text:) ->
+                  Dialogue(
+                    ..d,
+                    transcript: list.append(d.transcript, [
+                      types.Message(types.Assistant, text),
+                    ]),
+                  )
+                types.TurnLimit(..)
+                | types.Interrupted
+                | types.OutcomeUnknown(..) -> d
+              }
+              AgentAttempt(..a, steps:, state: AgentWaiting(d, model, cause))
+            })
+          #(put(spend(run, usage), slot, call), [types.Checkpoint])
         }
-        None -> #(run, [])
+        Error(Nil) -> #(run, [])
       }
     Error(Nil) -> #(run, [])
   }
@@ -1202,27 +1385,24 @@ fn agent_idle(
 /// the run goes idle until a fix and a `RetryUnavailable`.
 fn executor_failed(
   run: Run,
-  id: String,
+  id: RequestId,
   error: String,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(rec) ->
-      case in_flight(rec) {
-        Some(#(name, d)) -> {
-          let alias = case find_agent(run.workflow, name) {
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case in_flight(call) {
+        Ok(d) -> {
+          let alias = case find_agent(run.workflow, call_name(call)) {
             Ok(a) -> a.model
-            Error(Nil) -> name
+            Error(Nil) -> call_name(call)
           }
-          #(
-            record(
-              run,
-              id,
-              Record(..rec, progress: Unavailable(d, alias, error)),
-            ),
-            [types.Checkpoint],
-          )
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, state: AgentUnavailable(d, alias, error))
+            })
+          #(put(run, slot, call), [types.Checkpoint])
         }
-        None -> #(run, [])
+        Error(Nil) -> #(run, [])
       }
     Error(Nil) -> #(run, [])
   }
@@ -1230,153 +1410,214 @@ fn executor_failed(
 
 fn retry_unavailable(run: Run) -> #(Run, List(Effect)) {
   let #(run, effects) =
-    sorted_requests(run)
+    sorted_calls(run)
     |> list.fold(#(run, []), fn(acc, entry) {
       let #(run, effects) = acc
-      case entry.1 {
-        Record(
-          kind: AgentKind(agent:, input:, ..),
-          progress: Unavailable(dialogue:, ..),
-          ..,
-        ) as rec ->
-          case call_effect(run, entry.0, agent, input, rec.digest, dialogue) {
-            Ok(call) -> #(
-              record(
-                run,
-                entry.0,
-                Record(..rec, progress: AwaitingAgent(dialogue)),
-              ),
-              list.append(effects, [call]),
+      let #(slot, call) = entry
+      case agent_attempt(call) {
+        Ok(AgentAttempt(state: AgentUnavailable(dialogue:, ..), ..)) -> {
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, state: AgentRunning(dialogue, IssuedNow))
+            })
+          case call_effect(run, slot, call, dialogue) {
+            Ok(effect) -> #(
+              put(run, slot, call),
+              list.append(effects, [effect]),
             )
             Error(_) -> acc
           }
-        _ -> acc
+        }
+        Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentRunning(..), ..))
+        | Ok(AgentAttempt(state: AgentWaiting(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> acc
       }
     })
   case effects {
     [] -> #(run, [])
-    _ -> #(run, [types.Checkpoint, ..effects])
+    [_, ..] -> #(run, [types.Checkpoint, ..effects])
+  }
+}
+
+/// A checkpoint of a running agent call: a reissued attempt resumes there.
+fn progressed(
+  run: Run,
+  id: RequestId,
+  dialogue: Digest,
+) -> #(Run, List(Effect)) {
+  let refused = #(run, [
+    types.Refuse(None, types.NodeNotRunning(ids.request_text(id))),
+  ])
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case agent_attempt(call) {
+        Ok(AgentAttempt(state: AgentRunning(dialogue: d, issued:), ..)) -> {
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(
+                ..a,
+                state: AgentRunning(
+                  Dialogue(..d, checkpoint: Some(dialogue)),
+                  issued,
+                ),
+              )
+            })
+          #(put(run, slot, call), [types.Checkpoint])
+        }
+        Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentWaiting(..), ..))
+        | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> refused
+      }
+    Error(Nil) -> refused
+  }
+}
+
+/// The session's dialogue after an agent call's live attempt ends: its
+/// newest checkpoint, else the dialogue it started from (it never took a
+/// step).
+fn dialogue_after(run: Run, call: Call) -> Option(Digest) {
+  case agent_attempt(call) {
+    Ok(AgentAttempt(state: AgentRunning(dialogue: d, ..), ..))
+    | Ok(AgentAttempt(state: AgentWaiting(dialogue: d, ..), ..))
+    | Ok(AgentAttempt(state: AgentUnavailable(dialogue: d, ..), ..)) ->
+      option.or(d.checkpoint, history_of(run, call))
+    Ok(AgentAttempt(state: AgentHeld(..), ..))
+    | Ok(AgentAttempt(state: AgentSettled(..), ..))
+    | Error(Nil) -> history_of(run, call)
+  }
+}
+
+/// The session's dialogue before an agent call: what its previous call
+/// left (`None` for a session's first call).
+fn history_of(run: Run, call: Call) -> Option(Digest) {
+  case call {
+    AgentCall(session:, index:, ..) if index > 0 ->
+      case dict.get(run.chain, chain_key(session, index - 1)) {
+        Ok(previous) ->
+          case dict.get(run.calls, previous) {
+            Ok(before) ->
+              case agent_attempt(before) {
+                Ok(AgentAttempt(state: AgentSettled(dialogue:, ..), ..)) ->
+                  dialogue
+                Ok(AgentAttempt(state: AgentHeld(..), ..))
+                | Ok(AgentAttempt(state: AgentRunning(..), ..))
+                | Ok(AgentAttempt(state: AgentWaiting(..), ..))
+                | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+                | Error(Nil) -> None
+              }
+            Error(Nil) -> None
+          }
+        Error(Nil) -> None
+      }
+    AgentCall(..)
+    | CommandCall(..)
+    | ToolCall(..)
+    | OrchestratorCall(..)
+    | RefusedCall(..) -> None
   }
 }
 
 // --- Interventions -------------------------------------------------------------
 
-fn held(run: Run, node: String) -> Bool {
+fn held(run: Run, slot: Slot) -> Bool {
   case run.hold {
-    Some(#(id, _)) -> id == node
+    Some(#(held, _)) -> held == slot
     None -> False
   }
 }
 
-fn facts(run: Run, node: String) -> NodeFacts {
-  case dict.get(run.requests, node) {
-    // A held failure is live again for restart and cancel.
-    Ok(Record(kind: AgentKind(agent:, ..), ..)) if run.hold != None ->
-      case held(run, node) {
-        True ->
-          capability.Faulted(case find_agent(run.workflow, agent) {
-            Ok(a) -> a.steerable
-            Error(Nil) -> False
-          })
-        False -> agent_facts(run, node)
-      }
-    Ok(Record(kind: CommandKind(..), progress: Completed(..), ..)) ->
-      case held(run, node) {
-        True -> capability.CommandWorking
-        False -> capability.Settled
-      }
-    Ok(Record(kind: ToolKind(..), progress: Completed(..), ..)) ->
-      case held(run, node) {
-        True -> capability.ToolWorking
-        False -> capability.Settled
-      }
-    _ -> agent_facts(run, node)
+fn steerable(run: Run, agent: String) -> Bool {
+  case find_agent(run.workflow, agent) {
+    Ok(a) -> a.steerable
+    Error(Nil) -> False
   }
 }
 
-fn agent_facts(run: Run, node: String) -> NodeFacts {
-  case dict.get(run.requests, node) {
-    Ok(Record(kind: AgentKind(agent:, ..), progress:, ..)) -> {
-      let steerable = case find_agent(run.workflow, agent) {
-        Ok(a) -> a.steerable
-        Error(Nil) -> False
+fn node_facts(run: Run, id: RequestId) -> NodeFacts {
+  case lookup(run, id) {
+    Error(Nil) -> capability.Absent
+    Ok(#(slot, call)) ->
+      case held(run, slot), call {
+        // A held failure is live again for restart and cancel.
+        True, AgentCall(agent:, ..) -> capability.Faulted(steerable(run, agent))
+        True, CommandCall(..) -> capability.CommandWorking
+        True, ToolCall(..) -> capability.ToolWorking
+        True, OrchestratorCall(..) | True, RefusedCall(..) -> capability.Settled
+        // Not held: what its live attempt says, for every kind.
+        False, _ -> live_facts(run, call)
       }
-      case progress {
-        AwaitingAgent(..) -> capability.Working(steerable)
-        // Only a restart or a cancel resolves an unknown outcome.
-        AgentWaiting(cause: types.OutcomeUnknown(..), ..) ->
-          capability.Unsettled(steerable)
-        AgentWaiting(..) -> capability.Waiting(steerable)
-        Unavailable(..) -> capability.Faulted(steerable)
-        Blocked(..) -> capability.Held(steerable)
-        Completed(..) -> capability.Settled
-        // Not an agent's progress: never recorded with an agent.
-        AwaitingCommand | AwaitingTool | ToolUnknown | AwaitingOrchestrator ->
-          capability.Settled
+  }
+}
+
+fn live_facts(run: Run, call: Call) -> NodeFacts {
+  case call {
+    AgentCall(agent:, attempts:, ..) -> {
+      let steerable = steerable(run, agent)
+      case attempts {
+        [Tried(AgentAttempt(state:, ..)), ..] ->
+          case state {
+            AgentRunning(..) -> capability.Working(steerable)
+            // Only a restart or a cancel resolves an unknown outcome.
+            AgentWaiting(cause: types.OutcomeUnknown(..), ..) ->
+              capability.Unsettled(steerable)
+            AgentWaiting(..) -> capability.Waiting(steerable)
+            AgentUnavailable(..) -> capability.Faulted(steerable)
+            AgentHeld(..) -> capability.Held(steerable)
+            AgentSettled(..) -> capability.Settled
+          }
+        [Forgotten, ..] | [] -> capability.Settled
       }
     }
     // A command or a body tool call is live while it runs, waits for an
     // unknown outcome, or is held back before it starts.
-    Ok(Record(kind: CommandKind(..), progress:, ..)) ->
-      case progress {
-        AwaitingCommand | Blocked(..) -> capability.CommandWorking
-        Completed(..) -> capability.Settled
-        // Not a command's progress: never recorded with a command.
-        AwaitingAgent(..)
-        | AgentWaiting(..)
-        | Unavailable(..)
-        | AwaitingTool
-        | ToolUnknown
-        | AwaitingOrchestrator -> capability.Settled
+    CommandCall(attempts:, ..) ->
+      case attempts {
+        [Tried(CommandRunning(..)), ..] | [Tried(CommandHeld(..)), ..] ->
+          capability.CommandWorking
+        [Tried(CommandSettled(..)), ..] | [Forgotten, ..] | [] ->
+          capability.Settled
       }
-    Ok(Record(kind: ToolKind(..), progress:, ..)) ->
-      case progress {
-        AwaitingTool | ToolUnknown | Blocked(..) -> capability.ToolWorking
-        Completed(..) -> capability.Settled
-        // Not a tool call's progress: never recorded with one.
-        AwaitingAgent(..)
-        | AgentWaiting(..)
-        | Unavailable(..)
-        | AwaitingCommand
-        | AwaitingOrchestrator -> capability.Settled
+    ToolCall(attempts:, ..) ->
+      case attempts {
+        [Tried(ToolRunning(..)), ..]
+        | [Tried(ToolInDoubt), ..]
+        | [Tried(ToolHeld(..)), ..] -> capability.ToolWorking
+        [Tried(ToolSettled(..)), ..] | [Forgotten, ..] | [] ->
+          capability.Settled
       }
-    Ok(Record(kind: OrchestratorKind(..), progress:, ..)) ->
-      case progress {
-        AwaitingOrchestrator -> capability.Pending
-        Completed(..) -> capability.Settled
-        // Orchestrator nodes are never held back and never issued.
-        AwaitingAgent(..)
-        | AgentWaiting(..)
-        | Unavailable(..)
-        | Blocked(..)
-        | AwaitingCommand
-        | AwaitingTool
-        | ToolUnknown -> capability.Settled
+    OrchestratorCall(attempts:, ..) ->
+      case attempts {
+        [Tried(OrchestratorWaiting), ..] -> capability.Pending
+        [Tried(OrchestratorSettled(..)), ..] | [Forgotten, ..] | [] ->
+          capability.Settled
       }
-    Ok(Record(kind: RefusedKind, ..)) -> capability.Settled
-    Error(Nil) -> capability.Absent
+    RefusedCall(..) -> capability.Settled
   }
 }
 
-fn add_inbox(run: Run, id: String, kind: InboxKind, text: String) -> Run {
-  case dict.get(run.requests, id) {
-    Ok(Record(kind: AgentKind(..) as k, ..) as rec) -> {
-      let message = types.InboxMessage(kind:, text:, step: k.steps)
-      record(
-        run,
-        id,
-        Record(..rec, kind: AgentKind(..k, inbox: [message, ..k.inbox])),
-      )
+fn add_inbox(run: Run, id: RequestId, kind: InboxKind, text: String) -> Run {
+  case lookup(run, id) {
+    Ok(#(slot, AgentCall(inbox:, ..) as call)) -> {
+      let step = case agent_attempt(call) {
+        Ok(a) -> a.steps
+        Error(Nil) -> 0
+      }
+      let message = types.InboxMessage(kind:, text:, step:)
+      put(run, slot, AgentCall(..call, inbox: [message, ..inbox]))
     }
-    Ok(Record(kind: CommandKind(..) as k, ..) as rec) -> {
+    Ok(#(slot, CommandCall(inbox:, ..) as call)) -> {
       let message = types.InboxMessage(kind:, text:, step: 0)
-      record(
-        run,
-        id,
-        Record(..rec, kind: CommandKind(..k, inbox: [message, ..k.inbox])),
-      )
+      put(run, slot, CommandCall(..call, inbox: [message, ..inbox]))
     }
-    _ -> run
+    // Tool and orchestrator calls keep no inbox.
+    Ok(#(_, ToolCall(..)))
+    | Ok(#(_, OrchestratorCall(..)))
+    | Ok(#(_, RefusedCall(..)))
+    | Error(Nil) -> run
   }
 }
 
@@ -1389,61 +1630,69 @@ fn answer(
   turns: Int,
 ) -> #(Run, List(Effect)) {
   let id = capability.idle_id(node)
-  case dict.get(run.requests, id) {
-    // At its turn limit a node continues only with more turns.
-    Ok(Record(progress: AgentWaiting(cause: types.TurnLimit(..), ..), ..))
-      if turns <= 0
-    -> #(run, [types.Refuse(None, types.NoTurnsLeft(id))])
-    Ok(Record(kind: AgentKind(..) as k, ..) as rec) ->
-      continue_with(
-        add_inbox(
-          record(
-            run,
-            id,
-            Record(
-              ..rec,
-              kind: AgentKind(..k, allowed: k.allowed + int.max(0, turns)),
-            ),
-          ),
-          id,
-          types.Answer,
-          text,
-        ),
-        id,
-        text,
-      )
-    _ -> #(run, [types.Refuse(None, types.NotIdle(id))])
+  let not_idle = #(run, [
+    types.Refuse(None, types.NotIdle(ids.request_text(id))),
+  ])
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case agent_attempt(call) {
+        // At its turn limit a node continues only with more turns.
+        Ok(AgentAttempt(state: AgentWaiting(cause: types.TurnLimit(..), ..), ..))
+          if turns <= 0
+        -> #(run, [types.Refuse(None, types.NoTurnsLeft(ids.request_text(id)))])
+        Ok(AgentAttempt(state: AgentWaiting(..), ..)) -> {
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, allowed: a.allowed + int.max(0, turns))
+            })
+          let run = add_inbox(put(run, slot, call), id, types.Answer, text)
+          continue_with(run, id, text)
+        }
+        Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentRunning(..), ..))
+        | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> not_idle
+      }
+    Error(Nil) -> not_idle
   }
 }
 
-fn continue_with(run: Run, id: String, text: String) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(
-      Record(
-        kind: AgentKind(agent:, input:, ..),
-        progress: AgentWaiting(dialogue: d, ..),
-        ..,
-      ) as rec,
-    ) -> {
-      let d =
-        Dialogue(
-          ..d,
-          transcript: list.append(d.transcript, [
-            types.Message(types.User, text),
-          ]),
-        )
-      case call_effect(run, id, agent, input, rec.digest, d) {
-        Ok(call) -> #(
-          record(run, id, Record(..rec, progress: AwaitingAgent(d))),
-          [
-            types.Checkpoint,
-            call,
-          ],
-        )
-        Error(refusal) -> #(run, [types.Refuse(None, refusal)])
+fn continue_with(
+  run: Run,
+  id: RequestId,
+  text: String,
+) -> #(Run, List(Effect)) {
+  let not_idle = #(run, [
+    types.Refuse(None, types.NotIdle(ids.request_text(id))),
+  ])
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case agent_attempt(call) {
+        Ok(AgentAttempt(state: AgentWaiting(dialogue: d, ..), ..)) -> {
+          let d =
+            Dialogue(
+              ..d,
+              transcript: list.append(d.transcript, [
+                types.Message(types.User, text),
+              ]),
+            )
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, state: AgentRunning(d, IssuedNow))
+            })
+          case call_effect(run, slot, call, d) {
+            Ok(effect) -> #(put(run, slot, call), [types.Checkpoint, effect])
+            Error(refusal) -> #(run, [types.Refuse(None, refusal)])
+          }
+        }
+        Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentRunning(..), ..))
+        | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> not_idle
       }
-    }
-    _ -> #(run, [types.Refuse(None, types.NotIdle(id))])
+    Error(Nil) -> not_idle
   }
 }
 
@@ -1452,26 +1701,42 @@ fn continue_with(run: Run, id: String, text: String) -> #(Run, List(Effect)) {
 fn steer(run: Run, node: SteerableNode, text: String) -> #(Run, List(Effect)) {
   let id = capability.steerable_id(node)
   let run = add_inbox(run, id, types.Steer, text)
-  case dict.get(run.requests, id) {
-    Ok(Record(progress: AwaitingAgent(dialogue: d), ..) as rec) -> {
-      let d =
-        Dialogue(
-          ..d,
-          transcript: list.append(d.transcript, [
-            types.Message(types.User, text),
-          ]),
-        )
-      #(record(run, id, Record(..rec, progress: AwaitingAgent(d))), [
-        types.Checkpoint,
-      ])
-    }
-    _ -> #(run, [types.Refuse(None, types.NodeNotRunning(id))])
+  let not_running = #(run, [
+    types.Refuse(None, types.NodeNotRunning(ids.request_text(id))),
+  ])
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case agent_attempt(call) {
+        Ok(AgentAttempt(state: AgentRunning(dialogue: d, issued:), ..)) -> {
+          let d =
+            Dialogue(
+              ..d,
+              transcript: list.append(d.transcript, [
+                types.Message(types.User, text),
+              ]),
+            )
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, state: AgentRunning(d, issued))
+            })
+          #(put(run, slot, call), [types.Checkpoint])
+        }
+        Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentWaiting(..), ..))
+        | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> not_running
+      }
+    Error(Nil) -> not_running
   }
 }
 
-/// Discards the dialogue and reissues the call with its original input and
-/// the note. A note to a non-steerable node is refused; a call still held
-/// back by a pause or the budget has nothing to restart.
+/// A restart opens a new attempt with the call's original input (and the
+/// operator note, for an agent), so it executes again; the attempts before
+/// it, with their results, stay in the journal. A held failure is lifted
+/// first. An unknown outcome is retried within its attempt instead. A note
+/// to a non-steerable node is refused; a call still held back by a pause or
+/// the budget has nothing to restart.
 fn restart(
   run: Run,
   node: LiveNode,
@@ -1479,246 +1744,306 @@ fn restart(
   turns: Int,
 ) -> Result(#(Run, List(Effect)), Refusal) {
   let id = capability.live_id(node)
-  // A restart is a new attempt at the call's slot; the attempts before it,
-  // with their results, stay in the journal.
-  let retry = fn(run: Run) {
-    case dict.get(run.requests, id) {
-      Ok(rec) -> open_attempt(run, rec.digest, id)
-      Error(Nil) -> run
-    }
-  }
-  // A held failure: a new attempt, and the hold lifted; the call is then
-  // reissued like one in flight.
-  let was_held = held(run, id)
-  let run = case was_held, dict.get(run.requests, id) {
-    True, Ok(rec) -> {
-      let progress = case rec.kind {
-        AgentKind(..) -> AwaitingAgent(Dialogue([], None, None))
-        CommandKind(..) -> AwaitingCommand
-        ToolKind(..) -> AwaitingTool
-        OrchestratorKind(..) -> AwaitingOrchestrator
-        // A refused call is never a failure the run is held on.
-        RefusedKind -> rec.progress
-      }
-      Run(..retry(record(run, id, Record(..rec, progress:))), hold: None)
-    }
-    _, _ -> run
-  }
-  // Not held: the restart itself opens the new attempt (an unknown outcome
-  // is retried within its attempt, so it opens none).
-  let retry = fn(run: Run) {
-    case was_held {
-      True -> run
-      False -> retry(run)
-    }
-  }
+  let text = ids.request_text(id)
   use _ <- result.try(case note, capability.live_kind(node) {
     Some(_), capability.LiveAgent(steerable: False) ->
-      Error(types.NotSteerable(id))
+      Error(types.NotSteerable(text))
     Some(_), capability.LiveCommand | Some(_), capability.LiveTool ->
-      Error(types.NotAnAgent(id))
-    _, _ -> Ok(Nil)
+      Error(types.NotAnAgent(text))
+    Some(_), capability.LiveAgent(steerable: True)
+    | Some(_), capability.LiveOrchestrator
+    | None, _
+    -> Ok(Nil)
   })
-  case dict.get(run.requests, id) {
-    // A body MCP tool call is made again: the outside world is asked anew.
-    Ok(
-      Record(kind: ToolKind(tool:, input:, ..), progress: AwaitingTool, ..) as rec,
-    )
-    | Ok(
-        Record(kind: ToolKind(tool:, input:, ..), progress: ToolUnknown, ..) as rec,
-      ) ->
-      Ok(
-        #(retry(record(run, id, Record(..rec, progress: AwaitingTool))), [
-          types.Checkpoint,
-          types.CallTool(id:, tool:, input:, digest: rec.digest),
-        ]),
-      )
-    // An orchestrator node is asked again.
-    Ok(Record(kind: OrchestratorKind(..), progress: AwaitingOrchestrator, ..)) ->
-      Ok(#(retry(run), [types.Checkpoint]))
-    // A command reruns with the same input.
-    Ok(Record(
-      kind: CommandKind(command:, input:, ..),
-      progress: AwaitingCommand,
-      ..,
-    )) -> {
-      let run = retry(add_inbox(run, id, types.Restart, ""))
-      Ok(
-        #(run, [
-          types.Checkpoint,
-          command_effect(run, id, command, input, run_digest(run, id)),
-        ]),
-      )
-    }
-    // An unknown outcome: the call continues where it stopped, its dialogue,
-    // turns and journaled tool results kept; only the unknown call is made
-    // again (the host retries it).
-    Ok(
-      Record(
-        kind: AgentKind(agent:, input:, ..),
-        progress: AgentWaiting(dialogue: d, cause: types.OutcomeUnknown(..), ..),
-        ..,
-      ) as rec,
-    ) ->
-      case note {
-        Some(_) -> Error(types.RetryTakesNoNote(id))
-        None -> {
-          let run = add_inbox(run, id, types.Restart, "")
-          use call <- result.map(call_effect(
-            run,
-            id,
-            agent,
-            input,
-            rec.digest,
-            d,
-          ))
-          #(record(run, id, Record(..rec, progress: AwaitingAgent(d))), [
-            types.Checkpoint,
-            call,
-          ])
+  use #(slot, call) <- result.try(
+    lookup(run, id) |> result.replace_error(types.NotLive(text)),
+  )
+  let was_held = held(run, slot)
+  let lifted = case was_held {
+    True -> Run(..run, hold: None)
+    False -> run
+  }
+  case call {
+    // A body tool call is made again: the outside world is asked anew.
+    ToolCall(attempts: [Tried(state), ..], ..) ->
+      case state, was_held {
+        ToolRunning(..), _ | ToolInDoubt, _ | ToolSettled(..), True -> {
+          let call =
+            ToolCall(..call, attempts: [
+              Tried(ToolRunning(IssuedNow)),
+              ..call.attempts
+            ])
+          Ok(
+            #(put(lifted, slot, call), [
+              types.Checkpoint,
+              tool_effect(slot, call),
+            ]),
+          )
         }
+        ToolHeld(..), _ | ToolSettled(..), False -> Error(types.NotLive(text))
       }
-    Ok(Record(kind: AgentKind(agent:, input:, ..), progress:, ..) as rec) ->
-      case progress {
-        AwaitingAgent(..) | AgentWaiting(..) | Unavailable(..) -> {
-          let run = add_inbox(run, id, types.Restart, option.unwrap(note, ""))
-          let rec = dict.get(run.requests, id) |> result.unwrap(rec)
-          // Progress is discarded: the turn count and allowance start over,
-          // and its journaled tool results go (the outside is asked anew).
-          let rec = case rec.kind, find_agent(run.workflow, agent) {
-            AgentKind(..) as k, Ok(a) ->
-              Record(
-                ..rec,
-                kind: AgentKind(
-                  ..k,
-                  steps: 0,
-                  allowed: case turns > 0 {
-                    True -> turns
-                    False -> a.max_turns
-                  },
-                  tools: [],
-                ),
+    // An orchestrator node is asked again.
+    OrchestratorCall(attempts: [Tried(OrchestratorWaiting), ..], ..) -> {
+      let call =
+        OrchestratorCall(..call, attempts: [
+          Tried(OrchestratorWaiting),
+          ..call.attempts
+        ])
+      Ok(#(put(lifted, slot, call), [types.Checkpoint]))
+    }
+    // A command reruns with the same input.
+    CommandCall(attempts: [Tried(state), ..], ..) ->
+      case state, was_held {
+        CommandRunning(..), _ | CommandSettled(..), True -> {
+          let call =
+            CommandCall(..call, attempts: [
+              Tried(CommandRunning(IssuedNow)),
+              ..call.attempts
+            ])
+          let run = add_inbox(put(lifted, slot, call), id, types.Restart, "")
+          Ok(#(run, [types.Checkpoint, command_effect(run, slot, call)]))
+        }
+        CommandHeld(..), _ | CommandSettled(..), False ->
+          Error(types.NotLive(text))
+      }
+    AgentCall(attempts: [Tried(a), ..], ..) ->
+      case a.state, was_held {
+        // An unknown outcome: the call continues where it stopped, its
+        // dialogue, turns and journaled tool results kept; only the unknown
+        // call is made again (the host retries it).
+        AgentWaiting(dialogue: d, cause: types.OutcomeUnknown(..), ..), False ->
+          case note {
+            Some(_) -> Error(types.RetryTakesNoNote(text))
+            None -> {
+              let run = add_inbox(run, id, types.Restart, "")
+              use #(_, call) <- result.try(
+                lookup(run, id) |> result.replace_error(types.NotLive(text)),
               )
-            _, _ -> rec
-          }
-          let run = retry(rewind(record(run, id, rec), rec.kind))
-          let d = Dialogue([], note, None)
-          case admit(run) {
-            Error(reason) ->
-              Ok(
-                #(
-                  record(
-                    run,
-                    id,
-                    Record(..rec, progress: Blocked(reason, note)),
-                  ),
-                  [
-                    types.Checkpoint,
-                  ],
-                ),
-              )
-            Ok(Nil) -> {
-              use call <- result.map(call_effect(
-                run,
-                id,
-                agent,
-                input,
-                rec.digest,
-                d,
-              ))
-              #(record(run, id, Record(..rec, progress: AwaitingAgent(d))), [
-                types.Checkpoint,
-                call,
-              ])
+              let call =
+                update_agent(call, fn(a) {
+                  AgentAttempt(..a, state: AgentRunning(d, IssuedNow))
+                })
+              use effect <- result.map(call_effect(run, slot, call, d))
+              #(put(run, slot, call), [types.Checkpoint, effect])
             }
           }
-        }
-        _ -> Error(types.NodeNotRunning(id))
+        AgentRunning(..), _
+        | AgentWaiting(..), _
+        | AgentUnavailable(..), _
+        | AgentSettled(..), True
+        -> restart_agent(lifted, id, slot, note, turns)
+        AgentHeld(..), _ -> Error(types.NodeNotRunning(text))
+        AgentSettled(..), False -> Error(types.NotLive(text))
       }
-    _ -> Error(types.NotLive(id))
+    // Nothing live to restart: check_live refuses these before a restart.
+    ToolCall(..)
+    | OrchestratorCall(..)
+    | CommandCall(..)
+    | AgentCall(..)
+    | RefusedCall(..) -> Error(types.NotLive(text))
   }
 }
 
-/// Fails one node as an agent failure; the body gets a typed error.
+/// A new attempt of an agent call: its progress starts over (the turn count
+/// and allowance, and without its journaled tool results: the outside is
+/// asked anew), and the session's later calls are forgotten.
+fn restart_agent(
+  run: Run,
+  id: RequestId,
+  slot: Slot,
+  note: Option(String),
+  turns: Int,
+) -> Result(#(Run, List(Effect)), Refusal) {
+  let run = add_inbox(run, id, types.Restart, option.unwrap(note, ""))
+  use #(_, call) <- result.try(
+    lookup(run, id) |> result.replace_error(types.NotLive(ids.request_text(id))),
+  )
+  case call {
+    AgentCall(agent:, session:, index:, attempts:, ..) -> {
+      let allowed = case turns > 0, find_agent(run.workflow, agent) {
+        True, _ -> turns
+        False, Ok(a) -> a.max_turns
+        False, Error(Nil) -> 0
+      }
+      let run = rewind(run, session, index)
+      let attempt = fn(state) {
+        AgentCall(..call, attempts: [
+          Tried(AgentAttempt(0, allowed, [], state)),
+          ..attempts
+        ])
+      }
+      case admit(run) {
+        Error(reason) ->
+          Ok(
+            #(put(run, slot, attempt(AgentHeld(reason, note))), [
+              types.Checkpoint,
+            ]),
+          )
+        Ok(Nil) -> {
+          let d = Dialogue([], note, None)
+          let call = attempt(AgentRunning(d, IssuedNow))
+          use effect <- result.map(call_effect(run, slot, call, d))
+          #(put(run, slot, call), [types.Checkpoint, effect])
+        }
+      }
+    }
+    // `restart` calls this for agent calls only.
+    CommandCall(..) | ToolCall(..) | OrchestratorCall(..) | RefusedCall(..) ->
+      Error(types.NotAnAgent(ids.request_text(id)))
+  }
+}
+
+/// A session call restarts from the session's state before it: every later
+/// call of the session is forgotten (its attempts stay), so a later request
+/// is a new attempt, not a stale record.
+fn rewind(run: Run, session: SessionId, index: Int) -> Run {
+  let prefix = ids.session_text(session) <> ":"
+  run.chain
+  |> dict.to_list
+  |> list.filter_map(fn(e) {
+    case string.starts_with(e.0, prefix) {
+      True ->
+        case int.parse(string.drop_start(e.0, string.length(prefix))) {
+          Ok(i) if i > index -> Ok(e.1)
+          Ok(_) | Error(Nil) -> Error(Nil)
+        }
+      False -> Error(Nil)
+    }
+  })
+  |> list.fold(run, forget)
+}
+
+fn forget(run: Run, slot: Slot) -> Run {
+  case dict.get(run.calls, slot) {
+    Ok(call) ->
+      case live(call) {
+        LiveForgotten -> run
+        LiveSettled(_) | LiveOpen ->
+          case call {
+            // A refused call has no result to keep: it is asked again as is.
+            RefusedCall(..) -> run
+            AgentCall(attempts:, ..) ->
+              put(
+                run,
+                slot,
+                AgentCall(..call, attempts: [Forgotten, ..attempts]),
+              )
+            CommandCall(attempts:, ..) ->
+              put(
+                run,
+                slot,
+                CommandCall(..call, attempts: [Forgotten, ..attempts]),
+              )
+            ToolCall(attempts:, ..) ->
+              put(
+                run,
+                slot,
+                ToolCall(..call, attempts: [Forgotten, ..attempts]),
+              )
+            OrchestratorCall(attempts:, ..) ->
+              put(
+                run,
+                slot,
+                OrchestratorCall(..call, attempts: [Forgotten, ..attempts]),
+              )
+          }
+      }
+    Error(Nil) -> run
+  }
+}
+
+/// Fails one node as a typed failure; the body handles it.
 fn cancel_node(run: Run, node: LiveNode) -> #(Run, List(Effect)) {
   let id = capability.live_id(node)
-  case run.hold, dict.get(run.requests, id) {
-    // Accepting a held failure: it propagates, and the run ends Failed.
-    Some(#(held_id, reason)), _ if held_id == id ->
-      finish(Run(..run, hold: None), types.Failed(reason))
-    _, _ -> cancel_live(run, id)
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case run.hold {
+        // Accepting a held failure: it propagates, and the run ends Failed.
+        Some(#(held, reason)) if held == slot ->
+          finish(Run(..run, hold: None), types.Failed(reason))
+        Some(_) | None -> cancel_live(run, slot, call)
+      }
+    Error(Nil) -> #(run, [
+      types.Refuse(None, types.NotLive(ids.request_text(id))),
+    ])
   }
 }
 
-fn cancel_live(run: Run, id: String) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(Record(kind: OrchestratorKind(name:, ..), ..) as rec) -> {
-      let #(run, effects) =
-        settle(
-          run,
-          id,
-          Record(..rec, progress: Completed(None)),
-          Errored(types.OrchestratorCancelled(name)),
-        )
-      #(run, [types.Checkpoint, ..effects])
+fn cancel_live(run: Run, slot: Slot, call: Call) -> #(Run, List(Effect)) {
+  let settled = fn(run: Run, call: Call, entry: Entry) {
+    #(put(run, slot, call), [
+      types.Checkpoint,
+      answer_effect(call_id(call), entry),
+    ])
+  }
+  case call {
+    OrchestratorCall(name:, attempts:, ..) -> {
+      let entry = Errored(types.OrchestratorCancelled(name))
+      settled(
+        run,
+        OrchestratorCall(
+          ..call,
+          attempts: replace_head(attempts, OrchestratorSettled(entry)),
+        ),
+        entry,
+      )
     }
-    Ok(Record(kind: ToolKind(tool:, ..), progress:, ..) as rec) -> {
+    ToolCall(tool:, attempts:, ..) -> {
       // Sent (running, or unknown after a crash): it may have taken effect.
-      let failure = case progress {
-        AwaitingTool | ToolUnknown -> types.ToolUnknownOutcome
-        Blocked(..) -> types.ToolCancelled
-        // Not live: check_live refuses these before a cancel.
-        Completed(..)
-        | AwaitingAgent(..)
-        | AgentWaiting(..)
-        | Unavailable(..)
-        | AwaitingCommand
-        | AwaitingOrchestrator -> types.ToolCancelled
+      let failure = case attempts {
+        [Tried(ToolRunning(..)), ..] | [Tried(ToolInDoubt), ..] ->
+          types.ToolUnknownOutcome
+        [Tried(ToolHeld(..)), ..]
+        | [Tried(ToolSettled(..)), ..]
+        | [Forgotten, ..]
+        | [] -> types.ToolCancelled
       }
-      let #(run, effects) =
-        settle(
-          run,
-          id,
-          Record(..rec, progress: Completed(None)),
-          Errored(types.ToolCrashed(tool, failure)),
-        )
-      #(run, [types.Checkpoint, ..effects])
+      let entry = Errored(types.ToolCrashed(tool, failure))
+      settled(
+        run,
+        ToolCall(..call, attempts: replace_head(attempts, ToolSettled(entry))),
+        entry,
+      )
     }
-    Ok(Record(kind: CommandKind(command:, ..), ..) as rec) -> {
-      let #(run, effects) =
-        settle(
-          run,
-          id,
-          Record(..rec, progress: Completed(None)),
-          Errored(types.CommandCrashed(command, types.CommandCancelled)),
-        )
-      #(run, [types.Checkpoint, ..effects])
+    CommandCall(command:, attempts:, ..) -> {
+      let entry = Errored(types.CommandCrashed(command, types.CommandCancelled))
+      settled(
+        run,
+        CommandCall(
+          ..call,
+          attempts: replace_head(attempts, CommandSettled(entry)),
+        ),
+        entry,
+      )
     }
-    Ok(Record(kind: AgentKind(agent:, ..), progress:, ..) as rec) -> {
+    AgentCall(agent:, ..) -> {
       // Cancelled while a tool call's outcome was unknown: the body is told.
-      let failure = case progress {
-        AgentWaiting(cause: types.OutcomeUnknown(tool:, args:), ..) ->
-          types.UnknownOutcome(tool, args)
-        AgentWaiting(..)
-        | AwaitingAgent(..)
-        | Unavailable(..)
-        | Blocked(..)
-        | Completed(..)
-        | AwaitingCommand
-        | AwaitingTool
-        | ToolUnknown
-        | AwaitingOrchestrator -> types.CancelledByOwner
+      let failure = case agent_attempt(call) {
+        Ok(AgentAttempt(
+          state: AgentWaiting(cause: types.OutcomeUnknown(tool:, args:), ..),
+          ..,
+        )) -> types.UnknownOutcome(tool, args)
+        Ok(AgentAttempt(state: AgentWaiting(..), ..))
+        | Ok(AgentAttempt(state: AgentRunning(..), ..))
+        | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+        | Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> types.CancelledByOwner
       }
       let #(run, effects) =
-        settle(
+        settle_agent(
           run,
-          id,
-          Record(..rec, progress: Completed(None)),
+          slot,
+          call,
           Errored(types.AgentGaveUp(agent, failure)),
+          None,
+          no_usage(),
         )
       #(run, [types.Checkpoint, ..effects])
     }
-    _ -> #(run, [types.Refuse(None, types.NotLive(id))])
+    RefusedCall(id:, ..) -> #(run, [
+      types.Refuse(None, types.NotLive(ids.request_text(id))),
+    ])
   }
 }
 
@@ -1746,72 +2071,85 @@ fn raise_budget(
   #(run, [types.Checkpoint, ..effects])
 }
 
-fn sorted_requests(run: Run) -> List(#(String, Record)) {
-  run.requests
-  |> dict.to_list
-  |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
-}
-
-/// Issues every blocked request that the pause and the budget now admit.
+/// Issues every held-back call that the pause and the budget now admit.
 fn unblock(run: Run) -> #(Run, List(Effect)) {
-  sorted_requests(run)
+  sorted_calls(run)
   |> list.fold(#(run, []), fn(acc, entry) {
     let #(run, effects) = acc
-    let id = entry.0
-    case entry.1 {
-      Record(
-        kind: AgentKind(agent:, input:, ..),
-        progress: Blocked(note:, ..),
+    let #(slot, call) = entry
+    case call {
+      AgentCall(
+        attempts: [Tried(AgentAttempt(state: AgentHeld(note:, ..), ..)), ..],
         ..,
-      ) as rec ->
+      ) ->
         case admit(run) {
           Ok(Nil) -> {
             let d = Dialogue([], note, None)
-            case call_effect(run, id, agent, input, rec.digest, d) {
-              Ok(call) -> #(
-                record(run, id, Record(..rec, progress: AwaitingAgent(d))),
-                list.append(effects, [call]),
+            let call =
+              update_agent(call, fn(a) {
+                AgentAttempt(..a, state: AgentRunning(d, IssuedNow))
+              })
+            case call_effect(run, slot, call, d) {
+              Ok(effect) -> #(
+                put(run, slot, call),
+                list.append(effects, [effect]),
               )
               Error(_) -> acc
             }
           }
           Error(_) -> acc
         }
-      Record(kind: ToolKind(tool:, input:, ..), progress: Blocked(..), ..) as rec ->
+      ToolCall(attempts: [Tried(ToolHeld(..)), ..older], ..) ->
         case admission(run) {
-          Ok(Nil) -> #(
-            record(run, id, Record(..rec, progress: AwaitingTool)),
-            list.append(effects, [
-              types.CallTool(id:, tool:, input:, digest: rec.digest),
-            ]),
-          )
+          Ok(Nil) -> {
+            let call =
+              ToolCall(..call, attempts: [
+                Tried(ToolRunning(IssuedNow)),
+                ..older
+              ])
+            #(
+              put(run, slot, call),
+              list.append(effects, [tool_effect(slot, call)]),
+            )
+          }
           Error(_) -> acc
         }
-      Record(kind: CommandKind(command:, input:, ..), progress: Blocked(..), ..) as rec ->
+      CommandCall(attempts: [Tried(CommandHeld(..)), ..older], ..) ->
         case result.try(admission(run), fn(_) { compute_check(run) }) {
-          Ok(Nil) -> #(
-            record(run, id, Record(..rec, progress: AwaitingCommand)),
-            list.append(effects, [
-              command_effect(run, id, command, input, rec.digest),
-            ]),
-          )
+          Ok(Nil) -> {
+            let call =
+              CommandCall(..call, attempts: [
+                Tried(CommandRunning(IssuedNow)),
+                ..older
+              ])
+            #(
+              put(run, slot, call),
+              list.append(effects, [command_effect(run, slot, call)]),
+            )
+          }
           Error(_) -> acc
         }
-      _ -> acc
+      // Not held back: nothing to issue.
+      AgentCall(..)
+      | ToolCall(..)
+      | CommandCall(..)
+      | OrchestratorCall(..)
+      | RefusedCall(..) -> acc
     }
   })
 }
 
 fn command_settled(
   run: Run,
-  id: String,
+  id: RequestId,
   entry: fn(String) -> Entry,
   minutes: Float,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(
-      Record(kind: CommandKind(command:, ..), progress: AwaitingCommand, ..) as rec,
-    ) -> {
+  case lookup(run, id) {
+    Ok(#(
+      slot,
+      CommandCall(command:, attempts: [Tried(CommandRunning(..)), ..older], ..) as call,
+    )) -> {
       let run =
         Run(
           ..run,
@@ -1820,89 +2158,71 @@ fn command_settled(
             compute_minutes: run.spent.compute_minutes +. minutes,
           ),
         )
-      let #(run, effects) =
-        settle(
-          run,
-          id,
-          Record(..rec, progress: Completed(None)),
-          entry(command),
-        )
-      #(run, [types.Checkpoint, ..effects])
+      let entry = entry(command)
+      let call =
+        CommandCall(..call, attempts: [Tried(CommandSettled(entry)), ..older])
+      #(put(run, slot, call), [types.Checkpoint, answer_effect(id, entry)])
     }
-    _ -> #(run, [])
+    // Not running (cancelled, settled, restarted): the result is not this call's.
+    Ok(#(_, CommandCall(..)))
+    | Ok(#(_, AgentCall(..)))
+    | Ok(#(_, ToolCall(..)))
+    | Ok(#(_, OrchestratorCall(..)))
+    | Ok(#(_, RefusedCall(..)))
+    | Error(Nil) -> #(run, [])
   }
 }
 
-/// A session call restarts from the session's state before it: every
-/// later call of the session is invalidated, so it runs again.
-fn rewind(run: Run, kind: Kind) -> Run {
-  case kind {
-    AgentKind(session:, index:, ..) -> {
-      let prefix = session <> ":"
-      let later =
-        dict.to_list(run.chain)
-        |> list.filter_map(fn(e) {
-          case string.starts_with(e.0, prefix) {
-            True ->
-              case int.parse(string.drop_start(e.0, string.length(prefix))) {
-                Ok(i) if i > index -> Ok(e.1)
-                _ -> Error(Nil)
-              }
-            False -> Error(Nil)
-          }
-        })
-      // Each is forgotten (its attempts stay), so a later request is a new
-      // call, not a stale record.
-      list.fold(later, run, forget)
-    }
-    _ -> run
-  }
-}
-
-/// An MCP result inside a live agent call joins its journal entry.
+/// An MCP result inside a live agent call joins its attempt.
 fn tool_recorded(
   run: Run,
-  id: String,
-  call: String,
+  id: RequestId,
+  call_key: String,
   result: Value,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(Record(kind: AgentKind(tools:, ..) as k, ..) as rec) ->
-      case in_flight(rec) {
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case in_flight(call) {
         // A result for a call already journaled replaces it (the host found
         // the record did not match the call: another tool or arguments).
-        Some(_) -> #(
-          record(
-            run,
-            id,
-            Record(
-              ..rec,
-              kind: AgentKind(..k, tools: [
-                types.ToolResult(call, result),
-                ..list.filter(tools, fn(t) { t.call != call })
-              ]),
-            ),
-          ),
-          [types.Checkpoint],
-        )
-        None -> #(run, [])
+        Ok(_) -> {
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, tools: [
+                types.ToolResult(call_key, result),
+                ..list.filter(a.tools, fn(t) { t.call != call_key })
+              ])
+            })
+          #(put(run, slot, call), [types.Checkpoint])
+        }
+        Error(Nil) -> #(run, [])
       }
-    _ -> #(run, [])
+    Error(Nil) -> #(run, [])
   }
 }
 
 fn tool_settled(
   run: Run,
-  id: String,
+  id: RequestId,
   entry: fn(String) -> Entry,
 ) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(Record(kind: ToolKind(tool:, ..), progress: AwaitingTool, ..) as rec) -> {
-      let #(run, effects) =
-        settle(run, id, Record(..rec, progress: Completed(None)), entry(tool))
-      #(run, [types.Checkpoint, ..effects])
+  case lookup(run, id) {
+    Ok(#(
+      slot,
+      ToolCall(tool:, attempts: [Tried(ToolRunning(..)), ..older], ..) as call,
+    )) -> {
+      let entry = entry(tool)
+      let call =
+        ToolCall(..call, attempts: [Tried(ToolSettled(entry)), ..older])
+      #(put(run, slot, call), [types.Checkpoint, answer_effect(id, entry)])
     }
-    _ -> #(run, [])
+    // Not running: the result is not this call's.
+    Ok(#(_, ToolCall(..)))
+    | Ok(#(_, AgentCall(..)))
+    | Ok(#(_, CommandCall(..)))
+    | Ok(#(_, OrchestratorCall(..)))
+    | Ok(#(_, RefusedCall(..)))
+    | Error(Nil) -> #(run, [])
   }
 }
 
@@ -1914,38 +2234,42 @@ fn submit(
   answer: Value,
 ) -> Result(#(Run, List(Effect)), Refusal) {
   let id = capability.submittable_id(node)
-  case dict.get(run.requests, id) {
-    Ok(rec) -> {
-      let #(run, effects) =
-        settle(
-          run,
-          id,
-          Record(..rec, progress: Completed(None)),
-          Answered(answer),
+  case lookup(run, id) {
+    Ok(#(slot, OrchestratorCall(attempts:, ..) as call)) -> {
+      let entry = Answered(answer)
+      let call =
+        OrchestratorCall(
+          ..call,
+          attempts: replace_head(attempts, OrchestratorSettled(entry)),
         )
-      Ok(#(run, [types.Checkpoint, ..effects]))
+      Ok(#(put(run, slot, call), [types.Checkpoint, answer_effect(id, entry)]))
     }
-    Error(Nil) -> Error(types.NotPending(id))
+    Ok(#(_, AgentCall(..)))
+    | Ok(#(_, CommandCall(..)))
+    | Ok(#(_, ToolCall(..)))
+    | Ok(#(_, RefusedCall(..)))
+    | Error(Nil) -> Error(types.NotPending(ids.request_text(id)))
   }
 }
 
 /// A body tool call in flight at a crash and not safe to make again: it
 /// waits for its owner, its outcome unknown.
-fn tool_unknown(run: Run, id: String) -> #(Run, List(Effect)) {
-  case dict.get(run.requests, id) {
-    Ok(Record(kind: ToolKind(..), progress: AwaitingTool, ..) as rec) -> #(
-      record(run, id, Record(..rec, progress: ToolUnknown)),
+fn tool_unknown(run: Run, id: RequestId) -> #(Run, List(Effect)) {
+  case lookup(run, id) {
+    Ok(#(
+      slot,
+      ToolCall(attempts: [Tried(ToolRunning(..)), ..older], ..) as call,
+    )) -> #(
+      put(run, slot, ToolCall(..call, attempts: [Tried(ToolInDoubt), ..older])),
       [types.Checkpoint],
     )
     // Not a tool call in flight: nothing to record.
-    _ -> #(run, [])
-  }
-}
-
-fn run_digest(run: Run, id: String) -> String {
-  case dict.get(run.requests, id) {
-    Ok(rec) -> rec.digest
-    Error(Nil) -> ""
+    Ok(#(_, ToolCall(..)))
+    | Ok(#(_, AgentCall(..)))
+    | Ok(#(_, CommandCall(..)))
+    | Ok(#(_, OrchestratorCall(..)))
+    | Ok(#(_, RefusedCall(..)))
+    | Error(Nil) -> #(run, [])
   }
 }
 
@@ -1955,53 +2279,92 @@ fn find_agent(workflow: Workflow, name: String) -> Result(Agent, Nil) {
 
 // --- Status --------------------------------------------------------------------
 
-/// Running while any call or script is in flight. Otherwise idle: paused,
-/// for budget or an executor fault (the first blocked request by id), or
-/// because a node waits for an answer. A run with nothing in flight and
+/// What a call's live attempt contributes to the run's status.
+type Activity {
+  /// In flight.
+  Busy
+  /// Held back (or faulted) for this reason.
+  Blocked(IdleReason)
+  /// Waiting for its owner.
+  Awaiting
+  /// Settled or forgotten.
+  Quiet
+}
+
+fn activity(run: Run, call: Call) -> Activity {
+  case call {
+    AgentCall(attempts: [Tried(a), ..], ..) ->
+      case a.state {
+        AgentRunning(..) -> Busy
+        AgentHeld(reason:, ..) -> Blocked(current_reason(run, reason))
+        AgentUnavailable(alias:, error:, ..) ->
+          Blocked(types.ExecutorUnavailable(alias, error))
+        AgentWaiting(..) -> Awaiting
+        AgentSettled(..) -> Quiet
+      }
+    CommandCall(attempts: [Tried(state), ..], ..) ->
+      case state {
+        CommandRunning(..) -> Busy
+        CommandHeld(reason) -> Blocked(current_reason(run, reason))
+        CommandSettled(..) -> Quiet
+      }
+    ToolCall(attempts: [Tried(state), ..], ..) ->
+      case state {
+        ToolRunning(..) -> Busy
+        ToolHeld(reason) -> Blocked(current_reason(run, reason))
+        ToolInDoubt -> Awaiting
+        ToolSettled(..) -> Quiet
+      }
+    OrchestratorCall(attempts: [Tried(state), ..], ..) ->
+      case state {
+        OrchestratorWaiting -> Awaiting
+        OrchestratorSettled(..) -> Quiet
+      }
+    AgentCall(..)
+    | CommandCall(..)
+    | ToolCall(..)
+    | OrchestratorCall(..)
+    | RefusedCall(..) -> Quiet
+  }
+}
+
+/// Running while any call is in flight. Otherwise idle: on a held failure,
+/// paused, for budget or an executor fault (the first blocked call by id),
+/// or because a node waits for its owner. A run with nothing in flight and
 /// nothing waiting is running: its body is computing.
 pub fn status(run: RunState) -> Option(RunStatus) {
   case run {
     NotYetStarted -> None
     Active(Run(lifecycle: Ended(outcome), ..)) -> Some(types.Finished(outcome))
     Active(r) -> {
-      let records = list.map(sorted_requests(r), fn(e) { { e.1 }.progress })
-      let running =
-        list.any(records, fn(p) {
-          case p {
-            AwaitingAgent(..) | AwaitingCommand | AwaitingTool -> True
-            _ -> False
-          }
-        })
+      let activities = list.map(sorted_calls(r), fn(e) { activity(r, e.1) })
+      let running = list.contains(activities, Busy)
       let reason =
-        list.find_map(records, fn(p) {
-          case p {
-            Blocked(reason:, ..) -> Ok(current_reason(r, reason))
-            Unavailable(alias:, error:, ..) ->
-              Ok(types.ExecutorUnavailable(alias, error))
-            _ -> Error(Nil)
+        list.find_map(activities, fn(a) {
+          case a {
+            Blocked(reason) -> Ok(reason)
+            Busy | Awaiting | Quiet -> Error(Nil)
           }
         })
-      let waiting =
-        list.any(records, fn(p) {
-          case p {
-            AgentWaiting(..) | AwaitingOrchestrator | ToolUnknown -> True
-            _ -> False
-          }
-        })
-      case running, r.admission, reason, waiting {
-        True, _, _, _ -> Some(types.Running)
-        False, _, _, _ if r.hold != None ->
-          case r.hold {
-            Some(#(id, reason)) ->
-              Some(types.Idle(Some(types.NodeFailure(id, reason))))
-            None -> Some(types.Running)
-          }
-        False, Holding, _, _ -> Some(types.Idle(Some(types.PausedByUser)))
-        False, Admitting, Ok(reason), _ -> Some(types.Idle(Some(reason)))
-        False, Admitting, Error(Nil), True -> Some(types.Idle(None))
-        False, Admitting, Error(Nil), False -> Some(types.Running)
+      let waiting = list.contains(activities, Awaiting)
+      case running, r.hold, r.admission, reason, waiting {
+        // In flight wins; then a held failure; then a pause; then a reason.
+        True, _, _, _, _ -> Some(types.Running)
+        False, Some(#(slot, reason)), _, _, _ ->
+          Some(types.Idle(Some(types.NodeFailure(held_id(r, slot), reason))))
+        False, None, Holding, _, _ -> Some(types.Idle(Some(types.PausedByUser)))
+        False, None, Admitting, Ok(reason), _ -> Some(types.Idle(Some(reason)))
+        False, None, Admitting, Error(Nil), True -> Some(types.Idle(None))
+        False, None, Admitting, Error(Nil), False -> Some(types.Running)
       }
     }
+  }
+}
+
+fn held_id(run: Run, slot: Slot) -> String {
+  case dict.get(run.calls, slot) {
+    Ok(call) -> ids.request_text(call_id(call))
+    Error(Nil) -> ""
   }
 }
 
@@ -2013,176 +2376,143 @@ fn current_reason(run: Run, reason: IdleReason) -> IdleReason {
       budget_check(run) |> result.unwrap_error(reason)
     types.BudgetReached(kind: types.ComputeMinutes, ..) ->
       compute_check(run) |> result.unwrap_error(reason)
-    _ -> reason
+    types.ExecutorUnavailable(..)
+    | types.PausedByUser
+    | types.NodeFailure(..) -> reason
   }
 }
 
-/// Agent calls that started a dialogue, and command calls that started.
-/// Calls held back by a pause, the
-/// budget or an executor fault, and calls refused before they started, are
-/// not nodes; the run's idle reason names the held ones.
+/// Every call on the live path, as a node: running, waiting, held back,
+/// done, or refused. A forgotten call (a later call of a rewound session)
+/// is not on the live path and is not shown.
 pub fn nodes(run: RunState) -> List(Node) {
   case run {
     NotYetStarted -> []
     Active(r) ->
-      sorted_requests(r)
-      |> list.filter_map(fn(e) {
-        let #(id, rec) = e
-        let entry = live_entry(r, rec.digest)
-        case rec.kind {
-          AgentKind(agent:, inbox:, ..) -> {
-            let declared = find_agent(r.workflow, agent)
-            let steerable = case declared {
-              Ok(a) -> a.steerable
-              Error(Nil) -> False
-            }
-            let inbox = list.reverse(inbox)
-            let current = fn() {
-              case declared {
-                Ok(a) -> resolve_model(r.models, a.model) |> result.unwrap("")
-                Error(Nil) -> ""
-              }
-            }
-            case rec.progress {
-              AwaitingAgent(..) ->
-                Ok(types.NodeRunning(id, agent, current(), steerable, inbox))
-              AgentWaiting(model:, cause:, ..) ->
-                Ok(types.NodeIdle(id, agent, model, steerable, inbox, cause))
-              Blocked(reason:, ..) ->
-                Ok(types.NodeHeld(
-                  id,
-                  agent,
-                  current(),
-                  steerable,
-                  inbox,
-                  current_reason(r, reason),
-                ))
-              Unavailable(alias:, error:, ..) ->
-                Ok(types.NodeHeld(
-                  id,
-                  agent,
-                  current(),
-                  steerable,
-                  inbox,
-                  types.ExecutorUnavailable(alias, error),
-                ))
-              Completed(model:) -> {
-                let done = fn(outcome) {
-                  Ok(types.NodeDone(
-                    id,
-                    agent,
-                    option.unwrap(model, ""),
-                    steerable,
-                    inbox,
-                    outcome,
-                  ))
-                }
-                case entry {
-                  Ok(Answered(_)) -> done(types.Submitted)
-                  Ok(Errored(types.AgentGaveUp(failure:, ..))) ->
-                    done(types.NodeFailed(failure))
-                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
-                  // An agent call fails only as AgentGaveUp.
-                  Ok(Errored(_)) -> Error(Nil)
-                  // Invalidated (a later call of a rewound session): not on the live path.
-                  Error(Nil) -> Error(Nil)
-                }
-              }
-              // Not an agent's progress: never recorded with an agent.
-              AwaitingCommand
-              | AwaitingTool
-              | ToolUnknown
-              | AwaitingOrchestrator -> Error(Nil)
-            }
-          }
-          CommandKind(command:, inbox:, ..) -> {
-            let inbox = list.reverse(inbox)
-            case rec.progress {
-              AwaitingCommand -> Ok(types.CommandRunning(id, command, inbox))
-              Blocked(reason:, ..) ->
-                Ok(types.CommandHeld(
-                  id,
-                  command,
-                  inbox,
-                  current_reason(r, reason),
-                ))
-              Completed(..) ->
-                case entry {
-                  Ok(Answered(_)) ->
-                    Ok(types.CommandDone(id, command, inbox, types.Succeeded))
-                  Ok(Errored(types.CommandCrashed(failure:, ..))) ->
-                    Ok(types.CommandDone(
-                      id,
-                      command,
-                      inbox,
-                      types.FailedWith(failure),
-                    ))
-                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
-                  // A command fails only as CommandCrashed; no entry: invalidated.
-                  Ok(Errored(_)) | Error(Nil) -> Error(Nil)
-                }
-              // Not a command's progress: never recorded with a command.
-              AwaitingAgent(..)
-              | AgentWaiting(..)
-              | Unavailable(..)
-              | AwaitingTool
-              | ToolUnknown
-              | AwaitingOrchestrator -> Error(Nil)
-            }
-          }
-          ToolKind(tool:, input:, ..) ->
-            case rec.progress {
-              AwaitingTool -> Ok(types.ToolRunning(id, tool))
-              ToolUnknown -> Ok(types.ToolOutcomeUnknown(id, tool, input))
-              Blocked(reason:, ..) ->
-                Ok(types.ToolHeld(id, tool, current_reason(r, reason)))
-              Completed(..) ->
-                case entry {
-                  Ok(Answered(_)) ->
-                    Ok(types.ToolDone(id, tool, types.ToolSucceeded))
-                  Ok(Errored(types.ToolCrashed(failure:, ..))) ->
-                    Ok(types.ToolDone(id, tool, types.ToolFailedWith(failure)))
-                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
-                  // A tool call fails only as ToolCrashed; no entry: invalidated.
-                  Ok(Errored(_)) | Error(Nil) -> Error(Nil)
-                }
-              // Not a tool call's progress: never recorded with one.
-              AwaitingAgent(..)
-              | AgentWaiting(..)
-              | Unavailable(..)
-              | AwaitingCommand
-              | AwaitingOrchestrator -> Error(Nil)
-            }
-          OrchestratorKind(name:, input:) ->
-            case rec.progress {
-              AwaitingOrchestrator ->
-                Ok(types.OrchestratorPending(id, name, input))
-              Completed(..) ->
-                case entry {
-                  Ok(Answered(_)) -> Ok(types.OrchestratorDone(id, name))
-                  Ok(Errored(types.OrchestratorCancelled(..))) ->
-                    Ok(types.OrchestratorDropped(id, name))
-                  Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
-                  // An orchestrator node fails only as cancelled; no entry: invalidated.
-                  Ok(Errored(_)) | Error(Nil) -> Error(Nil)
-                }
-              // Orchestrator nodes are never held back and never issued.
-              AwaitingAgent(..)
-              | AgentWaiting(..)
-              | Unavailable(..)
-              | Blocked(..)
-              | AwaitingCommand
-              | AwaitingTool
-              | ToolUnknown -> Error(Nil)
-            }
-          RefusedKind ->
-            case entry {
-              Ok(Refused(refusal)) -> Ok(types.NodeRefused(id, refusal))
-              // A refused request is settled with its refusal only.
-              Ok(Answered(_)) | Ok(Errored(_)) | Error(Nil) -> Error(Nil)
-            }
+      sorted_calls(r)
+      |> list.filter_map(fn(e) { node_of(r, e.1) })
+  }
+}
+
+fn node_of(r: Run, call: Call) -> Result(Node, Nil) {
+  case call {
+    AgentCall(id:, agent:, inbox:, attempts:, ..) -> {
+      let id = ids.request_text(id)
+      let steerable = steerable(r, agent)
+      let inbox = list.reverse(inbox)
+      let current = fn() {
+        case find_agent(r.workflow, agent) {
+          Ok(a) -> resolve_model(r.models, a.model) |> result.unwrap("")
+          Error(Nil) -> ""
         }
-      })
+      }
+      case attempts {
+        [Tried(AgentAttempt(state:, ..)), ..] ->
+          case state {
+            AgentRunning(..) ->
+              Ok(types.NodeRunning(id, agent, current(), steerable, inbox))
+            AgentWaiting(model:, cause:, ..) ->
+              Ok(types.NodeIdle(id, agent, model, steerable, inbox, cause))
+            AgentHeld(reason:, ..) ->
+              Ok(types.NodeHeld(
+                id,
+                agent,
+                current(),
+                steerable,
+                inbox,
+                current_reason(r, reason),
+              ))
+            AgentUnavailable(alias:, error:, ..) ->
+              Ok(types.NodeHeld(
+                id,
+                agent,
+                current(),
+                steerable,
+                inbox,
+                types.ExecutorUnavailable(alias, error),
+              ))
+            AgentSettled(entry:, served:, ..) -> {
+              let done = fn(outcome) {
+                Ok(types.NodeDone(
+                  id,
+                  agent,
+                  option.unwrap(served, ""),
+                  steerable,
+                  inbox,
+                  outcome,
+                ))
+              }
+              case entry {
+                Answered(_) -> done(types.Submitted)
+                Errored(types.AgentGaveUp(failure:, ..)) ->
+                  done(types.NodeFailed(failure))
+                Refused(refusal) -> Ok(types.NodeRefused(id, refusal))
+                // An agent call fails only as AgentGaveUp.
+                Errored(_) -> Error(Nil)
+              }
+            }
+          }
+        [Forgotten, ..] | [] -> Error(Nil)
+      }
+    }
+    CommandCall(id:, command:, inbox:, attempts:, ..) -> {
+      let id = ids.request_text(id)
+      let inbox = list.reverse(inbox)
+      case attempts {
+        [Tried(CommandRunning(..)), ..] ->
+          Ok(types.CommandRunning(id, command, inbox))
+        [Tried(CommandHeld(reason)), ..] ->
+          Ok(types.CommandHeld(id, command, inbox, current_reason(r, reason)))
+        [Tried(CommandSettled(Answered(_))), ..] ->
+          Ok(types.CommandDone(id, command, inbox, types.Succeeded))
+        [Tried(CommandSettled(Errored(types.CommandCrashed(failure:, ..)))), ..] ->
+          Ok(types.CommandDone(id, command, inbox, types.FailedWith(failure)))
+        [Tried(CommandSettled(Refused(refusal))), ..] ->
+          Ok(types.NodeRefused(id, refusal))
+        // A command fails only as CommandCrashed.
+        [Tried(CommandSettled(Errored(_))), ..] | [Forgotten, ..] | [] ->
+          Error(Nil)
+      }
+    }
+    ToolCall(id:, tool:, input:, attempts:, ..) -> {
+      let id = ids.request_text(id)
+      case attempts {
+        [Tried(ToolRunning(..)), ..] -> Ok(types.ToolRunning(id, tool))
+        [Tried(ToolInDoubt), ..] ->
+          Ok(types.ToolOutcomeUnknown(id, tool, input))
+        [Tried(ToolHeld(reason)), ..] ->
+          Ok(types.ToolHeld(id, tool, current_reason(r, reason)))
+        [Tried(ToolSettled(Answered(_))), ..] ->
+          Ok(types.ToolDone(id, tool, types.ToolSucceeded))
+        [Tried(ToolSettled(Errored(types.ToolCrashed(failure:, ..)))), ..] ->
+          Ok(types.ToolDone(id, tool, types.ToolFailedWith(failure)))
+        [Tried(ToolSettled(Refused(refusal))), ..] ->
+          Ok(types.NodeRefused(id, refusal))
+        // A tool call fails only as ToolCrashed.
+        [Tried(ToolSettled(Errored(_))), ..] | [Forgotten, ..] | [] ->
+          Error(Nil)
+      }
+    }
+    OrchestratorCall(id:, name:, input:, attempts:) -> {
+      let id = ids.request_text(id)
+      case attempts {
+        [Tried(OrchestratorWaiting), ..] ->
+          Ok(types.OrchestratorPending(id, name, input))
+        [Tried(OrchestratorSettled(Answered(_))), ..] ->
+          Ok(types.OrchestratorDone(id, name))
+        [
+          Tried(OrchestratorSettled(Errored(types.OrchestratorCancelled(..)))),
+          ..
+        ] -> Ok(types.OrchestratorDropped(id, name))
+        [Tried(OrchestratorSettled(Refused(refusal))), ..] ->
+          Ok(types.NodeRefused(id, refusal))
+        // An orchestrator node fails only as cancelled.
+        [Tried(OrchestratorSettled(Errored(_))), ..] | [Forgotten, ..] | [] ->
+          Error(Nil)
+      }
+    }
+    RefusedCall(id:, refusal:) ->
+      Ok(types.NodeRefused(ids.request_text(id), refusal))
   }
 }
 
@@ -2195,34 +2525,72 @@ pub fn host_facts(run: RunState) -> json.Json {
   }
 }
 
+fn entry_text(entry: Entry) -> String {
+  case entry {
+    Answered(_) -> "answered"
+    Errored(_) -> "errored"
+    Refused(_) -> "refused"
+  }
+}
+
+fn describe_attempts(
+  attempts: List(Attempt(s)),
+  settled: fn(s) -> Option(String),
+) -> List(String) {
+  list.map(attempts, fn(attempt) {
+    case attempt {
+      Forgotten -> "forgotten"
+      Tried(state) -> option.unwrap(settled(state), "open")
+    }
+  })
+}
+
 /// The attempts at a request's slot, newest first, for tests and display:
 /// `open`, `forgotten`, or how it settled and by which model.
 pub fn attempts(run: RunState, id: String) -> List(String) {
   case run {
     NotYetStarted -> []
     Active(r) ->
-      case dict.get(r.requests, id) {
+      case lookup(r, ids.request_id(id)) {
         Error(Nil) -> []
-        Ok(rec) ->
-          dict.get(r.journal, rec.digest)
-          |> result.unwrap([])
-          |> list.map(fn(attempt) {
-            case attempt {
-              Forgotten -> "forgotten"
-              Tried(settled: None, ..) -> "open"
-              Tried(settled: Some(settled), ..) -> {
-                let how = case settled.entry {
-                  Answered(_) -> "answered"
-                  Errored(_) -> "errored"
-                  Refused(_) -> "refused"
+        Ok(#(_, call)) ->
+          case call {
+            AgentCall(attempts:, ..) ->
+              describe_attempts(attempts, fn(a) {
+                case a.state {
+                  AgentSettled(entry: e, served: Some(model), ..) ->
+                    Some(entry_text(e) <> " by " <> model)
+                  AgentSettled(entry: e, served: None, ..) ->
+                    Some(entry_text(e))
+                  AgentHeld(..)
+                  | AgentRunning(..)
+                  | AgentWaiting(..)
+                  | AgentUnavailable(..) -> None
                 }
-                case settled.served {
-                  Some(model) -> how <> " by " <> model
-                  None -> how
+              })
+            CommandCall(attempts:, ..) ->
+              describe_attempts(attempts, fn(s) {
+                case s {
+                  CommandSettled(e) -> Some(entry_text(e))
+                  CommandHeld(..) | CommandRunning(..) -> None
                 }
-              }
-            }
-          })
+              })
+            ToolCall(attempts:, ..) ->
+              describe_attempts(attempts, fn(s) {
+                case s {
+                  ToolSettled(e) -> Some(entry_text(e))
+                  ToolHeld(..) | ToolRunning(..) | ToolInDoubt -> None
+                }
+              })
+            OrchestratorCall(attempts:, ..) ->
+              describe_attempts(attempts, fn(s) {
+                case s {
+                  OrchestratorSettled(e) -> Some(entry_text(e))
+                  OrchestratorWaiting -> None
+                }
+              })
+            RefusedCall(..) -> ["refused"]
+          }
       }
   }
 }
@@ -2255,7 +2623,13 @@ pub fn snapshot(run: RunState) -> json.Json {
         #("budget", types.budget_to_json(r.budget)),
         #("models", sorted_object(r.models, json.string)),
         #("executor", json.nullable(r.executor, json.string)),
-        #("held", json.nullable(option.map(r.hold, fn(h) { h.0 }), json.string)),
+        #(
+          "held",
+          json.nullable(
+            option.map(r.hold, fn(h) { held_id(r, h.0) }),
+            json.string,
+          ),
+        ),
         #(
           "code",
           json.array(

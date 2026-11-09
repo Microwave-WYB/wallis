@@ -980,7 +980,7 @@ export class Session {
 				this.#later(() => this.#feed({ type: "agent_progressed", id, dialogue }));
 			},
 			resume,
-			digest: effect.digest,
+			slot: effect.slot,
 			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
 			history,
 			recorded: new Map(effect.recorded.map((r) => [r.call, r.result])),

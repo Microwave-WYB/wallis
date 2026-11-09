@@ -954,7 +954,10 @@ pub fn host_facts_are_noted_even_after_the_end_test() {
     ])
   assert json.to_string(run.host_facts(state)) == "{\"executor\":\"fake\"}"
   // Facts are about the host, not the run: the snapshot does not have them.
-  assert !string.contains(json.to_string(run.snapshot(state)), "executor\":\"fake")
+  assert !string.contains(
+    json.to_string(run.snapshot(state)),
+    "executor\":\"fake",
+  )
 }
 
 pub fn a_later_session_call_is_keyed_by_the_dialogue_before_it_test() {

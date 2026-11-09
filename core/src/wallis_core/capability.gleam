@@ -13,6 +13,7 @@ import gleam/list
 import gleam/option.{type Option, Some}
 import gleam/result
 import gleam/string
+import wallis_core/ids.{type RequestId}
 import wallis_core/types.{
   type Pin, type Refusal, NodeNotRunning, NotAnAgent, NotIdle, NotLive, NotOwner,
   NotPending, NotSteerable, PinMismatch,
@@ -60,46 +61,50 @@ pub type NodeFacts {
 }
 
 pub opaque type IdleNode {
-  IdleNode(node: String)
+  IdleNode(node: RequestId)
 }
 
 /// An answer goes only to a steerable node that waits for one.
 pub fn check_idle(
   _owned: OwnedRun,
-  node: String,
+  node: RequestId,
   facts: NodeFacts,
 ) -> Result(IdleNode, Refusal) {
   case facts {
     Waiting(steerable: True) -> Ok(IdleNode(node))
-    Waiting(steerable: False) -> Error(NotSteerable(node))
-    CommandWorking | ToolWorking | Pending -> Error(NotAnAgent(node))
-    _ -> Error(NotIdle(node))
+    Waiting(steerable: False) -> Error(NotSteerable(ids.request_text(node)))
+    CommandWorking | ToolWorking | Pending ->
+      Error(NotAnAgent(ids.request_text(node)))
+    Working(..) | Unsettled(..) | Faulted(..) | Held(..) | Settled | Absent ->
+      Error(NotIdle(ids.request_text(node)))
   }
 }
 
-pub fn idle_id(node: IdleNode) -> String {
+pub fn idle_id(node: IdleNode) -> RequestId {
   node.node
 }
 
 pub opaque type SteerableNode {
-  SteerableNode(node: String)
+  SteerableNode(node: RequestId)
 }
 
 /// Steer and interrupt reach only a running node of a steerable agent.
 pub fn check_steerable(
   _owned: OwnedRun,
-  node: String,
+  node: RequestId,
   facts: NodeFacts,
 ) -> Result(SteerableNode, Refusal) {
   case facts {
     Working(steerable: True) -> Ok(SteerableNode(node))
-    Working(steerable: False) -> Error(NotSteerable(node))
-    CommandWorking | ToolWorking | Pending -> Error(NotAnAgent(node))
-    _ -> Error(NodeNotRunning(node))
+    Working(steerable: False) -> Error(NotSteerable(ids.request_text(node)))
+    CommandWorking | ToolWorking | Pending ->
+      Error(NotAnAgent(ids.request_text(node)))
+    Waiting(..) | Unsettled(..) | Faulted(..) | Held(..) | Settled | Absent ->
+      Error(NodeNotRunning(ids.request_text(node)))
   }
 }
 
-pub fn steerable_id(node: SteerableNode) -> String {
+pub fn steerable_id(node: SteerableNode) -> RequestId {
   node.node
 }
 
@@ -114,13 +119,13 @@ pub type LiveKind {
 }
 
 pub opaque type LiveNode {
-  LiveNode(node: String, kind: LiveKind)
+  LiveNode(node: RequestId, kind: LiveKind)
 }
 
 /// Cancel and restart reach any node that is not done.
 pub fn check_live(
   _owned: OwnedRun,
-  node: String,
+  node: RequestId,
   facts: NodeFacts,
 ) -> Result(LiveNode, Refusal) {
   case facts {
@@ -132,11 +137,11 @@ pub fn check_live(
     CommandWorking -> Ok(LiveNode(node, LiveCommand))
     ToolWorking -> Ok(LiveNode(node, LiveTool))
     Pending -> Ok(LiveNode(node, LiveOrchestrator))
-    Settled | Absent -> Error(NotLive(node))
+    Settled | Absent -> Error(NotLive(ids.request_text(node)))
   }
 }
 
-pub fn live_id(node: LiveNode) -> String {
+pub fn live_id(node: LiveNode) -> RequestId {
   node.node
 }
 
@@ -145,13 +150,13 @@ pub fn live_kind(node: LiveNode) -> LiveKind {
 }
 
 pub opaque type SubmittableNode {
-  SubmittableNode(node: String)
+  SubmittableNode(node: RequestId)
 }
 
 /// `submit_result` reaches an orchestrator node waiting for its result.
 pub fn check_submittable(
   _owned: OwnedRun,
-  node: String,
+  node: RequestId,
   facts: NodeFacts,
 ) -> Result(SubmittableNode, Refusal) {
   case facts {
@@ -164,11 +169,11 @@ pub fn check_submittable(
     | CommandWorking
     | ToolWorking
     | Settled
-    | Absent -> Error(NotPending(node))
+    | Absent -> Error(NotPending(ids.request_text(node)))
   }
 }
 
-pub fn submittable_id(node: SubmittableNode) -> String {
+pub fn submittable_id(node: SubmittableNode) -> RequestId {
   node.node
 }
 

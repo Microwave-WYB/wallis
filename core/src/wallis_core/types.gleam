@@ -265,228 +265,267 @@ pub type Event {
 
 pub fn event_to_json(event: Event) -> json.Json {
   case event {
-    Started(workflow:, pin:, input:) -> json.object([
-      #("type", json.string("started")),
-      #("workflow", workflow_to_json(workflow)),
-      #("pin", pin_to_json(pin)),
-      #("input", json_value.to_json(input)),
-    ])
-    Resumed(pin:) -> json.object([
-      #("type", json.string("resumed")),
-      #("pin", pin_to_json(pin)),
-    ])
-    CodeChanged(from:, to:) -> json.object([
-      #("type", json.string("code_changed")),
-      #("from", json.string(from)),
-      #("to", json.string(to)),
-    ])
-    Requested(id:, request:, node_digest:, occurrence:) -> json.object([
-      #("type", json.string("requested")),
-      #("id", json.string(id)),
-      #("request", request_to_json(request)),
-      #("node_digest", json.string(node_digest)),
-      #("occurrence", json.int(occurrence)),
-    ])
-    AgentReturned(id:, output:, usage:, model:) -> json.object([
-      #("type", json.string("agent_returned")),
-      #("id", json.string(id)),
-      #("output", json_value.to_json(output)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    AgentIdle(id:, message:, usage:, model:) -> json.object([
-      #("type", json.string("agent_idle")),
-      #("id", json.string(id)),
-      #("message", json.string(message)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    AgentFailed(id:, failure:, usage:, model:) -> json.object([
-      #("type", json.string("agent_failed")),
-      #("id", json.string(id)),
-      #("failure", agent_failure_to_json(failure)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    TurnLimitReached(id:, used:, limit:, usage:, model:) -> json.object([
-      #("type", json.string("turn_limit_reached")),
-      #("id", json.string(id)),
-      #("used", json.int(used)),
-      #("limit", json.int(limit)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    ExecutorFailed(id:, error:) -> json.object([
-      #("type", json.string("executor_failed")),
-      #("id", json.string(id)),
-      #("error", json.string(error)),
-    ])
-    AgentAsked(id:, message:, usage:, model:) -> json.object([
-      #("type", json.string("agent_asked")),
-      #("id", json.string(id)),
-      #("message", json.string(message)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    CallOutcomeUnknown(id:, tool:, args:, usage:, model:) -> json.object([
-      #("type", json.string("call_outcome_unknown")),
-      #("id", json.string(id)),
-      #("tool", json.string(tool)),
-      #("args", json_value.to_json(args)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    PreviousDialogueMissing(id:) -> json.object([
-      #("type", json.string("previous_dialogue_missing")),
-      #("id", json.string(id)),
-    ])
-    AgentProgressed(id:, dialogue:) -> json.object([
-      #("type", json.string("agent_progressed")),
-      #("id", json.string(id)),
-      #("dialogue", json.string(dialogue)),
-    ])
-    TurnInterrupted(id:, usage:, model:) -> json.object([
-      #("type", json.string("turn_interrupted")),
-      #("id", json.string(id)),
-      #("usage", usage_to_json(usage)),
-      #("model", json.string(model)),
-    ])
-    ToolRecorded(id:, call:, result:) -> json.object([
-      #("type", json.string("tool_recorded")),
-      #("id", json.string(id)),
-      #("call", json.string(call)),
-      #("result", json_value.to_json(result)),
-    ])
-    InputRejected(id:, field:, chars:, limit:) -> json.object([
-      #("type", json.string("input_rejected")),
-      #("id", json.string(id)),
-      #("field", case field {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("chars", json.int(chars)),
-      #("limit", json.int(limit)),
-    ])
-    CommandReturned(id:, output:, minutes:) -> json.object([
-      #("type", json.string("command_returned")),
-      #("id", json.string(id)),
-      #("output", json_value.to_json(output)),
-      #("minutes", json.float(minutes)),
-    ])
-    CommandFailed(id:, failure:, minutes:) -> json.object([
-      #("type", json.string("command_failed")),
-      #("id", json.string(id)),
-      #("failure", command_failure_to_json(failure)),
-      #("minutes", json.float(minutes)),
-    ])
-    ToolReturned(id:, output:) -> json.object([
-      #("type", json.string("tool_returned")),
-      #("id", json.string(id)),
-      #("output", json_value.to_json(output)),
-    ])
-    ToolCallUnknown(id:) -> json.object([
-      #("type", json.string("tool_call_unknown")),
-      #("id", json.string(id)),
-    ])
-    ToolFailed(id:, failure:) -> json.object([
-      #("type", json.string("tool_failed")),
-      #("id", json.string(id)),
-      #("failure", tool_failure_to_json(failure)),
-    ])
-    ResultSubmitted(node:, value:, by:) -> json.object([
-      #("type", json.string("result_submitted")),
-      #("node", json.string(node)),
-      #("value", json_value.to_json(value)),
-      #("by", json.string(by)),
-    ])
-    Observed(at:, label:, value:) -> json.object([
-      #("type", json.string("observed")),
-      #("at", json.string(at)),
-      #("label", json.string(label)),
-      #("value", json_value.to_json(value)),
-    ])
-    Sent(node:, text:, message_id:, by:, turns:) -> json.object([
-      #("type", json.string("sent")),
-      #("node", json.string(node)),
-      #("text", json.string(text)),
-      #("message_id", json.string(message_id)),
-      #("by", json.string(by)),
-      #("turns", json.int(turns)),
-    ])
-    Steered(node:, text:, message_id:, by:) -> json.object([
-      #("type", json.string("steered")),
-      #("node", json.string(node)),
-      #("text", json.string(text)),
-      #("message_id", json.string(message_id)),
-      #("by", json.string(by)),
-    ])
-    InterruptRequested(node:, by:) -> json.object([
-      #("type", json.string("interrupt_requested")),
-      #("node", json.string(node)),
-      #("by", json.string(by)),
-    ])
-    Restarted(node:, note:, by:, turns:) -> json.object([
-      #("type", json.string("restarted")),
-      #("node", json.string(node)),
-      #("note", case note {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("by", json.string(by)),
-      #("turns", json.int(turns)),
-    ])
-    NodeCancelled(node:, by:) -> json.object([
-      #("type", json.string("node_cancelled")),
-      #("node", json.string(node)),
-      #("by", json.string(by)),
-    ])
-    AliasRebound(alias:, from:, to:) -> json.object([
-      #("type", json.string("alias_rebound")),
-      #("alias", json.string(alias)),
-      #("from", json.string(from)),
-      #("to", json.string(to)),
-    ])
-    BudgetRaised(kind:, limit:) -> json.object([
-      #("type", json.string("budget_raised")),
-      #("kind", budget_kind_to_json(kind)),
-      #("limit", json.float(limit)),
-    ])
-    ExecutorChanged(name:) -> json.object([
-      #("type", json.string("executor_changed")),
-      #("name", json.string(name)),
-    ])
-    RetryUnavailable -> json.object([
-      #("type", json.string("retry_unavailable")),
-    ])
-    CancelRequested(by:) -> json.object([
-      #("type", json.string("cancel_requested")),
-      #("by", json.string(by)),
-    ])
-    PauseRequested(by:) -> json.object([
-      #("type", json.string("pause_requested")),
-      #("by", json.string(by)),
-    ])
-    ResumeRequested(by:) -> json.object([
-      #("type", json.string("resume_requested")),
-      #("by", json.string(by)),
-    ])
-    Claimed(owner:) -> json.object([
-      #("type", json.string("claimed")),
-      #("owner", json.string(owner)),
-    ])
-    Noted(key:, value:) -> json.object([
-      #("type", json.string("noted")),
-      #("key", json.string(key)),
-      #("value", json_value.to_json(value)),
-    ])
-    BodyFinished(output:) -> json.object([
-      #("type", json.string("body_finished")),
-      #("output", json_value.to_json(output)),
-    ])
-    BodyFailed(reason:) -> json.object([
-      #("type", json.string("body_failed")),
-      #("reason", fail_reason_to_json(reason)),
-    ])
+    Started(workflow:, pin:, input:) ->
+      json.object([
+        #("type", json.string("started")),
+        #("workflow", workflow_to_json(workflow)),
+        #("pin", pin_to_json(pin)),
+        #("input", json_value.to_json(input)),
+      ])
+    Resumed(pin:) ->
+      json.object([
+        #("type", json.string("resumed")),
+        #("pin", pin_to_json(pin)),
+      ])
+    CodeChanged(from:, to:) ->
+      json.object([
+        #("type", json.string("code_changed")),
+        #("from", json.string(from)),
+        #("to", json.string(to)),
+      ])
+    Requested(id:, request:, node_digest:, occurrence:) ->
+      json.object([
+        #("type", json.string("requested")),
+        #("id", json.string(id)),
+        #("request", request_to_json(request)),
+        #("node_digest", json.string(node_digest)),
+        #("occurrence", json.int(occurrence)),
+      ])
+    AgentReturned(id:, output:, usage:, model:) ->
+      json.object([
+        #("type", json.string("agent_returned")),
+        #("id", json.string(id)),
+        #("output", json_value.to_json(output)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    AgentIdle(id:, message:, usage:, model:) ->
+      json.object([
+        #("type", json.string("agent_idle")),
+        #("id", json.string(id)),
+        #("message", json.string(message)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    AgentFailed(id:, failure:, usage:, model:) ->
+      json.object([
+        #("type", json.string("agent_failed")),
+        #("id", json.string(id)),
+        #("failure", agent_failure_to_json(failure)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    TurnLimitReached(id:, used:, limit:, usage:, model:) ->
+      json.object([
+        #("type", json.string("turn_limit_reached")),
+        #("id", json.string(id)),
+        #("used", json.int(used)),
+        #("limit", json.int(limit)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    ExecutorFailed(id:, error:) ->
+      json.object([
+        #("type", json.string("executor_failed")),
+        #("id", json.string(id)),
+        #("error", json.string(error)),
+      ])
+    AgentAsked(id:, message:, usage:, model:) ->
+      json.object([
+        #("type", json.string("agent_asked")),
+        #("id", json.string(id)),
+        #("message", json.string(message)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    CallOutcomeUnknown(id:, tool:, args:, usage:, model:) ->
+      json.object([
+        #("type", json.string("call_outcome_unknown")),
+        #("id", json.string(id)),
+        #("tool", json.string(tool)),
+        #("args", json_value.to_json(args)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    PreviousDialogueMissing(id:) ->
+      json.object([
+        #("type", json.string("previous_dialogue_missing")),
+        #("id", json.string(id)),
+      ])
+    AgentProgressed(id:, dialogue:) ->
+      json.object([
+        #("type", json.string("agent_progressed")),
+        #("id", json.string(id)),
+        #("dialogue", json.string(dialogue)),
+      ])
+    TurnInterrupted(id:, usage:, model:) ->
+      json.object([
+        #("type", json.string("turn_interrupted")),
+        #("id", json.string(id)),
+        #("usage", usage_to_json(usage)),
+        #("model", json.string(model)),
+      ])
+    ToolRecorded(id:, call:, result:) ->
+      json.object([
+        #("type", json.string("tool_recorded")),
+        #("id", json.string(id)),
+        #("call", json.string(call)),
+        #("result", json_value.to_json(result)),
+      ])
+    InputRejected(id:, field:, chars:, limit:) ->
+      json.object([
+        #("type", json.string("input_rejected")),
+        #("id", json.string(id)),
+        #("field", case field {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("chars", json.int(chars)),
+        #("limit", json.int(limit)),
+      ])
+    CommandReturned(id:, output:, minutes:) ->
+      json.object([
+        #("type", json.string("command_returned")),
+        #("id", json.string(id)),
+        #("output", json_value.to_json(output)),
+        #("minutes", json.float(minutes)),
+      ])
+    CommandFailed(id:, failure:, minutes:) ->
+      json.object([
+        #("type", json.string("command_failed")),
+        #("id", json.string(id)),
+        #("failure", command_failure_to_json(failure)),
+        #("minutes", json.float(minutes)),
+      ])
+    ToolReturned(id:, output:) ->
+      json.object([
+        #("type", json.string("tool_returned")),
+        #("id", json.string(id)),
+        #("output", json_value.to_json(output)),
+      ])
+    ToolCallUnknown(id:) ->
+      json.object([
+        #("type", json.string("tool_call_unknown")),
+        #("id", json.string(id)),
+      ])
+    ToolFailed(id:, failure:) ->
+      json.object([
+        #("type", json.string("tool_failed")),
+        #("id", json.string(id)),
+        #("failure", tool_failure_to_json(failure)),
+      ])
+    ResultSubmitted(node:, value:, by:) ->
+      json.object([
+        #("type", json.string("result_submitted")),
+        #("node", json.string(node)),
+        #("value", json_value.to_json(value)),
+        #("by", json.string(by)),
+      ])
+    Observed(at:, label:, value:) ->
+      json.object([
+        #("type", json.string("observed")),
+        #("at", json.string(at)),
+        #("label", json.string(label)),
+        #("value", json_value.to_json(value)),
+      ])
+    Sent(node:, text:, message_id:, by:, turns:) ->
+      json.object([
+        #("type", json.string("sent")),
+        #("node", json.string(node)),
+        #("text", json.string(text)),
+        #("message_id", json.string(message_id)),
+        #("by", json.string(by)),
+        #("turns", json.int(turns)),
+      ])
+    Steered(node:, text:, message_id:, by:) ->
+      json.object([
+        #("type", json.string("steered")),
+        #("node", json.string(node)),
+        #("text", json.string(text)),
+        #("message_id", json.string(message_id)),
+        #("by", json.string(by)),
+      ])
+    InterruptRequested(node:, by:) ->
+      json.object([
+        #("type", json.string("interrupt_requested")),
+        #("node", json.string(node)),
+        #("by", json.string(by)),
+      ])
+    Restarted(node:, note:, by:, turns:) ->
+      json.object([
+        #("type", json.string("restarted")),
+        #("node", json.string(node)),
+        #("note", case note {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("by", json.string(by)),
+        #("turns", json.int(turns)),
+      ])
+    NodeCancelled(node:, by:) ->
+      json.object([
+        #("type", json.string("node_cancelled")),
+        #("node", json.string(node)),
+        #("by", json.string(by)),
+      ])
+    AliasRebound(alias:, from:, to:) ->
+      json.object([
+        #("type", json.string("alias_rebound")),
+        #("alias", json.string(alias)),
+        #("from", json.string(from)),
+        #("to", json.string(to)),
+      ])
+    BudgetRaised(kind:, limit:) ->
+      json.object([
+        #("type", json.string("budget_raised")),
+        #("kind", budget_kind_to_json(kind)),
+        #("limit", json.float(limit)),
+      ])
+    ExecutorChanged(name:) ->
+      json.object([
+        #("type", json.string("executor_changed")),
+        #("name", json.string(name)),
+      ])
+    RetryUnavailable ->
+      json.object([
+        #("type", json.string("retry_unavailable")),
+      ])
+    CancelRequested(by:) ->
+      json.object([
+        #("type", json.string("cancel_requested")),
+        #("by", json.string(by)),
+      ])
+    PauseRequested(by:) ->
+      json.object([
+        #("type", json.string("pause_requested")),
+        #("by", json.string(by)),
+      ])
+    ResumeRequested(by:) ->
+      json.object([
+        #("type", json.string("resume_requested")),
+        #("by", json.string(by)),
+      ])
+    Claimed(owner:) ->
+      json.object([
+        #("type", json.string("claimed")),
+        #("owner", json.string(owner)),
+      ])
+    Noted(key:, value:) ->
+      json.object([
+        #("type", json.string("noted")),
+        #("key", json.string(key)),
+        #("value", json_value.to_json(value)),
+      ])
+    BodyFinished(output:) ->
+      json.object([
+        #("type", json.string("body_finished")),
+        #("output", json_value.to_json(output)),
+      ])
+    BodyFailed(reason:) ->
+      json.object([
+        #("type", json.string("body_failed")),
+        #("reason", fail_reason_to_json(reason)),
+      ])
   }
 }
 
@@ -710,8 +749,6 @@ pub fn event_decoder() -> decode.Decoder(Event) {
     _ -> decode.failure(RetryUnavailable, "Event")
   }
 }
-
-
 
 pub type Request {
   /// Call `index` of the session created at `session`: agents are called
@@ -1097,7 +1134,8 @@ pub type Effect {
     /// Model turns this node has used so far, and how many it may use.
     turn: Int,
     turn_limit: Int,
-    digest: String,
+    /// The call's journal slot.
+    slot: String,
     transcript: List(Message),
     note: Option(String),
     /// The digest of the session's dialogue before this call (a blob): where
@@ -1114,9 +1152,10 @@ pub type Effect {
     command: String,
     input: Value,
     compute_minutes: Option(Float),
-    digest: String,
+    /// The call's journal slot.
+    slot: String,
   )
-  CallTool(id: String, tool: String, input: Value, digest: String)
+  CallTool(id: String, tool: String, input: Value, slot: String)
   /// Log that this body tool call's outcome is unknown: the host steps
   /// `ToolCallUnknown(id)`.
   LogUnknownTool(id: String)
@@ -1130,77 +1169,99 @@ pub type Effect {
 
 pub fn effect_to_json(effect: Effect) -> json.Json {
   case effect {
-    Checkpoint -> json.object([
-      #("type", json.string("checkpoint")),
-    ])
-    CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, digest:, transcript:, note:, history:, checkpoint:, recorded:) -> json.object([
-      #("type", json.string("call_agent")),
-      #("id", json.string(id)),
-      #("agent", json.string(agent)),
-      #("model", json.string(model)),
-      #("input", json_value.to_json(input)),
-      #("turn", json.int(turn)),
-      #("turn_limit", json.int(turn_limit)),
-      #("digest", json.string(digest)),
-      #("transcript", json.array(transcript, message_to_json)),
-      #("note", case note {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("history", case history {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("checkpoint", case checkpoint {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("recorded", json.array(recorded, tool_result_to_json)),
-    ])
-    RunCommand(id:, command:, input:, compute_minutes:, digest:) -> json.object([
-      #("type", json.string("run_command")),
-      #("id", json.string(id)),
-      #("command", json.string(command)),
-      #("input", json_value.to_json(input)),
-      #("compute_minutes", case compute_minutes {
-        option.None -> json.null()
-        option.Some(value) -> json.float(value)
-      }),
-      #("digest", json.string(digest)),
-    ])
-    CallTool(id:, tool:, input:, digest:) -> json.object([
-      #("type", json.string("call_tool")),
-      #("id", json.string(id)),
-      #("tool", json.string(tool)),
-      #("input", json_value.to_json(input)),
-      #("digest", json.string(digest)),
-    ])
-    LogUnknownTool(id:) -> json.object([
-      #("type", json.string("log_unknown_tool")),
-      #("id", json.string(id)),
-    ])
-    Deliver(id:, value:) -> json.object([
-      #("type", json.string("deliver")),
-      #("id", json.string(id)),
-      #("value", json_value.to_json(value)),
-    ])
-    Fail(id:, reason:) -> json.object([
-      #("type", json.string("fail")),
-      #("id", json.string(id)),
-      #("reason", fail_reason_to_json(reason)),
-    ])
-    Refuse(id:, refusal:) -> json.object([
-      #("type", json.string("refuse")),
-      #("id", case id {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("refusal", refusal_to_json(refusal)),
-    ])
-    Finish(outcome:) -> json.object([
-      #("type", json.string("finish")),
-      #("outcome", outcome_to_json(outcome)),
-    ])
+    Checkpoint ->
+      json.object([
+        #("type", json.string("checkpoint")),
+      ])
+    CallAgent(
+      id:,
+      agent:,
+      model:,
+      input:,
+      turn:,
+      turn_limit:,
+      slot:,
+      transcript:,
+      note:,
+      history:,
+      checkpoint:,
+      recorded:,
+    ) ->
+      json.object([
+        #("type", json.string("call_agent")),
+        #("id", json.string(id)),
+        #("agent", json.string(agent)),
+        #("model", json.string(model)),
+        #("input", json_value.to_json(input)),
+        #("turn", json.int(turn)),
+        #("turn_limit", json.int(turn_limit)),
+        #("slot", json.string(slot)),
+        #("transcript", json.array(transcript, message_to_json)),
+        #("note", case note {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("history", case history {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("checkpoint", case checkpoint {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("recorded", json.array(recorded, tool_result_to_json)),
+      ])
+    RunCommand(id:, command:, input:, compute_minutes:, slot:) ->
+      json.object([
+        #("type", json.string("run_command")),
+        #("id", json.string(id)),
+        #("command", json.string(command)),
+        #("input", json_value.to_json(input)),
+        #("compute_minutes", case compute_minutes {
+          option.None -> json.null()
+          option.Some(value) -> json.float(value)
+        }),
+        #("slot", json.string(slot)),
+      ])
+    CallTool(id:, tool:, input:, slot:) ->
+      json.object([
+        #("type", json.string("call_tool")),
+        #("id", json.string(id)),
+        #("tool", json.string(tool)),
+        #("input", json_value.to_json(input)),
+        #("slot", json.string(slot)),
+      ])
+    LogUnknownTool(id:) ->
+      json.object([
+        #("type", json.string("log_unknown_tool")),
+        #("id", json.string(id)),
+      ])
+    Deliver(id:, value:) ->
+      json.object([
+        #("type", json.string("deliver")),
+        #("id", json.string(id)),
+        #("value", json_value.to_json(value)),
+      ])
+    Fail(id:, reason:) ->
+      json.object([
+        #("type", json.string("fail")),
+        #("id", json.string(id)),
+        #("reason", fail_reason_to_json(reason)),
+      ])
+    Refuse(id:, refusal:) ->
+      json.object([
+        #("type", json.string("refuse")),
+        #("id", case id {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("refusal", refusal_to_json(refusal)),
+      ])
+    Finish(outcome:) ->
+      json.object([
+        #("type", json.string("finish")),
+        #("outcome", outcome_to_json(outcome)),
+      ])
   }
 }
 
@@ -1215,28 +1276,53 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
       use input <- decode.field("input", json_value.decoder())
       use turn <- decode.field("turn", decode.int)
       use turn_limit <- decode.field("turn_limit", decode.int)
-      use digest <- decode.field("digest", decode.string)
-      use transcript <- decode.field("transcript", decode.list(message_decoder()))
+      use slot <- decode.field("slot", decode.string)
+      use transcript <- decode.field(
+        "transcript",
+        decode.list(message_decoder()),
+      )
       use note <- decode.field("note", decode.optional(decode.string))
       use history <- decode.field("history", decode.optional(decode.string))
-      use checkpoint <- decode.field("checkpoint", decode.optional(decode.string))
-      use recorded <- decode.field("recorded", decode.list(tool_result_decoder()))
-      decode.success(CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, digest:, transcript:, note:, history:, checkpoint:, recorded:))
+      use checkpoint <- decode.field(
+        "checkpoint",
+        decode.optional(decode.string),
+      )
+      use recorded <- decode.field(
+        "recorded",
+        decode.list(tool_result_decoder()),
+      )
+      decode.success(CallAgent(
+        id:,
+        agent:,
+        model:,
+        input:,
+        turn:,
+        turn_limit:,
+        slot:,
+        transcript:,
+        note:,
+        history:,
+        checkpoint:,
+        recorded:,
+      ))
     }
     "run_command" -> {
       use id <- decode.field("id", decode.string)
       use command <- decode.field("command", decode.string)
       use input <- decode.field("input", json_value.decoder())
-      use compute_minutes <- decode.field("compute_minutes", decode.optional(decode.float))
-      use digest <- decode.field("digest", decode.string)
-      decode.success(RunCommand(id:, command:, input:, compute_minutes:, digest:))
+      use compute_minutes <- decode.field(
+        "compute_minutes",
+        decode.optional(decode.float),
+      )
+      use slot <- decode.field("slot", decode.string)
+      decode.success(RunCommand(id:, command:, input:, compute_minutes:, slot:))
     }
     "call_tool" -> {
       use id <- decode.field("id", decode.string)
       use tool <- decode.field("tool", decode.string)
       use input <- decode.field("input", json_value.decoder())
-      use digest <- decode.field("digest", decode.string)
-      decode.success(CallTool(id:, tool:, input:, digest:))
+      use slot <- decode.field("slot", decode.string)
+      decode.success(CallTool(id:, tool:, input:, slot:))
     }
     "log_unknown_tool" -> {
       use id <- decode.field("id", decode.string)
@@ -1264,8 +1350,6 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
     _ -> decode.failure(Checkpoint, "Effect")
   }
 }
-
-
 
 pub type Refusal {
   PinMismatch(field: String, recorded: String, current: String)

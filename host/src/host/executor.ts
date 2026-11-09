@@ -79,7 +79,8 @@ export interface NodeSpec {
 	readonly checkpoint: (state: Json) => void;
 	/** This call's newest checkpoint, when it is reissued after a crash; else null. */
 	readonly resume: Json | null;
-	readonly digest: string;
+	/** The call's journal slot. */
+	readonly slot: string;
 	/** Messages after the first prompt, so far: the agent's questions and the replies. */
 	readonly transcript: readonly Message[];
 	/** The session's dialogue after its previous call (the executor's checkpoint format), or null for its first call. */

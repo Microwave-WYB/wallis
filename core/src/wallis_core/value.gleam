@@ -90,6 +90,13 @@ fn get_segments(value: Value, segments: List(String)) -> Option(Value) {
         Ok(inner) -> get_segments(inner, rest)
         Error(Nil) -> None
       }
-    _, _ -> None
+    // Only an object has keys.
+    [_, ..], JNull
+    | [_, ..], JBool(_)
+    | [_, ..], JInt(_)
+    | [_, ..], JFloat(_)
+    | [_, ..], JString(_)
+    | [_, ..], JArray(_)
+    -> None
   }
 }

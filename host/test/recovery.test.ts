@@ -158,7 +158,7 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		turnLimit: 6,
 		checkpoint: () => {},
 		resume: { messages, turns: 1, compacted: null },
-		digest: "d",
+		slot: "d",
 		transcript: [],
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer" } } },
 		workspace: { root: dir, inputs: dir, scratch: dir, mounts: {}, spill: join(dir, "spill") },
