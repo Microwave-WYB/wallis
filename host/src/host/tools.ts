@@ -4,8 +4,13 @@
 // caps every result that enters the model's context, and injects secrets
 // only into MCP server processes.
 //
-// Every agent gets `codemode` and `submit_result`, plus its allowlisted MCP
-// tools, callable directly and from codemode. An agent with a sandbox also
+// Every agent gets `codemode`, `ask` and `submit_result`, plus its
+// allowlisted MCP tools, callable directly and from codemode (`ask` and
+// `ask`-mode tools only directly: they pause the turn). `ask` puts a question
+// to the agent's caller; the reply becomes its result. An `ask`-mode MCP
+// tool waits for the orchestrator's approval; a rejection's reason is its
+// result. Every MCP result is journaled before the model sees it, so a
+// reissued call never calls the outside world again. An agent with a sandbox also
 // gets `bash` (run in that sandbox) and file tools confined to its scratch
 // dir (`/w`), its sandbox's mounts (`/w/<mount>`, read-only) and its input
 // artifacts (`/run/wallis/inputs`, read-only). Without a sandbox it has no
@@ -14,10 +19,10 @@
 // Agents cannot be handed commands: custom tools mean an MCP server.
 //
 // MCP servers run in the sandbox the workflow's overlay gives them, with
-// their own network allowlist; `${VAR}` secrets go into the server
-// process's environment only. A tool whose annotations say it writes
-// outside (`destructiveHint`, or not read-only and open-world) is refused
-// in preflight unless the overlay allows it.
+// the network it declares; `${VAR}` secrets go into the server process's
+// environment only. A direct tool whose annotations say it writes outside
+// (`destructiveHint`, or not read-only and open-world) is refused in
+// preflight: it must be in `ask` mode.
 //
 // Context protection: a direct tool result or a codemode output longer than
 // the cap is cut, and its full text is spilled to the node's spill dir with
@@ -29,7 +34,7 @@ import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { CodemodeSandbox, type CodemodeTool, renderDeclarations, toCodemodeIdentifier } from "@earendil-works/pi-codemode";
 import { McpClient, StdioTransport, StreamableHttpTransport, toLlmContent } from "@earendil-works/pi-mcp";
-import type { Json } from "../sdk/index.ts";
+import type { Json, ServerTools } from "../sdk/index.ts";
 import { LAYOUT, runSpawn, type Spawn } from "./confine.ts";
 import { type NodeSpec, validateSubmission } from "./executor.ts";
 
@@ -38,13 +43,19 @@ export interface WallisTool {
 	readonly name: string;
 	readonly description: string;
 	readonly parameters: Json;
-	run(args: Json, signal?: AbortSignal): Promise<ToolOutcome>;
+	/** `call` names the tool call (the model's tool call id, or `<codemode call>/<n>` nested): MCP results are journaled under it. */
+	run(args: Json, signal: AbortSignal | undefined, call: string): Promise<ToolOutcome>;
 }
+
+/** What pauses a turn: a question to the caller, or an `ask`-mode tool call waiting for approval. */
+export type Pending = { readonly type: "ask"; readonly message: string } | { readonly type: "approval"; readonly server: string; readonly tool: string; readonly args: Json };
 
 export interface ToolOutcome {
 	readonly text: string;
 	readonly value?: Json;
 	readonly isError?: boolean;
+	/** Set by `ask` and `ask`-mode tools: the turn ends here and waits. */
+	readonly pending?: Pending;
 }
 
 export interface ToolLayerOptions {
@@ -66,12 +77,21 @@ const SPILL_PAGE = 8_000;
 export class NodeTools {
 	readonly spec: NodeSpec;
 	submitted: Json | undefined = undefined;
+	/** The tool call the turn waits on, if any: at most one per turn. */
+	pending: { readonly call: string; readonly pending: Pending } | null = null;
 	calls = 0;
+	/** Tools that pause the turn (`ask` and `ask`-mode MCP tools): calling them again only asks again. */
+	readonly pausing = new Set<string>(["ask"]);
+	/** How an approved `ask`-mode tool runs, by `<server>/<tool>`. */
+	readonly approved = new Map<string, (args: Json, signal: AbortSignal | undefined, call: string) => Promise<ToolOutcome>>();
 	readonly #tools = new Map<string, WallisTool>();
 	readonly #maxCalls: number;
 	readonly #cap: number;
 	readonly #clients: McpClient[] = [];
 	#spills = 0;
+	/** The codemode call running now, and its nested calls so far: their journal keys. */
+	#codemodeCall = "";
+	#nested = 0;
 
 	constructor(spec: NodeSpec, maxCalls: number, cap: number) {
 		this.spec = spec;
@@ -92,7 +112,7 @@ export class NodeTools {
 	}
 
 	/** Every call, direct or nested, goes through here. */
-	async invoke(name: string, args: Json, nested: boolean, signal?: AbortSignal): Promise<ToolOutcome> {
+	async invoke(name: string, args: Json, nested: boolean, signal: AbortSignal | undefined, call: string): Promise<ToolOutcome> {
 		const tool = this.#tools.get(name);
 		this.spec.log({ kind: "tool_call", tool: name, args, nested });
 		let outcome: ToolOutcome;
@@ -100,10 +120,15 @@ export class NodeTools {
 		else if (++this.calls > this.#maxCalls) outcome = { text: `tool budget exhausted (${this.#maxCalls} calls)`, isError: true };
 		else {
 			try {
-				outcome = await tool.run(args, signal);
+				outcome = await tool.run(args, signal, call);
 			} catch (error) {
 				outcome = { text: error instanceof Error ? error.message : String(error), isError: true };
 			}
+		}
+		if (outcome.pending !== undefined) {
+			if (nested) outcome = { text: `${name} pauses the turn, so it cannot run from codemode: call it directly`, isError: true };
+			else if (this.pending !== null) outcome = { text: `this turn already waits on ${this.pending.pending.type === "ask" ? "a question" : "an approval"}: one at a time`, isError: true };
+			else this.pending = { call, pending: outcome.pending };
 		}
 		this.spec.log({ kind: "tool_result", tool: name, result: outcome.value ?? outcome.text, isError: outcome.isError === true, nested });
 		return outcome;
@@ -133,9 +158,11 @@ export class NodeTools {
 				label: tool.name,
 				description: tool.description,
 				parameters: tool.parameters as object,
-				execute: async (_id: string, params: unknown, signal?: AbortSignal) => {
-					const r = await this.invoke(tool.name, params as Json, false, signal);
-					return { content: [{ type: "text" as const, text: this.cap(r.text) }], details: undefined, isError: r.isError === true, terminate: this.submitted !== undefined };
+				execute: async (id: string, params: unknown, signal?: AbortSignal) => {
+					const r = await this.invoke(tool.name, params as Json, false, signal, id);
+					// A pausing call's result is a placeholder, replaced by the reply or the decision when it arrives.
+					const details = r.pending === undefined ? undefined : { wallis_pending: r.pending as unknown as Json };
+					return { content: [{ type: "text" as const, text: this.cap(r.text) }], details, isError: r.isError === true, terminate: this.submitted !== undefined };
 				},
 			};
 		});
@@ -151,7 +178,7 @@ export class NodeTools {
 					description: tool.description,
 					inputSchema: tool.parameters as never,
 					execute: async (args: unknown, ctx: { signal: AbortSignal }) => {
-						const r = await this.invoke(name, args as Json, true, ctx.signal);
+						const r = await this.invoke(name, args as Json, true, ctx.signal, `${this.#codemodeCall}/${this.#nested++}`);
 						if (r.isError) throw new Error(r.text);
 						return r.value ?? r.text;
 					},
@@ -167,7 +194,9 @@ export class NodeTools {
 				renderDeclarations({ tools: nestedTools }),
 			].join("\n\n"),
 			parameters: { type: "object", required: ["code"], properties: { code: { type: "string" } } },
-			run: async (args, signal) => {
+			run: async (args, signal, call) => {
+				this.#codemodeCall = call;
+				this.#nested = 0;
 				const sandbox = new CodemodeSandbox({ tools: nestedTools });
 				try {
 					const code = `const input = load("input");\n${String((args as { code?: unknown }).code ?? "")}`;
@@ -221,6 +250,17 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			if (errors.length > 0) return { text: `submit_result does not match the result schema:\n${errors.join("\n")}`, isError: true };
 			tools.submitted = args;
 			return { text: "submitted", value: null };
+		},
+	});
+
+	tools.add({
+		name: "ask",
+		description:
+			"Ask your caller a question in plain language and wait for the reply, which becomes this tool's result. Make the question self-contained: the reader sees only it.",
+		parameters: { type: "object", required: ["message"], properties: { message: { type: "string", minLength: 1 } } },
+		run: async (args) => {
+			const message = String((args as { message?: unknown }).message ?? "");
+			return { text: "(waiting for the caller's reply)", pending: { type: "ask", message } };
 		},
 	});
 
@@ -313,27 +353,45 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 	}
 
 	// Upstream MCP servers, through pi-mcp, each in its own sandbox. Secrets reach the server process only.
-	for (const [server, allow] of Object.entries(spec.declaration.mcp)) {
+	for (const [server, selected] of Object.entries(spec.declaration.mcp)) {
 		const client = await connectServer(server, spec.mcp, options.secrets ?? process.env, spec.mcpSpawn);
 		if (!client) continue;
 		tools.addClient(client);
 		for (const t of await client.listTools()) {
-			if (allow !== "*" && !allow.includes(t.name)) continue;
+			const mode = toolMode(selected, t.name);
+			if (mode === null) continue;
+			// Journaled: a call already recorded (a reissued call after a crash) is answered from the journal.
+			const execute = async (args: Json, signal: AbortSignal | undefined, call: string): Promise<ToolOutcome> => {
+				const recorded = spec.recorded.get(call);
+				if (recorded !== undefined) return recorded as unknown as ToolOutcome;
+				const r = await client.callTool(t.name, args as Record<string, unknown>, { signal });
+				const content = toLlmContent(r)
+					.map((c) => (c.type === "text" ? c.text : "[image]"))
+					.join("\n");
+				const outcome: ToolOutcome = { text: content, value: (r.structuredContent ?? content) as Json, isError: r.isError === true };
+				spec.record(call, outcome as unknown as Json);
+				return outcome;
+			};
+			tools.approved.set(`${server}/${t.name}`, execute);
+			const name = `mcp__${server}__${t.name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+			if (mode === "ask") tools.pausing.add(name);
 			tools.add({
-				name: `mcp__${server}__${t.name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64),
-				description: t.description ?? t.name,
+				name,
+				description: mode === "ask" ? `${t.description ?? t.name}\n(Runs only after the orchestrator approves this call; a rejection's reason is the result.)` : (t.description ?? t.name),
 				parameters: { ...t.inputSchema, type: "object", properties: t.inputSchema.properties ?? {} } as unknown as Json,
-				run: async (args, signal) => {
-					const r = await client.callTool(t.name, args as Record<string, unknown>, { signal });
-					const content = toLlmContent(r)
-						.map((c) => (c.type === "text" ? c.text : "[image]"))
-						.join("\n");
-					return { text: content, value: (r.structuredContent ?? content) as Json, isError: r.isError === true };
-				},
+				run: async (args, signal, call) =>
+					mode === "ask" ? { text: "(waiting for the orchestrator's approval)", pending: { type: "approval", server, tool: t.name, args } } : execute(args, signal, call),
 			});
 		}
 	}
 	return tools;
+}
+
+/** How an agent selected a server's tool: direct, `ask`, or not at all. */
+export function toolMode(selected: ServerTools, tool: string): "direct" | "ask" | null {
+	if (selected.ask.includes(tool)) return "ask";
+	if (selected.direct === "*" || selected.direct.includes(tool)) return "direct";
+	return null;
 }
 
 type ServerConfig = { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> };
@@ -363,34 +421,25 @@ export async function connectServer(
 }
 
 /**
- * The containment check: agent side effects stay in its sandbox, so an
- * allowlisted MCP tool that declares writes outside (`destructiveHint`, or
- * not read-only and open-world) is refused unless the overlay allows it.
+ * The containment check: a run's outward effects go only through `ask`-mode
+ * tools the orchestrator approves, so a tool used directly (by an agent, or
+ * by the body as a node) whose annotations say it writes outside
+ * (`destructiveHint`, or not read-only and open-world) is refused.
  */
 export async function checkContainment(
-	agents: Readonly<Record<string, { readonly mcp: Readonly<Record<string, readonly string[] | "*">> }>>,
-	allowWrites: Readonly<Record<string, readonly string[]>>,
+	direct: ReadonlyMap<string, ReadonlySet<string> | "*">,
 	configs: Json | null,
 	secrets: Readonly<Record<string, string | undefined>>,
 	sandboxed: McpSpawn | undefined,
 ): Promise<{ server: string; tool: string } | null> {
-	const servers = new Map<string, Set<string> | "*">();
-	for (const a of Object.values(agents)) {
-		for (const [server, allow] of Object.entries(a.mcp)) {
-			const prior = servers.get(server);
-			if (allow === "*" || prior === "*") servers.set(server, "*");
-			else servers.set(server, new Set([...(prior ?? []), ...allow]));
-		}
-	}
-	for (const [server, allow] of servers) {
+	for (const [server, allow] of direct) {
 		const client = await connectServer(server, configs, secrets, sandboxed);
 		if (!client) continue;
 		try {
 			for (const t of await client.listTools()) {
 				if (allow !== "*" && !allow.has(t.name)) continue;
 				const a = (t as { annotations?: { destructiveHint?: boolean; readOnlyHint?: boolean; openWorldHint?: boolean } }).annotations ?? {};
-				const writesOutside = a.destructiveHint === true || (a.readOnlyHint === false && a.openWorldHint === true);
-				if (writesOutside && !(allowWrites[server] ?? []).includes(t.name)) return { server, tool: t.name };
+				if (a.destructiveHint === true || (a.readOnlyHint === false && a.openWorldHint === true)) return { server, tool: t.name };
 			}
 		} finally {
 			await client.close();

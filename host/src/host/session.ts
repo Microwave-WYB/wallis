@@ -16,22 +16,28 @@
 //    answers and cancels.
 //
 // Interventions take capabilities (`OwnedRun`, `IdleNode`, `SteerableNode`,
-// `LiveNode`), checked against the live core; the core checks them again
-// when it applies the event.
+// `LiveNode`, `SubmittableNode`), checked against the live core; the core
+// checks them again when it applies the event.
+//
+// Agents are called through sessions: each call of a session continues the
+// dialogue its previous call left (`sessions/<slot>.json`, copied from the
+// call's checkpoint when it ends), and the session's scratch dir
+// (`work/<session>/scratch`) outlives its calls. MCP tools reached by
+// agents or by the body are journaled, so nothing outside is called twice.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
-import type { ArtifactRef, CommandFailure, Json, Refusal } from "../sdk/index.ts";
+import { type ArtifactRef, type CommandFailure, Decision, type Json, type Refusal, type ToolFailure } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
 import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
 import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
-import { checkContainment, type McpSpawn } from "./tools.ts";
+import { checkContainment, connectServer, type McpSpawn } from "./tools.ts";
 import { bundleWorkflow } from "./bundle.ts";
-import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode } from "./capability.ts";
+import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode, SubmittableNode } from "./capability.ts";
 import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
@@ -167,8 +173,6 @@ export class Session {
 	readonly #requests: Event[] = [];
 	readonly #deliveries: [string, Reply][] = [];
 	readonly #seen = new Set<string>();
-	/** Answers to deliver once an interrupted turn has ended, with who sent them. */
-	readonly #afterInterrupt = new Map<string, { text: string; by: string }>();
 	/** Per node: the current executor turn. A result of an older turn (before a restart) is discarded. */
 	readonly #generation = new Map<string, number>();
 	#core = new Core();
@@ -249,15 +253,57 @@ export class Session {
 		return refusal;
 	}
 
-	/** Aborts a running node's current step; `text`, if given, is delivered once it stops. Progress is kept. */
-	interrupt(node: SteerableNode, text?: string): Refusal | null {
+	/**
+	 * A message to an agent node: delivered now if the node is idle (the
+	 * reply to its question, more turns, or after an interrupt), or queued as
+	 * a steer after its current turn if it is running.
+	 */
+	send(owned: OwnedRun, id: string, text: string, messageId = newMessageId(), turns = 0): { readonly delivered: "reply" | "steer" } | { readonly refusal: Refusal } {
+		const idle = IdleNode.check(owned, id);
+		if (idle instanceof IdleNode) {
+			const refusal = this.answer(idle, text, messageId, turns);
+			return refusal ? { refusal } : { delivered: "reply" };
+		}
+		const running = SteerableNode.check(owned, id);
+		if (running instanceof SteerableNode) {
+			const refusal = this.steer(running, text, messageId);
+			return refusal ? { refusal } : { delivered: "steer" };
+		}
+		return { refusal: owned.snapshot.nodes.some((n) => n.id === id && n.type === "node_running") ? running : idle };
+	}
+
+	/** Aborts a running node's current turn, its tool calls included: it goes Idle(interrupted), progress kept. */
+	interrupt(node: SteerableNode): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
-		const refusal = this.#feed({ type: "interrupted", node: id, by: node.owned.by })[0];
+		const refusal = this.#feed({ type: "interrupt_requested", node: id, by: node.owned.by })[0];
 		if (refusal) return refusal;
-		if (text !== undefined) this.#afterInterrupt.set(id, { text, by: node.owned.by });
 		this.#nodes.get(id)?.session.interrupt?.();
 		return null;
+	}
+
+	/**
+	 * The orchestrator's `submit_result`: an orchestrator node's result,
+	 * checked against its output schema, or a decision on an approval. A
+	 * mismatch is refused with the errors and the node stays pending.
+	 */
+	submit(node: SubmittableNode, value: unknown): Refusal | null {
+		if (this.#settled) return { type: "not_running" };
+		const target = node.target;
+		const schema = target.kind === "answer" ? this.#decl.orchestrators[target.node.name]?.output : Decision;
+		const json = toJson(value);
+		const errors = !json.ok ? json.errors : schemaErrors(schema, json.value);
+		if (!json.ok || errors.length > 0) return { type: "invalid_answer", node: target.node.id, errors };
+		try {
+			verifyRefs(json.value, this.paths.dir);
+		} catch (error) {
+			if (error instanceof ArtifactError) return { type: "invalid_answer", node: target.node.id, errors: [error.message] };
+			throw error;
+		}
+		const refusal = this.#feed({ type: "result_submitted", node: target.node.id, value: json.value, by: node.owned.by })[0] ?? null;
+		this.#pump();
+		this.#settle();
+		return refusal;
 	}
 
 	/** Discards a node's progress and reissues its call with the original input and the note. Logged. */
@@ -438,12 +484,12 @@ export class Session {
 			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, digests)]));
 			this.#boxes = can ? new Sandboxes({ decls, bins, mounts, mountDigests: digests }) : null;
 			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
-			for (const note of this.#boxes?.notes ?? []) process.stderr.write(`wallis: ${note}\n`);
-			writeMeta(this.paths, {
+				writeMeta(this.paths, {
 				...meta,
 				bins: Object.fromEntries(Object.entries(bins).map(([n, path]) => [n, versions[n] === undefined ? { path } : { path, version: versions[n]! }])),
 				base: meta.base ?? baseIdentity(),
 				confined: this.#boxes !== null,
+				answers: Object.fromEntries(Object.entries(this.#decl.orchestrators).map(([name, o]) => [name, o.output as unknown as Json])),
 			});
 		} catch (error) {
 			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
@@ -456,23 +502,33 @@ export class Session {
 		const boxes = this.#boxes;
 		if (!boxes) return undefined;
 		return (server, argv, env) => {
-			const box = this.#decl.mcpServers[server]?.sandbox;
-			if (!box) throw new Error(`MCP server ${server} has no sandbox in the workflow's mcp overlay`);
+			const overlay = this.#decl.mcpServers[server];
+			if (!overlay?.sandbox) throw new Error(`MCP server ${server} has no sandbox in the workflow's mcp overlay`);
 			const scratch = join(this.paths.dir, "work", `mcp-${nodeDirName(server)}`);
 			mkdirSync(scratch, { recursive: true });
-			return boxes.spawn(box, argv, { scratch, inputs: null }, { env });
+			// MCP servers are the run's channel outside: their network is the overlay's, `full` by default.
+			return boxes.spawn(overlay.sandbox, argv, { scratch, inputs: null }, { env, network: overlay.network });
 		};
 	}
 
-	/** Preflight of every allowlisted MCP tool's annotations: no writes outside unless the overlay allows them. */
+	/**
+	 * Preflight of the annotations of every MCP tool used directly (by an
+	 * agent, or by the body as a node): one that writes outside must be in
+	 * `ask` mode (`tool_writes_outside`).
+	 */
 	async #containment(): Promise<void> {
 		// Confinement off is for tests and development: no MCP servers are started in preflight.
 		if ((this.#options.confine ?? "auto") === "off") return;
-		const agents = Object.fromEntries(Object.entries(this.#decl.agents).filter(([, a]) => Object.keys(a.mcp).length > 0));
-		if (Object.keys(agents).length === 0) return;
-		const allow = Object.fromEntries(Object.entries(this.#decl.mcpServers).map(([s, o]) => [s, o.allow_writes]));
+		const direct = new Map<string, Set<string> | "*">();
+		const add = (server: string, tools: readonly string[] | "*") => {
+			const prior = direct.get(server);
+			direct.set(server, tools === "*" || prior === "*" ? "*" : new Set([...(prior ?? []), ...tools]));
+		};
+		for (const a of Object.values(this.#decl.agents)) for (const [server, t] of Object.entries(a.mcp)) add(server, t.direct);
+		for (const t of Object.values(this.#decl.tools)) add(t.server, [t.tool]);
+		if (direct.size === 0) return;
 		const servers = (this.#decl.mcp as { mcpServers?: Json } | null)?.mcpServers ?? null;
-		const bad = await checkContainment(agents, allow, servers, process.env, this.#mcpSpawn());
+		const bad = await checkContainment(direct, servers, process.env, this.#mcpSpawn());
 		if (bad) throw new RunRefused({ type: "tool_writes_outside", ...bad });
 	}
 
@@ -529,15 +585,17 @@ export class Session {
 				return this.pause(owned);
 			case "resume":
 				return this.unpause(owned);
-			case "answer": {
-				const node = IdleNode.check(owned, entry.node);
-				return node instanceof IdleNode ? this.answer(node, entry.text, entry.id, entry.turns ?? 0) : node;
+			case "send": {
+				const sent = this.send(owned, entry.node, entry.text, entry.id, entry.turns ?? 0);
+				return "refusal" in sent ? sent.refusal : null;
 			}
-			case "steer":
 			case "interrupt": {
 				const node = SteerableNode.check(owned, entry.node);
-				if (!(node instanceof SteerableNode)) return node;
-				return entry.type === "steer" ? this.steer(node, entry.text, entry.id) : this.interrupt(node, entry.text);
+				return node instanceof SteerableNode ? this.interrupt(node) : node;
+			}
+			case "submit": {
+				const node = SubmittableNode.check(owned, entry.node);
+				return node instanceof SubmittableNode ? this.submit(node, entry.value) : node;
 			}
 			case "restart":
 			case "cancel_node": {
@@ -603,14 +661,18 @@ export class Session {
 	 * of the body (issue order, which is synchronous and deterministic).
 	 */
 	#keyed(event: Extract<Event, { type: "requested" }>): Event {
-		const r = event.request as { type: string; agent?: string; command?: string; input?: Json };
-		const name = r.type === "call" ? `agent:${r.agent}` : `command:${r.command}`;
+		const r = event.request as { type: string; agent?: string; command?: string; tool?: string; name?: string; input?: Json };
+		const name = r.type === "call" ? `agent:${r.agent}` : r.type === "command" ? `command:${r.command}` : r.type === "tool" ? `tool:${r.tool}` : `orchestrator:${r.name}`;
 		let digest = this.#nodeDigests.get(name);
 		if (digest === undefined) {
 			const definition =
 				r.type === "call"
 					? { kind: "agent", ...this.#decl.agents[r.agent!], sandbox: this.#decl.agents[r.agent!]?.sandbox ? this.#decl.sandboxes[this.#decl.agents[r.agent!]!.sandbox!] : null }
-					: { kind: "command", ...this.#decl.commands[r.command!], env: this.#sandboxDigests[this.#decl.commands[r.command!]?.sandbox ?? ""] ?? null };
+					: r.type === "command"
+						? { kind: "command", ...this.#decl.commands[r.command!], env: this.#sandboxDigests[this.#decl.commands[r.command!]?.sandbox ?? ""] ?? null }
+						: r.type === "tool"
+							? { kind: "tool", ...this.#decl.tools[r.tool!] }
+							: { kind: "orchestrator", ...this.#decl.orchestrators[r.name!] };
 			digest = createHash("sha256").update(canonical(JSON.parse(JSON.stringify(definition)) as Json)).digest("hex");
 			this.#nodeDigests.set(name, digest);
 		}
@@ -664,7 +726,7 @@ export class Session {
 	}
 
 	#invalidRequest(request: Json): Reply | null {
-		const r = request as { type: string; agent?: string; input?: Json; command?: string };
+		const r = request as { type: string; agent?: string; input?: Json; command?: string; tool?: string; name?: string };
 		const fail = (subject: string, errors: string[]): Reply | null => (errors.length > 0 ? { type: "schema", subject, errors } : null);
 		switch (r.type) {
 			case "call": {
@@ -674,6 +736,14 @@ export class Session {
 			case "command": {
 				const command = this.#decl.commands[r.command!];
 				return command ? fail(`input of command ${r.command}`, schemaErrors(command.input, r.input)) : null;
+			}
+			case "tool": {
+				const tool = this.#decl.tools[r.tool!];
+				return tool ? fail(`input of MCP tool ${r.tool}`, schemaErrors(tool.input, r.input)) : null;
+			}
+			case "orchestrator": {
+				const node = this.#decl.orchestrators[r.name!];
+				return node ? fail(`input of orchestrator node ${r.name}`, schemaErrors(node.input, r.input)) : null;
 			}
 			default:
 				return null;
@@ -702,6 +772,9 @@ export class Session {
 				return;
 			case "run_command":
 				this.#runCommand(effect);
+				return;
+			case "call_tool":
+				this.#callTool(effect);
 				return;
 			case "deliver":
 				this.#deliveries.push([effect.id, { type: "deliver", value: effect.value }]);
@@ -768,7 +841,9 @@ export class Session {
 		let workspace: NodeDirs;
 		try {
 			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
-			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts));
+			// The scratch dir belongs to the session (`#3` for call `#3:1`) and outlives its calls.
+			const session = id.slice(0, id.lastIndexOf(":"));
+			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), join(this.paths.dir, "work", nodeDirName(session), "scratch"));
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -800,6 +875,12 @@ export class Session {
 			checkpoint: join(workspace.root, "session.json"),
 			digest: effect.digest,
 			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
+			history: effect.previous === null ? null : this.#dialogue(effect.previous),
+			recorded: new Map(effect.recorded.map((r) => [r.call, r.result])),
+			// Journaled before the model sees it; a result of a restarted call is dropped by the core.
+			record: (call, result) => {
+				if (current()) this.#later(() => this.#feed({ type: "tool_recorded", id, call, result }));
+			},
 			outputSchema: declaration.output as unknown as Json,
 			workspace,
 			sandbox: this.#agentSandbox(declaration.sandbox, workspace),
@@ -810,6 +891,11 @@ export class Session {
 			log,
 		};
 		const done = () => {
+			// The session's next call continues from here.
+			if (existsSync(spec.checkpoint)) {
+				mkdirSync(join(this.paths.dir, "sessions"), { recursive: true });
+				copyFileSync(spec.checkpoint, this.#dialogue(effect.digest));
+			}
 			this.#closeNode(id);
 			discardNode(this.paths.dir, id);
 		};
@@ -848,25 +934,33 @@ export class Session {
 						}
 						const usage = turn.usage ?? NO_USAGE;
 						log({ kind: "turn", result: turn.type, usage });
-						if (turn.type === "ended") {
-							this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
-							this.#afterIdle(id, log);
-							return;
+						switch (turn.type) {
+							case "ended":
+								this.#feed({ type: "agent_idle", ...base, message: turn.message, usage });
+								return;
+							case "asked":
+								this.#feed({ type: "agent_asked", ...base, message: turn.message, usage });
+								return;
+							case "approval":
+								this.#feed({ type: "approval_requested", ...base, server: turn.server, tool: turn.tool, args: turn.args, usage });
+								return;
+							case "interrupted":
+								this.#feed({ type: "turn_interrupted", ...base, usage });
+								return;
+							case "turn_limit":
+								this.#feed({ type: "turn_limit_reached", ...base, used: turn.used, limit: turn.limit, usage });
+								return;
+							case "agent_error":
+								this.#feed({ type: "agent_failed", ...base, failure: turn.failure, usage });
+								done();
+								return;
+							case "submitted": {
+								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
+								if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage });
+								else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
+								done();
+							}
 						}
-						if (turn.type === "turn_limit") {
-							this.#feed({ type: "turn_limit_reached", ...base, used: turn.used, limit: turn.limit, usage });
-							this.#afterIdle(id, log);
-							return;
-						}
-						if (turn.type === "agent_error") {
-							this.#feed({ type: "agent_failed", ...base, failure: turn.failure, usage });
-							done();
-							return;
-						}
-						const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
-						if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage });
-						else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
-						done();
 					}),
 				(error: unknown) =>
 					this.#later(() => {
@@ -877,23 +971,68 @@ export class Session {
 			);
 	}
 
+	/** Where a session's dialogue after the call with this slot is kept. */
+	#dialogue(slot: string): string {
+		return join(this.paths.dir, "sessions", `${slot.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+	}
+
+	/**
+	 * A body MCP tool call: the server in its overlay sandbox, the tool's
+	 * pure `parse` in the workflow VM, the output checked against its schema.
+	 * Every failure is a typed `ToolFailure`; the result is journaled.
+	 */
+	#callTool(effect: Extract<Effect, { type: "call_tool" }>): void {
+		const id = effect.id;
+		const declaration = this.#decl.tools[effect.tool]!;
+		const generation = (this.#generation.get(id) ?? 0) + 1;
+		this.#generation.set(id, generation);
+		const current = () => this.#generation.get(id) === generation;
+		const log = this.#transcriptLog(id);
+		const failed = (failure: ToolFailure) => this.#feed({ type: "tool_failed", id, failure });
+		this.#commandAborts.get(id)?.abort();
+		const abort = new AbortController();
+		this.#commandAborts.set(id, abort);
+		log({ kind: "tool_call", tool: `${declaration.server}/${declaration.tool}`, args: effect.input });
+		const servers = (this.#decl.mcp as { mcpServers?: Json } | null)?.mcpServers ?? null;
+		const call = async () => {
+			const client = await connectServer(declaration.server, servers, process.env, this.#mcpSpawn());
+			if (!client) throw new Error(`no MCP server ${declaration.server}`);
+			try {
+				return await client.callTool(declaration.tool, effect.input as Record<string, unknown>, { signal: abort.signal });
+			} finally {
+				await client.close();
+			}
+		};
+		call().then(
+			(r) =>
+				this.#later(() => {
+					if (this.#commandAborts.get(id) === abort) this.#commandAborts.delete(id);
+					if (!current()) return log({ kind: "note", text: "discarded the result of a tool call that was restarted or cancelled" });
+					const content = (r.content ?? []) as { type: string; text?: string }[];
+					const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
+					log({ kind: "tool_result", tool: `${declaration.server}/${declaration.tool}`, result: r.structuredContent ?? text, isError: r.isError === true });
+					if (r.isError === true) return failed({ type: "tool_error", message: text.slice(0, 2000) });
+					const parsed = this.#sandbox!.parseTool(effect.tool, { content, structuredContent: r.structuredContent, text });
+					if (!parsed.ok) return failed({ type: "tool_output_mismatch", errors: [`parse: ${parsed.error}`] });
+					const out = this.#parseOutput(parsed.output, declaration.output, null);
+					if (out.ok) this.#feed({ type: "tool_returned", id, output: out.value });
+					else failed({ type: "tool_output_mismatch", errors: [out.error] });
+				}),
+			(error: unknown) =>
+				this.#later(() => {
+					if (this.#commandAborts.get(id) === abort) this.#commandAborts.delete(id);
+					if (!current()) return;
+					failed({ type: "tool_unreachable", error: errorText(error) });
+				}),
+		);
+	}
+
 	/**
 	 * A command call: its argv from the command's pure `run` (in the workflow
 	 * VM, on the mounted input), the process in its sandbox, then its pure
 	 * `parse`; files it names must exist in its scratch dir; the output is
 	 * checked against the schema. Every failure is a typed `CommandFailure`.
 	 */
-	/** A message parked by an interrupt is delivered once the aborted turn has ended. */
-	#afterIdle(id: string, log: (entry: TranscriptEntry) => void): void {
-		const parked = this.#afterInterrupt.get(id);
-		if (parked === undefined) return;
-		this.#afterInterrupt.delete(id);
-		const owned = this.owned(parked.by);
-		const node = owned instanceof OwnedRun ? IdleNode.check(owned, id) : owned;
-		const refusal = node instanceof IdleNode ? this.answer(node, parked.text) : node;
-		if (refusal) log({ kind: "note", text: `the message after the interrupt was refused: ${JSON.stringify(refusal)}` });
-	}
-
 	#runCommand(effect: Extract<Effect, { type: "run_command" }>): void {
 		const id = effect.id;
 		const declaration = this.#decl.commands[effect.command]!;

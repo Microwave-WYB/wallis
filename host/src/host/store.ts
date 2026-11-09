@@ -72,6 +72,8 @@ export interface RunMeta {
 	readonly base?: { readonly distro: string; readonly kernel: string };
 	/** Whether the run's sandboxes were built with bwrap. */
 	readonly confined?: boolean;
+	/** Answer schemas of the workflow's orchestrator nodes, for pending items. */
+	readonly answers?: Readonly<Record<string, Json>>;
 	/** Parameters for the first session of a run started detached. */
 	readonly start?: {
 		readonly input?: Json;
@@ -152,9 +154,10 @@ function releaseLock(paths: RunPaths, pid: number): void {
 
 /** An intervention from another process. Each carries `by`, checked when the driver applies it. */
 export type InboxEntry =
-	| { readonly id: string; readonly type: "answer"; readonly node: string; readonly text: string; readonly by: string; readonly turns?: number }
-	| { readonly id: string; readonly type: "steer"; readonly node: string; readonly text: string; readonly by: string }
-	| { readonly id: string; readonly type: "interrupt"; readonly node: string; readonly text?: string; readonly by: string }
+	/** Delivered if the node is idle, queued as a steer if it is running: decided when the driver applies it. */
+	| { readonly id: string; readonly type: "send"; readonly node: string; readonly text: string; readonly by: string; readonly turns?: number }
+	| { readonly id: string; readonly type: "interrupt"; readonly node: string; readonly by: string }
+	| { readonly id: string; readonly type: "submit"; readonly node: string; readonly value: Json; readonly by: string }
 	| { readonly id: string; readonly type: "restart"; readonly node: string; readonly note?: string; readonly by: string; readonly turns?: number }
 	| { readonly id: string; readonly type: "cancel_node"; readonly node: string; readonly by: string }
 	| { readonly id: string; readonly type: "cancel"; readonly by: string }

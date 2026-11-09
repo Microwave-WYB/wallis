@@ -80,6 +80,11 @@ export class Sandbox {
 		return JSON.parse(this.#invoke("__wallis_parse", [command, JSON.stringify(result)])) as never;
 	}
 
+	/** A body MCP tool's `parse` (or its default), evaluated in the workflow VM: pure, synchronous. */
+	parseTool(tool: string, result: { content: unknown[]; structuredContent?: unknown; text: string }): { ok: true; output: unknown } | { ok: false; error: string } {
+		return JSON.parse(this.#invoke("__wallis_parse_tool", [tool, JSON.stringify(result)])) as never;
+	}
+
 	#invoke(name: string, args: string[]): string {
 		const vm = this.#vm;
 		using fn = vm.global.getProp(name);

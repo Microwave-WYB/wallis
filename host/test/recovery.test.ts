@@ -31,7 +31,7 @@ const codemode = (code: string) => fauxAssistantMessage([fauxToolCall("codemode"
 const submit = (args: Record<string, unknown>) => fauxAssistantMessage([fauxToolCall("submit_result", args as never)], { stopReason: "toolUse" });
 const failure = (message: string) => fauxAssistantMessage([fauxText("")], { stopReason: "error", errorMessage: message });
 
-function transcript(dir: string, node = "_0"): TranscriptEntry[] {
+function transcript(dir: string, node = "_0_0"): TranscriptEntry[] {
 	return readFileSync(join(dir, "nodes", `${node}.jsonl`), "utf8")
 		.trim()
 		.split("\n")
@@ -79,7 +79,7 @@ test("R2: SIGKILL at turn 3; the resumed node continues at turn 3 and turns 1-2 
 	const dir = join(tmp(), "run");
 	const killed = spawnSync(process.execPath, [resolve(here, "fixtures/crash/drive.ts"), dir, "3"], { encoding: "utf8", timeout: 60_000 });
 	assert.equal(killed.signal, "SIGKILL", killed.stderr);
-	const checkpoint = JSON.parse(readFileSync(join(dir, "work", "_0", "session.json"), "utf8")) as { turns: number };
+	const checkpoint = JSON.parse(readFileSync(join(dir, "work", "_0_0", "session.json"), "utf8")) as { turns: number };
 	assert.equal(checkpoint.turns, 2);
 	const { provider, executor } = faux();
 	const requests: string[] = [];
@@ -119,9 +119,12 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		},
 	]);
 	const spec = {
-		id: "#0",
+		id: "#0:0",
 		agent: "a",
 		declaration: { model: "default", prompt: "p", input: {}, output: {}, mcp: {}, skills: [], needs: {}, sandbox: null, steerable: true, compaction: true, max_turns: 6 },
+		history: null,
+		recorded: new Map(),
+		record: () => {},
 		model: "faux/faux-1",
 		prompt: "Input",
 		input: null,
@@ -182,7 +185,7 @@ test("pi: reaching the turn limit stops the node (turn_limit) with its progress;
 	const first = await runWorkflow({ workflow: limited, dir, executor, confine: "off", input: { topic: "t", notes: [] }, inboxPollMs: null });
 	const node = first.run.nodes[0]!;
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "turn_limit", used: 2, limit: 2 });
-	const done = await runWorkflow({ workflow: limited, dir, executor, confine: "off", sends: [{ node: "#0", text: "Continue.", turns: 2 }], inboxPollMs: null });
+	const done = await runWorkflow({ workflow: limited, dir, executor, confine: "off", sends: [{ node: "#0:0", text: "Continue.", turns: 2 }], inboxPollMs: null });
 	assert.deepEqual(done.outcome, { type: "done", value: { summary: "done" } });
 	assert.equal(provider.state.callCount, 3, "nothing requested twice");
 });
@@ -205,19 +208,19 @@ test("R3: an uncaught node failure holds the run on that node; the independent s
 	const executor = failingScout();
 	const r = await runWorkflow({ workflow: fanout, dir, executor, commands: fakeTrain(), confine: "off", input: null, inboxPollMs: null });
 	assert.equal(r.outcome, null, "not finished");
-	assert.deepEqual(r.status, { type: "idle", reason: { type: "node_failure", node: "#0.a#0", reason: { type: "agent_gave_up", agent: "scout", failure: { type: "gave_up", error: "could not read the area" } } } });
-	assert.equal(r.run.held, "#0.a#0");
-	const sibling = r.run.nodes.find((n) => n.id === "#0.b#0")!;
+	assert.deepEqual(r.status, { type: "idle", reason: { type: "node_failure", node: "#0.a#0:0", reason: { type: "agent_gave_up", agent: "scout", failure: { type: "gave_up", error: "could not read the area" } } } });
+	assert.equal(r.run.held, "#0.a#0:0");
+	const sibling = r.run.nodes.find((n) => n.id === "#0.b#0:0")!;
 	assert.equal(sibling.type === "node_done" && sibling.outcome.type, "submitted");
 	const { attention, describe } = await import("../src/host/query.ts");
 	const { inspectRun } = await import("../src/host/index.ts");
-	assert.match(describe(attention(inspectRun(dir))), /node #0\.a#0 failed and the workflow did not handle it[\s\S]*npx wallis restart/);
+	assert.match(describe(attention(inspectRun(dir))), /node #0\.a#0:0 failed and the workflow did not handle it[\s\S]*npx wallis restart/);
 });
 
 test("R3: restart the held node: it reruns, the body runs again against the journal, and the run completes", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ workflow: fanout, dir, executor: failingScout(), commands: fakeTrain(), confine: "off", input: null, inboxPollMs: null });
-	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0.a#0", note: "the area is fine now", by: "human" });
+	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0.a#0:0", note: "the area is fine now", by: "human" });
 	const fixed = new FakeExecutor({
 		scout: { output: { errors: ["E-a"] } },
 		judge: { output: { findings: [] } },
@@ -229,14 +232,14 @@ test("R3: restart the held node: it reruns, the body runs again against the jour
 	assert.deepEqual((done.outcome as unknown as { value: { errors: string[] } }).value.errors, ["E-a", "E-b"]);
 	// The restarted scout ran with its note; the completed sibling was not called again.
 	const scouts = fixed.calls.filter((c) => c.agent === "scout");
-	assert.deepEqual(scouts.map((c) => [c.id, c.note]), [["#0.a#0", "the area is fine now"]]);
+	assert.deepEqual(scouts.map((c) => [c.id, c.note]), [["#0.a#0:0", "the area is fine now"]]);
 	assert.ok(new EventLog(join(dir, "log.jsonl")).read().some((e) => e.type === "restarted"));
 });
 
 test("R3: cancel the held node: the failure propagates and the run finishes failed", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ workflow: fanout, dir, executor: failingScout(), commands: fakeTrain(), confine: "off", input: null, inboxPollMs: null });
-	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#0.a#0", by: "human" });
+	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#0.a#0:0", by: "human" });
 	const r = await runWorkflow({ workflow: fanout, dir, executor: failingScout(), commands: fakeTrain(), confine: "off", inboxPollMs: null });
 	assert.deepEqual(r.outcome, { type: "failed", reason: { type: "agent_gave_up", agent: "scout", failure: { type: "gave_up", error: "could not read the area" } } });
 });
@@ -263,12 +266,14 @@ test("R3: a failed command is held the same way and a restart reruns it", async 
 
 // --- Containment ---
 
-test("containment: an allowlisted MCP tool that writes outside is refused unless the overlay allows it", async () => {
+test("containment: a direct MCP tool whose annotations say it writes outside is refused; in ask mode it is fine", async () => {
 	const server = resolve(here, "fixtures/mcp-server.ts");
 	const configs = { fx: { command: process.execPath, args: [server] } };
-	const agents = (tools: string[]) => ({ a: { mcp: { fx: tools } } });
-	assert.equal(await checkContainment(agents(["echo"]), {}, configs, process.env, undefined), null);
-	assert.deepEqual(await checkContainment(agents(["echo", "wipe"]), {}, configs, process.env, undefined), { server: "fx", tool: "wipe" });
-	assert.deepEqual(await checkContainment(agents(["post"]), {}, configs, process.env, undefined), { server: "fx", tool: "post" });
-	assert.equal(await checkContainment(agents(["wipe", "post"]), { fx: ["wipe", "post"] }, configs, process.env, undefined), null);
+	const direct = (tools: string[]) => new Map([["fx", new Set(tools)]]);
+	assert.equal(await checkContainment(direct(["echo"]), configs, process.env, undefined), null);
+	assert.deepEqual(await checkContainment(direct(["echo", "wipe"]), configs, process.env, undefined), { server: "fx", tool: "wipe" });
+	assert.deepEqual(await checkContainment(direct(["post"]), configs, process.env, undefined), { server: "fx", tool: "post" });
+	assert.deepEqual(await checkContainment(new Map([["fx", "*" as const]]), configs, process.env, undefined), { server: "fx", tool: "wipe" });
+	// The session puts only direct tools in the check; `ask` tools wait for the orchestrator.
+	assert.equal(await checkContainment(new Map(), configs, process.env, undefined), null);
 });

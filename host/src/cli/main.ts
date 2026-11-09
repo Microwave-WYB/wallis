@@ -4,8 +4,10 @@
 //
 //   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--mount name=dir]... [--executor module] [--detach]
 //   wallis resume <run> [--model a=m]... [--budget kind=limit]... [--executor module] [--detach]
-//   wallis send <run> <node> <text>          answer an idle node
-//   wallis steer <run> <node> <text>         a running node of a steerable agent, at its next step
+//   wallis describe <workflow>               its input, agents and the questions it may ask (JSON)
+//   wallis doc                               how to write and orchestrate workflows
+//   wallis send <run> <node> <text> [--turns n]   idle: delivered; running: queued as a steer
+//   wallis submit <run> <node> '<json>'      complete an orchestrator node, or decide an approval
 //   wallis restart <run> <node> [note]       discard the node's progress, reissue with the note
 //   wallis cancel <run>
 //   wallis status <run> [--json]
@@ -13,7 +15,7 @@
 //   wallis pending [--json]
 //   wallis claim <run>
 //   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> [<node>]
-//   wallis interrupt <run> <node> [text] | pause <run> | cancel <run> [--node <node>]
+//   wallis interrupt <run> <node> | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
 //   wallis fork <run> [--model a=m]... [--detach]   (copies the journal; unchanged calls hit)
 //   wallis export <run> <artifact> <dir>
@@ -45,7 +47,9 @@ import {
 	waitForAttention,
 	waitForOwn,
 } from "../host/query.ts";
-import { IdleNode, LiveNode, must, OwnedRun, parseNodeId, parseRunId, SteerableNode } from "../host/capability.ts";
+import { LiveNode, must, OwnedRun, parseNodeId, parseRunId, SteerableNode, SubmittableNode } from "../host/capability.ts";
+import { describeWorkflow } from "../host/describe.ts";
+import { deliveryOf } from "../host/query.ts";
 import type { Refusal } from "../sdk/index.ts";
 import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
@@ -54,7 +58,8 @@ import { ProcessCommands } from "../host/commands.ts";
 import { CONTINUE } from "../host/query.ts";
 import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
-import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, runPaths, runsDir, writeMeta } from "../host/store.ts";
+import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir, writeMeta } from "../host/store.ts";
+import { toJson } from "../sdk/validate.ts";
 
 const self = fileURLToPath(import.meta.url);
 /** pi, with pi-ai's built-in providers. */
@@ -132,7 +137,7 @@ function report(dir: string): void {
 	const view = inspectRun(dir);
 	const observed = latestObservations(view);
 	if (values.json) {
-		return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed, spent: view.run.spent }));
+		return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed, spent: view.run.spent, attention: attention(view) }));
 	}
 	const items = attention(view);
 	out(items.length > 0 ? describe(items) : `Run ${view.runId}: ${view.run.status?.type}${view.stopped ? ", stopped" : ""}.`);
@@ -215,7 +220,7 @@ async function deliver(dir: string, entry: Parameters<typeof appendInbox>[1]): P
 	appendInbox(paths, entry);
 	const taken = () =>
 		(existsSync(`${paths.inbox}.done`) && readFileSync(`${paths.inbox}.done`, "utf8").split("\n").includes(entry.id)) ||
-		new EventLog(paths.log).read().some((e) => e.type === "sent" && e.message_id === entry.id);
+		new EventLog(paths.log).read().some((e) => (e.type === "sent" || e.type === "steered") && e.message_id === entry.id);
 	const deadline = Date.now() + 15_000;
 	let started = 0;
 	while (Date.now() < deadline && !taken()) {
@@ -270,33 +275,55 @@ async function main(): Promise<number> {
 			if (command === "resume") report(dir);
 			return 0;
 		}
+		case "describe": {
+			out(JSON.stringify(await describeWorkflow(resolveWorkflow(root, args[0] ?? "")), null, 2));
+			return 0;
+		}
+		case "doc": {
+			out(readFileSync(fileURLToPath(new URL("./doc.md", import.meta.url)), "utf8").trimEnd());
+			return 0;
+		}
 		case "send": {
 			const [run, id, ...words] = args;
 			const { dir, node } = target(run, id);
-			// Checked here and again by the driver when it applies the answer.
-			must(IdleNode.check(control(dir), node), refused);
+			control(dir);
 			const turns = values.turns ? Number(values.turns) : 0;
 			const text = words.join(" ") || (turns > 0 ? CONTINUE : "");
-			await deliver(dir, turns > 0 ? { id: newMessageId(), type: "answer", node, text, by: caller, turns } : { id: newMessageId(), type: "answer", node, text, by: caller });
-			out(`Sent to ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
+			const entry = { id: newMessageId(), type: "send" as const, node, text, by: caller, ...(turns > 0 ? { turns } : {}) };
+			// The driver decides how it is delivered (idle: now; running: as a steer) and checks again.
+			await deliver(dir, entry);
+			const refusal = refusedEntry(runPaths(dir), entry.id);
+			if (refusal) throw new RunRefused(refusal);
+			out(`Sent: ${deliveryOf(dir, entry.id) ?? `to ${node}`}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
-		case "steer":
+		case "submit": {
+			const [run, id, value] = args;
+			const { dir, node } = target(run, id);
+			must(SubmittableNode.check(control(dir), node), refused);
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(value ?? "");
+			} catch {
+				throw new RunRefused({ type: "invalid_answer", node, errors: ["the value is not JSON"] });
+			}
+			const json = toJson(parsed);
+			if (!json.ok) throw new RunRefused({ type: "invalid_answer", node, errors: json.errors });
+			const entry = { id: newMessageId(), type: "submit" as const, node, value: json.value, by: caller };
+			await deliver(dir, entry);
+			// Checked against the node's answer schema by the driver; a mismatch leaves it pending.
+			const refusal = refusedEntry(runPaths(dir), entry.id);
+			if (refusal) throw new RunRefused(refusal);
+			out(`Submitted to ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
+			return 0;
+		}
 		case "interrupt": {
-			const [run, id, ...words] = args;
+			const [run, id] = args;
 			const { dir, node } = target(run, id);
 			must(SteerableNode.check(control(dir), node), refused);
 			if (lockHolder(runPaths(dir)) === null) throw new RunRefused({ type: "node_not_running", node });
-			const text = words.join(" ");
-			await deliver(
-				dir,
-				command === "steer"
-					? { id: newMessageId(), type: "steer", node, text, by: caller }
-					: words.length > 0
-						? { id: newMessageId(), type: "interrupt", node, text, by: caller }
-						: { id: newMessageId(), type: "interrupt", node, by: caller },
-			);
-			out(`${command === "steer" ? "Steered" : "Interrupted"} ${node} of run ${runPaths(dir).id}.`);
+			await deliver(dir, { id: newMessageId(), type: "interrupt", node, by: caller });
+			out(`Interrupted ${node} of run ${runPaths(dir).id}: it waits, progress kept. Redirect it with: npx wallis send ${runPaths(dir).id} '${node}' "<message>"`);
 			return 0;
 		}
 		case "restart": {
@@ -316,7 +343,7 @@ async function main(): Promise<number> {
 			}
 			const entry = { id: newMessageId(), type: "restart" as const, node, by: caller, ...(words.length > 0 ? { note: words.join(" ") } : {}), ...(turns > 0 ? { turns } : {}) };
 			await deliver(dir, entry);
-			out(`Restarted ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
+			out(`Restarted ${node} of run ${runPaths(dir).id}; the MCP tools and approvals it uses reach the outside again. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
 		case "cancel": {
@@ -474,7 +501,7 @@ async function main(): Promise<number> {
 			return new Promise<number>(() => {});
 		}
 		default:
-			process.stderr.write(`usage: wallis run|resume|send|steer|interrupt|restart|cancel|pause|claim|status|wait|pending|ls|tree|log|show|fork|export|serve ...\n`);
+			process.stderr.write(`usage: wallis run|resume|send|submit|interrupt|restart|cancel|pause|claim|status|wait|pending|describe|doc|ls|tree|log|show|fork|export|serve ...\n`);
 			return 64;
 	}
 }

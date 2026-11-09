@@ -79,7 +79,7 @@ test("an invalid submit_result goes back to the model; the node completes on a v
 	assert.deepEqual(r.executor.submissions.map((s) => s.errors.length > 0), [true, true, false]);
 	// The log keeps only the final, valid output, with the whole call's usage.
 	const returned = r.log.filter((e) => e.type === "agent_returned");
-	assert.deepEqual(returned, [{ type: "agent_returned", id: "#0", output: { answer: 2 }, usage: { usd: 0.03, tokens: 300, turns: 3 }, model: "fake/default" }]);
+	assert.deepEqual(returned, [{ type: "agent_returned", id: "#0:0", output: { answer: 2 }, usage: { usd: 0.03, tokens: 300, turns: 3 }, model: "fake/default" }]);
 	assert.ok(!JSON.stringify(r.log).includes('"two"'));
 	// Replay is identical: a second run gives the same log, a resume executes nothing.
 	const again = await run("submit", { strict });
@@ -103,9 +103,9 @@ test("reaching maxTurns idles the node (turn_limit); more turns continue it; rep
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "turn_limit", used: 4, limit: 4 });
 	assert.ok(first.log.some((e) => e.type === "turn_limit_reached"));
 	// An answer without turns is refused; with turns it continues the same node.
-	await assert.rejects(runWorkflow({ workflow, dir: first.dir, executor: new FakeExecutor({ strict }), confine: "off", sends: [{ node: "#0", text: "go on" }], inboxPollMs: null }), /no_turns_left/);
+	await assert.rejects(runWorkflow({ workflow, dir: first.dir, executor: new FakeExecutor({ strict }), confine: "off", sends: [{ node: "#0:0", text: "go on" }], inboxPollMs: null }), /no_turns_left/);
 	const executor = new FakeExecutor({ strict });
-	const done = await runWorkflow({ workflow, dir: first.dir, executor, confine: "off", sends: [{ node: "#0", text: "Continue.", turns: 3 }], inboxPollMs: null });
+	const done = await runWorkflow({ workflow, dir: first.dir, executor, confine: "off", sends: [{ node: "#0:0", text: "Continue.", turns: 3 }], inboxPollMs: null });
 	assert.deepEqual(done.outcome, { type: "done", value: { answer: 5 } });
 	assert.deepEqual(executor.calls.map((c) => [c.turn, c.turnLimit]), [[4, 7]]);
 	// A resume replays from the journal: the same snapshot, nothing called.

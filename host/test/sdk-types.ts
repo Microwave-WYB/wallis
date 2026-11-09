@@ -78,12 +78,12 @@ export default workflow({
 	output: Type.Number(),
 	run: async (ctx) => {
 		// One `ctx.call` for every kind of node.
-		const out = await ctx.call(ok, { q: "?", papers: [] });
+		const out = await ctx.session(ok).call({ q: "?", papers: [] });
 		const trained = await ctx.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: 2 });
 		const n: number = await ctx.call(inner, null);
 		const answer: string = out.answer;
 		// @ts-expect-error: call input is typed by the node's input schema
-		await ctx.call(ok, { q: 1, papers: [] });
+		await ctx.session(ok).call({ q: 1, papers: [] });
 		// @ts-expect-error: outputs are typed too
 		const wrong: number = out.answer;
 		ctx.observe("answer", answer);

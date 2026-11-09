@@ -16,8 +16,15 @@
 // - The executor gets the agent's output JSON Schema (provider-side
 //   structured output) and validates `submit_result` against it, returning
 //   the errors to the model so it can retry within its turn.
+// - A node is one call of a session. `NodeSpec.history` is where the
+//   session's previous call left the dialogue: the call continues it.
+// - `asked`: the agent called its `ask` tool; the reply arrives as the next
+//   `turn(message)` and becomes that tool call's result. `approval`: it
+//   called an `ask`-mode MCP tool; the next `turn(message)` carries the
+//   orchestrator's decision (canonical JSON of `Decision`). `interrupted`:
+//   the owner's interrupt aborted the turn.
 // - `ended`: the turn ended without a result; the node goes idle and the
-//   message is its question. `turn_limit`: the node used its turns without
+//   message is its question (an implicit ask). `turn_limit`: the node used its turns without
 //   submitting; it goes idle, progress kept, until its owner grants more
 //   turns, restarts or cancels it. Every turn the model sees "Turn k of N".
 //   `agent_error` (gave up, context exhausted) reaches the body as a typed
@@ -69,6 +76,12 @@ export interface NodeSpec {
 	readonly digest: string;
 	/** Messages after the first prompt, so far: the agent's questions and the replies. */
 	readonly transcript: readonly Message[];
+	/** The session's dialogue after its previous call (the executor's checkpoint format), or null for its first call. */
+	readonly history: string | null;
+	/** MCP tool results already journaled for this call, by tool call key. */
+	readonly recorded: ReadonlyMap<string, Json>;
+	/** Journals an MCP tool result of this call before the model sees it. */
+	readonly record: (call: string, result: Json) => void;
 	/** JSON Schema of the result: pass it to the provider as structured output and check `submit_result` with it. */
 	readonly outputSchema: Json;
 	/** The node's dirs: mounted input artifacts, scratch dir, mounts and spill dir. */
@@ -100,6 +113,12 @@ export type AgentCall = NodeSpec;
 export type TurnResult =
 	| { readonly type: "submitted"; readonly output: unknown; readonly usage?: Usage }
 	| { readonly type: "ended"; readonly message: string; readonly usage?: Usage }
+	/** The agent called `ask`: it waits for its caller's reply. */
+	| { readonly type: "asked"; readonly message: string; readonly usage?: Usage }
+	/** The agent called an `ask`-mode MCP tool: it waits for the orchestrator's decision. */
+	| { readonly type: "approval"; readonly server: string; readonly tool: string; readonly args: Json; readonly usage?: Usage }
+	/** The owner's interrupt aborted the turn; progress is kept. */
+	| { readonly type: "interrupted"; readonly usage?: Usage }
 	| { readonly type: "agent_error"; readonly failure: AgentFailure; readonly usage?: Usage }
 	/** The node used its turns without submitting: it waits for more (progress kept). */
 	| { readonly type: "turn_limit"; readonly used: number; readonly limit: number; readonly usage?: Usage }
@@ -148,6 +167,8 @@ export type Turn =
 	| { readonly submits: readonly Json[]; readonly usage?: Usage }
 	/** Ends the turn without a result: the node goes idle with this message. */
 	| { readonly idle: string; readonly usage?: Usage }
+	/** Calls `ask`: the node waits for a reply. */
+	| { readonly ask: string; readonly usage?: Usage }
 	/** The executor fails (provider, auth, billing). */
 	| { readonly unavailable: string }
 	| { readonly giveUp: string; readonly usage?: Usage }
@@ -245,7 +266,7 @@ export class FakeExecutor implements Executor {
 				const result = this.#play(call, turn);
 				if (result.type !== "executor_error") used += result.usage?.turns ?? 0;
 				if (result.type === "turn_limit") used = result.used;
-				if (result.type === "ended") transcript.push({ role: "assistant", text: result.message });
+				if (result.type === "ended" || result.type === "asked") transcript.push({ role: "assistant", text: result.message });
 				return result;
 			},
 			rebind: (next) => {
@@ -261,6 +282,7 @@ export class FakeExecutor implements Executor {
 		if ("giveUp" in turn) return { type: "agent_error", failure: { type: "gave_up", error: turn.giveUp }, usage: turn.usage ?? TURN_USAGE };
 		if ("contextExhausted" in turn) return { type: "agent_error", failure: { type: "context_exhausted" }, usage: turn.usage ?? TURN_USAGE };
 		if ("idle" in turn) return { type: "ended", message: turn.idle, usage: turn.usage ?? TURN_USAGE };
+		if ("ask" in turn) return { type: "asked", message: turn.ask, usage: turn.usage ?? TURN_USAGE };
 		const attempts = "submits" in turn ? turn.submits : ["submit" in turn ? turn.submit : turn.output];
 		for (const [i, output] of attempts.entries()) {
 			const n = i + 1;

@@ -9,7 +9,9 @@
 // nothing else is branded.
 
 import type { Refusal } from "../sdk/index.ts";
-import type { CommandDone, Core, DoneNode, IdleNodeState, LiveNodeState, Pin, RunningNode, Snapshot } from "./core.ts";
+import type { CommandDone, Core, DoneNode, IdleCause, IdleNodeState, LiveNodeState, OrchestratorNode, Pin, RunningNode, Snapshot, ToolNode } from "./core.ts";
+
+type ToolDone = Extract<ToolNode, { type: "tool_done" }>;
 
 /** A run id parsed from outside input. */
 export type RunId = string & { readonly __brand: "RunId" };
@@ -26,9 +28,9 @@ export function parseRunId(raw: unknown): RunId {
 	return raw as RunId;
 }
 
-/** Request ids: `#0`, `#2.a#0`, `#3>retry#1`. */
+/** Request ids: `#0`, `#2.a#0`, `#3>retry#1`; a session's calls are `#1:0`, `#1:1`. */
 export function parseNodeId(raw: unknown): NodeId {
-	if (typeof raw !== "string" || !/^(#\d+|\.[A-Za-z0-9_-]+|>[A-Za-z0-9_-]+)+$/.test(raw) || !raw.startsWith("#")) {
+	if (typeof raw !== "string" || !/^(#\d+|:\d+|\.[A-Za-z0-9_-]+|>[A-Za-z0-9_-]+)+$/.test(raw) || !raw.startsWith("#")) {
 		throw new BadId(`not a node id: ${JSON.stringify(raw)}`);
 	}
 	return raw as NodeId;
@@ -77,9 +79,11 @@ export class IdleNode extends Capability {
 
 	static check(owned: OwnedRun, id: string): IdleNode | Refusal {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
+		// An approval takes a decision (`submit_result`), not a message.
+		if (node?.type === "node_idle" && node.cause.type === "approval") return { type: "not_idle", node: id };
 		if (node?.type === "node_idle" && node.steerable) return new IdleNode(owned, node);
 		if (node?.type === "node_idle") return { type: "not_steerable", node: id };
-		if (node?.type === "command_running" || node?.type === "command_done") return { type: "not_an_agent", node: id };
+		if (node !== undefined && !("agent" in node)) return { type: "not_an_agent", node: id };
 		return { type: "not_idle", node: id };
 	}
 
@@ -99,7 +103,7 @@ export class SteerableNode extends Capability {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
 		if (node?.type === "node_running" && node.steerable) return new SteerableNode(owned, node);
 		if (node?.type === "node_running") return { type: "not_steerable", node: id };
-		if (node?.type === "command_running" || node?.type === "command_done") return { type: "not_an_agent", node: id };
+		if (node !== undefined && !("agent" in node)) return { type: "not_an_agent", node: id };
 		return { type: "node_not_running", node: id };
 	}
 
@@ -108,8 +112,8 @@ export class SteerableNode extends Capability {
 /** A node that is not done, or a failed one the run is held on: what cancel and restart reach. */
 export class LiveNode extends Capability {
 	readonly owned: OwnedRun;
-	readonly node: LiveNodeState | DoneNode | CommandDone;
-	private constructor(owned: OwnedRun, node: LiveNodeState | DoneNode | CommandDone) {
+	readonly node: LiveNodeState | DoneNode | CommandDone | ToolDone;
+	private constructor(owned: OwnedRun, node: LiveNodeState | DoneNode | CommandDone | ToolDone) {
 		super();
 		this.owned = owned;
 		this.node = node;
@@ -117,10 +121,36 @@ export class LiveNode extends Capability {
 
 	static check(owned: OwnedRun, id: string): LiveNode | Refusal {
 		const node = owned.snapshot.nodes.find((n) => n.id === id);
-		if (node !== undefined && (owned.snapshot.held === id || (node.type !== "node_done" && node.type !== "command_done"))) return new LiveNode(owned, node);
+		if (node === undefined) return { type: "not_live", node: id };
+		if (owned.snapshot.held === id && (node.type === "node_done" || node.type === "command_done" || node.type === "tool_done")) return new LiveNode(owned, node);
+		if (node.type === "node_running" || node.type === "node_idle" || node.type === "command_running" || node.type === "tool_running") return new LiveNode(owned, node);
 		return { type: "not_live", node: id };
 	}
 
+}
+
+/**
+ * What `submit_result` reaches: an orchestrator node waiting for its result,
+ * or an agent node waiting for a decision on an `ask`-mode tool. `kind` says
+ * which schema the value is checked against.
+ */
+export class SubmittableNode extends Capability {
+	readonly owned: OwnedRun;
+	readonly target:
+		| { readonly kind: "answer"; readonly node: Extract<OrchestratorNode, { type: "orchestrator_pending" }> }
+		| { readonly kind: "decision"; readonly node: IdleNodeState; readonly approval: Extract<IdleCause, { type: "approval" }> };
+	private constructor(owned: OwnedRun, target: SubmittableNode["target"]) {
+		super();
+		this.owned = owned;
+		this.target = target;
+	}
+
+	static check(owned: OwnedRun, id: string): SubmittableNode | Refusal {
+		const node = owned.snapshot.nodes.find((n) => n.id === id);
+		if (node?.type === "orchestrator_pending") return new SubmittableNode(owned, { kind: "answer", node });
+		if (node?.type === "node_idle" && node.cause.type === "approval") return new SubmittableNode(owned, { kind: "decision", node, approval: node.cause });
+		return { type: "not_pending", node: id };
+	}
 }
 
 /** A refolded run whose pin matched: the only run a session replays. */

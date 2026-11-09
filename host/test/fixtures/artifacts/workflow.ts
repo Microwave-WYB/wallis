@@ -80,7 +80,7 @@ export default workflow({
 		} catch (error) {
 			missing = (error as { failure?: unknown }).failure ?? String(error);
 		}
-		const written = await ctx.call(writer, { checkpoint: trained.checkpoint });
+		const written = await ctx.session(writer).call({ checkpoint: trained.checkpoint });
 		return { model: made.model, checkpoint: trained.checkpoint, size: trained.size, report: written.report, probed, missing };
 	},
 });

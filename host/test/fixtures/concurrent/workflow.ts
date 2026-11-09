@@ -19,10 +19,10 @@ export default workflow({
 	input: Type.Null(),
 	output: Type.Any(),
 	run: async (ctx) => {
-		const [a, b, c] = await Promise.all([ctx.call(echo, { n: 1 }), ctx.call(echo, { n: 1 }), ctx.call(echo, { n: 2 })]);
+		const [a, b, c] = await Promise.all([ctx.session(echo).call({ n: 1 }), ctx.session(echo).call({ n: 1 }), ctx.session(echo).call({ n: 2 })]);
 		const steps = await ctx.map([10, 20], async (branch, x) => {
-			const one = await branch.call(echo, { n: x });
-			const two = await branch.call(echo, { n: one.n + 1 });
+			const one = await branch.session(echo).call({ n: x });
+			const two = await branch.session(echo).call({ n: one.n + 1 });
 			return [one.by, two.by];
 		});
 		return { a: a.by, b: b.by, c: c.by, steps };

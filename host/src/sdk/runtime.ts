@@ -9,8 +9,8 @@
 // synchronously when `ctx.call` is invoked, so they are the same on every
 // replay regardless of the order results arrive in.
 
-import type { AgentDef, CommandDef, CommandResult, Ctx, FailReason, Json, Node, Refusal, SandboxDef, WorkflowDef, WorkflowNode } from "./index.ts";
-import { AgentFailed, CommandFailed, Refused, SchemaError, WorkflowFailed } from "./index.ts";
+import type { AgentDef, CallableNode, CommandDef, CommandResult, Ctx, FailReason, Json, McpToolDef, Refusal, SandboxDef, Session, ToolResult, WorkflowDef, WorkflowNode } from "./index.ts";
+import { AgentFailed, CommandFailed, Refused, SchemaError, ToolFailed, WorkflowFailed } from "./index.ts";
 import { schemaErrors } from "./validate.ts";
 
 /** What the host answers a request with. */
@@ -45,6 +45,8 @@ function thrown(reason: FailReason): Error {
 			return new AgentFailed(reason.agent, reason.failure);
 		case "command_crashed":
 			return new CommandFailed(reason.command, reason.failure);
+		case "tool_crashed":
+			return new ToolFailed(reason.tool, reason.failure);
 		case "workflow_failed":
 			return new WorkflowFailed(reason.workflow, reason.reason);
 		case "body_error":
@@ -73,6 +75,7 @@ function check(schema: unknown, value: unknown, subject: string): void {
 function failReason(error: unknown): FailReason {
 	if (error instanceof AgentFailed) return { type: "agent_gave_up", agent: error.agent, failure: error.failure };
 	if (error instanceof CommandFailed) return { type: "command_crashed", command: error.command, failure: error.failure };
+	if (error instanceof ToolFailed) return { type: "tool_crashed", tool: error.tool, failure: error.failure };
 	if (error instanceof WorkflowFailed) return { type: "workflow_failed", workflow: error.workflow, reason: error.reason };
 	return { type: "body_error", message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
 }
@@ -88,10 +91,21 @@ function makeCtx(path: string, seed: number): Ctx {
 	let counter = 0;
 	let observed = 0;
 	const next = () => `${path}#${counter++}`;
-	const callAgent = async (id: string, agent: AgentDef, input: unknown) => {
-		const output = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json }));
+	const callAgent = async (id: string, agent: AgentDef, input: unknown, session: string, index: number) => {
+		const output = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json, session, index }));
 		const errors = schemaErrors(agent.output, output);
 		if (errors.length > 0) throw new AgentFailed(agent.name, { type: "gave_up", error: `output does not match its schema: ${errors.join("; ")}` });
+		return output;
+	};
+	/** An external node (MCP tool or orchestrator): its answer is checked against `output` here too. */
+	const callExternal = async (id: string, node: McpToolDef | { kind: "orchestrator"; name: string; output: unknown }, input: unknown) => {
+		const req: Json = node.kind === "tool" ? { type: "tool", tool: node.name, input: input as Json } : { type: "orchestrator", name: node.name, input: input as Json };
+		const output = unwrap(await request(id, req));
+		const errors = schemaErrors(node.output, output);
+		if (errors.length > 0) {
+			if (node.kind === "tool") throw new ToolFailed(node.name, { type: "tool_output_mismatch", errors });
+			throw new SchemaError(`answer of orchestrator node ${node.name}`, errors);
+		}
 		return output;
 	};
 	const callCommand = async (id: string, command: CommandDef, input: unknown) => {
@@ -113,20 +127,44 @@ function makeCtx(path: string, seed: number): Ctx {
 	};
 	const ctx: Ctx = {
 		seed,
-		call(node: Node, input) {
+		call(node: CallableNode, input) {
+			// Agents are called through sessions only; the type says so, and so does the runtime.
+			if ((node as { kind: string }).kind === "agent") return Promise.reject(new Refused({ type: "session_required", agent: node.name }));
 			// Checked and numbered now, synchronously: the id never depends on arrival order.
 			const subject = `input of ${node.kind} ${node.name}`;
 			const errors = schemaErrors(node.input, input);
 			if (errors.length > 0) return Promise.reject(new SchemaError(subject, errors));
 			const id = next();
 			switch (node.kind) {
-				case "agent":
-					return callAgent(id, node, input) as never;
 				case "command":
 					return callCommand(id, node, input) as never;
 				case "workflow":
 					return callWorkflow(id, node, input) as never;
+				case "tool":
+				case "orchestrator":
+					return callExternal(id, node, input) as never;
 			}
+		},
+		session(agent) {
+			// The session's identity is where it was created, taken now like a request id.
+			const id = next();
+			let index = 0;
+			let busy = false;
+			const session: Session = {
+				id,
+				agent: agent.name,
+				call(input) {
+					if (busy) return Promise.reject(new Refused({ type: "session_busy", session: id }));
+					const errors = schemaErrors(agent.input, input);
+					if (errors.length > 0) return Promise.reject(new SchemaError(`input of agent ${agent.name}`, errors));
+					const k = index++;
+					busy = true;
+					return callAgent(`${id}:${k}`, agent, input, id, k).finally(() => {
+						busy = false;
+					}) as never;
+				},
+			};
+			return session as never;
 		},
 		parallel(branches) {
 			const at = next();
@@ -159,20 +197,23 @@ function seededRandom(seed: number): () => number {
 }
 
 function sandboxDeclaration(s: SandboxDef) {
-	return { requires: s.requires, setup: s.setup, mounts: s.mounts, network: s.network, base: s.base };
+	return { requires: s.requires, setup: s.setup, mounts: s.mounts, base: s.base };
 }
 
 /** Declarations: the core's workflow plus what the host and executors need. */
 export function declarations(def: WorkflowDef) {
 	const spec = def.spec;
 	const names = new Set<string>();
-	for (const node of [...spec.agents, ...(spec.commands ?? [])]) {
+	for (const node of [...spec.agents, ...(spec.commands ?? []), ...(spec.orchestrators ?? []), ...(spec.mcpTools ?? [])]) {
 		if (names.has(node.name)) throw new Error(`duplicate node name ${node.name}`);
 		names.add(node.name);
 	}
 	const commands = spec.commands ?? [];
+	const orchestrators = spec.orchestrators ?? [];
+	const tools = spec.mcpTools ?? [];
 	const mounts = spec.mounts?.table ?? {};
-	const overlay = (spec.mcp?.overlay ?? {}) as Record<string, { sandbox?: SandboxDef; allowWrites?: readonly string[] } | undefined>;
+	const overlay = (spec.mcp?.overlay ?? {}) as Record<string, { sandbox?: SandboxDef; network?: "none" | "full" } | undefined>;
+	for (const t of tools) if (!(t.server in (spec.mcp?.config.mcpServers ?? {}))) throw new Error(`MCP tool ${t.name}: server ${t.server} is not in mcp.json`);
 	// Every sandbox, by name: from commands, agents and MCP servers.
 	const sandboxes = new Map<string, SandboxDef>();
 	const use = (s: SandboxDef | null | undefined): string | null => {
@@ -191,6 +232,8 @@ export function declarations(def: WorkflowDef) {
 			name: spec.name,
 			agents: spec.agents.map((a) => ({ name: a.name, model: a.model, max_turns: a.maxTurns, steerable: a.steerable })),
 			commands: commands.map((c) => c.name),
+			orchestrators: orchestrators.map((o) => o.name),
+			tools: tools.map((t) => t.name),
 			budget: { turns: spec.budget?.turns ?? null, compute_minutes: spec.budget?.computeMinutes ?? null },
 		},
 		models: spec.models.table,
@@ -228,8 +271,12 @@ export function declarations(def: WorkflowDef) {
 				},
 			]),
 		),
+		orchestrators: Object.fromEntries(orchestrators.map((o) => [o.name, { description: o.description, input: o.input, output: o.output }])),
+		tools: Object.fromEntries(
+			tools.map((t) => [t.name, { server: t.server, tool: t.tool, input: t.input, output: t.output, code: t.parse ? t.parse.toString() : "default" }]),
+		),
 		mcp: spec.mcp?.config ?? null,
-		mcpServers: Object.fromEntries(Object.entries(overlay).map(([server, o]) => [server, { sandbox: use(o?.sandbox), allow_writes: [...(o?.allowWrites ?? [])] }])),
+		mcpServers: Object.fromEntries(Object.entries(overlay).map(([server, o]) => [server, { sandbox: use(o?.sandbox), network: o?.network ?? "full" }])),
 		sandboxes: Object.fromEntries([...sandboxes].map(([name, s]) => [name, sandboxDeclaration(s)])),
 		input: spec.input,
 		output: spec.output,
@@ -241,6 +288,12 @@ export type Declarations = ReturnType<typeof declarations>;
 /** The commands of a workflow, by name, for the host's `run` and `parse` calls. */
 function commandsOf(def: WorkflowDef): Map<string, CommandDef> {
 	return new Map((def.spec.commands ?? []).map((c) => [c.name, c]));
+}
+
+/** A body MCP tool's output from its result: `parse`, else the structured content, else the text as JSON. */
+function toolOutput(t: McpToolDef, result: ToolResult): unknown {
+	if (t.parse) return t.parse(result);
+	return result.structuredContent !== undefined ? result.structuredContent : JSON.parse(result.text);
 }
 
 export function install(def: WorkflowDef): void {
@@ -265,6 +318,17 @@ export function install(def: WorkflowDef): void {
 			return JSON.stringify({ ok: true, argv });
 		} catch (error) {
 			return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+		}
+	};
+	// A body MCP tool's output from its result, pure: `{ ok, output }` or `{ ok: false, error }`.
+	const tools = new Map((def.spec.mcpTools ?? []).map((t) => [t.name, t]));
+	g.__wallis_parse_tool = (name: string, resultJson: string) => {
+		try {
+			const t = tools.get(name);
+			if (!t) throw new Error(`no MCP tool ${name}`);
+			return JSON.stringify({ ok: true, output: toolOutput(t, JSON.parse(resultJson) as ToolResult) ?? null });
+		} catch (error) {
+			return JSON.stringify({ ok: false, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
 		}
 	};
 	// The command's output from its process result; files it names become artifact drafts.

@@ -65,7 +65,7 @@ const retry = subWorkflow({
 	run: async (ctx, input) => {
 		for (let n = 1; n <= input.max; n++) {
 			ctx.observe("attempt", n);
-			if ((await ctx.call(attempt, { n })).ok) return { attempts: n };
+			if ((await ctx.session(attempt).call({ n })).ok) return { attempts: n };
 		}
 		return { attempts: input.max };
 	},
@@ -85,14 +85,14 @@ export default workflow({
 		let findings: { content: string; confidence: number }[] = [];
 		const archive: { content: string; confidence: number }[] = [];
 		const found = await ctx.parallel({
-			a: (c) => c.call(scout, { area: "a", known: errors }),
-			b: (c) => c.call(scout, { area: "b", known: errors }),
+			a: (c) => c.session(scout).call({ area: "a", known: errors }),
+			b: (c) => c.session(scout).call({ area: "b", known: errors }),
 		});
 		errors = [...new Set([...errors, ...found.a.errors, ...found.b.errors])].sort();
 		ctx.observe("errors", errors);
-		const verdict = await ctx.call(judge, { errors });
+		const verdict = await ctx.session(judge).call({ errors });
 		// Merging is ordinary workflow code: an agent call, then plain JS.
-		const merged = await ctx.call(merger, { current: findings, incoming: verdict.findings, max: 2 });
+		const merged = await ctx.session(merger).call({ current: findings, incoming: verdict.findings, max: 2 });
 		findings = merged.items.slice(-2);
 		archive.push(...merged.archived);
 		const tries = await ctx.call(retry, { max: 3 });

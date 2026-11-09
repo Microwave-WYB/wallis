@@ -26,7 +26,7 @@ const call = (name: string, args: Record<string, unknown>) => fauxAssistantMessa
 function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: TranscriptEntry[] } {
 	const entries: TranscriptEntry[] = [];
 	return {
-		id: "#0",
+		id: "#0:0",
 		agent: "answerer",
 		declaration: {
 			model: "default",
@@ -50,6 +50,9 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		turnLimit: 6,
 		digest: "d",
 		transcript: [],
+		history: null,
+		recorded: new Map(),
+		record: () => {},
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
 		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", mounts: {}, spill: join(tmp(), "spill") },
 		sandbox: { type: "none" },
@@ -131,12 +134,12 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	const first = await runWorkflow({ ...opts, input: { topic: "folds" } });
 	const node = first.run.nodes[0]!;
 	assert.equal(node.type === "node_idle" && node.cause.type === "question" && node.cause.message, "Who is the audience?");
-	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0", text: "newcomers" }] });
+	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0:0", text: "newcomers" }] });
 	assert.equal(done.outcome?.type, "done", JSON.stringify(done.status));
 	// The new session resumed from the node's checkpoint: the real conversation, with the quota on each newest message.
 	assert.match(prompts[0]!, /"role":"assistant","content":\[\{"type":"text","text":"Who is the audience\?"/);
 	assert.match(prompts[0]!, /newcomers\\n\\n\[Turn 2 of 16\]/);
-	const transcript = readFileSync(join(dir, "nodes", "_0.jsonl"), "utf8");
+	const transcript = readFileSync(join(dir, "nodes", "_0_0.jsonl"), "utf8");
 	assert.match(transcript, /"kind":"assistant","text":"Who is the audience\?"/);
 	assert.match(transcript, /"kind":"user","text":"newcomers"/);
 	assert.match(transcript, /"kind":"tool_call","tool":"submit_result"/);
@@ -159,13 +162,13 @@ test("pi codemode: every agent gets codemode; its script reads the full input (f
 	assert.match(prompts[0]!, /folded.*array.*items.*30/);
 	assert.match(prompts[0]!, /Folded fields.*\/notes/);
 	assert.doesNotMatch(prompts[0]!, /note number 29/);
-	const transcript = readFileSync(join(dir, "nodes", "_0.jsonl"), "utf8")
+	const transcript = readFileSync(join(dir, "nodes", "_0_0.jsonl"), "utf8")
 		.trim()
 		.split("\n")
 		.map((l) => JSON.parse(l));
 	const calls = transcript.filter((e) => e.kind === "tool_call").map((e) => [e.tool, e.nested]);
 	assert.deepEqual(calls, [["codemode", false], ["submit_result", true]]);
-	assert.ok(!existsSync(join(dir, "work", "_0")), "the node's dir is gone");
+	assert.ok(!existsSync(join(dir, "work", "_0_0")), "the node's dir is gone");
 });
 
 test("pi: a dialogue over the window is compacted (logged); with compaction off it fails as context_exhausted", async () => {
@@ -210,11 +213,11 @@ test("the tool layer caps results: the overflow is spilled with a marker and pag
 	const out = await direct.execute("1", {}, undefined as never, undefined as never);
 	const text = (out.content[0] as { text: string }).text;
 	assert.match(text, /^y{100}\n\[output truncated at 100 of 250 chars; the full text is spill "1.txt"\. Page it from the next script: await tools.read_spill\(\{ name: "1.txt", offset: 100 \}\)\]$/);
-	const page = await tools.invoke("read_spill", { name: "1.txt", offset: 100 }, true);
+	const page = await tools.invoke("read_spill", { name: "1.txt", offset: 100 }, true, undefined, "t1");
 	assert.deepEqual(page.value, { text: "y".repeat(150), next: 250, total: 250 });
 	assert.ok(s.entries.some((e) => e.kind === "note" && /spilled 250 chars/.test((e as { text: string }).text)));
 	// A submitted result over the output cap goes back as a validation error.
-	const huge = await tools.invoke("submit_result", { answer: 1, pad: "z".repeat(200_000) }, false);
+	const huge = await tools.invoke("submit_result", { answer: 1, pad: "z".repeat(200_000) }, false, undefined, "t1");
 	assert.equal(huge.isError, true);
 	assert.match(huge.text, /the cap is 100000/);
 });
@@ -241,35 +244,35 @@ test("the tool layer: a sandboxed agent gets bash and file tools mapped onto its
 	});
 	mkdirSync(join(dir, "scratch"), { recursive: true });
 	const tools = await buildNodeTools(s);
-	assert.deepEqual(tools.agentTools().map((t) => t.name).sort(), ["bash", "codemode", "export_artifact", "list_dir", "read_file", "read_spill", "submit_result", "write_file"]);
+	assert.deepEqual(tools.agentTools().map((t) => t.name).sort(), ["ask", "bash", "codemode", "export_artifact", "list_dir", "read_file", "read_spill", "submit_result", "write_file"]);
 	// Paths are the sandbox's: /w is scratch, /w/<mount> is the mount (read-only).
-	assert.equal((await tools.invoke("read_file", { path: "/w/data/notes.txt" }, false)).text, "from the mount");
-	assert.equal((await tools.invoke("write_file", { path: "data/x", content: "no" }, false)).isError, true);
-	assert.equal((await tools.invoke("write_file", { path: "out.txt", content: "yes" }, false)).text, "wrote out.txt");
+	assert.equal((await tools.invoke("read_file", { path: "/w/data/notes.txt" }, false, undefined, "t1")).text, "from the mount");
+	assert.equal((await tools.invoke("write_file", { path: "data/x", content: "no" }, false, undefined, "t1")).isError, true);
+	assert.equal((await tools.invoke("write_file", { path: "out.txt", content: "yes" }, false, undefined, "t1")).text, "wrote out.txt");
 	assert.equal(readFileSync(join(dir, "scratch", "out.txt"), "utf8"), "yes");
-	assert.equal((await tools.invoke("read_file", { path: "/etc/passwd" }, false)).isError, true);
+	assert.equal((await tools.invoke("read_file", { path: "/etc/passwd" }, false, undefined, "t1")).isError, true);
 	// Declared but not buildable here: bash says so, typed as an error for the model.
-	assert.match((await tools.invoke("bash", { command: "id" }, false)).text, /no sandbox: test/);
-	const refused = await tools.invoke("exec", { command: "id" }, true);
+	assert.match((await tools.invoke("bash", { command: "id" }, false, undefined, "t1")).text, /no sandbox: test/);
+	const refused = await tools.invoke("exec", { command: "id" }, true, undefined, "t1");
 	assert.equal(refused.isError, true);
 	assert.match(refused.text, /not allowed/);
 	assert.ok(s.entries.some((e) => e.kind === "tool_call" && e.tool === "exec"));
 	// An agent without a sandbox gets codemode too, and no filesystem at all.
 	const none = await buildNodeTools(spec());
-	assert.deepEqual(none.agentTools().map((t) => t.name).sort(), ["codemode", "read_spill", "submit_result"]);
+	assert.deepEqual(none.agentTools().map((t) => t.name).sort(), ["ask", "codemode", "read_spill", "submit_result"]);
 });
 
 test("upstream MCP through pi-mcp: only allowlisted tools, secrets only in the server process", async () => {
 	const server = resolve(here, "fixtures/mcp-server.ts");
 	const s = spec({
-		declaration: { ...(spec().declaration as object), mcp: { fx: ["echo"] } } as never,
+		declaration: { ...(spec().declaration as object), mcp: { fx: { direct: ["echo"], ask: [] } } } as never,
 		mcp: { fx: { command: process.execPath, args: [server], env: { TOKEN: "${TOKEN}", PATH: process.env.PATH ?? "" } } },
 	});
 	const tools = await buildNodeTools(s, { secrets: { TOKEN: "s3cret" } });
 	try {
 		assert.ok(tools.names.includes("mcp__fx__echo"));
 		assert.ok(!tools.names.includes("mcp__fx__other"));
-		const r = await tools.invoke("mcp__fx__echo", { text: "hi" }, false);
+		const r = await tools.invoke("mcp__fx__echo", { text: "hi" }, false, undefined, "t1");
 		assert.equal(r.text, "hi; token=present");
 		assert.ok(!JSON.stringify(s.entries).includes("s3cret"), "the secret never reaches the transcript");
 		assert.ok(!JSON.stringify(s).includes("s3cret"), "nor the node spec");

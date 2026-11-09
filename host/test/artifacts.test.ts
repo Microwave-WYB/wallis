@@ -61,7 +61,7 @@ async function run(s: ReturnType<typeof setup>, extra: Record<string, unknown> =
 	});
 }
 
-test("artifacts flow between commands and agents by ref; argv and parse are typed adapters; node dirs are discarded", { skip }, async () => {
+test("artifacts flow between commands and agents by ref; argv and parse are typed adapters; call dirs are discarded", { skip }, async () => {
 	const s = setup();
 	const r = await run(s);
 	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
@@ -77,7 +77,9 @@ test("artifacts flow between commands and agents by ref; argv and parse are type
 	const log = readFileSync(join(s.dir, "log.jsonl"), "utf8");
 	assert.doesNotMatch(log, /"artifact":/);
 	assert.doesNotMatch(log, /not-exported/);
-	assert.deepEqual(existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [], []);
+	// Calls' dirs are discarded; only the writer session's scratch dir stays, cleaned with the run.
+	assert.deepEqual(existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [], ["_4"]);
+	assert.deepEqual(readdirSync(join(s.dir, "work", "_4")), ["scratch"]);
 	const started = new EventLog(join(s.dir, "log.jsonl")).read()[0] as { pin: { inputs: Record<string, string> } };
 	assert.match(started.pin.inputs["mount.corpus"]!, /^mount:sha256:[0-9a-f]{64}$/);
 	// Run metadata: resolved binaries with versions, and the base.
@@ -158,7 +160,7 @@ test("setup runs once per digest with the network on, writes $WALLIS_ENV, and it
 	);
 });
 
-test("an idle node keeps its scratch dir; a done node's dir is deleted", { skip }, async () => {
+test("a session's scratch dir outlives its calls; a done call's own dir is deleted", { skip }, async () => {
 	const s = setup();
 	const executor = () =>
 		new FakeExecutor({
@@ -174,10 +176,14 @@ test("an idle node keeps its scratch dir; a done node's dir is deleted", { skip 
 		});
 	const idle = await run(s, { executor: executor() });
 	const node = idle.run.nodes.find((n) => n.type === "node_idle")!;
-	const scratch = join(s.dir, "work", node.id.replace(/[^A-Za-z0-9._-]/g, "_"), "scratch");
+	const session = node.id.slice(0, node.id.lastIndexOf(":"));
+	const scratch = join(s.dir, "work", session.replace(/[^A-Za-z0-9._-]/g, "_"), "scratch");
+	const own = join(s.dir, "work", node.id.replace(/[^A-Za-z0-9._-]/g, "_"));
 	assert.equal(readFileSync(join(scratch, "draft.md"), "utf8"), "draft");
+	assert.ok(existsSync(own));
 	const done = await run(s, { executor: executor(), sends: [{ node: node.id, text: "yes" }] });
 	const report = (done.outcome as unknown as { value: { report: { digest: string } } }).value.report;
 	assert.equal(readFileSync(blobPath(s.dir, report.digest), "utf8"), "draft, short");
-	assert.ok(!existsSync(scratch));
+	assert.ok(existsSync(join(scratch, "report.md")), "the session's scratch dir stays");
+	assert.ok(!existsSync(own), "the call's own dir is gone");
 });

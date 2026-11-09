@@ -9,8 +9,9 @@
 //   /w                            the call's private scratch dir (cwd, writable)
 //   /w/<mount>                    each declared mount, read-only
 // and nothing else: not the workflow dir, not $HOME. The network is off
-// unless the sandbox lists domains. GPU devices are bound only for calls
-// that declare `resources.gpu`.
+// for agents and commands, always; only `setup` and MCP servers whose
+// overlay declares `network: "full"` (the default) share the host network.
+// GPU devices are bound only for calls that declare `resources.gpu`.
 //
 // Binaries resolve per name: call-time `--bin` > local profile (per
 // workflow, then global) > the caller's PATH when the run was created.
@@ -146,6 +147,8 @@ export interface SpawnOptions {
 	readonly gpu?: boolean;
 	/** Extra environment (secrets for MCP servers, WALLIS_COMPUTE_MINUTES). */
 	readonly env?: Readonly<Record<string, string>>;
+	/** MCP servers only: their overlay's network. Agents and commands never get one. */
+	readonly network?: "none" | "full";
 	/** Setup only: the network on and `$WALLIS_ENV` writable. */
 	readonly setup?: { readonly envDir: string };
 }
@@ -160,8 +163,6 @@ export class Sandboxes {
 	readonly #mountDigests: Readonly<Record<string, string>>;
 	readonly #cache: string;
 	readonly #envs = new Map<string, string>();
-	/** Warnings for the run's log: network allowlists bwrap cannot enforce per domain. */
-	readonly notes: string[] = [];
 
 	constructor(options: {
 		readonly decls: Readonly<Record<string, SandboxDecl>>;
@@ -175,9 +176,6 @@ export class Sandboxes {
 		this.#mounts = options.mounts;
 		this.#mountDigests = options.mountDigests;
 		this.#cache = options.cacheDir ?? join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "wallis", "envs");
-		for (const [name, s] of Object.entries(this.#decls)) {
-			if (s.network.length > 0) this.notes.push(`sandbox ${name}: network on for ${s.network.join(", ")}; bwrap cannot restrict it per domain`);
-		}
 	}
 
 	#decl(name: string): SandboxDecl {
@@ -191,7 +189,7 @@ export class Sandboxes {
 		const s = this.#decl(name);
 		const envDir = options.setup?.envDir ?? this.#envs.get(name) ?? null;
 		const args = ["--die-with-parent", "--new-session", "--unshare-all"];
-		if (options.setup || s.network.length > 0) args.push("--share-net");
+		if (options.setup || options.network === "full") args.push("--share-net");
 		args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 		if (options.gpu) args.push(...gpuDevices());
 		for (const r of s.requires) args.push("--ro-bind", this.#bins[r.name]!, `${LAYOUT.bin}/${r.name}`);

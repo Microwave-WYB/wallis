@@ -65,11 +65,11 @@ export default workflow({
 				case "command_bad_input":
 					return await ctx.call(measure, { n: "one" } as never);
 				case "report":
-					return await ctx.call(reporter, null);
+					return await ctx.session(reporter).call(null);
 				case "agent":
-					return await ctx.call(tagger, null);
+					return await ctx.session(tagger).call(null);
 				case "submit":
-					return await ctx.call(strict, null);
+					return await ctx.session(strict).call(null);
 			}
 		} catch (error) {
 			return caught(error);

@@ -128,10 +128,14 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
 	return join(dirs.inputs, ref.digest.slice("sha256:".length), ref.name);
 }
 
-/** Creates (or reuses, for a continued node) a node's dirs and links its input artifacts. */
-export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>): NodeDirs {
+/**
+ * Creates (or reuses, for a continued node) a node's dirs and links its
+ * input artifacts. An agent call's scratch dir is its session's (`scratch`),
+ * which outlives the call.
+ */
+export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>, scratch?: string): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
-	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: join(root, "scratch"), mounts, spill: join(root, "spill") };
+	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: scratch ?? join(root, "scratch"), mounts, spill: join(root, "spill") };
 	verifyRefs(input, runDir);
 	mkdirSync(dirs.inputs, { recursive: true });
 	mkdirSync(dirs.scratch, { recursive: true });

@@ -5,13 +5,14 @@ import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Json, Refusal } from "../sdk/index.ts";
+import { toJson } from "../sdk/validate.ts";
 import type { BudgetKind } from "./core.ts";
 import { type CommandRunner, ProcessCommands } from "./commands.ts";
 import type { Executor } from "./executor.ts";
-import { IdleNode, LiveNode, must, type NodeId, OwnedRun, type RunId, SteerableNode } from "./capability.ts";
+import { IdleNode, LiveNode, must, type NodeId, OwnedRun, type RunId, SteerableNode, SubmittableNode } from "./capability.ts";
 import { NotOwner, type Owner, serverOwner } from "./owner.ts";
 import { loadProfile } from "./profile.ts";
-import { applyControl, inspectRun, type RunView } from "./query.ts";
+import { applyControl, deliveryOf, inspectRun, type RunView } from "./query.ts";
 import { type Session, type SessionOptions, startSession } from "./session.ts";
 import { MachineSlots } from "./slots.ts";
 import { appendInbox, type InboxEntry, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir } from "./store.ts";
@@ -159,23 +160,41 @@ export class Runs {
 		return this.#session(runId, request);
 	}
 
-	/** Answers an idle node. */
-	async answer(runId: RunId, node: NodeId, text: string, turns = 0): Promise<void> {
-		await this.resume(runId, { sends: [{ node, text, turns }] });
+	/**
+	 * A message to an agent node: delivered if it is idle, queued as a steer
+	 * after its current turn if it is running. Returns how it was delivered.
+	 */
+	async send(runId: RunId, node: NodeId, text: string, turns = 0): Promise<string> {
+		this.control(runId);
+		const id = newMessageId();
+		const live = this.#live.get(runId);
+		if (live && !live.settled) {
+			const sent = live.send(must(live.owned(this.owner), refused), node, text, id, turns);
+			if ("refusal" in sent) throw new SendRefused(sent.refusal);
+		} else await this.#viaInbox(runId, turns > 0 ? { id, type: "send", node, text, by: this.owner, turns } : { id, type: "send", node, text, by: this.owner });
+		return deliveryOf(resolveRunDir(this.root, runId), id) ?? `sent to ${node}`;
 	}
 
-	/** Steers a running node of a live run. */
-	steer(runId: RunId, node: NodeId, text: string): void {
+	/** Aborts a running node's current turn: it goes Idle(interrupted), progress kept. */
+	interrupt(runId: RunId, node: NodeId): void {
 		const live = this.#running(runId, node);
-		const refusal = live.steer(must(SteerableNode.check(must(live.owned(this.owner), refused), node), refused), text);
+		const refusal = live.interrupt(must(SteerableNode.check(must(live.owned(this.owner), refused), node), refused));
 		if (refusal) throw new SendRefused(refusal);
 	}
 
-	/** Aborts a running node's current step; `text` is delivered once it stops. */
-	interrupt(runId: RunId, node: NodeId, text?: string): void {
-		const live = this.#running(runId, node);
-		const refusal = live.interrupt(must(SteerableNode.check(must(live.owned(this.owner), refused), node), refused), text);
-		if (refusal) throw new SendRefused(refusal);
+	/** The orchestrator's result for an orchestrator node, or its decision on an approval; checked against its schema. */
+	async submit(runId: RunId, node: NodeId, value: unknown): Promise<void> {
+		const owned = this.control(runId);
+		must(SubmittableNode.check(owned, node), refused);
+		const live = this.#live.get(runId);
+		if (live && !live.settled) {
+			const refusal = live.submit(must(SubmittableNode.check(must(live.owned(this.owner), refused), node), refused), value);
+			if (refusal) throw new SendRefused(refusal);
+		} else {
+			const json = toJson(value);
+			if (!json.ok) throw new SendRefused({ type: "invalid_answer", node, errors: json.errors });
+			await this.#viaInbox(runId, { id: newMessageId(), type: "submit", node, value: json.value, by: this.owner });
+		}
 	}
 
 	#running(runId: RunId, node: NodeId): Session {

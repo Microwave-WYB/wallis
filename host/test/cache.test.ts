@@ -78,10 +78,10 @@ test("a changed prompt misses; downstream misses when its input changes, hits wh
 
 test("an inserted node runs; its neighbours still hit under their new ids", async () => {
 	const { fork } = await finishedThenFork();
-	const workflow = variant(twoNode, (t) => t.replace("const plan = await ctx.call(planner, { topic: input.topic });", 'await ctx.call(planner, { topic: "warm-up" });\n\t\tconst plan = await ctx.call(planner, { topic: input.topic });'));
+	const workflow = variant(twoNode, (t) => t.replace("const plan = await ctx.session(planner).call({ topic: input.topic });", 'await ctx.session(planner).call({ topic: "warm-up" });\n\t\tconst plan = await ctx.session(planner).call({ topic: input.topic });'));
 	const executor = new FakeExecutor(responses());
 	const r = await runWorkflow({ ...quiet, workflow, dir: fork, executor });
-	assert.deepEqual(executor.calls.map((c) => [c.id, (c.input as { topic?: string }).topic]), [["#0", "warm-up"]]);
+	assert.deepEqual(executor.calls.map((c) => [c.id, (c.input as { topic?: string }).topic]), [["#0:0", "warm-up"]]);
 	assert.equal(r.outcome?.type, "done");
 });
 
@@ -101,8 +101,8 @@ test("reordering two parallel branches still hits", async () => {
 	const fork = forkRun(dir, join(root, "fork")).dir;
 	const workflow = variant(fanout, (t) =>
 		t.replace(
-			'a: (c) => c.call(scout, { area: "a", known: errors }),\n\t\t\tb: (c) => c.call(scout, { area: "b", known: errors }),',
-			'b: (c) => c.call(scout, { area: "b", known: errors }),\n\t\t\ta: (c) => c.call(scout, { area: "a", known: errors }),',
+			'a: (c) => c.session(scout).call({ area: "a", known: errors }),\n\t\t\tb: (c) => c.session(scout).call({ area: "b", known: errors }),',
+			'b: (c) => c.session(scout).call({ area: "b", known: errors }),\n\t\t\ta: (c) => c.session(scout).call({ area: "a", known: errors }),',
 		),
 	);
 	const again = exec();
@@ -129,7 +129,7 @@ test("Promise.all and ctx.map are deterministic whatever order results arrive in
 	assert.deepEqual(a.outcome, b.outcome);
 	const out = (a.outcome as unknown as { value: { a: string; b: string; c: string; steps: string[][] } }).value;
 	// Ids are taken at invocation: #0, #1, #2; each map branch has its own counter.
-	assert.deepEqual(out, { a: "#0", b: "#1", c: "#2", steps: [["#3.0#0", "#3.0#1"], ["#3.1#0", "#3.1#1"]] });
+	assert.deepEqual(out, { a: "#0:0", b: "#1:0", c: "#2:0", steps: [["#3.0#0:0", "#3.0#1:0"], ["#3.1#0:0", "#3.1#1:0"]] });
 
 	// Killed after a few results; resumed with results arriving in the other order: the same outcome, and no completed call runs again.
 	const log = new EventLog(join(root, "a", "log.jsonl")).read();

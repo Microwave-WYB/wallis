@@ -39,17 +39,37 @@ export interface Mcp<J extends McpConfig = McpConfig> {
 
 /**
  * Wraps an imported `mcp.json` (`import m from "./mcp.json" with { type: "json" }`).
- * The TS overlay gives each stdio server its sandbox (with its own network
- * allowlist), and names tools allowed to write outside the agent's sandbox.
+ * The TS overlay gives each stdio server its sandbox and its network
+ * (`"full"` by default: MCP servers are the run's only channel outside).
  */
 export function defineMcp<const J extends McpConfig>(config: J, overlay: McpOverlay<J> = {}): Mcp<J> {
 	return { kind: "mcp", config, overlay };
 }
 
-/** Per agent: a subset of servers, each with a tool allowlist or `"*"`. */
+/**
+ * Per agent: a subset of servers, each with its tools. A plain list (or
+ * `"*"`) is direct: the tool runs when the agent calls it. Tools under `ask`
+ * run only after the orchestrator approves the call; a rejection's reason is
+ * the tool's result. A tool whose annotations say it writes outside must be
+ * under `ask` (preflight refuses it otherwise).
+ *
+ *     mcp: { scholar: ["search"], ente: { ask: ["upload"] } }
+ */
+export type McpTools = readonly string[] | "*" | { readonly direct?: readonly string[] | "*"; readonly ask?: readonly string[] };
+
 export type McpSelection<J extends McpConfig> = {
-	readonly [S in keyof J["mcpServers"] & string]?: readonly string[] | "*";
+	readonly [S in keyof J["mcpServers"] & string]?: McpTools;
 };
+
+/** An agent's tools of one server, normalized: direct ones, and those that ask first. */
+export type ServerTools = { readonly direct: readonly string[] | "*"; readonly ask: readonly string[] };
+
+/** The orchestrator's decision on an `ask`-mode tool call. A rejection needs a reason. */
+export const Decision = Type.Union([
+	Type.Object({ type: Type.Literal("approve") }, { additionalProperties: false }),
+	Type.Object({ type: Type.Literal("reject"), reason: Type.String({ minLength: 1, pattern: "\\S" }) }, { additionalProperties: false }),
+]);
+export type Decision = Static<typeof Decision>;
 
 // --- Artifacts -------------------------------------------------------------------
 
@@ -117,8 +137,6 @@ export interface SandboxSpec<T extends MountTable, R extends string> {
 	readonly setup?: readonly (readonly string[])[];
 	/** Read-only, by name from `defineMounts`; seen at `/w/<name>`. There is no writable mount. */
 	readonly mounts?: readonly (keyof T & string)[];
-	/** Domains the sandbox may reach at run time. Default: none. */
-	readonly network?: readonly string[];
 	/** Reserved for a container backend: an image. bwrap ignores it. */
 	readonly base?: string;
 }
@@ -126,7 +144,9 @@ export interface SandboxSpec<T extends MountTable, R extends string> {
 /**
  * A sandbox the workflow declares. Nothing is implicit: the workflow dir is
  * not mounted; whatever the sandbox needs comes through its mounts. Each call
- * gets a private writable scratch dir (`/w`, the working directory).
+ * gets a private writable scratch dir (`/w`, the working directory). Agents
+ * and commands never have network; only `setup`, and MCP servers (through
+ * their overlay), reach outside.
  */
 export interface SandboxDef<R extends string = string> {
 	readonly kind: "sandbox";
@@ -134,7 +154,6 @@ export interface SandboxDef<R extends string = string> {
 	readonly requires: readonly { readonly name: R; readonly check: readonly string[] }[];
 	readonly setup: readonly (readonly string[])[];
 	readonly mounts: readonly string[];
-	readonly network: readonly string[];
 	readonly base: string | null;
 }
 
@@ -148,7 +167,6 @@ export function defineSandbox<const T extends MountTable, const R extends string
 		requires: (spec.requires ?? []).map((r) => (typeof r === "string" ? { name: r, check: [r, "--version"] } : r)),
 		setup: spec.setup ?? [],
 		mounts: [...(spec.mounts ?? [])],
-		network: [...(spec.network ?? [])],
 		base: spec.base ?? null,
 	};
 }
@@ -249,7 +267,7 @@ export interface AgentSpec<M extends ModelTable, J extends McpConfig, I extends 
 	readonly input: I;
 	/** The result the agent submits; executors pass it to the model as the structured-output schema. */
 	readonly output: O;
-	/** The agent's tools beyond codemode and submit_result: allowlisted MCP tools only. */
+	/** The agent's tools beyond codemode, ask and submit_result: allowlisted MCP tools only, direct or `ask`. */
 	readonly mcp?: McpSelection<J>;
 	readonly skills?: readonly string[];
 	/**
@@ -279,7 +297,7 @@ export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSche
 	readonly prompt: string;
 	readonly input: I;
 	readonly output: O;
-	readonly mcp: { readonly [server: string]: readonly string[] | "*" };
+	readonly mcp: { readonly [server: string]: ServerTools };
 	readonly skills: readonly string[];
 	readonly maxTurns: number;
 	readonly needs: AgentSpec<ModelTable, McpConfig, I, O>["needs"];
@@ -302,7 +320,12 @@ export function defineAgent<const M extends ModelTable, const J extends McpConfi
 		prompt: spec.prompt,
 		input: spec.input,
 		output: spec.output,
-		mcp: (spec.mcp ?? {}) as AgentDef["mcp"],
+		mcp: Object.fromEntries(
+			Object.entries((spec.mcp ?? {}) as Record<string, McpTools>).map(([server, t]): [string, ServerTools] => [
+				server,
+				typeof t === "string" || Array.isArray(t) ? { direct: t as ServerTools["direct"], ask: [] } : { direct: (t as { direct?: ServerTools["direct"] }).direct ?? [], ask: (t as { ask?: readonly string[] }).ask ?? [] },
+			]),
+		),
 		skills: spec.skills ?? [],
 		maxTurns,
 		needs: spec.needs,
@@ -337,6 +360,12 @@ export type Refusal =
 	| { readonly type: "unknown_bin"; readonly name: string }
 	| { readonly type: "unknown_alias"; readonly alias: string }
 	| { readonly type: "journal_missing"; readonly request: string }
+	| { readonly type: "session_busy"; readonly session: string }
+	| { readonly type: "session_required"; readonly agent: string }
+	| { readonly type: "unknown_orchestrator"; readonly name: string }
+	| { readonly type: "unknown_tool"; readonly name: string }
+	| { readonly type: "invalid_answer"; readonly node: string; readonly errors: readonly string[] }
+	| { readonly type: "not_pending"; readonly node: string }
 	| { readonly type: "invalid_declaration"; readonly message: string }
 	| { readonly type: "invalid_event"; readonly message: string }
 	| { readonly type: "not_started" }
@@ -358,15 +387,31 @@ export type CommandFailure =
 	| { readonly type: "unrunnable"; readonly error: string }
 	| { readonly type: "command_cancelled" };
 
+/** Why a body MCP tool call failed. Mirrors `ToolFailure` in the core. */
+export type ToolFailure =
+	| { readonly type: "tool_error"; readonly message: string }
+	| { readonly type: "tool_output_mismatch"; readonly errors: readonly string[] }
+	| { readonly type: "tool_unreachable"; readonly error: string }
+	| { readonly type: "tool_cancelled" };
+
 /** Why a run (or a nested workflow) failed. Mirrors `FailReason` in the core. */
 export type FailReason =
 	| { readonly type: "body_error"; readonly message: string }
 	| { readonly type: "agent_gave_up"; readonly agent: string; readonly failure: AgentFailure }
 	| { readonly type: "command_crashed"; readonly command: string; readonly failure: CommandFailure }
+	| { readonly type: "tool_crashed"; readonly tool: string; readonly failure: ToolFailure }
 	| { readonly type: "workflow_failed"; readonly workflow: string; readonly reason: FailReason };
 
-export function failureText(failure: AgentFailure | CommandFailure): string {
+export function failureText(failure: AgentFailure | CommandFailure | ToolFailure): string {
 	switch (failure.type) {
+		case "tool_error":
+			return failure.message;
+		case "tool_output_mismatch":
+			return `output does not match its schema: ${failure.errors.join("; ")}`;
+		case "tool_unreachable":
+			return `server unreachable: ${failure.error}`;
+		case "tool_cancelled":
+			return "cancelled by the owner";
 		case "gave_up":
 			return failure.error;
 		case "context_exhausted":
@@ -416,6 +461,18 @@ export class CommandFailed extends Error {
 	constructor(command: string, failure: CommandFailure) {
 		super(`${command}: ${failureText(failure)}`);
 		this.command = command;
+		this.failure = failure;
+	}
+}
+
+/** A body MCP tool call failed: an error result, an output mismatch, an unreachable server, or a cancel. */
+export class ToolFailed extends Error {
+	override readonly name = "ToolFailed";
+	readonly tool: string;
+	readonly failure: ToolFailure;
+	constructor(tool: string, failure: ToolFailure) {
+		super(`${tool}: ${failureText(failure)}`);
+		this.tool = tool;
 		this.failure = failure;
 	}
 }
@@ -473,8 +530,87 @@ export interface WorkflowNode<I extends TSchema = TSchema, O extends TSchema = T
 	readonly run: (ctx: Ctx, input: Static<I>) => Promise<Static<O>>;
 }
 
-/** Everything `ctx.call` can invoke, discriminated by `kind`. */
-export type Node<I extends TSchema = TSchema, O extends TSchema = TSchema> = AgentDef<I, O> | CommandDef<I, O> | WorkflowNode<I, O>;
+// --- External nodes: MCP tools and the orchestrator ---------------------------
+
+/**
+ * A node the orchestrator completes (`submit_result`, or `wallis submit`),
+ * with a value checked against `output`. Its question must be
+ * self-contained: the orchestrator sees only the input.
+ */
+export interface OrchestratorDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+	readonly kind: "orchestrator";
+	readonly name: string;
+	readonly description: string;
+	readonly input: I;
+	readonly output: O;
+}
+
+export function orchestrator<I extends TSchema, O extends TSchema>(spec: { readonly name: string; readonly description?: string; readonly input: I; readonly output: O }): OrchestratorDef<I, O> {
+	return { kind: "orchestrator", name: spec.name, description: spec.description ?? "", input: spec.input, output: spec.output };
+}
+
+/** What a body MCP tool node's `parse` gets: the tool's result. */
+export interface ToolResult {
+	readonly content: readonly unknown[];
+	readonly structuredContent?: unknown;
+	/** The text parts, joined. */
+	readonly text: string;
+}
+
+/**
+ * An MCP tool the body calls as a node. Its result is journaled: replay,
+ * resume and fork never call the outside world again. Without `parse` the
+ * output is the tool's `structuredContent`, else its text parsed as JSON.
+ * Tools that write outside are refused here (they need an agent's `ask`
+ * mode).
+ */
+export interface McpToolDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+	readonly kind: "tool";
+	readonly name: string;
+	readonly server: string;
+	readonly tool: string;
+	readonly input: I;
+	readonly output: O;
+	readonly parse: ((result: ToolResult) => unknown) | null;
+}
+
+export function mcpTool<const J extends McpConfig, I extends TSchema, O extends TSchema>(
+	_env: { readonly mcp: Mcp<J> },
+	spec: {
+		readonly name?: string;
+		readonly server: keyof J["mcpServers"] & string;
+		readonly tool: string;
+		readonly input: I;
+		readonly output: O;
+		/** Pure, run in the workflow sandbox. Checked against `output` either way. */
+		readonly parse?: (result: ToolResult) => Static<O>;
+	},
+): McpToolDef<I, O> {
+	return { kind: "tool", name: spec.name ?? `${spec.server}.${spec.tool}`, server: spec.server, tool: spec.tool, input: spec.input, output: spec.output, parse: spec.parse ?? null };
+}
+
+/** Every node, discriminated by `kind`. Agents are called through sessions. */
+export type Node<I extends TSchema = TSchema, O extends TSchema = TSchema> =
+	| AgentDef<I, O>
+	| CommandDef<I, O>
+	| WorkflowNode<I, O>
+	| OrchestratorDef<I, O>
+	| McpToolDef<I, O>;
+
+/** What `ctx.call` takes: every node but an agent. */
+export type CallableNode<I extends TSchema = TSchema, O extends TSchema = TSchema> = CommandDef<I, O> | WorkflowNode<I, O> | OrchestratorDef<I, O> | McpToolDef<I, O>;
+
+/**
+ * A conversation with one agent: each `call` appends its input to the same
+ * dialogue as a new message and returns the agent's validated output. A
+ * session is data, not a process; its identity is where it was created.
+ */
+export interface Session<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+	readonly id: string;
+	readonly agent: string;
+	/** Throws `Refused(session_busy)` while the previous call is in flight. */
+	call(input: Static<I>): Promise<Static<O>>;
+}
 
 /**
  * What the workflow body sees: typed calls, each affecting the body only
@@ -491,12 +627,15 @@ export interface Ctx {
 	/** Run seed from the pin. `Math.random` is already seeded from it. */
 	readonly seed: number;
 	/**
-	 * Calls a node: an agent, a command or a workflow. Throws `SchemaError`
-	 * for a bad input, `AgentFailed`, `CommandFailed` or `WorkflowFailed`
-	 * when it fails, `Refused` when the core refuses it. A reached budget
-	 * holds the call instead.
+	 * Calls a node: a command, a workflow, an MCP tool or an orchestrator
+	 * node (agents go through `session`). Throws `SchemaError` for a bad
+	 * input, `CommandFailed`, `ToolFailed` or `WorkflowFailed` when it fails,
+	 * `Refused` when the core refuses it. A reached budget holds the call
+	 * instead.
 	 */
-	call<I extends TSchema, O extends TSchema>(node: Node<I, O>, input: Static<I>): Promise<Static<O>>;
+	call<I extends TSchema, O extends TSchema>(node: CallableNode<I, O>, input: Static<I>): Promise<Static<O>>;
+	/** Opens a session with an agent: the only way to call one. It takes its id now, like a call. */
+	session<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>): Session<I, O>;
 	/** Runs branches concurrently; each gets its own request ids. */
 	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(
 		branches: B,
@@ -512,9 +651,9 @@ export function subWorkflow<I extends TSchema, O extends TSchema>(spec: Omit<Wor
 	return { kind: "workflow", ...spec };
 }
 
-/** Per server in mcp.json: the sandbox its process runs in, and tools allowed to write outside. */
+/** Per server in mcp.json: the sandbox its process runs in, and its network (default `"full"`). */
 export type McpOverlay<J extends McpConfig> = {
-	readonly [S in keyof J["mcpServers"] & string]?: { readonly sandbox?: SandboxDef; readonly allowWrites?: readonly string[] };
+	readonly [S in keyof J["mcpServers"] & string]?: { readonly sandbox?: SandboxDef; readonly network?: "none" | "full" };
 };
 
 export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T extends MountTable, I extends TSchema, O extends TSchema> {
@@ -526,6 +665,10 @@ export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T exten
 	readonly agents: readonly AgentDef[];
 	/** Every command the body may call, nested workflows included. */
 	readonly commands?: readonly CommandDef[];
+	/** Every orchestrator node the body may call: the questions the run may ask, with their answer schemas. */
+	readonly orchestrators?: readonly OrchestratorDef[];
+	/** Every MCP tool the body may call as a node. */
+	readonly mcpTools?: readonly McpToolDef[];
 	readonly budget?: Budget;
 	readonly pin?: PinSpec;
 	readonly input: I;
