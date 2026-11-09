@@ -6,13 +6,13 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type { NodeSpec, TranscriptEntry } from "../src/host/executor.ts";
-import { appendInbox, EventLog, FakeCommands, FakeExecutor, PiExecutor, runPaths, runWorkflow } from "../src/host/index.ts";
+import { appendInbox, EventLog, FakeCommands, FakeExecutor, PiExecutor, runPaths, runWorkflow, startSession } from "../src/host/index.ts";
 import { writesOutside } from "../src/host/toolsets.ts";
 import { transientError } from "../src/host/pi.ts";
 import { tmp } from "./util.ts";
@@ -274,4 +274,46 @@ test("the write rule: a tool may write outside unless annotated read-only, or ne
 	assert.equal(writesOutside({ readOnlyHint: false, destructiveHint: false, openWorldHint: false }), false);
 	assert.equal(writesOutside({ readOnlyHint: false, destructiveHint: false }), true);
 	assert.equal(writesOutside({ destructiveHint: true }), true);
+});
+
+test("a body tool call still in flight when the body runs again (a held node's restart) is not called twice", async () => {
+	const { mkdirSync, readFileSync: read, existsSync } = await import("node:fs");
+	const dir = tmp();
+	const count = join(dir, "count.txt");
+	mkdirSync(join(dir, "wf"));
+	writeFileSync(
+		join(dir, "wf", "mcp.json"),
+		JSON.stringify({ mcpServers: { fx: { command: process.execPath, args: [resolve(here, "fixtures/mcp-server.ts")], env: { COUNT_FILE: "${COUNT_FILE}" } } } }),
+	);
+	writeFileSync(
+		join(dir, "wf", "workflow.ts"),
+		`import { defineAgent, defineMcp, defineModels, Type, workflow } from "wallis";
+import m from "./mcp.json" with { type: "json" };
+const models = defineModels({ default: "fake/default" });
+const fx = defineMcp(m);
+const flaky = defineAgent({ models }, { name: "flaky", model: "default", prompt: "p", input: Type.Null(), output: Type.Object({ ok: Type.Boolean() }) });
+export default workflow({ name: "inflight", models, mcp: fx, agents: [flaky], input: Type.Null(), output: Type.Any(),
+	run: async (ctx) => ctx.parallel({ slow: (c) => c.call(fx.fx.slow, {}), flaky: (c) => c.session(flaky).call(null) }) });
+`,
+	);
+	let calls = 0;
+	const executor = new FakeExecutor({ flaky: () => (calls++ === 0 ? { giveUp: "first time" } : { submit: { ok: true } }) });
+	process.env.COUNT_FILE = count;
+	try {
+		const run = join(dir, "run");
+		const session = await startSession({ workflow: join(dir, "wf", "workflow.ts"), dir: run, executor, confine: "off", input: null, inboxPollMs: 20 });
+		// The flaky branch fails and the run is held on it while the slow tool call is still in flight.
+		for (let i = 0; i < 100 && session.snapshot().held === null; i++) await new Promise((r) => setTimeout(r, 20));
+		assert.equal(session.snapshot().held, "#0.flaky#0:0");
+		// The server has the call before the body runs again.
+		for (let i = 0; i < 100 && !existsSync(count); i++) await new Promise((r) => setTimeout(r, 20));
+		appendInbox(runPaths(run), { id: "r1", type: "restart", node: "#0.flaky#0:0", by: "human" });
+		const done = await session.result;
+		assert.deepEqual(done.outcome, { type: "done", value: { slow: { done: true }, flaky: { ok: true } } });
+		assert.deepEqual(existsSync(count) ? read(count, "utf8").trim().split("\n") : [], ["slow"], "the outside world saw the call once");
+		const transcript = read(join(run, "nodes", "_0.slow_0.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l) as { kind: string });
+		assert.equal(transcript.filter((e) => e.kind === "tool_call").length, 1, "issued once");
+	} finally {
+		delete process.env.COUNT_FILE;
+	}
 });

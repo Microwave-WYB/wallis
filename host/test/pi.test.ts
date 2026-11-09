@@ -291,7 +291,7 @@ test("MCP tools through pi-mcp: a tool ref, a whole server (read-only tools only
 	const { s } = withSources([{ kind: "mcp_tool", server: "fx", tool: "echo" }, { kind: "mcp_server", server: "fx" }]);
 	const tools = await buildNodeTools(s);
 	try {
-		assert.deepEqual(tools.names.filter((n) => n.startsWith("mcp__")).sort(), ["mcp__fx__echo", "mcp__fx__search"]);
+		assert.deepEqual(tools.names.filter((n) => n.startsWith("mcp__")).sort(), ["mcp__fx__echo", "mcp__fx__search", "mcp__fx__slow"]);
 		const r = await tools.invoke("mcp__fx__echo", { text: "hi" }, false, undefined, "0/t1");
 		assert.equal(r.text, "hi; token=present");
 		const notes = s.entries.filter((e) => e.kind === "note").map((e) => (e as { text: string }).text);

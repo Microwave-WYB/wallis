@@ -1113,3 +1113,23 @@ pub fn an_agent_tool_result_journaled_again_replaces_the_first_test() {
     CallAgent(recorded: [types.ToolResult("0/call_0", JString("r2"))], ..),
   ] = run.step(state, call("#0", "worker", JNull)).1
 }
+
+pub fn a_body_tool_call_in_flight_is_not_issued_again_in_the_same_session_test() {
+  // Requested again in this session (a fresh run of the body after a held
+  // node's restart) while still in flight: the same call, not a new one.
+  let safe = support.tool("#0", input(1))
+  let unsafe =
+    types.Requested(
+      "#1",
+      types.Tool("upload", input(1), types.ReplayNever),
+      "upload",
+      0,
+    )
+  let #(state, _, _) = replay([started(basic()), safe, unsafe])
+  assert run.step(state, safe).1 == []
+  let #(state, effects) = run.step(state, unsafe)
+  assert effects == []
+  // Still running, not an unknown outcome.
+  let assert [types.ToolRunning("#0", "search"), types.ToolRunning("#1", "upload")] =
+    run.nodes(state)
+}

@@ -609,32 +609,33 @@ fn new_request(
 ) -> #(Run, List(Effect)) {
   let run = Run(..run, slots: dict.insert(run.slots, slot, id))
   let #(run, effects) = live_request(run, id, slot, request)
-  #(mark_issued(run, slot, effects), [types.Checkpoint, ..effects])
+  #(run, [types.Checkpoint, ..effects])
 }
 
 /// Every call issued by these effects, so a replay in the same session does
 /// not issue it again.
 fn issued(run: Run, effects: List(Effect)) -> Run {
   list.fold(effects, run, fn(run, e) {
-    case e {
-      types.CallAgent(digest:, ..) | types.RunCommand(digest:, ..) ->
-        Run(..run, issued: dict.insert(run.issued, digest, Nil))
-      _ -> run
+    case issued_slot(e) {
+      Some(slot) -> Run(..run, issued: dict.insert(run.issued, slot, Nil))
+      None -> run
     }
   })
 }
 
-fn mark_issued(run: Run, slot: String, effects: List(Effect)) -> Run {
-  case
-    list.any(effects, fn(e) {
-      case e {
-        types.CallAgent(..) | types.RunCommand(..) -> True
-        _ -> False
-      }
-    })
-  {
-    True -> Run(..run, issued: dict.insert(run.issued, slot, Nil))
-    False -> run
+/// The journal slot a call effect issues. Every effect is listed: a new kind
+/// must say here whether it issues a call. (An effect's `digest` field is
+/// its slot.)
+fn issued_slot(effect: Effect) -> Option(String) {
+  case effect {
+    types.CallAgent(digest:, ..)
+    | types.RunCommand(digest:, ..)
+    | types.CallTool(digest:, ..) -> Some(digest)
+    types.Checkpoint
+    | types.Deliver(..)
+    | types.Fail(..)
+    | types.Refuse(..)
+    | types.Finish(..) -> None
   }
 }
 
@@ -678,7 +679,7 @@ fn reissue(
         ]
         _, _ -> []
       }
-      #(mark_issued(run, slot, effects), effects)
+      #(run, effects)
     }
   }
 }

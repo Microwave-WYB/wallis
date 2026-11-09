@@ -13,6 +13,12 @@ const counted = (tool: string) => {
 	if (process.env.COUNT_FILE) appendFileSync(process.env.COUNT_FILE, `${tool}\n`);
 };
 const server = new McpServer({ name: "fixture", version: "0.0.0" });
+// Slow and read-only: a body call of it is still in flight while other things happen.
+server.registerTool("slow", { description: "Slow", inputSchema: {}, annotations: { readOnlyHint: true } }, async () => {
+	counted("slow");
+	await new Promise((r) => setTimeout(r, 1500));
+	return { content: [{ type: "text", text: "slow" }], structuredContent: { done: true } };
+});
 server.registerTool("search", { description: "Search", inputSchema: { q: z.string() }, annotations: { readOnlyHint: true } }, async ({ q }) => {
 	counted("search");
 	return { content: [{ type: "text", text: JSON.stringify({ hits: [`${q}-1`, `${q}-2`] }) }], structuredContent: { hits: [`${q}-1`, `${q}-2`] } };
