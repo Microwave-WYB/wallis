@@ -19,21 +19,17 @@ pub type Workflow {
     commands: List(String),
     /// Orchestrator nodes: typed questions the orchestrator answers.
     orchestrators: List(String),
-    /// MCP tools the body calls as nodes.
-    tools: List(String),
     budget: Budget,
   )
 }
 
 pub fn workflow_to_json(workflow: Workflow) -> json.Json {
-  let Workflow(name:, agents:, commands:, orchestrators:, tools:, budget:) =
-    workflow
+  let Workflow(name:, agents:, commands:, orchestrators:, budget:) = workflow
   json.object([
     #("name", json.string(name)),
     #("agents", json.array(agents, agent_to_json)),
     #("commands", json.array(commands, json.string)),
     #("orchestrators", json.array(orchestrators, json.string)),
-    #("tools", json.array(tools, json.string)),
     #("budget", budget_to_json(budget)),
   ])
 }
@@ -43,16 +39,8 @@ pub fn workflow_decoder() -> decode.Decoder(Workflow) {
   use agents <- decode.field("agents", decode.list(agent_decoder()))
   use commands <- decode.field("commands", decode.list(decode.string))
   use orchestrators <- decode.field("orchestrators", decode.list(decode.string))
-  use tools <- decode.field("tools", decode.list(decode.string))
   use budget <- decode.field("budget", budget_decoder())
-  decode.success(Workflow(
-    name:,
-    agents:,
-    commands:,
-    orchestrators:,
-    tools:,
-    budget:,
-  ))
+  decode.success(Workflow(name:, agents:, commands:, orchestrators:, budget:))
 }
 
 /// `steerable: False` admits only cancel and a restart without a note.
@@ -196,7 +184,7 @@ pub type Event {
   /// `id` is for display and interventions only.
   Requested(id: String, request: Request, node_digest: String, occurrence: Int)
   AgentReturned(id: String, output: Value, usage: Usage, model: String)
-  /// The agent ended its turn without submitting a result.
+  /// The agent ended its turn with neither a result nor a question.
   AgentIdle(id: String, message: String, usage: Usage, model: String)
   AgentFailed(id: String, failure: AgentFailure, usage: Usage, model: String)
   /// The agent used its turns without submitting: the node waits for more
@@ -213,16 +201,17 @@ pub type Event {
   /// The agent called its `ask` tool: the message is its question to its
   /// caller, and the reply becomes the tool's result.
   AgentAsked(id: String, message: String, usage: Usage, model: String)
-  /// The agent called an MCP tool in `ask` mode: it waits for the
-  /// orchestrator's decision before the tool runs.
-  ApprovalRequested(
+  /// After a host crash, a tool call that was in flight and is not safe to
+  /// reissue: whether it took effect is unknown. The node waits.
+  CallOutcomeUnknown(
     id: String,
-    server: String,
     tool: String,
     args: Value,
     usage: Usage,
     model: String,
   )
+  /// The call continues a session whose previous dialogue is missing.
+  PreviousDialogueMissing(id: String)
   /// The owner's interrupt aborted the turn: the node waits, progress kept.
   TurnInterrupted(id: String, usage: Usage, model: String)
   /// The result of an MCP tool an agent call made, journaled so a reissued
@@ -235,8 +224,7 @@ pub type Event {
   /// A body MCP tool call returned (its output parsed and checked).
   ToolReturned(id: String, output: Value)
   ToolFailed(id: String, failure: ToolFailure)
-  /// The orchestrator's answer: the result of an orchestrator node, or a
-  /// decision (`approve` | `reject` with a reason) on an approval.
+  /// The orchestrator's result for an orchestrator node.
   ResultSubmitted(node: String, value: Value, by: String)
   /// Monitoring only: never matched on replay, never delivered to the body.
   Observed(at: String, label: String, value: Value)
@@ -340,15 +328,19 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("usage", usage_to_json(usage)),
         #("model", json.string(model)),
       ])
-    ApprovalRequested(id:, server:, tool:, args:, usage:, model:) ->
+    CallOutcomeUnknown(id:, tool:, args:, usage:, model:) ->
       json.object([
-        #("type", json.string("approval_requested")),
+        #("type", json.string("call_outcome_unknown")),
         #("id", json.string(id)),
-        #("server", json.string(server)),
         #("tool", json.string(tool)),
         #("args", json_value.to_json(args)),
         #("usage", usage_to_json(usage)),
         #("model", json.string(model)),
+      ])
+    PreviousDialogueMissing(id:) ->
+      json.object([
+        #("type", json.string("previous_dialogue_missing")),
+        #("id", json.string(id)),
       ])
     TurnInterrupted(id:, usage:, model:) ->
       json.object([
@@ -576,21 +568,17 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use model <- decode.field("model", decode.string)
       decode.success(AgentAsked(id:, message:, usage:, model:))
     }
-    "approval_requested" -> {
+    "call_outcome_unknown" -> {
       use id <- decode.field("id", decode.string)
-      use server <- decode.field("server", decode.string)
       use tool <- decode.field("tool", decode.string)
       use args <- decode.field("args", json_value.decoder())
       use usage <- decode.field("usage", usage_decoder())
       use model <- decode.field("model", decode.string)
-      decode.success(ApprovalRequested(
-        id:,
-        server:,
-        tool:,
-        args:,
-        usage:,
-        model:,
-      ))
+      decode.success(CallOutcomeUnknown(id:, tool:, args:, usage:, model:))
+    }
+    "previous_dialogue_missing" -> {
+      use id <- decode.field("id", decode.string)
+      decode.success(PreviousDialogueMissing(id:))
     }
     "turn_interrupted" -> {
       use id <- decode.field("id", decode.string)
@@ -726,8 +714,9 @@ pub type Request {
   /// only through sessions, and each call continues the session's dialogue.
   Call(agent: String, input: Value, session: String, index: Int)
   Command(command: String, input: Value)
-  /// An MCP tool called by the body.
-  Tool(tool: String, input: Value)
+  /// A tool called by the body (a custom tool or an MCP tool). `replay`
+  /// says whether a call in flight at a crash may be made again.
+  Tool(tool: String, input: Value, replay: Replay)
   /// A node the orchestrator completes.
   Orchestrator(name: String, input: Value)
 }
@@ -748,11 +737,12 @@ pub fn request_to_json(request: Request) -> json.Json {
         #("command", json.string(command)),
         #("input", json_value.to_json(input)),
       ])
-    Tool(tool:, input:) ->
+    Tool(tool:, input:, replay:) ->
       json.object([
         #("type", json.string("tool")),
         #("tool", json.string(tool)),
         #("input", json_value.to_json(input)),
+        #("replay", replay_to_json(replay)),
       ])
     Orchestrator(name:, input:) ->
       json.object([
@@ -781,7 +771,8 @@ pub fn request_decoder() -> decode.Decoder(Request) {
     "tool" -> {
       use tool <- decode.field("tool", decode.string)
       use input <- decode.field("input", json_value.decoder())
-      decode.success(Tool(tool:, input:))
+      use replay <- decode.field("replay", replay_decoder())
+      decode.success(Tool(tool:, input:, replay:))
     }
     "orchestrator" -> {
       use name <- decode.field("name", decode.string)
@@ -790,6 +781,29 @@ pub fn request_decoder() -> decode.Decoder(Request) {
     }
     _ ->
       decode.failure(Command(command: "", input: json_value.JNull), "Request")
+  }
+}
+
+pub type Replay {
+  /// Reissued after a crash: a read-only or idempotent tool.
+  ReplaySafe
+  /// Never reissued: its outcome is unknown after a crash.
+  ReplayNever
+}
+
+pub fn replay_to_json(replay: Replay) -> json.Json {
+  case replay {
+    ReplaySafe -> json.string("replay_safe")
+    ReplayNever -> json.string("replay_never")
+  }
+}
+
+pub fn replay_decoder() -> decode.Decoder(Replay) {
+  use variant <- decode.then(decode.string)
+  case variant {
+    "replay_safe" -> decode.success(ReplaySafe)
+    "replay_never" -> decode.success(ReplayNever)
+    _ -> decode.failure(ReplaySafe, "Replay")
   }
 }
 
@@ -1277,8 +1291,8 @@ pub type Refusal {
   UnknownBin(name: String)
   UnknownAlias(alias: String)
   JournalMissing(request: String)
-  /// A session's `call` while its previous call is still in flight.
-  SessionBusy(session: String)
+  /// A session called from another branch than the one that created it.
+  ForeignSession(session: String)
   /// Agents are called through `ctx.session(agent).call(input)` only.
   SessionRequired(agent: String)
   UnknownOrchestrator(name: String)
@@ -1287,6 +1301,8 @@ pub type Refusal {
   InvalidAnswer(node: String, errors: List(String))
   /// The node does not wait for a submitted result.
   NotPending(node: String)
+  /// A session call whose previous call left no dialogue to continue.
+  DialogueMissing(node: String)
   InvalidDeclaration(message: String)
   InvalidEvent(message: String)
   NotStarted
@@ -1414,9 +1430,9 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
         #("type", json.string("journal_missing")),
         #("request", json.string(request)),
       ])
-    SessionBusy(session:) ->
+    ForeignSession(session:) ->
       json.object([
-        #("type", json.string("session_busy")),
+        #("type", json.string("foreign_session")),
         #("session", json.string(session)),
       ])
     SessionRequired(agent:) ->
@@ -1443,6 +1459,11 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
     NotPending(node:) ->
       json.object([
         #("type", json.string("not_pending")),
+        #("node", json.string(node)),
+      ])
+    DialogueMissing(node:) ->
+      json.object([
+        #("type", json.string("dialogue_missing")),
         #("node", json.string(node)),
       ])
     InvalidDeclaration(message:) ->
@@ -1565,9 +1586,9 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use request <- decode.field("request", decode.string)
       decode.success(JournalMissing(request:))
     }
-    "session_busy" -> {
+    "foreign_session" -> {
       use session <- decode.field("session", decode.string)
-      decode.success(SessionBusy(session:))
+      decode.success(ForeignSession(session:))
     }
     "session_required" -> {
       use agent <- decode.field("agent", decode.string)
@@ -1590,6 +1611,10 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use node <- decode.field("node", decode.string)
       decode.success(NotPending(node:))
     }
+    "dialogue_missing" -> {
+      use node <- decode.field("node", decode.string)
+      decode.success(DialogueMissing(node:))
+    }
     "invalid_declaration" -> {
       use message <- decode.field("message", decode.string)
       decode.success(InvalidDeclaration(message:))
@@ -1610,6 +1635,8 @@ pub type FailReason {
   AgentGaveUp(agent: String, failure: AgentFailure)
   CommandCrashed(command: String, failure: CommandFailure)
   ToolCrashed(tool: String, failure: ToolFailure)
+  /// The owner cancelled an orchestrator node.
+  OrchestratorCancelled(name: String)
   /// A nested workflow failed; its reason propagates.
   WorkflowFailed(workflow: String, reason: FailReason)
 }
@@ -1638,6 +1665,11 @@ pub fn fail_reason_to_json(fail_reason: FailReason) -> json.Json {
         #("type", json.string("tool_crashed")),
         #("tool", json.string(tool)),
         #("failure", tool_failure_to_json(failure)),
+      ])
+    OrchestratorCancelled(name:) ->
+      json.object([
+        #("type", json.string("orchestrator_cancelled")),
+        #("name", json.string(name)),
       ])
     WorkflowFailed(workflow:, reason:) ->
       json.object([
@@ -1669,6 +1701,10 @@ pub fn fail_reason_decoder() -> decode.Decoder(FailReason) {
       use tool <- decode.field("tool", decode.string)
       use failure <- decode.field("failure", tool_failure_decoder())
       decode.success(ToolCrashed(tool:, failure:))
+    }
+    "orchestrator_cancelled" -> {
+      use name <- decode.field("name", decode.string)
+      decode.success(OrchestratorCancelled(name:))
     }
     "workflow_failed" -> {
       use workflow <- decode.field("workflow", decode.string)
@@ -1867,6 +1903,8 @@ pub type Node {
   )
   /// A body MCP tool call.
   ToolRunning(id: String, tool: String)
+  /// In flight at a crash and not safe to reissue: its outcome is unknown.
+  ToolOutcomeUnknown(id: String, tool: String, input: Value)
   ToolDone(id: String, tool: String, outcome: ToolOutcome)
   /// An orchestrator node waiting for its result.
   OrchestratorPending(id: String, name: String, input: Value)
@@ -1924,6 +1962,13 @@ pub fn node_to_json(node: Node) -> json.Json {
         #("type", json.string("tool_running")),
         #("id", json.string(id)),
         #("tool", json.string(tool)),
+      ])
+    ToolOutcomeUnknown(id:, tool:, input:) ->
+      json.object([
+        #("type", json.string("tool_outcome_unknown")),
+        #("id", json.string(id)),
+        #("tool", json.string(tool)),
+        #("input", json_value.to_json(input)),
       ])
     ToolDone(id:, tool:, outcome:) ->
       json.object([
@@ -1995,6 +2040,12 @@ pub fn node_decoder() -> decode.Decoder(Node) {
       use tool <- decode.field("tool", decode.string)
       decode.success(ToolRunning(id:, tool:))
     }
+    "tool_outcome_unknown" -> {
+      use id <- decode.field("id", decode.string)
+      use tool <- decode.field("tool", decode.string)
+      use input <- decode.field("input", json_value.decoder())
+      decode.success(ToolOutcomeUnknown(id:, tool:, input:))
+    }
     "tool_done" -> {
       use id <- decode.field("id", decode.string)
       use tool <- decode.field("tool", decode.string)
@@ -2049,17 +2100,16 @@ pub fn tool_outcome_decoder() -> decode.Decoder(ToolOutcome) {
 
 /// Why an agent node waits.
 pub type IdleCause {
-  /// It ended its turn without submitting: the message is its question.
-  Question(message: String)
   /// It called `ask`: the reply becomes the tool's result.
-  Asked(message: String)
+  Question(message: String)
+  /// It ended its turn with neither a result nor a question; its final text.
+  EndedWithoutResult(text: String)
   /// It used `used` of `limit` turns without submitting.
   TurnLimit(used: Int, limit: Int)
   /// Its owner interrupted the turn; progress is kept.
   Interrupted
-  /// It called an MCP tool in `ask` mode: the orchestrator approves or
-  /// rejects it (with a reason).
-  Approval(server: String, tool: String, args: Value)
+  /// After a crash, a tool call in flight that is not safe to reissue.
+  OutcomeUnknown(tool: String, args: Value)
 }
 
 pub fn idle_cause_to_json(idle_cause: IdleCause) -> json.Json {
@@ -2069,10 +2119,10 @@ pub fn idle_cause_to_json(idle_cause: IdleCause) -> json.Json {
         #("type", json.string("question")),
         #("message", json.string(message)),
       ])
-    Asked(message:) ->
+    EndedWithoutResult(text:) ->
       json.object([
-        #("type", json.string("asked")),
-        #("message", json.string(message)),
+        #("type", json.string("ended_without_result")),
+        #("text", json.string(text)),
       ])
     TurnLimit(used:, limit:) ->
       json.object([
@@ -2084,10 +2134,9 @@ pub fn idle_cause_to_json(idle_cause: IdleCause) -> json.Json {
       json.object([
         #("type", json.string("interrupted")),
       ])
-    Approval(server:, tool:, args:) ->
+    OutcomeUnknown(tool:, args:) ->
       json.object([
-        #("type", json.string("approval")),
-        #("server", json.string(server)),
+        #("type", json.string("outcome_unknown")),
         #("tool", json.string(tool)),
         #("args", json_value.to_json(args)),
       ])
@@ -2101,9 +2150,9 @@ pub fn idle_cause_decoder() -> decode.Decoder(IdleCause) {
       use message <- decode.field("message", decode.string)
       decode.success(Question(message:))
     }
-    "asked" -> {
-      use message <- decode.field("message", decode.string)
-      decode.success(Asked(message:))
+    "ended_without_result" -> {
+      use text <- decode.field("text", decode.string)
+      decode.success(EndedWithoutResult(text:))
     }
     "turn_limit" -> {
       use used <- decode.field("used", decode.int)
@@ -2111,11 +2160,10 @@ pub fn idle_cause_decoder() -> decode.Decoder(IdleCause) {
       decode.success(TurnLimit(used:, limit:))
     }
     "interrupted" -> decode.success(Interrupted)
-    "approval" -> {
-      use server <- decode.field("server", decode.string)
+    "outcome_unknown" -> {
       use tool <- decode.field("tool", decode.string)
       use args <- decode.field("args", json_value.decoder())
-      decode.success(Approval(server:, tool:, args:))
+      decode.success(OutcomeUnknown(tool:, args:))
     }
     _ -> decode.failure(Interrupted, "IdleCause")
   }

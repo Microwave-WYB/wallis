@@ -43,8 +43,8 @@ pub type NodeFacts {
   /// Ended its turn with a question (or asked, or hit its turn limit, or was
   /// interrupted): a message continues it.
   Waiting(steerable: Bool)
-  /// Waits for the orchestrator's decision on an `ask`-mode MCP tool.
-  Approving(steerable: Bool)
+  /// A tool call's outcome is unknown after a crash: restart or cancel only.
+  Unsettled(steerable: Bool)
   /// The executor could not serve it; reissued after a fix.
   Faulted(steerable: Bool)
   /// Held back by a pause or the budget before it was issued.
@@ -107,8 +107,10 @@ pub fn steerable_id(node: SteerableNode) -> String {
 pub type LiveKind {
   LiveAgent(steerable: Bool)
   LiveCommand
-  /// A body MCP tool call: a restart calls the outside world again.
+  /// A body tool call: a restart calls the outside world again.
   LiveTool
+  /// An orchestrator node: a restart asks again; a cancel fails it.
+  LiveOrchestrator
 }
 
 pub opaque type LiveNode {
@@ -124,12 +126,13 @@ pub fn check_live(
   case facts {
     Working(steerable:)
     | Waiting(steerable:)
-    | Approving(steerable:)
+    | Unsettled(steerable:)
     | Faulted(steerable:)
     | Held(steerable:) -> Ok(LiveNode(node, LiveAgent(steerable)))
     CommandWorking -> Ok(LiveNode(node, LiveCommand))
     ToolWorking -> Ok(LiveNode(node, LiveTool))
-    Pending | Settled | Absent -> Error(NotLive(node))
+    Pending -> Ok(LiveNode(node, LiveOrchestrator))
+    Settled | Absent -> Error(NotLive(node))
   }
 }
 
@@ -141,38 +144,24 @@ pub fn live_kind(node: LiveNode) -> LiveKind {
   node.kind
 }
 
-/// What a submitted result answers.
-pub type SubmitKind {
-  /// An orchestrator node: the value is its result.
-  SubmitAnswer
-  /// An approval: the value is `approve` or `reject` with a reason.
-  SubmitDecision
-}
-
 pub opaque type SubmittableNode {
-  SubmittableNode(node: String, kind: SubmitKind)
+  SubmittableNode(node: String)
 }
 
-/// `submit_result` reaches an orchestrator node waiting for its result, or
-/// an agent node waiting for a decision on an `ask`-mode tool.
+/// `submit_result` reaches an orchestrator node waiting for its result.
 pub fn check_submittable(
   _owned: OwnedRun,
   node: String,
   facts: NodeFacts,
 ) -> Result(SubmittableNode, Refusal) {
   case facts {
-    Pending -> Ok(SubmittableNode(node, SubmitAnswer))
-    Approving(..) -> Ok(SubmittableNode(node, SubmitDecision))
+    Pending -> Ok(SubmittableNode(node))
     _ -> Error(NotPending(node))
   }
 }
 
 pub fn submittable_id(node: SubmittableNode) -> String {
   node.node
-}
-
-pub fn submittable_kind(node: SubmittableNode) -> SubmitKind {
-  node.kind
 }
 
 pub opaque type ResumableRun {

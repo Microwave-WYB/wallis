@@ -190,7 +190,7 @@ pub fn agent_ending_turn_without_result_idles_its_node_test() {
         "fake/model",
         True,
         [],
-        types.Question("Which dataset?"),
+        types.EndedWithoutResult("Which dataset?"),
       ),
     ]
 }
@@ -897,21 +897,49 @@ pub fn a_session_call_continues_after_its_previous_call_test() {
 }
 
 pub fn a_later_session_call_is_keyed_by_the_dialogue_before_it_test() {
-  // The same second input after a different first call misses.
-  let run = fn(first) {
-    [
+  // Calls 0 (input 1) and 1 (input 9) are journaled.
+  let #(state, _, _) =
+    replay([
       started(basic()),
-      support.session_call("#0", 0, input(first)),
+      support.session_call("#0", 0, input(1)),
       returned("#0:0", summary("a")),
       support.session_call("#0", 1, input(9)),
       returned("#0:1", summary("b")),
+    ])
+  // Another execution of the body with the same first call: both hit.
+  let #(same, effects) =
+    run.step(state, support.session_call("#0", 0, input(1)))
+  assert effects == [Deliver("#0:0", summary("a"))]
+  assert run.step(same, support.session_call("#0", 1, input(9))).1
+    == [Deliver("#0:1", summary("b"))]
+  // With a different first call, the same second input misses: it is keyed
+  // by the dialogue before it.
+  let #(other, _) = run.step(state, support.session_call("#0", 0, input(2)))
+  let #(other, _) = run.step(other, returned("#0:0", summary("c")))
+  let assert [Checkpoint, CallAgent(id: "#0:1", ..)] =
+    run.step(other, support.session_call("#0", 1, input(9))).1
+}
+
+pub fn restarting_a_session_call_rewinds_the_session_test() {
+  // An earlier execution journaled calls 0 and 1 of session #0.
+  let #(state, _, _) =
+    replay([
+      started(basic()),
+      support.session_call("#0", 0, input(1)),
+      returned("#0:0", summary("a")),
       support.session_call("#0", 1, input(9)),
-    ]
-  }
-  assert last(run(1)) == [Deliver("#0:1", summary("b"))]
-  let #(state, _, _) = replay(run(1))
-  let assert #(_, [Checkpoint, CallAgent(..)]) =
-    run.step(state, support.session_call("#5", 1, input(9)))
+      returned("#0:1", summary("b")),
+    ])
+  // This execution's call 0 has another input: it is in flight, and restarted.
+  let #(state, _) = run.step(state, support.session_call("#0", 0, input(2)))
+  let #(state, effects) =
+    run.step(state, types.Restarted("#0:0", None, human, 0))
+  let assert [Checkpoint, CallAgent(id: "#0:0", previous: None, ..)] = effects
+  // The session's later calls are invalidated: the old call 1 is gone from
+  // the journal, even when it is requested after the old call 0 again.
+  let #(state, _) = run.step(state, support.session_call("#0", 0, input(1)))
+  let assert [Checkpoint, CallAgent(id: "#0:1", ..)] =
+    run.step(state, support.session_call("#0", 1, input(9))).1
 }
 
 pub fn restarting_a_held_session_call_reissues_it_after_its_previous_call_test() {
@@ -932,17 +960,39 @@ pub fn restarting_a_held_session_call_reissues_it_after_its_previous_call_test()
   assert list.contains(effects, Deliver("#0:1", summary("b2")))
 }
 
-pub fn an_explicit_ask_idles_the_node_and_a_reply_continues_it_test() {
+pub fn a_previous_dialogue_missing_is_a_typed_refusal_test() {
+  let assert [Refuse(Some("#0:1"), types.DialogueMissing("#0:1"))] =
+    last([
+      started(basic()),
+      support.session_call("#0", 0, input(1)),
+      returned("#0:0", summary("a")),
+      support.session_call("#0", 1, input(2)),
+      types.PreviousDialogueMissing("#0:1"),
+    ])
+}
+
+// --- Asks, ends, interrupts, unknown outcomes ---
+
+pub fn an_ask_idles_the_node_with_its_question_and_a_reply_continues_it_test() {
   let events = [
     started(basic()),
     call("#0", "worker", JNull),
     types.AgentAsked("#0", "which dataset?", support.usage(), "fake/model"),
   ]
-  let assert [NodeIdle(cause: types.Asked("which dataset?"), ..)] =
+  let assert [NodeIdle(cause: types.Question("which dataset?"), ..)] =
     nodes_after(events)
   let assert [Checkpoint, CallAgent(transcript: t, ..)] =
     run.step(replay(events).0, sent("#0", "digits")).1
   assert t == [Message(Assistant, "which dataset?"), Message(User, "digits")]
+}
+
+pub fn ending_a_turn_without_a_result_is_not_a_question_test() {
+  let assert [NodeIdle(cause: types.EndedWithoutResult("done, I think"), ..)] =
+    nodes_after([
+      started(basic()),
+      call("#0", "worker", JNull),
+      idle("#0", "done, I think"),
+    ])
 }
 
 pub fn an_interrupted_turn_idles_the_node_until_a_message_test() {
@@ -957,53 +1007,28 @@ pub fn an_interrupted_turn_idles_the_node_until_a_message_test() {
     run.step(replay(events).0, sent("#0", "go on")).1
 }
 
-// --- Approvals, orchestrator nodes and body tool calls ---
-
-fn approval_pending() {
-  [
+pub fn an_unknown_outcome_takes_a_restart_or_a_cancel_not_a_message_test() {
+  let events = [
     started(basic()),
     call("#0", "worker", JNull),
-    types.ApprovalRequested(
+    types.CallOutcomeUnknown(
       "#0",
-      "ente",
       "upload",
       value.object([#("file", JString("a.jpg"))]),
       support.usage(),
       "fake/model",
     ),
   ]
-}
-
-pub fn an_approval_takes_a_decision_not_a_message_test() {
-  let #(state, _, _) = replay(approval_pending())
-  let assert [NodeIdle(cause: types.Approval("ente", "upload", _), ..)] =
+  let #(state, _, _) = replay(events)
+  let assert [NodeIdle(cause: types.OutcomeUnknown("upload", _), ..)] =
     run.nodes(state)
-  assert run.step(state, sent("#0", "yes")).1 == [Refuse(None, NotIdle("#0"))]
-  let approve = value.object([#("type", JString("approve"))])
-  let assert [Checkpoint, CallAgent(transcript: [Message(User, text)], ..)] =
-    run.step(state, types.ResultSubmitted("#0", approve, human)).1
-  assert text == "{\"type\":\"approve\"}"
+  assert run.step(state, sent("#0", "it worked")).1
+    == [Refuse(None, NotIdle("#0"))]
+  let assert [Checkpoint, CallAgent(..)] =
+    run.step(state, types.Restarted("#0", None, human, 0)).1
 }
 
-pub fn a_rejection_needs_a_non_empty_reason_test() {
-  let #(state, _, _) = replay(approval_pending())
-  let reject = fn(reason) {
-    value.object([#("type", JString("reject")), #("reason", JString(reason))])
-  }
-  let assert [Refuse(None, types.InvalidAnswer("#0", _))] =
-    run.step(state, types.ResultSubmitted("#0", reject(" "), human)).1
-  let assert [Refuse(None, types.InvalidAnswer("#0", _))] =
-    run.step(
-      state,
-      types.ResultSubmitted(
-        "#0",
-        value.object([#("type", JString("no"))]),
-        human,
-      ),
-    ).1
-  let assert [Checkpoint, CallAgent(..)] =
-    run.step(state, types.ResultSubmitted("#0", reject("too big"), human)).1
-}
+// --- Orchestrator nodes and body tool calls ---
 
 pub fn an_orchestrator_node_waits_for_its_submitted_result_test() {
   let events = [started(basic()), support.orchestrator("#0", input(1))]
@@ -1022,6 +1047,18 @@ pub fn an_orchestrator_node_waits_for_its_submitted_result_test() {
     == [Refuse(None, types.NotPending("#0"))]
 }
 
+pub fn an_orchestrator_node_can_be_asked_again_or_cancelled_test() {
+  let #(state, _, _) =
+    replay([started(basic()), support.orchestrator("#0", input(1))])
+  let #(asked_again, effects) =
+    run.step(state, types.Restarted("#0", None, human, 0))
+  assert effects == [Checkpoint]
+  let assert [types.OrchestratorPending("#0", "pick", _)] =
+    run.nodes(asked_again)
+  assert run.step(state, types.NodeCancelled("#0", human)).1
+    == [Checkpoint, Fail("#0", types.OrchestratorCancelled("pick"))]
+}
+
 pub fn a_body_tool_call_is_journaled_and_hit_on_replay_test() {
   let events = [
     started(basic()),
@@ -1036,15 +1073,43 @@ pub fn a_body_tool_call_is_journaled_and_hit_on_replay_test() {
     last([started(basic()), support.tool("#0", input(1))])
 }
 
-pub fn agent_tool_results_are_journaled_once_and_reach_a_reissued_call_test() {
-  let rec = types.ToolRecorded("#0", "call-1", JString("r"))
-  let events = [started(basic()), call("#0", "worker", JNull), rec, rec]
-  let #(_, _, log) = replay(events)
-  assert list.length(list.filter(log, fn(e) { e == rec })) == 1
-  // A resume reissues the call with the recorded result.
-  let #(state, _, _) = replay(log)
-  let #(state, _) = run.step(state, Resumed(pin()))
+pub fn a_body_tool_call_in_flight_at_a_crash_is_reissued_only_if_safe_test() {
+  let unsafe =
+    types.Requested(
+      "#0",
+      types.Tool("upload", input(1), types.ReplayNever),
+      "upload",
+      0,
+    )
+  let #(_, _, log) =
+    replay([started(basic()), support.tool("#1", input(1)), unsafe])
+  let #(state, _) = run.step(support.refold(log), Resumed(pin()))
+  // The safe one is made again; the unsafe one waits, its outcome unknown.
+  let assert [types.CallTool(id: "#1", ..)] =
+    run.step(state, support.tool("#1", input(1))).1
+  let #(state, _) = run.step(state, types.ToolReturned("#1", JString("p")))
+  let #(state, effects) = run.step(state, unsafe)
+  assert effects == []
+  let assert [types.ToolOutcomeUnknown("#0", "upload", _)] =
+    list.filter(run.nodes(state), fn(n) {
+      case n {
+        types.ToolOutcomeUnknown(..) -> True
+        _ -> False
+      }
+    })
+  assert run.status(state) == Some(Idle(None))
+  // A restart calls it again.
+  let assert [Checkpoint, types.CallTool(id: "#0", tool: "upload", ..)] =
+    run.step(state, types.Restarted("#0", None, human, 0)).1
+}
+
+pub fn an_agent_tool_result_journaled_again_replaces_the_first_test() {
+  let first = types.ToolRecorded("#0", "0/call_0", JString("r1"))
+  let second = types.ToolRecorded("#0", "0/call_0", JString("r2"))
+  let #(_, _, log) =
+    replay([started(basic()), call("#0", "worker", JNull), first, second])
+  let #(state, _) = run.step(support.refold(log), Resumed(pin()))
   let assert [
-    CallAgent(recorded: [types.ToolResult("call-1", JString("r"))], ..),
+    CallAgent(recorded: [types.ToolResult("0/call_0", JString("r2"))], ..),
   ] = run.step(state, call("#0", "worker", JNull)).1
 }

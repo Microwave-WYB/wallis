@@ -25,7 +25,6 @@ pub fn workflow(agents: List(Agent)) -> Workflow {
     agents:,
     commands: ["train"],
     orchestrators: ["pick"],
-    tools: ["search"],
     budget: Budget(turns: None, compute_minutes: None),
   )
 }
@@ -89,7 +88,7 @@ pub fn session_call(session: String, index: Int, input: Value) -> Event {
 pub fn tool(id: String, input: Value) -> Event {
   Requested(
     id:,
-    request: types.Tool(tool: "search", input:),
+    request: types.Tool(tool: "search", input:, replay: types.ReplaySafe),
     node_digest: "search",
     occurrence: 0,
   )
@@ -144,6 +143,12 @@ pub fn replay_from(
     }
     #(state, effects, log)
   })
+}
+
+/// The state a log folds to.
+pub fn refold(log: List(Event)) -> RunState {
+  let #(state, _, _) = replay(log)
+  state
 }
 
 /// Effects of the last event, without the checkpoint marker.
