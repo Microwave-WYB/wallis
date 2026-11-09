@@ -59,3 +59,22 @@ test("the name check is on the listing too, and a second tool by one name is nev
 	tools.add({ name: "x", description: "", parameters: {}, run: async () => ({ text: "" }) });
 	assert.throws(() => tools.add({ name: "x", description: "", parameters: {}, run: async () => ({ text: "" }) }), /tool_name_taken/);
 });
+
+test("each toolset's bundle digest is in run metadata, and describe shows the latest", async () => {
+	const { createHash } = await import("node:crypto");
+	const { readFileSync } = await import("node:fs");
+	const { describeWorkflow } = await import("../src/host/describe.ts");
+	const { readMeta, runPaths } = await import("../src/host/store.ts");
+	const root = tmp();
+	const dir = join(root, ".wallis", "runs", "r1");
+	await runWorkflow({ ...opts(fixture("workflow.ts")), dir });
+	const digests = readMeta(runPaths(dir))!.toolsets!;
+	assert.deepEqual(Object.keys(digests).sort(), ["./tools/lib.ts", "./tools/other.ts"]);
+	for (const d of Object.values(digests)) {
+		const hex = d.slice("sha256:".length);
+		const code = readFileSync(join(dir, "toolsets", hex.slice(0, 16), "runner.mjs"), "utf8");
+		assert.equal(createHash("sha256").update(code).digest("hex"), hex);
+	}
+	const described = (await describeWorkflow(fixture("workflow.ts"), root)) as { toolset_bundles: unknown };
+	assert.deepEqual(described.toolset_bundles, { from_run: "r1", digests });
+});

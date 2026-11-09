@@ -552,6 +552,9 @@ export class Session {
 			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
 			throw error;
 		}
+		// What ran, for `describe`: a toolset is code from the project, bundled per session.
+		const bundles = this.#sources.bundleDigests();
+		if (Object.keys(bundles).length > 0) writeMeta(this.paths, { ...readMeta(this.paths)!, toolsets: bundles });
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
 			if (resolved.unknown !== null) throw new RunRefused({ type: "unknown_tool", name: resolved.unknown });

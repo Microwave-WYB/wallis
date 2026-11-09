@@ -164,9 +164,12 @@ Prototype choices:
 - With `noUncheckedIndexedAccess`, `server.tool` reads as `McpTool |
   undefined` (tool names are not typed); `tools` and `ctx.call` take that.
 - `describe` shows the warnings of the latest preflight of that workflow in
-  the project; it does not start tool processes itself.
+  the project, and each toolset's bundle digest from it; it does not start
+  tool processes itself.
 - A toolset's body-call digest is its tool id, not its code: like an MCP
-  server, a changed module is the outside world changing.
+  server, a changed module is the outside world changing. What code ran is
+  recorded instead: each preflight writes the toolsets' bundle digests
+  (`sha256` of module and runner, as run) to run metadata (`toolsets`).
 
 ## Goal (decided)
 

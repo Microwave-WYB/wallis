@@ -156,6 +156,8 @@ export class ToolSources {
 	readonly #confinement: Confinement;
 	readonly #env: Readonly<Record<string, string | undefined>>;
 	readonly #bundles = new Map<string, Promise<string>>();
+	/** Each bundled toolset's digest (its module and the runner, as run). */
+	readonly #digests = new Map<string, string>();
 
 	constructor(options: { decl: Declarations; workflowDir: string; runDir: string; confinement: Confinement; env?: Readonly<Record<string, string | undefined>> }) {
 		this.#decl = options.decl;
@@ -225,6 +227,11 @@ export class ToolSources {
 		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe", ...(sp.cwd ? { cwd: sp.cwd } : {}) });
 	}
 
+	/** The digest of every toolset bundled so far, by path. */
+	bundleDigests(): Record<string, string> {
+		return Object.fromEntries(this.#digests);
+	}
+
 	/** A fresh scratch dir for one connection: `work/<prefix>-<random>`. */
 	#scratch(prefix: string): string {
 		mkdirSync(join(this.#runDir, "work"), { recursive: true });
@@ -252,6 +259,7 @@ export class ToolSources {
 					logLevel: "silent",
 				});
 				const code = result.outputFiles[0]!.text;
+				this.#digests.set(path, `sha256:${digest(code)}`);
 				const dir = join(this.#runDir, "toolsets", digest(code).slice(0, 16));
 				mkdirSync(dir, { recursive: true });
 				writeFileSync(join(dir, "runner.mjs"), code);
