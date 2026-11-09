@@ -28,6 +28,8 @@ description = "Host tests: sandbox, log, resume (fake executor)"
 dir = "host"
 depends = ["build"]
 run = "node --test 'test/*.test.ts'"
+# Every host session checks, after each event, that the state rebuilt from the log equals the live one.
+env = { WALLIS_DIFFERENTIAL = "1" }
 
 [tasks.test]
 description = "All tests"

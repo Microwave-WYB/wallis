@@ -61,6 +61,10 @@ generics or wrappers that add no proof.
   as the executor module and work in throwaway projects (`test/util.ts`).
 - pi executor tests use pi-ai's faux provider (`fauxProvider().setResponses`);
   never real paid model calls.
+- Host tests run with `WALLIS_DIFFERENTIAL=1` (`mise.toml`, `test/util.ts`):
+  after every event a session checks that the state rebuilt from the log
+  (as the CLI and MCP see it) equals its live state, and ends on a
+  mismatch. Every state change must be logged.
 - CLI tests run detached hosts with `WALLIS_HOST=plain` (set in
   `test/util.ts`) so SIGKILL tests are not restarted by systemd; tests that
   need bwrap or systemd skip with a message when unavailable.

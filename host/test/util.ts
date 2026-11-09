@@ -7,6 +7,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Every host session in a test (and every CLI host it starts) checks after each event that the
+// state rebuilt from the log equals the live state (Session #differential).
+process.env.WALLIS_DIFFERENTIAL = "1";
+
 const here = fileURLToPath(new URL(".", import.meta.url));
 export const cli = resolve(here, "../src/cli/main.ts");
 export const fakeExecutor = resolve(here, "fixtures/fake-executor.ts");

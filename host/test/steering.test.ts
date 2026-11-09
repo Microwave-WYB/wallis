@@ -253,6 +253,7 @@ test("an interrupt made while a restarted call starts reaches that call, not the
 							entry.interrupted = true;
 							endTurn?.({ type: "interrupted" });
 						},
+						handle: () => ({ start: spec.id }),
 						close: () => {},
 					});
 				starts.push(entry);

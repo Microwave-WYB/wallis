@@ -217,6 +217,8 @@ export class Session {
 	readonly #commandAborts = new Map<string, AbortController>();
 	#resumed = false;
 	#settled = false;
+	/** Nested `#feed`s in progress: the differential check runs when the outermost returns. */
+	#feeding = 0;
 	#timer: ReturnType<typeof setInterval> | null = null;
 	#done!: (result: RunResult) => void;
 	#fail!: (error: unknown) => void;
@@ -664,13 +666,35 @@ export class Session {
 	/** Steps one event; returns the refusals of the event itself. */
 	#feed(event: Event): Refusal[] {
 		const refusals: Refusal[] = [];
-		const effects = this.#core.step(event);
-		this.#noteCodeChange(event, effects);
-		for (const effect of effects) {
-			if (effect.type === "refuse" && effect.id === null) refusals.push(effect.refusal);
-			else this.#handle(effect, event);
+		this.#feeding++;
+		try {
+			const effects = this.#core.step(event);
+			this.#noteCodeChange(event, effects);
+			for (const effect of effects) {
+				if (effect.type === "refuse" && effect.id === null) refusals.push(effect.refusal);
+				else this.#handle(effect, event);
+			}
+		} finally {
+			this.#feeding--;
 		}
+		if (this.#feeding === 0) this.#differential(event);
 		return refusals;
+	}
+
+	/**
+	 * Tests only (`WALLIS_DIFFERENTIAL=1`): after every event, the run state
+	 * rebuilt from the log, as the CLI and MCP see it (`inspectRun`), must
+	 * equal the live state. A mismatch is a state change that was not
+	 * logged; it ends the session.
+	 */
+	#differential(event: Event): void {
+		if (process.env.WALLIS_DIFFERENTIAL !== "1" || this.#settled) return;
+		const rebuilt = Core.refold(this.#log.read()).snapshotText();
+		const live = this.#core.snapshotText();
+		if (rebuilt === live) return;
+		const error = new Error(`differential check: after ${event.type}, the state rebuilt from the log differs from the live state\nlive:    ${live}\nrebuilt: ${rebuilt}`);
+		process.stderr.write(`wallis: ${error.message}\n`);
+		this.#abort(error);
 	}
 
 	#pump(): void {
