@@ -34,6 +34,7 @@ import Value from "typebox/value";
 import type { Json, Refusal } from "../sdk/index.ts";
 import type { Usage } from "./core.ts";
 import type { Capabilities, Executor, NodeSession, NodeSpec, TurnResult } from "./executor.ts";
+import { splitImages } from "./images.ts";
 import { CHARS_PER_TOKEN } from "./render.ts";
 import { buildNodeTools, type NodeTools, type Pending, type ToolLayerOptions } from "./tools.ts";
 
@@ -89,7 +90,14 @@ const KEEP_RECENT_TOKENS = 20_000;
 const RESERVE = 0.2;
 
 function contextTokens(system: string, messages: readonly AgentMessage[]): number {
-	return Math.ceil(system.length / CHARS_PER_TOKEN) + messages.reduce((n, m) => n + Math.max(estimateTokens(m), Math.ceil(JSON.stringify(m).length / CHARS_PER_TOKEN)), 0);
+	// Text at CHARS_PER_TOKEN; an image by its dimensions (images.ts), never by its base64.
+	return (
+		Math.ceil(system.length / CHARS_PER_TOKEN) +
+		messages.reduce((n, m) => {
+			const { tokens, rest } = splitImages(m);
+			return n + tokens + Math.max(estimateTokens(rest as AgentMessage), Math.ceil(JSON.stringify(rest).length / CHARS_PER_TOKEN));
+		}, 0)
+	);
 }
 
 function textOf(message: AgentMessage | undefined): string {

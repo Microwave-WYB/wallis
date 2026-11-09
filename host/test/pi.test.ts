@@ -18,7 +18,7 @@ import { tmp } from "./util.ts";
 const here = fileURLToPath(new URL(".", import.meta.url));
 
 function faux() {
-	const provider = fauxProvider({ models: [{ id: "faux-1" }, { id: "faux-2" }, { id: "faux-small", contextWindow: 2000 }] });
+	const provider = fauxProvider({ models: [{ id: "faux-1" }, { id: "faux-2" }, { id: "faux-small", contextWindow: 2000 }, { id: "faux-vision", contextWindow: 128_000 }] });
 	const models = createModels();
 	models.setProvider(provider.provider);
 	return { provider, executor: new PiExecutor({ models }) };
@@ -441,4 +441,29 @@ test("codemode in flight at a crash is as unsafe as the worst tool it can reach"
 	assert.deepEqual(await kind(3), { type: "sandbox_only" }, "with bash it is not safe to run again");
 	assert.deepEqual(await kind(1, [{ kind: "mcp_tool", server: "fx", tool: "search" }]), { type: "external_call", replay: "replay_safe" });
 	assert.deepEqual(await kind(2, [{ kind: "mcp_tool", server: "fx", tool: "post" }]), { type: "external_call", replay: "replay_never" });
+});
+
+/** A PNG of these dimensions padded to `bytes` (only the header is read; the rest is noise). */
+function png(width: number, height: number, bytes: number): Buffer {
+	const head = Buffer.alloc(33);
+	Buffer.from("89504e470d0a1a0a", "hex").copy(head, 0);
+	head.writeUInt32BE(13, 8);
+	head.write("IHDR", 12, "ascii");
+	head.writeUInt32BE(width, 16);
+	head.writeUInt32BE(height, 20);
+	return Buffer.concat([head, Buffer.from(Array.from({ length: bytes - 33 }, (_, i) => (i * 7919) % 251))]);
+}
+
+test("pi: an image counts by its dimensions, not its base64: a 1.2 MB contact sheet fits a 128k window", async () => {
+	const { provider, executor } = faux();
+	const dir = tmp();
+	mkdirSync(join(dir, "scratch"), { recursive: true });
+	writeFileSync(join(dir, "scratch", "sheet.png"), png(2400, 1600, 1_200_000));
+	provider.setResponses([call("read", { path: "sheet.png" }), call("submit_result", { answer: 1 })]);
+	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), work: null, trees: [], mounts: {}, spill: join(dir, "spill") };
+	const s = spec({ model: "faux/faux-vision", declaration: { ...spec().declaration, access: 1, compaction: false }, workspace: ws, sandbox: { type: "none" } });
+	const session = await executor.start(s);
+	const turn = await session.turn();
+	await session.close();
+	assert.equal(turn.type, "submitted", JSON.stringify(turn));
 });
