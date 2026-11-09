@@ -1,6 +1,6 @@
 // The append-only JSONL event log. Run state is a fold over it.
 
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, statSync, truncateSync, writeSync } from "node:fs";
 import type { Event } from "./core.ts";
 
 export class EventLog {
@@ -20,7 +20,19 @@ export class EventLog {
 		return complete.filter((l) => l.length > 0).map((l) => JSON.parse(l) as Event);
 	}
 
+	/**
+	 * Appends one event. A line a crash cut short is cut off first (back to
+	 * the last newline), so the new line never continues it.
+	 */
 	append(event: Event): void {
+		if (existsSync(this.path)) {
+			const size = statSync(this.path).size;
+			if (size > 0) {
+				const text = readFileSync(this.path);
+				const end = text.lastIndexOf(0x0a) + 1;
+				if (end !== size) truncateSync(this.path, end);
+			}
+		}
 		const fd = openSync(this.path, "a");
 		try {
 			writeSync(fd, `${JSON.stringify(event)}\n`);

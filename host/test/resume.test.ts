@@ -64,3 +64,15 @@ test("resuming a finished run reports its outcome without executing anything", (
 	assert.deepEqual(JSON.parse(again.stdout).outcome, JSON.parse(first.stdout).outcome);
 	assert.throws(() => readFileSync(join(dir, "exec.jsonl")));
 });
+
+test("a last log line a crash cut short is cut off before the next append, so the log stays readable", async () => {
+	const { EventLog } = await import("../src/host/log.ts");
+	const { appendFileSync, readFileSync } = await import("node:fs");
+	const path = join(mkdtempSync(join(tmpdir(), "wallis-log-")), "log.jsonl");
+	const log = new EventLog(path);
+	log.append({ type: "claimed", owner: "a" });
+	appendFileSync(path, '{"type":"claimed","own');
+	log.append({ type: "claimed", owner: "b" });
+	assert.equal(readFileSync(path, "utf8"), '{"type":"claimed","owner":"a"}\n{"type":"claimed","owner":"b"}\n');
+	assert.deepEqual(log.read(), [{ type: "claimed", owner: "a" }, { type: "claimed", owner: "b" }]);
+});
