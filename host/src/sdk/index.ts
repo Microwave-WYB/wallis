@@ -6,6 +6,7 @@
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import Type, { type Static, type TSchema } from "typebox";
+import { type CheckVolumes, parseVolume, type Volume } from "./volumes.ts";
 
 export { Type };
 export type { Static, TSchema };
@@ -92,8 +93,8 @@ export interface ToolsetOptions {
 	readonly sandbox: SandboxDef;
 	/** Names of environment variables that reach the tools' process, and nothing else. */
 	readonly secrets?: readonly string[];
-	/** Toolsets reach the outside: `"full"` by default. */
-	readonly network?: "none" | "full";
+	/** Toolsets reach the outside: the host network (`"host"`) by default. */
+	readonly network?: "none" | "host";
 }
 
 export type Toolset<M> = { readonly [K in keyof M as M[K] extends { readonly execute: unknown; readonly parameters: unknown } ? K & string : never]: CustomTool<ParamsOf<M[K]>, OutputOf<M[K]>> } & {
@@ -136,9 +137,9 @@ export type McpServer<S extends string = string> = Tool<{ readonly kind: "mcp_se
 
 const MCP: unique symbol = Symbol("wallis.mcp");
 
-/** Per server in mcp.json: the sandbox its process runs in, and its network (default `"full"`). */
+/** Per server in mcp.json: the sandbox its process runs in, and its network (default `"host"`). */
 export type McpOverlay<J extends McpConfig> = {
-	readonly [S in keyof J["mcpServers"] & string]?: { readonly sandbox?: SandboxDef; readonly network?: "none" | "full" };
+	readonly [S in keyof J["mcpServers"] & string]?: { readonly sandbox?: SandboxDef; readonly network?: "none" | "host" };
 };
 
 export type McpServers<J extends McpConfig = McpConfig> = { readonly [S in keyof J["mcpServers"] & string]: McpServer<S> } & {
@@ -160,7 +161,7 @@ export function defineMcp<const J extends McpConfig>(config: J, overlay: McpOver
 	return servers as McpServers<J>;
 }
 
-export function mcpDecl(value: unknown): { readonly config: McpConfig; readonly overlay: Readonly<Record<string, { readonly sandbox?: SandboxDef; readonly network?: "none" | "full" } | undefined>> } | null {
+export function mcpDecl(value: unknown): { readonly config: McpConfig; readonly overlay: Readonly<Record<string, { readonly sandbox?: SandboxDef; readonly network?: "none" | "host" } | undefined>> } | null {
 	return value !== null && typeof value === "object" && MCP in value ? (value as { [MCP]: never })[MCP] : null;
 }
 
@@ -198,69 +199,65 @@ export interface Resources {
 
 // --- Mounts ----------------------------------------------------------------------
 
-/**
- * Mount table: name -> default host dir. Relative paths resolve against the
- * workflow dir; an empty string means the caller or the local profile must
- * supply it. Mounts are read-only: there is no writable variant. Writes
- * leave a call only as returned artifacts (and a run only through
- * `wallis export`).
- */
-export type MountTable = { readonly [name: string]: string };
-
-export interface Mounts<T extends MountTable = MountTable> {
-	readonly kind: "mounts";
-	readonly table: T;
-}
-
-export function defineMounts<const T extends MountTable>(table: T): Mounts<T> {
-	return { kind: "mounts", table };
-}
-
 // --- Sandboxes -------------------------------------------------------------------
 
 /** A binary the base must provide, checked inside the sandbox (default `<name> --version`). */
 export type Requirement<R extends string> = R | { readonly name: R; readonly check: readonly string[] };
 
-export interface SandboxSpec<T extends MountTable, R extends string> {
+export interface SandboxSpec<R extends string, V extends readonly string[]> {
 	/** Names the sandbox in logs, run metadata and the setup cache. */
 	readonly name: string;
-	/** Commands the base must provide; each is bound alone, read-only, at `/run/wallis/bin/<name>`. */
+	/** Programs the host base must provide: called by their real path, checked inside the sandbox. */
 	readonly requires?: readonly Requirement<R>[];
 	/** Run once per digest WITH network, writing into `$WALLIS_ENV`; runs then see it read-only. */
 	readonly setup?: readonly (readonly string[])[];
-	/** Read-only, by name from `defineMounts`; seen at `/w/<name>`. There is no writable mount. */
-	readonly mounts?: readonly (keyof T & string)[];
-	/** Reserved for a container backend: an image. bwrap ignores it. */
-	readonly base?: string;
+	/**
+	 * Docker/compose volumes: `"<host path>:<target>:ro"` (a read-only bind;
+	 * the mode must be written and only `ro` exists; the host path is
+	 * relative to the workflow dir or starts with `~/`), or
+	 * `"<name>:<target>"` (a wallis-managed writable cache, shared across
+	 * runs; results must not depend on it). A bind's content is part of the
+	 * cache key of every call in the sandbox.
+	 */
+	readonly volumes?: V & CheckVolumes<V>;
+	/** Device nodes bound as declared (a GPU: `/dev/dri`). */
+	readonly devices?: readonly string[];
+	/** `"none"` (default) or `"host"`: the host's network, for tool sources only (agents and commands never get network). */
+	readonly network?: "none" | "host";
+	/** Environment variables of every process in the sandbox. */
+	readonly environment?: Readonly<Record<string, string>>;
+	/** Reserved for a Docker backend; bwrap ignores it and uses the host rootfs. */
+	readonly image?: string;
 }
 
 /**
- * A sandbox the workflow declares. Nothing is implicit: the workflow dir is
- * not mounted; whatever the sandbox needs comes through its mounts. Each call
- * gets a private writable scratch dir (`/w`, the working directory). Agents
- * and commands never have network; only `setup`, and MCP servers (through
- * their overlay), reach outside.
+ * A sandbox the workflow declares: a subset of a compose service. Nothing is
+ * implicit: the workflow dir is not mounted; whatever the sandbox needs comes
+ * through its volumes. Each call gets its own `/w` (the working directory).
  */
 export interface SandboxDef<R extends string = string> {
 	readonly kind: "sandbox";
 	readonly name: string;
 	readonly requires: readonly { readonly name: R; readonly check: readonly string[] }[];
 	readonly setup: readonly (readonly string[])[];
-	readonly mounts: readonly string[];
-	readonly base: string | null;
+	readonly volumes: readonly Volume[];
+	readonly devices: readonly string[];
+	readonly network: "none" | "host";
+	readonly environment: Readonly<Record<string, string>>;
+	readonly image: string | null;
 }
 
-export function defineSandbox<const T extends MountTable, const R extends string = never>(
-	_env: { readonly mounts?: Mounts<T> },
-	spec: SandboxSpec<T, R>,
-): SandboxDef<R> {
+export function defineSandbox<const R extends string = never, const V extends readonly string[] = readonly []>(_env: object, spec: SandboxSpec<R, V>): SandboxDef<R> {
 	return {
 		kind: "sandbox",
 		name: spec.name,
 		requires: (spec.requires ?? []).map((r) => (typeof r === "string" ? { name: r, check: [r, "--version"] } : r)),
 		setup: spec.setup ?? [],
-		mounts: [...(spec.mounts ?? [])],
-		base: spec.base ?? null,
+		volumes: (spec.volumes ?? []).map((v: string) => parseVolume(v)),
+		devices: [...(spec.devices ?? [])],
+		network: spec.network ?? "none",
+		environment: { ...(spec.environment ?? {}) },
+		image: spec.image ?? null,
 	};
 }
 
@@ -379,7 +376,7 @@ interface AgentBase<M extends ModelTable, I extends TSchema, O extends TSchema> 
  * (read, ls), `write` (also write, edit), `exec` (also bash). `exec` runs
  * commands, so it needs a declared sandbox; without one, `read` and `write`
  * work on a minimal workspace (the input artifacts and a scratch dir, no
- * mounts).
+ * volumes).
  */
 export type Workspace =
 	| { readonly access: "read"; readonly sandbox?: SandboxDef }
@@ -455,7 +452,10 @@ export type Refusal =
 	| { readonly type: "unknown_agent"; readonly name: string }
 	| { readonly type: "unknown_command"; readonly name: string }
 	| { readonly type: "needs_unmet"; readonly agent: string; readonly need: string }
-	| { readonly type: "mount_unset"; readonly mount: string }
+	| { readonly type: "invalid_volume"; readonly sandbox: string; readonly volume: string; readonly reason: string }
+	| { readonly type: "volume_missing"; readonly sandbox: string; readonly target: string; readonly path: string }
+	| { readonly type: "device_missing"; readonly sandbox: string; readonly device: string }
+	| { readonly type: "unknown_volume"; readonly target: string }
 	| { readonly type: "input_too_large"; readonly agent: string; readonly field: string | null; readonly chars: number; readonly limit: number }
 	| { readonly type: "not_owner"; readonly by: string; readonly owner: string | null }
 	| { readonly type: "not_idle"; readonly node: string }
@@ -830,14 +830,13 @@ export function subWorkflow<I extends TSchema, O extends TSchema>(spec: Omit<Wor
 	return { kind: "workflow", ...spec };
 }
 
-export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T extends MountTable, I extends TSchema, O extends TSchema> {
+export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, I extends TSchema, O extends TSchema> {
 	readonly name: string;
 	readonly models: Models<M>;
 	/** The MCP servers its agents and body use (`defineMcp`). */
 	readonly mcp?: McpServers<J>;
 	/** The tool modules its agents and body use (`toolset`). */
 	readonly toolsets?: readonly { readonly [TOOLSET]: { readonly path: string } & ToolsetOptions }[];
-	readonly mounts?: Mounts<T>;
 	/** Every agent the body may call, nested workflows included. */
 	readonly agents: readonly AgentDef[];
 	/** Every command the body may call, nested workflows included. */
@@ -852,11 +851,11 @@ export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, T exten
 }
 
 export interface WorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> extends WorkflowNode<I, O> {
-	readonly spec: WorkflowSpec<ModelTable, McpConfig, MountTable, I, O>;
+	readonly spec: WorkflowSpec<ModelTable, McpConfig, I, O>;
 }
 
-export function workflow<const M extends ModelTable, const J extends McpConfig, const T extends MountTable, I extends TSchema, O extends TSchema>(
-	spec: WorkflowSpec<M, J, T, I, O>,
+export function workflow<const M extends ModelTable, const J extends McpConfig, I extends TSchema, O extends TSchema>(
+	spec: WorkflowSpec<M, J, I, O>,
 ): WorkflowDef<I, O> {
-	return { kind: "workflow", name: spec.name, input: spec.input, output: spec.output, run: spec.run, spec: spec as unknown as WorkflowSpec<ModelTable, McpConfig, MountTable, I, O> };
+	return { kind: "workflow", name: spec.name, input: spec.input, output: spec.output, run: spec.run, spec: spec as unknown as WorkflowSpec<ModelTable, McpConfig, I, O> };
 }

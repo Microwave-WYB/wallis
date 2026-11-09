@@ -84,8 +84,8 @@ const Facts = Type.Object({
 	warnings: Type.Optional(Type.Array(Type.String())),
 	/** Answer schemas of the workflow's orchestrator nodes, for pending items. */
 	answers: Type.Optional(Type.Record(Type.String(), Type.Unsafe<Json>({}))),
-	/** Host dirs the caller gave for mounts (`--mount`), by name: reused on resume. */
-	mounts: Type.Optional(Type.Record(Type.String(), Type.String())),
+	/** Host dirs the caller gave for bind volumes (`--volume`), by container target: reused on resume. */
+	volumes: Type.Optional(Type.Record(Type.String(), Type.String())),
 	/** Each toolset's bundle digest (its module and the runner, as run), by path. */
 	toolsets: Type.Optional(Type.Record(Type.String(), Type.String())),
 });
@@ -95,7 +95,7 @@ const Start = Type.Object({
 	input: Type.Optional(Type.Unsafe<Json>({})),
 	seed: Type.Optional(Type.Number()),
 	models: Type.Optional(Type.Record(Type.String(), Type.String())),
-	mounts: Type.Optional(Type.Record(Type.String(), Type.String())),
+	volumes: Type.Optional(Type.Record(Type.String(), Type.String())),
 	bins: Type.Optional(Type.Record(Type.String(), Type.String())),
 	callerPath: Type.Optional(Type.String()),
 	owner: Type.Optional(Type.String()),

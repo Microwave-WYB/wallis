@@ -19,6 +19,6 @@ process.stdout.write(
 		writes_outside: attempt(() => writeFileSync(`${args.outside}.copy`, "leak")),
 		sees_home: attempt(() => readFileSync(`${process.env.WALLIS_HOME_PROBE ?? "/home"}`)),
 		sees_workflow_dir: attempt(() => readFileSync("../workflow.ts")) || attempt(() => readFileSync("/w/workflow.ts")),
-		writes_mount: attempt(() => writeFileSync("/mnt/scripts/x", "leak")),
+		writes_mount: attempt(() => writeFileSync("/scripts/x", "leak")),
 	}),
 );

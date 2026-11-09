@@ -139,7 +139,8 @@ orchestrator node. The framework does not enforce it.
   `confine: "off"` too. Body calls are not checked.
 - **Network.** Agents and commands never have network. Tool processes
   (toolsets, MCP servers) are the channel outside: `network: "none" |
-  "full"`, default `"full"`. Sandbox `setup` keeps its network (logged).
+  "host"`, default `"host"` (it was `"full"`). Sandbox `setup` keeps its
+  network (logged).
 
 Round 7 removed what round 6 added for writes by agents: `ask`-mode MCP
 tools, the built-in approval node and its pending kind, approvals answered
@@ -161,7 +162,7 @@ defineAgent(env, { ..., workspace: { sandbox: py, access: "exec" }, tools: [ask,
   `export_artifact`; `exec` adds `bash` and needs a declared sandbox (the
   union makes `exec` without one a type error). Without a sandbox, `read`
   and `write` work on a minimal workspace: the input artifacts and a
-  scratch dir, no mounts. Without `workspace` there is no filesystem. The
+  scratch dir, no volumes. Without `workspace` there is no filesystem. The
   file tools are wallis's own, with pi's names, parameters and descriptions
   (pi-coding-agent is not a dependency); `read` returns images as image
   content. The access is kept as one rank on the agent definition (none 0,
@@ -218,8 +219,9 @@ defineAgent(env, { ..., workspace: { sandbox: py, access: "exec" }, tools: [ask,
 Prototype choices:
 
 - The sandbox layout is `/in` (input artifacts, and Trees at
-  `/in/trees/<hex>`, read-only), `/w` (the workspace), `/mnt/<name>`
-  (mounts, read-only) and `/tmp` (plain, ephemeral) (foundation round).
+  `/in/trees/<hex>`, read-only), `/w` (the workspace), each volume at its
+  target and `/tmp` (plain, ephemeral) (foundation round; volumes this
+  round).
 - With `noUncheckedIndexedAccess`, `server.tool` reads as `McpTool |
   undefined` (tool names are not typed); `tools` and `ctx.call` take that.
 - `describe` shows the warnings of the latest preflight of that workflow in
@@ -247,23 +249,23 @@ layer (carried history, resume, run invariants, accounting) maps onto wallis.
 ```
 .agents/workflows/<name>/
   workflow.ts      # entry: declarations + control flow
-  prompts/*.md     # prompts, imported as text; never mounted into a sandbox
+  prompts/*.md     # prompts, imported as text; never bound into a sandbox
   mcp.json         # standard MCP config, imported as JSON
   skills/          # standard SKILL.md directories
-  <dirs>/          # code and files sandboxes need, mounted by name (e.g. trainer/, checks/)
+  <dirs>/          # code and files sandboxes need, bound as volumes (e.g. ./trainer:/trainer:ro)
 ```
 
 - Prompts: `import p from "./prompts/p.md" with { type: "text" }`. The
   bundler inlines them, so the workflow digest covers prompt content.
 - MCP: `import m from "./mcp.json" with { type: "json" }`, wrapped by
   `defineMcp(m, overlay)`, where the TS overlay gives each stdio server its
-  sandbox (and its network, `"none" | "full"`); it returns server objects
+  sandbox (and its network, `"none" | "host"`); it returns server objects
   for agents' `tools` and body calls. `${VAR}` in `env` is a secret
   reference. Custom tools live in modules next to the workflow
   (`tools/*.ts`), loaded with `toolset` (see "Agent tools and the
   workspace").
-- Nothing in the workflow dir is visible to a sandbox unless it is mounted
-  by name (`defineMounts({ trainer: "./trainer" })`).
+- Nothing in the workflow dir is visible to a sandbox unless a volume binds
+  it (`volumes: ["./trainer:/trainer:ro"]`).
 - The workflow directory name is the workflow name and its MCP tool name.
 
 ## Models (decided)
@@ -822,7 +824,7 @@ Prototype choices:
   completed is a hit and it continues. Or the owner `cancel`s it: only then
   does the failure propagate, and the run finishes Failed if the body does
   not handle it. Commands work the same way (a restart reruns them, e.g.
-  after fixing a `requires` or mount problem). A restart re-executes the
+  after fixing a `requires` or volume problem). A restart re-executes the
   node: the tools it calls and the questions it asks reach the outside
   again, which is recovery, not reproduction.
 - **Code changes are allowed.** Resume re-executes the body with the new
@@ -831,8 +833,9 @@ Prototype choices:
   prints "code changed; N calls reused, first new call: <node> at <id>".
 - Operational changes are logged events: alias remaps (`AliasRebound`),
   budget raises (`BudgetRaised`), executor changes (`ExecutorChanged`).
-- Result-defining changes are refused on resume: pinned files, mount
-  content, seed and the core's semantics version.
+- Result-defining changes are refused on resume: pinned files, seed and
+  the core's semantics version. A changed bind volume is not refused: it
+  misses the cache of the calls that bind it.
 - `wallis fork <run>` copies the whole journal (and blobs) into a new run,
   which re-executes; unchanged calls hit. The journal is per run and its
   forks, never shared implicitly with other runs: runs are independent
@@ -980,37 +983,46 @@ Prototype choices:
   (bwrap only).**
 
   ```ts
-  const py = defineSandbox({ mounts }, {
+  const py = defineSandbox({}, {          // a subset of a compose service
     name: "py",
     requires: ["uv"],                     // binaries the base must provide
     setup: [["uv", "sync", "--frozen"]],  // optional: once per digest, WITH network
-    mounts: ["trainer", "data"],          // read-only only, by name from defineMounts
-  });                                     // no network option: agents and commands never have one
+    volumes: ["./trainer:/trainer:ro",    // a bind: the mode is written, only :ro exists
+              "uv-cache:/var/cache/uv"],  // a named volume: a writable cache
+    devices: ["/dev/dri"],                // dev-bound as declared
+    environment: { UV_OFFLINE: "1" },
+    network: "none",                      // default; "host" is for tool sources only
+  });
   ```
 
   Nothing is implicit: the workflow dir is not mounted; whatever a sandbox
-  needs comes through its mounts, so an implementor cannot read judge
-  prompts or Health code. Each call gets a private writable scratch dir.
-  There is no writable mount. The base is the host's system dirs,
-  read-only; its identity (distro and version, kernel) goes in run
-  metadata, and an optional `base` (a container image) is reserved for a
-  later backend and ignored by bwrap.
+  needs comes through its volumes, so an implementor cannot read judge
+  prompts or Health code. Each call gets a private writable `/w`. There is
+  no writable bind. The base is the host's system dirs, read-only; its
+  identity (distro and version, kernel) goes in run metadata, and `image`
+  (a container image) is reserved for a later backend and ignored by bwrap.
+  `defineMounts`, the workflow's `mounts` table and sandbox `mounts` are
+  gone (this round; see "Volumes").
 - **`requires`**, per name: call-time `--bin name=path` (MCP `bins`) >
   local profile (per workflow > global) > the caller's PATH at run
   creation (not the host process's: systemd hosts have a minimal PATH).
   The resolved absolute paths are stored in run metadata and reused on
-  resume. Only that one file is bound, read-only, at
-  `/run/wallis/bin/<name>`, first on PATH. Preflight runs a check inside
+  resume. A required program is called by its real path; its install
+  prefix (the dir above its `bin/`) is visible read-only at the same path,
+  so files it finds relative to itself are there, and its dir is on PATH
+  (this round). Preflight runs a check inside
   the sandbox (`<name> --version`, or `{ name, check }`). Typed refusals:
   `requires_missing(name)`, `requires_broken(name, exit, stderr_head)`,
   `unknown_bin(name)`. Versions go in metadata only, not the pin.
 - **`setup`** runs once per digest (the declaration, its binaries and the
-  content of its mounts) in bwrap with the network on, writing a cached env
+  content of its bind volumes) in bwrap with the network on, writing a cached env
   dir exposed as `$WALLIS_ENV`; `$WALLIS_ENV/bin` is on every run's PATH,
   and runs mount the env read-only without network. After setup every
   binary in `$WALLIS_ENV/bin` is smoke-tested the same way. It is logged
   (there is no first-run approval listing yet). Failure: `setup_failed`.
-- **GPU** devices are bound only when the call declares `resources.gpu`.
+- **Devices** a sandbox declares are dev-bound as declared; one this host
+  lacks is refused at preflight (`device_missing(sandbox, device)`). GPU
+  devices are also bound when a call declares `resources.gpu`.
 - **Commands are typed adapters, called only by workflow code:**
 
   ```ts
@@ -1034,19 +1046,23 @@ Prototype choices:
 Prototype choices:
 
 - Layout inside a sandbox: `/w` is the working directory (a command's
-  private dir; an agent's overlay of its session's layers); each mount is
-  at `/mnt/<name>`, read-only; input artifacts are at `/in/<hex>/<name>`
-  and Trees at `/in/trees/<hex>`; binaries at `/run/wallis/bin`; the
-  setup env at `/run/wallis/env`. Plus `/usr`, `/etc`, the merged-`/usr`
+  private dir; an agent's overlay of its session's layers); each volume is
+  at its target (a bind read-only, a named volume writable); input
+  artifacts are at `/in/<hex>/<name>` and Trees at `/in/trees/<hex>`;
+  required programs at their real paths; the setup env at
+  `/run/wallis/env`. Plus `/usr`, `/etc`, the merged-`/usr`
   symlinks, private `/proc`, `/dev`, `/tmp`, no network, and the sandbox
   dies with the host. The environment is exactly `PATH`, `HOME=/w`,
   `LANG`, `WALLIS_SCRATCH`, `WALLIS_INPUTS`, `WALLIS_ENV`,
-  `WALLIS_COMPUTE_MINUTES` (and, for MCP servers, their secrets); secrets
+  `WALLIS_COMPUTE_MINUTES`, the sandbox's declared `environment` (and, for
+  MCP servers, their secrets); secrets
   never appear on a command line.
 - No sandbox an agent or a command runs in has network (round 6: the
-  domain allowlist is gone; filtering it per domain was premature). An MCP
-  server's spawn shares the host network when its overlay says `"full"`
-  (the default), and `setup` always does.
+  domain allowlist is gone; filtering it per domain was premature): an
+  agent or command whose sandbox declares `network: "host"` is a
+  declaration error. A tool source's spawn shares the host network when its
+  overlay or its sandbox says `"host"` (the overlay's default; it was
+  `"full"` before this round), and `setup` always does.
 - A command whose sandbox cannot be built (no bwrap) fails as
   `unrunnable`; agents' `bash` reports it. A local tool source (a toolset,
   an MCP server with a command) is refused at preflight
@@ -1062,40 +1078,65 @@ Prototype choices:
 - Per-node dirs: `work/<node>/inputs/<hex>/<name>`, `work/<node>/scratch/`,
   and `work/<node>/spill/`, deleted when the node is done.
 
-## Mounts (decided, round 4)
+## Volumes (decided, this round; replaces the round-4 mounts)
 
-- Declared like models: `defineMounts({ kb: "./knowledge", data: "" })`. A
-  value is the default host dir; a relative path resolves against the
-  workflow dir; an empty string means it must be supplied.
-- The caller (`--mount name=dir`, MCP `mounts`) or the local profile remaps
-  a name. Sandboxes reference names, typed as `keyof` the table.
-- Read-only only: the `Mount` type has no writable variant. Writes leave a
-  node only as returned artifacts, and a run only through `wallis export`.
-- A missing value is a preflight error (`mount_unset`). Each mount's content
-  digest goes into the pin (`inputs.mount.<name>`).
-- This replaces the round-3 data dirs. There is no git-specific kind.
+A sandbox declares its volumes in Docker/compose vocabulary, so a sandbox
+reads as a subset of a compose service.
+
+- **Bind volumes**, `"<host path>:<target>:ro"`: a host dir, read-only at
+  the target. The mode must be written and only `:ro` exists; a missing
+  mode, `:rw` or any other mode is a compile error (template literal types,
+  with a readable message) and, for a string that slips past the types, a
+  typed refusal at preflight (`invalid_volume(sandbox, volume, reason)`).
+  The host path is relative (to the workflow dir) or starts with `~/`.
+  Writes leave a node only as returned artifacts, and a run only through
+  `wallis export`.
+- The caller gives another host dir for a bind by its container target:
+  `--volume /data=<dir>`, MCP `volumes: { "/data": dir }`, or the local
+  profile's `volumes` (per workflow > global; paths resolve against the
+  project root). Call-time dirs of a new run are noted (`noted volumes`)
+  and reused by every later host of the run (a resume, the detached host
+  of `submit`). A host dir that does not exist is
+  `volume_missing(sandbox, target, path)`; a caller-given target no
+  sandbox binds is `unknown_volume(target)`.
+- **A bind's content digest is part of the cache key** of every command
+  and agent call whose sandbox binds it (through the sandbox digest in the
+  node digest). It is no longer pinned: changing a bound script re-runs
+  the calls that use it, and only those, on resume or in a fork. (A
+  snapshot of each bind at run start is foundation step 9.)
+- **Named volumes**, `"<name>:<target>"`: a wallis-managed writable dir,
+  `$XDG_CACHE_HOME/wallis/volumes/<name>`, shared across runs and
+  sandboxes that name it, and left out of every cache key. The contract:
+  results must not depend on its contents (a cache: downloaded models, a
+  compiler cache, darktable's cache). wallis cannot check it.
+- **Targets** are absolute, plain (no `.`, `..` or trailing `/`), and
+  overlap neither each other nor a dir the bwrap backend owns: `/usr`,
+  `/etc`, `/bin`, `/sbin`, `/lib*`, `/proc`, `/dev`, `/in`, `/w`, `/tmp`,
+  `/run/wallis` (nor `/` or `/run`, which contain them). This is a bwrap
+  backend restriction (it reuses the host base at the same paths); the
+  types refuse the reserved dirs too, and preflight refuses the rest as
+  `invalid_volume`.
+- Agents can use sandboxes with read-only binds and named volumes, which is
+  all a volume can be; their file tools see each volume at its target (a
+  bind read-only, a named volume writable with `write`).
+- `describe` lists each sandbox's volumes, devices and network.
 
 Prototype choices:
 
-- Resolution per name: call-time > local profile (`mounts.workflows.<wf>`
-  beats `mounts.global`) > the declared default. Call-time and profile
-  paths resolve against the project root.
-- The digest is `mount:sha256:` over the sorted relative paths and file
+- The digest is `bind:sha256:` over the sorted relative paths and file
   sha256s. File hashes are cached by path, mtime and size in
   `$XDG_CACHE_HOME/wallis/file-hashes.json`; a content change that keeps
   all three is not detected.
-- A sandbox sees each of its mounts at `/w/<name>`, read-only. Agents with a
-  sandbox read their mounts with `read`, `ls` and (with `exec`) `bash`.
 
 ## The journal is a cache (decided, round 5)
 
 - **Key:** (node definition digest, canonical input digest, occurrence n).
   The nth call with the same node and input gets the nth recorded result.
   - Agent digest: prompt, model alias, input and output schemas, MCP
-    selection, skills, needs, sandbox declaration, steerable, compaction,
-    maxTurns.
+    selection, skills, needs, the sandbox digest (declaration, binaries,
+    bind volume content), steerable, compaction, maxTurns.
   - Command digest: its `run` and `parse` code, schemas, resources, the
-    sandbox declaration and its env digest (binaries and mount content).
+    sandbox digest (declaration, binaries, bind volume content).
   - Occurrences follow call issue order, which is synchronous and
     deterministic.
 - **Resume re-executes the body against the cache.** Unchanged calls hit;
@@ -1113,8 +1154,9 @@ Prototype choices:
   implicitly across runs.
 - Request ids are only display and intervention identities.
 - **Pin:** the workflow digest is recorded, not compared (code changes are
-  allowed and logged); pinned files, mounts, the seed and the semantics
-  version still refuse.
+  allowed and logged); pinned files, the seed and the semantics version
+  still refuse. Bind volumes are not pinned: their content is in the
+  cache key of the calls that bind them.
 
 Prototype choices:
 
@@ -1162,7 +1204,7 @@ Prototype choices:
 ## SDK (prototype choice)
 
 The `wallis` package in `host/` exports `defineModels`, `defineMcp(config,
-overlay)`, `toolset(path, options)`, `ask`, `defineMounts`,
+overlay)`, `toolset(path, options)`, `ask`,
 `defineSandbox(env, spec)`, `defineAgent(env, spec)`, `command(spec)`,
 `orchestrator(spec)`, `subWorkflow`, `workflow`, `Foldable`, `Artifact`,
 the `WallisTool` and `ToolAnnotations` types, TypeBox's `Type`, and the
@@ -1220,7 +1262,8 @@ external result. The tools:
 - the workspace's file tools by access (`read`, `ls`; `write`, `edit`,
   `export_artifact`; `bash`), on the sandbox's paths (`/w` the workspace,
   read through its layers and written to the call's upper dir; `/in`,
-  `/in/trees/<hex>` and `/mnt/<name>` read-only); an agent with a
+  `/in/trees/<hex>` and bind volumes read-only, named volumes writable);
+  an agent with a
   workspace gets one short note on these dirs in its system prompt;
 - `ask`, if declared;
 - custom tools and MCP tools from their sources (`toolsets.ts`), over one
@@ -1240,7 +1283,7 @@ turn, so `maxTurns` is at least 2.
 **Tool processes run in sandboxes.** A toolset runs under node in the
 sandbox its `toolset` call names; each stdio MCP server in mcp.json runs in
 the sandbox its overlay gives it; both with their declared network
-(`"full"` by default). `${VAR}` secrets of mcp.json and a toolset's
+(`"host"` by default). `${VAR}` secrets of mcp.json and a toolset's
 `secrets` go into the tool process's environment only, never into an
 agent's sandbox. Annotations are the tool's own claim: the write rule is a
 warning, not a proof.
@@ -1286,7 +1329,7 @@ Built:
 - the pi executor (retries, per-turn checkpoints, quota, turn limit,
   compaction, sessions, `ask`, unknown outcomes), the wallis tool layer
   (workspace file tools, custom toolsets, MCP servers, journaling), bwrap
-  sandboxes with binaries and setup, commands, mounts, artifacts, machine
+  sandboxes with binaries and setup, commands, volumes, artifacts, machine
   slots, body tool calls, orchestrator nodes, structured pending, and the
   write-rule warnings;
 - the fake executor and fake command runner;
@@ -1300,7 +1343,7 @@ Not built yet:
 - file inputs and image inputs for agents;
 - nested orchestration (a parent agent answering its child's `ask`);
 - a workspace inferred from Artifact fields (round 8), and the `/in`,
-  `/w`, `/mnt/<name>` layout.
+  `/w` layout, with volumes at their targets.
 
 ## Open
 

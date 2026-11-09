@@ -12,12 +12,14 @@
 //                                 agent, an overlay of its session's layers
 //                                 with the call's own upper dir; for a
 //                                 command, a private dir
-//   /mnt/<name>                   each declared mount, read-only
+//   <target>                      each declared volume: a bind read-only,
+//                                 a named volume writable
 //   /tmp                          plain, ephemeral
 // and nothing else: not the workflow dir, not $HOME. The network is off
 // for agents and commands, always; only `setup` and MCP servers whose
-// overlay declares `network: "full"` (the default) share the host network.
-// GPU devices are bound only for calls that declare `resources.gpu`.
+// overlay declares `network: "host"` (the default), and sandboxes declaring it, share the host network.
+// Declared `devices` are dev-bound as declared; GPU devices are also bound
+// for calls that declare `resources.gpu`. `environment` is set as declared.
 //
 // Binaries resolve per name: call-time `--bin` > local profile (per
 // workflow, then global) > the caller's PATH when the run was created.
@@ -25,7 +27,7 @@
 // resume. Preflight runs each requirement's check inside the sandbox.
 //
 // `setup` runs once per digest (the declaration plus the content of its
-// mounts and its binaries) with the network on, writing `$WALLIS_ENV`;
+// bind volumes and its binaries) with the network on, writing `$WALLIS_ENV`;
 // afterwards every binary in `$WALLIS_ENV/bin` is smoke-tested the same way.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -35,11 +37,12 @@ import { homedir, release, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
+import type { ResolvedVolume } from "./volumes.ts";
 
 export type SandboxDecl = Declarations["sandboxes"][string];
 
 /** Paths inside a sandbox. */
-export const LAYOUT = { work: "/w", inputs: "/in", trees: "/in/trees", mounts: "/mnt", tmp: "/tmp", bin: "/run/wallis/bin", env: "/run/wallis/env" } as const;
+export const LAYOUT = { work: "/w", inputs: "/in", trees: "/in/trees", tmp: "/tmp", bin: "/run/wallis/bin", env: "/run/wallis/env" } as const;
 
 export class SandboxError extends Error {
 	override readonly name = "SandboxError";
@@ -120,9 +123,13 @@ export function baseIdentity(): { distro: string; kernel: string } {
 	return { distro, kernel: release() };
 }
 
-/** A sandbox's identity: its declaration, its binaries' paths and the content of its mounts. */
-export function sandboxDigest(s: SandboxDecl, bins: Readonly<Record<string, string>>, mountDigests: Readonly<Record<string, string>>): string {
-	const parts = { s, bins: s.requires.map((r) => [r.name, bins[r.name]]), mounts: s.mounts.map((m) => [m, mountDigests[m] ?? ""]) };
+/**
+ * A sandbox's identity: its declaration, its binaries' paths and the
+ * content of its bind volumes (by target). Named volumes are left out: they
+ * are caches, and results must not depend on them.
+ */
+export function sandboxDigest(s: SandboxDecl, bins: Readonly<Record<string, string>>, bindDigests: Readonly<Record<string, string>>): string {
+	const parts = { s, bins: s.requires.map((r) => [r.name, bins[r.name]]), binds: Object.entries(bindDigests).sort(([a], [b]) => (a < b ? -1 : 1)) };
 	return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
@@ -176,7 +183,7 @@ export interface SpawnOptions {
 	/** Extra environment (secrets for MCP servers, WALLIS_COMPUTE_MINUTES). */
 	readonly env?: Readonly<Record<string, string>>;
 	/** MCP servers only: their overlay's network. Agents and commands never get one. */
-	readonly network?: "none" | "full";
+	readonly network?: "none" | "host";
 	/** Setup only: the network on and `$WALLIS_ENV` writable. */
 	readonly setup?: { readonly envDir: string };
 }
@@ -187,22 +194,24 @@ const head = (text: string) => text.trim().split("\n").slice(-12).join("\n").sli
 export class Sandboxes {
 	readonly #decls: Readonly<Record<string, SandboxDecl>>;
 	readonly #bins: Readonly<Record<string, string>>;
-	readonly #mounts: Readonly<Record<string, string>>;
-	readonly #mountDigests: Readonly<Record<string, string>>;
+	readonly #volumes: Readonly<Record<string, readonly ResolvedVolume[]>>;
+	readonly #bindDigests: Readonly<Record<string, Readonly<Record<string, string>>>>;
 	readonly #cache: string;
 	readonly #envs = new Map<string, string>();
 
 	constructor(options: {
 		readonly decls: Readonly<Record<string, SandboxDecl>>;
 		readonly bins: Readonly<Record<string, string>>;
-		readonly mounts: Readonly<Record<string, string>>;
-		readonly mountDigests: Readonly<Record<string, string>>;
+		/** Each sandbox's volumes, resolved. */
+		readonly volumes: Readonly<Record<string, readonly ResolvedVolume[]>>;
+		/** Each sandbox's bind volumes' content digests, by target. */
+		readonly bindDigests: Readonly<Record<string, Readonly<Record<string, string>>>>;
 		readonly cacheDir?: string;
 	}) {
 		this.#decls = options.decls;
 		this.#bins = options.bins;
-		this.#mounts = options.mounts;
-		this.#mountDigests = options.mountDigests;
+		this.#volumes = options.volumes;
+		this.#bindDigests = options.bindDigests;
 		this.#cache = options.cacheDir ?? join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "wallis", "envs");
 	}
 
@@ -217,9 +226,10 @@ export class Sandboxes {
 		const s = this.#decl(name);
 		const envDir = options.setup?.envDir ?? this.#envs.get(name) ?? null;
 		const args = ["--die-with-parent", "--new-session", "--unshare-all"];
-		if (options.setup || options.network === "full") args.push("--share-net");
+		if (options.setup || options.network === "host" || s.network === "host") args.push("--share-net");
 		args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 		if (options.gpu) args.push(...gpuDevices());
+		for (const d of s.devices) args.push("--dev-bind", d, d);
 		// Each required program stays where it is, called by its real path: its install prefix is
 		// visible read-only at the same path, so files it finds relative to itself are there.
 		for (const prefix of new Set(s.requires.map((r) => installPrefix(this.#bins[r.name]!)))) if (!underBase(prefix)) args.push("--ro-bind", prefix, prefix);
@@ -239,7 +249,8 @@ export class Sandboxes {
 			for (const l of dirs.overlay.lowers) args.push("--overlay-src", l);
 			args.push("--overlay", dirs.scratch, dirs.overlay.ovl, LAYOUT.work);
 		} else args.push("--bind", dirs.scratch, LAYOUT.work);
-		for (const m of s.mounts) args.push("--ro-bind", this.#mounts[m]!, `${LAYOUT.mounts}/${m}`);
+		// Volumes at their targets: a bind read-only, a named volume (a cache) writable.
+		for (const v of this.#volumes[name] ?? []) args.push(v.kind === "bind" ? "--ro-bind" : "--bind", v.dir, v.target);
 		args.push("--chdir", LAYOUT.work, "--");
 		const program = argv[0] ?? "";
 		args.push(s.requires.some((r) => r.name === program) && this.#bins[program] ? this.#bins[program]! : program, ...argv.slice(1));
@@ -250,14 +261,15 @@ export class Sandboxes {
 			WALLIS_SCRATCH: LAYOUT.work,
 			WALLIS_INPUTS: LAYOUT.inputs,
 			...(envDir ? { WALLIS_ENV: LAYOUT.env } : {}),
+			...s.environment,
 			...(options.env ?? {}),
 		};
 		return { command: "bwrap", args, env, cwd: dirs.scratch };
 	}
 
-	/** The setup digest: the declaration, its binaries and the content of its mounts. */
+	/** The setup digest: the declaration, its binaries and the content of its bind volumes. */
 	digest(name: string): string {
-		return sandboxDigest(this.#decl(name), this.#bins, this.#mountDigests);
+		return sandboxDigest(this.#decl(name), this.#bins, this.#bindDigests[name] ?? {});
 	}
 
 	/**

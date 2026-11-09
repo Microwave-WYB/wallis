@@ -1,16 +1,14 @@
 // Compile-time checks of the SDK's and the host's typing. `tsc --noEmit`
 // fails if any `@ts-expect-error` line stops being an error.
 
-import { type Session as SessionValue, ask, command, done, next, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
+import { type Session as SessionValue, ask, command, done, next, defineAgent, defineMcp, defineModels, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
 import { IdleNode, LiveNode, OwnedRun, SteerableNode, SubmittableNode } from "../src/host/capability.ts";
 import type { CommandRunning, IdleNodeState, Node, RunningNode, Snapshot } from "../src/host/core.ts";
 import type { Session } from "../src/host/session.ts";
 
 const models = defineModels({ default: "p/m", judge: "" });
 const mcp = defineMcp({ mcpServers: { arxiv: { command: "uvx", args: ["arxiv-mcp-server==0.2.10"] } } });
-const mounts = defineMounts({ kb: "./knowledge", data: "" });
-
-const py = defineSandbox({ mounts }, { name: "py", requires: ["uv", { name: "bash", check: ["bash", "--version"] }], mounts: ["kb"] });
+const py = defineSandbox({}, { name: "py", requires: ["uv", { name: "bash", check: ["bash", "--version"] }], volumes: ["./knowledge:/kb:ro", "uv-cache:/root/.cache/uv"], devices: ["/dev/dri"], environment: { UV_OFFLINE: "1" } });
 const nodeBox = defineSandbox({}, { name: "tools", requires: ["node"] });
 const lib = toolset<typeof import("./fixtures/accept/tools/lib.ts")>("./tools/lib.ts", { sandbox: nodeBox, secrets: ["COUNT_FILE"] });
 
@@ -66,19 +64,40 @@ defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.N
 // @ts-expect-error: the old agent `mcp` selection is gone
 defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { arxiv: ["search"] } });
 
-// @ts-expect-error: a sandbox mount must be in the mount table
-defineSandbox({ mounts }, { name: "s", mounts: ["ghost"] });
+// Volumes in compose vocabulary: a bind's mode must be written, and only :ro exists.
+defineSandbox({}, { name: "s", volumes: ["./a:/a:ro", "~/b:/b:ro", "../c:/c:ro", "cache:/cache"] });
 
-// @ts-expect-error: a sandbox has no writable-mount option
-defineSandbox({ mounts }, { name: "s", mounts: [{ name: "kb", writable: true }] });
+// @ts-expect-error: a bind volume needs its mode
+defineSandbox({}, { name: "s", volumes: ["./scripts:/scripts"] });
 
-// @ts-expect-error: nor a writable flag
-defineSandbox({ mounts }, { name: "s", mounts: ["kb"], writable: ["kb"] });
+// @ts-expect-error: :rw does not exist (a volume is never writable)
+defineSandbox({}, { name: "s", volumes: ["./scripts:/scripts:rw"] });
 
-// @ts-expect-error: agents and commands never have network: a sandbox has no network option
-defineSandbox({ mounts }, { name: "s", network: ["arxiv.org"] });
+// @ts-expect-error: nor does any other mode
+defineSandbox({}, { name: "s", volumes: ["./scripts:/scripts:z"] });
 
-// @ts-expect-error: the overlay declares a server's network, "none" or "full", not domains
+// @ts-expect-error: a bind's host path is relative or starts with ~/
+defineSandbox({}, { name: "s", volumes: ["/etc:/x:ro"] });
+
+// @ts-expect-error: the container target must be absolute
+defineSandbox({}, { name: "s", volumes: ["./scripts:scripts:ro"] });
+
+// @ts-expect-error: a named volume's target must be absolute too
+defineSandbox({}, { name: "s", volumes: ["cache:cache"] });
+
+// @ts-expect-error: a target may not overlap a dir the bwrap backend owns
+defineSandbox({}, { name: "s", volumes: ["./x:/usr/local:ro"] });
+
+// @ts-expect-error: nor be above one
+defineSandbox({}, { name: "s", volumes: ["cache:/run"] });
+
+// @ts-expect-error: the old mount names are gone
+defineSandbox({}, { name: "s", mounts: ["kb"] });
+
+// @ts-expect-error: a sandbox's network is "none" or "host", not domains
+defineSandbox({}, { name: "s", network: ["arxiv.org"] });
+
+// @ts-expect-error: the overlay declares a server's network, "none" or "host", not domains
 defineMcp({ mcpServers: { arxiv: {} } }, { arxiv: { network: ["arxiv.org"] } });
 
 // @ts-expect-error: nor tools allowed to write outside
@@ -102,7 +121,6 @@ const pick = orchestrator({ name: "pick", input: Type.Object({ question: Type.St
 export default workflow({
 	name: "types",
 	models,
-	mounts,
 	agents: [ok],
 	commands: [train],
 	orchestrators: [pick],

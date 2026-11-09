@@ -97,7 +97,7 @@ export interface NodeSpec {
 	readonly record: (call: string, result: Json) => void;
 	/** JSON Schema of the result: pass it to the provider as structured output and check `submit_result` with it. */
 	readonly outputSchema: Json;
-	/** The node's dirs: mounted input artifacts, scratch dir, mounts and spill dir. */
+	/** The node's dirs: mounted input artifacts, scratch dir, volumes and spill dir. */
 	readonly workspace: NodeDirs;
 	/** The agent's sandbox, for its `bash` and file tools. */
 	readonly sandbox: AgentSandbox;

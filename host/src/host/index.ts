@@ -1,7 +1,7 @@
 export { bundleWorkflow, type Bundle } from "./bundle.ts";
 export { Core, type Effect, type Event, type Node, type Outcome, type Pin, type RunStatus, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
 export { BadId, HUMAN as HUMAN_ID, IdleNode, LiveNode, type NodeId, OwnedRun, parseNodeId, parseRunId, ResumableRun, type RunId, SteerableNode } from "./capability.ts";
-export { type Mount, mountDigest, resolveMounts } from "./mounts.ts";
+export { bindDigest, type ResolvedVolume, resolveVolumes } from "./volumes.ts";
 export { canonical, renderInput, windowCheck } from "./render.ts";
 export {
 	type AgentCall,

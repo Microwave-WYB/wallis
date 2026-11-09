@@ -1,4 +1,4 @@
-// Artifacts, per-call dirs, mounts and the bwrap sandboxes: commands run
+// Artifacts, per-call dirs, volumes and the bwrap sandboxes: commands run
 // for real here, so the file is skipped without bubblewrap.
 
 import assert from "node:assert/strict";
@@ -14,7 +14,7 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 const workflow = resolve(here, "fixtures/artifacts/workflow.ts");
 const hasBwrap = bwrapAvailable();
 const skip = !hasBwrap && "bubblewrap cannot create a sandbox here";
-// Mount file hashes and setup envs go to a throwaway cache.
+// Bind file hashes, named volumes and setup envs go to a throwaway cache.
 process.env.XDG_CACHE_HOME = tmp("wallis-cache-");
 if (!hasBwrap) process.stderr.write("artifacts.test: bubblewrap cannot create a sandbox here; these tests are skipped\n");
 
@@ -54,7 +54,7 @@ async function run(s: ReturnType<typeof setup>, extra: Record<string, unknown> =
 		confine: "require",
 		bins,
 		input: { outside: s.outside },
-		mounts: { corpus: s.corpus },
+		volumes: { "/corpus": s.corpus },
 		local: {},
 		inboxPollMs: null,
 		...extra,
@@ -68,7 +68,7 @@ test("artifacts flow between commands and agents by ref; argv and parse are type
 	const out = (r.outcome as unknown as { value: Record<string, { digest: string; name: string; media: string }> & { size: number; missing: unknown } }).value;
 	assert.deepEqual(Object.keys(out.model!).sort(), ["digest", "media", "name"]);
 	assert.equal(readFileSync(blobPath(s.dir, out.model!.digest), "utf8"), "weights");
-	// train got the model's mounted path in its argv and the corpus mount; parse took its stdout and a file.
+	// train got the model's mounted path in its argv and the /corpus volume; parse took its stdout and a file.
 	assert.equal(readFileSync(blobPath(s.dir, out.checkpoint!.digest), "utf8"), "weights+corpus");
 	assert.equal(out.size, "weights".length + "corpus".length);
 	assert.equal(readFileSync(blobPath(s.dir, out.report!.digest), "utf8"), "# Report\nweights+corpus\n");
@@ -81,14 +81,16 @@ test("artifacts flow between commands and agents by ref; argv and parse are type
 	assert.deepEqual(existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [], []);
 	const layers = readdirSync(join(s.dir, "layers")).filter((f) => f.endsWith(".json"));
 	assert.equal(layers.length, 1);
+	// Bind volumes are not pinned (their content is in the cache key); the caller's host dir is noted.
 	const started = new EventLog(join(s.dir, "log.jsonl")).read()[0] as { pin: { inputs: Record<string, string> } };
-	assert.match(started.pin.inputs["mount.corpus"]!, /^mount:sha256:[0-9a-f]{64}$/);
+	assert.deepEqual(Object.keys(started.pin.inputs), []);
 	// Run metadata: resolved binaries with versions, and the base.
 	const meta = readMeta(runPaths(s.dir))!;
 	assert.equal(meta.bins!.node!.path, process.execPath);
 	assert.match(meta.bins!.node!.version ?? "", /^v\d+/);
 	assert.ok(meta.base!.kernel.length > 0);
 	assert.equal(meta.confined, true);
+	assert.deepEqual(meta.volumes, { "/corpus": s.corpus });
 
 	const target = tmp();
 	assert.equal(readFileSync(exportArtifact(s.dir, "report.md", target), "utf8"), "# Report\nweights+corpus\n");
@@ -96,7 +98,7 @@ test("artifacts flow between commands and agents by ref; argv and parse are type
 	assert.equal(statSync(blobPath(fork.dir, out.model!.digest)).ino, statSync(blobPath(s.dir, out.model!.digest)).ino, "hardlinked, not copied");
 });
 
-test("nothing is implicit: a command sees its mounts read-only, its inputs, its scratch dir, and nothing else", { skip }, async () => {
+test("nothing is implicit: a command sees its bind volumes read-only, its inputs, its scratch dir, and nothing else", { skip }, async () => {
 	const s = setup();
 	const r = await run(s);
 	const probed = (r.outcome as unknown as { value: { probed: Record<string, boolean> } }).value.probed;
@@ -105,11 +107,33 @@ test("nothing is implicit: a command sees its mounts read-only, its inputs, its 
 	assert.ok(!existsSync(`${s.outside}.copy`));
 });
 
-test("a changed mount is a result-defining change: resume refuses it", { skip }, async () => {
+test("a changed bind volume misses the cache of the calls whose sandbox binds it, and only theirs", { skip }, async () => {
 	const s = setup();
 	await run(s);
 	writeFileSync(join(s.corpus, "words.txt"), "a different corpus");
-	await assert.rejects(run(s), (e: unknown) => e instanceof RunRefused && e.refusal.type === "pin_mismatch" && e.refusal.field === "inputs.mount.corpus");
+	// The fork re-runs the body against the journal, with the noted host dir for /corpus.
+	const fork = forkRun(s.dir, join(s.root, ".wallis", "runs", "r2"));
+	const commands = new ProcessCommands();
+	const ran: string[] = [];
+	const counting = { run: (spec: Parameters<ProcessCommands["run"]>[0]) => (ran.push(spec.command), commands.run(spec)) };
+	const r = await run({ ...s, dir: fork.dir }, { commands: counting, volumes: undefined });
+	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
+	// train binds /corpus; make, probe and lost bind only /scripts, which did not change.
+	assert.deepEqual(ran, ["train"]);
+	const out = (r.outcome as unknown as { value: { checkpoint: { digest: string } } }).value;
+	assert.equal(readFileSync(blobPath(fork.dir, out.checkpoint.digest), "utf8"), "weights+a different corpus");
+});
+
+test("volumes the backend cannot honour, and a missing host dir, are typed refusals", { skip }, async () => {
+	const s = setup();
+	const refusal = (extra: Record<string, unknown>) =>
+		run(s, extra).then(
+			() => null,
+			(e: unknown) => (e instanceof RunRefused ? e.refusal : e),
+		);
+	const corpus = resolve(here, "fixtures/artifacts/corpus");
+	assert.deepEqual(await refusal({ volumes: {} }), { type: "volume_missing", sandbox: "trainer", target: "/corpus", path: corpus });
+	assert.deepEqual(await refusal({ volumes: { "/corpus": s.corpus, "/elsewhere": s.corpus } }), { type: "unknown_volume", target: "/elsewhere" });
 });
 
 test("requires: a missing binary, a broken one (a lone shim), an undeclared --bin are typed refusals", { skip }, async () => {
@@ -138,13 +162,15 @@ test("setup runs once per digest with the network on, writes $WALLIS_ENV, and it
 		env: {
 			requires: [{ name: "bash", check: ["bash", "--version"] }],
 			setup: [["bash", "-c", 'mkdir -p "$WALLIS_ENV/bin" && printf "#!/bin/sh\\necho tool 1.0\\n" > "$WALLIS_ENV/bin/tool" && chmod +x "$WALLIS_ENV/bin/tool" && date +%N > "$WALLIS_ENV/stamp"']],
-			mounts: [],
-			network: [],
-			base: null,
+			volumes: [],
+			devices: [],
+			network: "none" as const,
+			environment: {},
+			image: null,
 		},
 	};
 	const cacheDir = tmp("wallis-envs-");
-	const make = () => new Sandboxes({ decls, bins: { bash: "/usr/bin/bash" }, mounts: {}, mountDigests: {}, cacheDir });
+	const make = () => new Sandboxes({ decls, bins: { bash: "/usr/bin/bash" }, volumes: {}, bindDigests: {}, cacheDir });
 	const notes: string[] = [];
 	make().prepare((t) => notes.push(t));
 	const dirs = readdirSync(cacheDir);
@@ -156,7 +182,7 @@ test("setup runs once per digest with the network on, writes $WALLIS_ENV, and it
 	// A setup binary that does not run fails the setup, typed.
 	const bad = { env: { ...decls.env, setup: [["bash", "-c", 'mkdir -p "$WALLIS_ENV/bin" && printf "#!/opt/none/sh\\n" > "$WALLIS_ENV/bin/shim" && chmod +x "$WALLIS_ENV/bin/shim"']] } };
 	assert.throws(
-		() => new Sandboxes({ decls: bad, bins: { bash: "/usr/bin/bash" }, mounts: {}, mountDigests: {}, cacheDir }).prepare(),
+		() => new Sandboxes({ decls: bad, bins: { bash: "/usr/bin/bash" }, volumes: {}, bindDigests: {}, cacheDir }).prepare(),
 		(e: unknown) => (e as { refusal?: { type: string } }).refusal?.type === "setup_failed",
 	);
 });

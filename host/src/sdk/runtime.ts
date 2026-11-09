@@ -257,7 +257,7 @@ function seededRandom(seed: number): () => number {
 }
 
 function sandboxDeclaration(s: SandboxDef) {
-	return { requires: s.requires, setup: s.setup, mounts: s.mounts, base: s.base };
+	return { requires: s.requires, setup: s.setup, volumes: s.volumes, devices: s.devices, network: s.network, environment: s.environment, image: s.image };
 }
 
 /** Declarations: the core's workflow plus what the host and executors need. */
@@ -276,7 +276,6 @@ export function declarations(def: WorkflowDef) {
 		if (!d) throw new Error("toolsets takes only toolset(...) values");
 		return d;
 	});
-	const mounts = spec.mounts?.table ?? {};
 	const overlay = mcp?.overlay ?? {};
 	const servers = Object.keys(mcp?.config.mcpServers ?? {});
 	for (const a of spec.agents) {
@@ -291,13 +290,14 @@ export function declarations(def: WorkflowDef) {
 		if (!s) return null;
 		const prior = sandboxes.get(s.name);
 		if (prior && JSON.stringify(sandboxDeclaration(prior)) !== JSON.stringify(sandboxDeclaration(s))) throw new Error(`two different sandboxes are named ${s.name}`);
-		for (const m of s.mounts) if (!(m in mounts)) throw new Error(`sandbox ${s.name}: mount ${m} is not in the workflow's mount table`);
 		sandboxes.set(s.name, s);
 		return s.name;
 	};
 	for (const a of spec.agents) {
 		if (a.access === 3 && !a.sandbox?.requires.some((r) => r.name === "bash")) throw new Error(`agent ${a.name}: exec needs a sandbox that requires bash`);
+		if (a.sandbox?.network === "host") throw new Error(`agent ${a.name}: agents never get network; sandbox ${a.sandbox.name} has network "host"`);
 	}
+	for (const c of commands) if (c.sandbox.network === "host") throw new Error(`command ${c.name}: commands never get network; sandbox ${c.sandbox.name} has network "host"`);
 	return {
 		core: {
 			name: spec.name,
@@ -307,7 +307,6 @@ export function declarations(def: WorkflowDef) {
 			budget: { turns: spec.budget?.turns ?? null, compute_minutes: spec.budget?.computeMinutes ?? null },
 		},
 		models: spec.models.table,
-		mounts,
 		pin: { files: [...(spec.pin?.files ?? [])] },
 		agents: Object.fromEntries(
 			spec.agents.map((a) => [
@@ -343,9 +342,9 @@ export function declarations(def: WorkflowDef) {
 			]),
 		),
 		orchestrators: Object.fromEntries(orchestrators.map((o) => [o.name, { description: o.description, input: o.input, output: o.output }])),
-		toolsets: Object.fromEntries(toolsets.map((t) => [t.path, { sandbox: use(t.sandbox)!, secrets: [...(t.secrets ?? [])], network: t.network ?? "full" }])),
+		toolsets: Object.fromEntries(toolsets.map((t) => [t.path, { sandbox: use(t.sandbox)!, secrets: [...(t.secrets ?? [])], network: t.network ?? "host" }])),
 		mcp: mcp?.config ?? null,
-		mcpServers: Object.fromEntries(servers.map((server) => [server, { sandbox: use(overlay[server]?.sandbox), network: overlay[server]?.network ?? "full" }])),
+		mcpServers: Object.fromEntries(servers.map((server) => [server, { sandbox: use(overlay[server]?.sandbox), network: overlay[server]?.network ?? "host" }])),
 		sandboxes: Object.fromEntries([...sandboxes].map(([name, s]) => [name, sandboxDeclaration(s)])),
 		input: spec.input,
 		output: spec.output,

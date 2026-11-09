@@ -94,15 +94,15 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 				input: z.any().optional().describe("Workflow input (JSON)"),
 				seed: z.number().int().optional(),
 				models: z.record(z.string(), z.string()).optional().describe("Model alias remaps, alias -> provider/model:thinking"),
-				mounts: z.record(z.string(), z.string()).optional().describe("Mount remaps, name -> host dir (read-only)"),
+				volumes: z.record(z.string(), z.string()).optional().describe("Host dirs for bind volumes, container target -> host dir (read-only)"),
 				bins: z.record(z.string(), z.string()).optional().describe("Paths of required binaries, name -> absolute path"),
 			},
 		},
-		async ({ workflow, input, seed, models, mounts, bins }) => {
+		async ({ workflow, input, seed, models, volumes, bins }) => {
 			try {
 				const parsed = toJson(input ?? null);
 				if (!parsed.ok) return reply(`Bad input: ${parsed.errors.join("; ")}`, { error: "bad_input" }, true);
-				const session = await runs.start({ workflow, input: parsed.value, seed, models, mounts, bins });
+				const session = await runs.start({ workflow, input: parsed.value, seed, models, volumes, bins });
 				const view = runs.view(parseRunId(session.paths.id));
 				return reply(`${summary(view)}\n\nTo be notified when it needs attention, run in the background: npx wallis wait ${view.runId}`, data(view));
 			} catch (error) {

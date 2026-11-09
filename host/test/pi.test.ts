@@ -62,7 +62,7 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		}),
 		record: () => {},
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
-		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", work: null, trees: [], mounts: {}, spill: join(tmp(), "spill") },
+		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", work: null, trees: [], volumes: [], spill: join(tmp(), "spill") },
 		sandbox: { type: "none" },
 		checkpoint: () => {},
 		resume: null,
@@ -246,9 +246,9 @@ test("pi: a provider error is an executor error: the run pauses, a resume reissu
 test("the tool layer: workspace access gives pi's file tools on the sandbox's paths; unknown names are refused and logged", async () => {
 	const dir = tmp();
 	const mount = tmp();
-	writeFileSync(join(mount, "notes.txt"), "from the mount\nline 2");
+	writeFileSync(join(mount, "notes.txt"), "from the volume\nline 2");
 	writeFileSync(join(mount, "dot.png"), Buffer.from("89504e470d0a1a0a", "hex"));
-	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), work: null, trees: [], mounts: { data: mount }, spill: join(dir, "spill") };
+	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), work: null, trees: [], volumes: [{ kind: "bind" as const, target: "/data", dir: mount }], spill: join(dir, "spill") };
 	mkdirSync(join(dir, "scratch"), { recursive: true });
 	const at = (access: 0 | 1 | 2 | 3) => spec({ declaration: { ...spec().declaration, access }, workspace: ws, sandbox: { type: "unavailable", name: "shell", reason: "test" } });
 	const names = async (access: 0 | 1 | 2 | 3) => (await buildNodeTools(at(access))).agentTools().map((t) => t.name).sort();
@@ -259,9 +259,9 @@ test("the tool layer: workspace access gives pi's file tools on the sandbox's pa
 	const s = at(3);
 	const tools = await buildNodeTools(s);
 	const run = (name: string, args: Record<string, unknown>) => tools.invoke(name, args as never, false, undefined, "0/t1");
-	// Paths are the sandbox's: /w is scratch, /w/<mount> is the mount (read-only).
-	assert.equal((await run("read", { path: "/mnt/data/notes.txt", offset: 2 })).text, "line 2");
-	assert.equal((await run("write", { path: "/mnt/data/x", content: "no" })).isError, true);
+	// Paths are the sandbox's: /w is scratch, /data is the bind volume (read-only).
+	assert.equal((await run("read", { path: "/data/notes.txt", offset: 2 })).text, "line 2");
+	assert.equal((await run("write", { path: "/data/x", content: "no" })).isError, true);
 	assert.equal((await run("write", { path: "out.txt", content: "yes yes" })).text, "wrote 7 characters to out.txt");
 	assert.equal((await run("edit", { path: "out.txt", oldText: "yes", newText: "no" })).isError, true, "oldText must occur once");
 	assert.equal((await run("edit", { path: "out.txt", oldText: "yes yes", newText: "no" })).text, "edited out.txt");
@@ -269,7 +269,7 @@ test("the tool layer: workspace access gives pi's file tools on the sandbox's pa
 	assert.deepEqual((await run("ls", {})).value, ["out.txt"]);
 	assert.equal((await run("read", { path: "/etc/passwd" })).isError, true);
 	// read returns images as image content.
-	assert.deepEqual((await run("read", { path: "/mnt/data/dot.png" })).images, [{ data: Buffer.from("89504e470d0a1a0a", "hex").toString("base64"), mimeType: "image/png" }]);
+	assert.deepEqual((await run("read", { path: "/data/dot.png" })).images, [{ data: Buffer.from("89504e470d0a1a0a", "hex").toString("base64"), mimeType: "image/png" }]);
 	// Declared but not buildable here: bash says so, typed as an error for the model.
 	assert.match((await run("bash", { command: "id" })).text, /no sandbox: test/);
 	const refused = await tools.invoke("exec", { command: "id" }, true, undefined, "0/t1");
@@ -282,7 +282,7 @@ test("the tool layer: workspace access gives pi's file tools on the sandbox's pa
 function withSources(tools: readonly ToolDesc[], recorded = new Map<string, Json>()) {
 	const count = join(tmp(), "count.txt");
 	const sources = new ToolSources({
-		decl: { mcp: { mcpServers: { fx: { command: process.execPath, args: [resolve(here, "fixtures/mcp-server.ts")], env: { TOKEN: "${TOKEN}", COUNT_FILE: "${COUNT_FILE}" } } } }, mcpServers: { fx: { sandbox: null, network: "full" } }, toolsets: {} } as never,
+		decl: { mcp: { mcpServers: { fx: { command: process.execPath, args: [resolve(here, "fixtures/mcp-server.ts")], env: { TOKEN: "${TOKEN}", COUNT_FILE: "${COUNT_FILE}" } } } }, mcpServers: { fx: { sandbox: null, network: "host" } }, toolsets: {} } as never,
 		workflowDir: here,
 		runDir: tmp(),
 		confinement: { type: "off" },
@@ -401,7 +401,7 @@ test("the file tools never follow a symlink out of the sandbox: escapes are refu
 	symlinkSync(`../../../layers/${layer.slice(7)}/a.txt`, join(work.upper, "rel"));
 	symlinkSync("a.txt", join(work.upper, "inner"));
 	symlinkSync("/w/a.txt", join(work.upper, "absolute-inside"));
-	const ws = { root, inputs: join(root, "inputs"), scratch: work.upper, work, trees: [], mounts: {}, spill: join(root, "spill") };
+	const ws = { root, inputs: join(root, "inputs"), scratch: work.upper, work, trees: [], volumes: [], spill: join(root, "spill") };
 	const s = spec({ declaration: { ...spec().declaration, access: 3 }, workspace: ws, sandbox: { type: "unavailable", name: "shell", reason: "test" } });
 	const tools = await buildNodeTools(s);
 	const run = (name: string, args: Record<string, unknown>) => tools.invoke(name, args as never, false, undefined, "0/t1");
@@ -429,7 +429,7 @@ test("the file tools never follow a symlink out of the sandbox: escapes are refu
 test("codemode in flight at a crash is as unsafe as the worst tool it can reach", async () => {
 	const kind = async (access: 0 | 1 | 2 | 3, tools: readonly ToolDesc[] = []) => {
 		const { s } = tools.length > 0 ? withSources(tools) : { s: spec() };
-		const ws = { root: tmp(), inputs: tmp(), scratch: tmp(), work: null, trees: [], mounts: {}, spill: tmp() };
+		const ws = { root: tmp(), inputs: tmp(), scratch: tmp(), work: null, trees: [], volumes: [], spill: tmp() };
 		const built = await buildNodeTools({ ...s, declaration: { ...s.declaration, access }, workspace: ws, sandbox: { type: "unavailable", name: "x", reason: "test" } });
 		try {
 			return built.inFlight("codemode", "0/c", {}).kind;
@@ -460,7 +460,7 @@ test("pi: an image counts by its dimensions, not its base64: a 1.2 MB contact sh
 	mkdirSync(join(dir, "scratch"), { recursive: true });
 	writeFileSync(join(dir, "scratch", "sheet.png"), png(2400, 1600, 1_200_000));
 	provider.setResponses([call("read", { path: "sheet.png" }), call("submit_result", { answer: 1 })]);
-	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), work: null, trees: [], mounts: {}, spill: join(dir, "spill") };
+	const ws = { root: dir, inputs: join(dir, "inputs"), scratch: join(dir, "scratch"), work: null, trees: [], volumes: [], spill: join(dir, "spill") };
 	const s = spec({ model: "faux/faux-vision", declaration: { ...spec().declaration, access: 1, compaction: false }, workspace: ws, sandbox: { type: "none" } });
 	const session = await executor.start(s);
 	const turn = await session.turn();

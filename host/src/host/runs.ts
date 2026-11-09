@@ -62,7 +62,7 @@ export interface StartRun {
 	readonly input?: Json;
 	readonly seed?: number;
 	readonly models?: Readonly<Record<string, string>>;
-	readonly mounts?: Readonly<Record<string, string>>;
+	readonly volumes?: Readonly<Record<string, string>>;
 	readonly bins?: Readonly<Record<string, string>>;
 }
 
@@ -128,7 +128,7 @@ export class Runs {
 				input: request.input ?? null,
 				seed: request.seed,
 				models: request.models,
-				mounts: request.mounts,
+				volumes: request.volumes,
 				bins: request.bins,
 				callerPath: process.env.PATH,
 				owner: this.owner,

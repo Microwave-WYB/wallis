@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
+import type { ResolvedVolume } from "./volumes.ts";
 import { layerDir, locate, prepareWork, removeWork, syncPath, ViewError, type ViewEntry, type Work, workRoot } from "./layers.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -174,8 +175,8 @@ export interface NodeDirs {
 	readonly work: Work | null;
 	/** Every Tree in the input, read-only at `/in/trees/<hex>`: its layers, bottom first. */
 	readonly trees: readonly { readonly at: string; readonly lowers: readonly string[] }[];
-	/** Mounts by name, read-only. */
-	readonly mounts: Readonly<Record<string, string>>;
+	/** The sandbox's volumes: bind volumes read-only, named volumes writable. */
+	readonly volumes: readonly ResolvedVolume[];
 	/** Host-owned: where capped tool and codemode output spills. Not a tool-visible dir. */
 	readonly spill: string;
 }
@@ -194,7 +195,7 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
  * input artifacts. An agent call's scratch dir is its session's (`scratch`),
  * which outlives the call.
  */
-export function prepareNode(runDir: string, id: string, input: Json, schema: unknown, mounts: Readonly<Record<string, string>>, layers: readonly string[] | null = null, attempt = 1): NodeDirs {
+export function prepareNode(runDir: string, id: string, input: Json, schema: unknown, volumes: readonly ResolvedVolume[], layers: readonly string[] | null = null, attempt = 1): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
 	verifyRefs(input, runDir);
 	let work: Work | null = null;
@@ -207,7 +208,7 @@ export function prepareNode(runDir: string, id: string, input: Json, schema: unk
 		for (const l of t.layers) if (!existsSync(layerDir(runDir, l))) throw new ArtifactError(`layer ${l} of a tree in the input is not in the store`);
 		return { at: treePath(t), lowers: t.layers.map((l) => layerDir(runDir, l)) };
 	});
-	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: work?.upper ?? join(root, "scratch"), work, trees, mounts, spill: join(root, "spill") };
+	const dirs: NodeDirs = { root, inputs: join(root, "inputs"), scratch: work?.upper ?? join(root, "scratch"), work, trees, volumes, spill: join(root, "spill") };
 	// Mount points inside the read-only /in exist before the sandbox starts.
 	for (const t of trees) mkdirSync(join(dirs.inputs, t.at.slice(`${"/in"}/`.length)), { recursive: true });
 	mkdirSync(dirs.inputs, { recursive: true });

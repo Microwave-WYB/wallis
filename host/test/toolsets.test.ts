@@ -40,15 +40,16 @@ test("each MCP connection gets its own scratch dir; a toolset runs bundled under
 	execute: async () => ({ content: [{ type: "text", text: process.cwd() }], details: undefined, structuredContent: { cwd: process.cwd(), secret: process.env.TOKEN ?? null, home: process.env.HOME } }) };\n`,
 	);
 	const node = { name: "node", check: ["node", "--version"] };
+	const plain = { setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const;
 	const boxes = new Sandboxes({
-		decls: { srv: { requires: [node], setup: [], mounts: ["srv"], base: null }, tools: { requires: [node], setup: [], mounts: [], base: null } },
+		decls: { srv: { ...plain, requires: [node], volumes: [{ kind: "bind", host: "./srv", target: "/srv" }] }, tools: { ...plain, requires: [node] } },
 		bins: { node: realpathSync(process.execPath) },
-		mounts: { srv },
-		mountDigests: {},
+		volumes: { srv: [{ kind: "bind", target: "/srv", dir: srv }] },
+		bindDigests: {},
 	});
 	const sources = new ToolSources({
 		decl: {
-			mcp: { mcpServers: { probe: { command: "node", args: ["/mnt/srv/server.mjs"] } } },
+			mcp: { mcpServers: { probe: { command: "node", args: ["/srv/server.mjs"] } } },
 			mcpServers: { probe: { sandbox: "srv", network: "none" } },
 			toolsets: { "./lib.ts": { sandbox: "tools", secrets: ["TOKEN"], network: "none" } },
 		} as never,
@@ -88,7 +89,7 @@ function probeSources(confinement: { type: "off" } | { type: "unavailable" }) {
 	writeFileSync(join(work, "server.mjs"), SERVER);
 	const runDir = tmp();
 	const sources = new ToolSources({
-		decl: { mcp: { mcpServers: { probe: { command: process.execPath, args: [join(work, "server.mjs")] } } }, mcpServers: { probe: { sandbox: null, network: "full" } }, toolsets: { "./lib.ts": { sandbox: "tools", secrets: [], network: "full" } } } as never,
+		decl: { mcp: { mcpServers: { probe: { command: process.execPath, args: [join(work, "server.mjs")] } } }, mcpServers: { probe: { sandbox: null, network: "host" } }, toolsets: { "./lib.ts": { sandbox: "tools", secrets: [], network: "host" } } } as never,
 		workflowDir: work,
 		runDir,
 		confinement,

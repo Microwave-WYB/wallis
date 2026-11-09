@@ -17,7 +17,6 @@ import {
 	defineAgent,
 	defineModels,
 	command,
-	defineMounts,
 	defineSandbox,
 	Foldable,
 	toolset,
@@ -138,65 +137,70 @@ const S = Type.Script(
 
 const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheEntry, CollapseEntry, Evidence, Incumbent, Proposal, Scope, Direction, HealthCheck } = S;
 
-// --- Artifacts, mounts and sandboxes ------------------------------------------------
+// --- Artifacts, volumes and sandboxes -----------------------------------------------
 //
 // Files handed downstream are artifacts: the implementor exports the model
 // plugin, train mounts it and returns the checkpoint, evaluate and Health
 // mount the checkpoint.
 //
 // Nothing is implicit: the workflow dir is never mounted. Each sandbox sees
-// only the mounts it names, read-only at /mnt/<name>, its inputs at /in, and
-// its call's /w (a private dir for a command, a layered workspace for an agent).
-// `trainer/` and `checks/` are workflow-relative mounts; `prompts/` is
-// never mounted anywhere, so no agent or command can read the judge's
-// prompt or the Health code it is graded by. `data` (the dataset) and
-// `config` (data_scope.json, health_config.yaml, advice.md: the locked
-// files of run_invariants.py) are supplied by the caller or the local
-// profile. Every mount's content digest is pinned.
+// only the volumes it declares (bind volumes, read-only at their targets),
+// its inputs at /in, and its call's /w (a private dir for a command, a
+// layered workspace for an agent). `./trainer` and `./checks` are
+// workflow-relative; `prompts/` is never bound anywhere, so no agent or
+// command can read the judge's prompt or the Health code it is graded by.
+// /data (the dataset) and /config (data_scope.json, health_config.yaml,
+// advice.md: the locked files of run_invariants.py) are given by the caller
+// (`--volume /data=<dir>`) or the local profile. A bind's content digest is
+// part of the cache key of every call whose sandbox binds it.
 
 const ModelPlugin = Artifact("text/x-python");
 const Checkpoint = Artifact("application/x-checkpoint");
-const mounts = defineMounts({ trainer: "./trainer", checks: "./checks", data: "", config: "" });
+/** ./data and ./config are not in the workflow dir: the caller gives them. */
+const trainer = "./trainer:/trainer:ro";
+const checks = "./checks:/checks:ro";
+const data = "./data:/data:ro";
+const config = "./config:/config:ro";
 
-/** Files in the `config` mount, as the sandboxes see them. */
+/** Files in the /config volume, as the sandboxes see them. */
 const files = {
-	dataScope: "/mnt/config/data_scope.json",
-	healthConfig: "/mnt/config/health_config.yaml",
-	advice: "/mnt/config/advice.md",
+	dataScope: "/config/data_scope.json",
+	healthConfig: "/config/health_config.yaml",
+	advice: "/config/advice.md",
 };
 
 /** train and evaluate: the trainer's locked environment, built once by `uv sync`, then used offline. */
 const trainerBox = defineSandbox(
-	{ mounts },
+	{},
 	{
 		name: "trainer",
 		requires: ["uv", "sh"],
-		setup: [["sh", "-c", 'UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" uv sync --frozen --project /mnt/trainer']],
-		mounts: ["trainer", "data", "config"],
+		setup: [["sh", "-c", 'UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" uv sync --frozen --project /trainer']],
+		volumes: [trainer, data, config],
 	},
 );
 
 /** The deterministic checks: Health, fingerprints, the validator, the metric order. */
-const checksBox = defineSandbox({ mounts }, { name: "checks", requires: ["python3"], mounts: ["checks", "data", "config"] });
+const checksBox = defineSandbox({}, { name: "checks", requires: ["python3"], volumes: [checks, data, config] });
 
 /** The implementor: the data only, never the trainer or the checks it is judged by. */
-const codingBox = defineSandbox({ mounts }, { name: "coding", requires: ["bash", "python3"], mounts: ["data"] });
+const codingBox = defineSandbox({}, { name: "coding", requires: ["bash", "python3"], volumes: [data] });
 
 /** The data analyst: the data read-only and a shell (this replaces SIDERIUS's run_skill tool). */
-const analysisBox = defineSandbox({ mounts }, { name: "analysis", requires: ["bash", "python3"], mounts: ["data"] });
+const analysisBox = defineSandbox({}, { name: "analysis", requires: ["bash", "python3"], volumes: [data] });
 
 /** Interpretation and proposal read the run's advice. */
-const readingBox = defineSandbox({ mounts }, { name: "reading", requires: ["bash"], mounts: ["config"] });
+const readingBox = defineSandbox({}, { name: "reading", requires: ["bash"], volumes: [config] });
 
 /** The LLM validator reviews the plugin, an input artifact; it sees nothing else. */
-const reviewBox = defineSandbox({ mounts }, { name: "review", requires: ["bash"] });
+const reviewBox = defineSandbox({}, { name: "review", requires: ["bash"] });
 
 /** The literature tools run under node in their own sandbox, with the network; only S2_API_KEY reaches them. */
 const literatureBox = defineSandbox({}, { name: "literature-tools", requires: ["node"] });
 const lit = toolset<typeof import("./tools/literature.ts")>("./tools/literature.ts", { sandbox: literatureBox, secrets: ["S2_API_KEY"] });
 
 /** The default protocol: input JSON on stdin, output JSON (with artifact drafts) on stdout. */
-const trainerRun = (script: string) => ["sh", "-c", `UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" exec uv run --offline --no-sync --project /mnt/trainer python /mnt/trainer/${script}`] as const;
+const trainerRun = (script: string) => ["sh", "-c", `UV_PROJECT_ENVIRONMENT="$WALLIS_ENV" exec uv run --offline --no-sync --project /trainer python /trainer/${script}`] as const;
 
 // --- Commands: the task package's domain code, as typed adapters ------------------
 
@@ -232,7 +236,7 @@ const healthScript = command({
 	sandbox: checksBox,
 	input: Type.Script({ Checkpoint }, `{ checkpoint: Checkpoint, health_config: string, model_type: string }`),
 	output: Type.Script({ HealthCheck }, `{ valid: boolean, policy: "blocking" | "recording", failed_checks: HealthCheck[] }`),
-	run: ["python3", "/mnt/checks/health.py"],
+	run: ["python3", "/checks/health.py"],
 });
 
 const fingerprintScript = command({
@@ -241,7 +245,7 @@ const fingerprintScript = command({
 	sandbox: checksBox,
 	input: Type.Script({ HealthCheck, Int }, `{ failed_checks: HealthCheck[], model_type: string, iteration: Int }`),
 	output: Type.Script({ CollapseEntry }, `{ entries: CollapseEntry[] }`),
-	run: ["python3", "/mnt/checks/fingerprint.py"],
+	run: ["python3", "/checks/fingerprint.py"],
 });
 
 const metricOrderScript = command({
@@ -250,7 +254,7 @@ const metricOrderScript = command({
 	sandbox: checksBox,
 	input: Type.Script(`{ data_scope: string }`),
 	output: Type.Script({ Direction }, `{ metric_id: string, direction: Direction }`),
-	run: ["python3", "/mnt/checks/metric_order.py"],
+	run: ["python3", "/checks/metric_order.py"],
 });
 
 const validateScript = command({
@@ -259,7 +263,7 @@ const validateScript = command({
 	sandbox: checksBox,
 	input: Type.Script({ ModelPlugin, Int }, `{ model: ModelPlugin, probe_seed: Int }`),
 	output: Type.Script(`{ passed: boolean, error: string | null, checks: Record<string, boolean> }`),
-	run: ["python3", "/mnt/checks/validate.py"],
+	run: ["python3", "/checks/validate.py"],
 });
 
 // --- Findings consolidation (cache_consolidator.list_merge) ---------------------
@@ -347,7 +351,7 @@ const interpreter = defineAgent(env, {
 		legacy_prediction_pool: Type.Record(Type.String(), Type.Integer()),
 		analysis_brief: Type.String(),
 	}),
-	// advice.md is read from the config mount.
+	// advice.md is read from the /config volume.
 	workspace: { access: "read", sandbox: readingBox },
 	maxTurns: 4,
 	needs: { structuredOutput: true, contextTokens: 128_000 },
@@ -812,7 +816,6 @@ export default workflow({
 	name: "siderius",
 	models,
 	toolsets: [lit],
-	mounts,
 	agents: [interpreter, dataAnalyst, literature, evidenceJudge, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
 	orchestrators: [stopCheck],
 	commands: [trainScript, evaluateScript, healthScript, fingerprintScript, metricOrderScript, validateScript],
@@ -822,9 +825,9 @@ export default workflow({
 	// USD and tokens are recorded for information only.
 	budget: { turns: 3000, computeMinutes: 24 * 60 },
 	// run_invariants.py: resolved_data_scope, health_config_sha256 and
-	// advice_sha256 are the `config` mount's content digest, pinned with the
-	// `data` mount's. The seed, workflow digest and resolved alias table are
-	// always pinned.
+	// advice_sha256 are the /config volume's content digest, which with the
+	// /data volume's is part of the cache key of every call that binds them.
+	// The seed, workflow digest and resolved alias table are always pinned.
 	input: Input,
 	output: Type.Object({
 		stop_reason: Type.String(),

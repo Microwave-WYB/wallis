@@ -3,7 +3,7 @@
 //
 //   {
 //     "models":    { "global": { alias: model }, "workflows": { name: { alias: model } } },
-//     "mounts":    { "global": { name: dir }, "workflows": { name: { mount: dir } } },
+//     "volumes":   { "global": { target: dir }, "workflows": { name: { target: dir } } },
 //     "bins":      { "global": { name: path }, "workflows": { name: { bin: path } } },
 //     "retries":   [5, 30, 120],          // transient executor errors, seconds between attempts
 //     "providers": { "openai": 4 },        // concurrent LLM calls per provider
@@ -15,11 +15,12 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Profile } from "./models.ts";
 import type { BinProfile } from "./confine.ts";
-import type { MountProfile } from "./mounts.ts";
+import type { VolumeProfile } from "./volumes.ts";
 
 export interface LocalProfile {
 	readonly models?: Profile;
-	readonly mounts?: MountProfile;
+	/** Host dirs for bind volumes, by container target. */
+	readonly volumes?: VolumeProfile;
 	readonly bins?: BinProfile;
 	/** Transient executor errors: retry delays in seconds (default [5, 30, 120]). */
 	readonly retries?: readonly number[];
@@ -44,9 +45,9 @@ export function loadProfile(root: string, home = process.env.WALLIS_HOME ?? join
 			workflows: { ...global.bins?.workflows, ...local.bins?.workflows },
 		},
 		retries: local.retries ?? global.retries,
-		mounts: {
-			global: { ...global.mounts?.global, ...local.mounts?.global },
-			workflows: { ...global.mounts?.workflows, ...local.mounts?.workflows },
+		volumes: {
+			global: { ...global.volumes?.global, ...local.volumes?.global },
+			workflows: { ...global.volumes?.workflows, ...local.volumes?.workflows },
 		},
 		providers: { ...global.providers, ...local.providers },
 		slots: { ...global.slots, ...local.slots },

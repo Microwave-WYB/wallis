@@ -127,7 +127,7 @@ function scripts() {
 	});
 }
 
-const mountsOf = (root: string) => ({ data: join(root, "data"), config: join(root, "siderius") });
+const volumesOf = (root: string) => ({ "/data": join(root, "data"), "/config": join(root, "siderius") });
 /** Commands are scripted here: no sandbox preflight (bins are still resolved and recorded). */
 const offline = { confine: "off", bins: { uv: "/bin/true", sh: "/bin/sh", python3: "/bin/true", bash: "/bin/bash" } } as const;
 const local = {};
@@ -148,7 +148,7 @@ test("the SIDERIUS workflow runs end to end on scripted agents and commands", as
 
 	const executor = agents();
 	const runner = scripts();
-	const result = await runWorkflow({ ...offline, workflow, dir: join(root, "run"), executor, commands: runner, input, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
+	const result = await runWorkflow({ ...offline, workflow, dir: join(root, "run"), executor, commands: runner, input, root, seed: 11, inboxPollMs: null, local, volumes: volumesOf(root) });
 	assert.equal(result.outcome?.type, "done", JSON.stringify(result.status));
 	const out = (result.outcome as unknown as { value: { stop_reason: string; iterations: number; incumbent: { score: number }; carried: Record<string, never> } }).value;
 	assert.equal(out.stop_reason, "iterations_exhausted");
@@ -204,7 +204,7 @@ test("the SIDERIUS workflow runs end to end on scripted agents and commands", as
 	assert.equal("steerable" in judgeNode && judgeNode.steerable, false);
 	const lastInterpret = executor.calls.filter((c) => c.agent === "interpret").at(-1)!;
 	assert.equal((lastInterpret.input as { history: { runs: unknown[] } }).history.runs.length, 6);
-	assert.ok(lastInterpret.workspace.mounts.config, "the config mount (advice.md) is readable");
+	assert.ok(lastInterpret.workspace.volumes.some((v) => v.target === "/config"), "the /config volume (advice.md) is readable");
 
 	// Each candidate: Trial rounds, then one forced Formal round.
 	const scopes = runner.calls.filter((c) => c.command === "train").map((c) => (c.input as { scope: string }).scope);
@@ -216,7 +216,7 @@ test("the SIDERIUS workflow runs end to end on scripted agents and commands", as
 	assert.ok(JSON.parse(result.snapshot).spent.turns > 0);
 	// The implementor's sandbox has the data, never the trainer or the checks.
 	const implement = executor.calls.find((c) => c.agent === "implement")!;
-	assert.deepEqual(Object.keys(implement.workspace.mounts), ["data"]);
+	assert.deepEqual(implement.workspace.volumes.map((v) => v.target), ["/data"]);
 	assert.equal(executor.calls.find((c) => c.agent === "literature_review")!.sandbox.type, "none");
 });
 
@@ -228,7 +228,7 @@ test("JudgeStop request_input: the stop-check orchestrator node asks the orchest
 			evidence_judge: { output: { brief: "nothing new", kept: [], stop: { recommend: true, reason: "the evidence repeats" } } },
 		});
 	const askInput = { ...input, stops: { noImprovementBodies: 0, judgeCriterion: "stop when evidence repeats", judgeOnMet: "request_input" } };
-	const first = await runWorkflow({ ...offline, workflow, dir, executor: make(), commands: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
+	const first = await runWorkflow({ ...offline, workflow, dir, executor: make(), commands: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local, volumes: volumesOf(root) });
 	assert.deepEqual(first.status, { type: "idle", reason: null });
 	const asking = first.run.nodes.find((n) => n.type === "orchestrator_pending")!;
 	assert.deepEqual(asking.type === "orchestrator_pending" && [asking.name, asking.input], ["stop_check", { iteration: 1, criterion: "stop when evidence repeats", recommendation: "the evidence repeats" }]);
@@ -242,7 +242,7 @@ test("JudgeStop request_input: the stop-check orchestrator node asks the orchest
 	appendInbox(runPaths(dir), { id: "s1", type: "submit", node: asking.id, value: { decision: "maybe", note: "" }, by: "human" });
 	appendInbox(runPaths(dir), { id: "s2", type: "submit", node: asking.id, value: { decision: "stop", note: "the orchestrator agreed" }, by: "human" });
 	const executor = make();
-	const done = await runWorkflow({ ...offline, workflow, dir, executor, commands: scripts(), root, local, mounts: mountsOf(root), inboxPollMs: null });
+	const done = await runWorkflow({ ...offline, workflow, dir, executor, commands: scripts(), root, local, volumes: volumesOf(root), inboxPollMs: null });
 	assert.equal(refusedEntry(runPaths(dir), "s1")?.type, "invalid_answer");
 	assert.equal(refusedEntry(runPaths(dir), "s2"), null);
 	const out = (done.outcome as unknown as { value: { stop_reason: string; iterations: number } }).value;

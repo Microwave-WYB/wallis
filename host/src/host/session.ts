@@ -49,7 +49,7 @@ import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, t
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
-import { type Mount, MountError, mountDigest, resolveMounts } from "./mounts.ts";
+import { bindDigest, checkDevices, type ResolvedVolume, resolveVolumes, VolumeError } from "./volumes.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
@@ -85,10 +85,10 @@ export interface SessionOptions {
 	readonly root?: string;
 	/** New run: call-time alias remaps. Resume: rebinds, each logged as `alias_rebound`. */
 	readonly models?: Readonly<Record<string, string>>;
-	/** Call-time mount remaps (name -> dir). A changed mount digest is a pin mismatch on resume. */
-	readonly mounts?: Readonly<Record<string, string>>;
+	/** Call-time host dirs for bind volumes (container target -> dir). A changed content digest misses the cache of the calls that bind it. */
+	readonly volumes?: Readonly<Record<string, string>>;
 	readonly profile?: Profile;
-	/** The local profile (mounts, provider limits, slots). Defaults to the one on disk. */
+	/** The local profile (volumes, provider limits, slots). Defaults to the one on disk. */
 	readonly local?: LocalProfile;
 	/** Resume: raised limits, each logged as `budget_raised`. */
 	readonly budget?: Readonly<Partial<Record<BudgetKind, number>>>;
@@ -117,7 +117,7 @@ export interface RunResult {
 	readonly resumed: boolean;
 }
 
-/** The core refused the run as a whole (pin mismatch, path divergence, invalid declarations, unmet needs, unset mounts). */
+/** The core refused the run as a whole (pin mismatch, path divergence, invalid declarations, unmet needs, invalid or missing volumes). */
 export class RunRefused extends Error {
 	override readonly name = "RunRefused";
 	readonly refusal: Refusal;
@@ -180,9 +180,10 @@ export class Session {
 	#sandbox: Sandbox | null = null;
 	#decl!: Declarations;
 	#local!: LocalProfile;
-	#mounts: Record<string, Mount> = {};
+	/** Per sandbox: its volumes, resolved. */
+	#volumes: Record<string, ResolvedVolume[]> = {};
 	#boxes: Sandboxes | null = null;
-	/** Per sandbox: its identity (declaration, binaries, mount content), part of command node digests. */
+	/** Per sandbox: its identity (declaration, binaries, bind volume content), part of command and agent node digests. */
 	#sandboxDigests: Record<string, string> = {};
 	/** Per node name: the digest of its definition, the first part of its journal key. */
 	readonly #nodeDigests = new Map<string, string>();
@@ -406,18 +407,20 @@ export class Session {
 		this.#decl = decl;
 		this.#local = o.local ?? loadProfile(this.#root);
 		try {
-			// The caller's mounts of a new run are noted, and reused by every later host of the run.
-			const callTime = o.mounts ?? readMeta(this.paths)?.mounts;
-			this.#mounts = resolveMounts(decl.core.name, dirname(this.#workflow), decl.mounts, { root: this.#root, callTime, profile: this.#local.mounts });
-			if (callTime !== undefined && Object.keys(callTime).length > 0) this.#note("mounts", Object.fromEntries(Object.keys(callTime).map((n) => [n, this.#mounts[n]!.dir])));
+			// The caller's host dirs for bind volumes of a new run are noted, and reused by every later host of the run.
+			const callTime = o.volumes ?? readMeta(this.paths)?.volumes;
+			this.#volumes = resolveVolumes(decl.core.name, dirname(this.#workflow), decl.sandboxes, { root: this.#root, callTime, profile: this.#local.volumes });
+			checkDevices(decl.sandboxes);
+			if (callTime !== undefined && Object.keys(callTime).length > 0) {
+				const dirs = new Map(Object.values(this.#volumes).flat().map((v) => [v.target, v.dir]));
+				this.#note("volumes", Object.fromEntries(Object.keys(callTime).map((t) => [t, dirs.get(t)!])));
+			}
 		} catch (error) {
-			if (error instanceof MountError) throw new RunRefused(error.refusal);
+			if (error instanceof VolumeError) throw new RunRefused(error.refusal);
 			throw error;
 		}
 		const inputs: Record<string, string> = Object.fromEntries(decl.pin.files.map((f) => [f, digestFile(resolve(this.#root, f))]));
-		// Mounts are read in place, never copied: their content digest is pinned.
-		for (const [name, mount] of Object.entries(this.#mounts)) inputs[`mount.${name}`] = mountDigest(mount.dir);
-		this.#prepareSandboxes(prior.length === 0, inputs);
+		this.#prepareSandboxes(prior.length === 0);
 
 		let input: Json;
 		let seed: number;
@@ -496,7 +499,7 @@ export class Session {
 	 * each sandbox's checks and setup unless confinement is off. Typed
 	 * refusals: requires_missing, requires_broken, setup_failed, unknown_bin.
 	 */
-	#prepareSandboxes(fresh: boolean, inputs: Readonly<Record<string, string>>): void {
+	#prepareSandboxes(fresh: boolean): void {
 		const o = this.#options;
 		const decls = this.#decl.sandboxes;
 		const meta = readMeta(this.paths);
@@ -507,10 +510,13 @@ export class Session {
 			const confine = o.confine ?? "auto";
 			const can = confine !== "off" && bwrapAvailable();
 			if (confine === "require" && !can) throw new Error("bubblewrap is required but cannot create a sandbox here");
-			const mounts = Object.fromEntries(Object.entries(this.#mounts).map(([n, m]) => [n, m.dir]));
-			const digests = Object.fromEntries(Object.keys(mounts).map((n) => [n, inputs[`mount.${n}`] ?? ""]));
-			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, digests)]));
-			this.#boxes = can ? new Sandboxes({ decls, bins, mounts, mountDigests: digests }) : null;
+			// Bind volumes are read in place: their content digest is part of the cache key of every call that binds them.
+			const digests = new Map<string, string>();
+			const bindDigests = Object.fromEntries(
+				Object.entries(this.#volumes).map(([n, vs]) => [n, Object.fromEntries(vs.flatMap((v) => (v.kind === "bind" ? [[v.target, digests.get(v.dir) ?? digests.set(v.dir, bindDigest(v.dir)).get(v.dir)!]] : [])))]),
+			);
+			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, bindDigests[n] ?? {})]));
+			this.#boxes = can ? new Sandboxes({ decls, bins, volumes: this.#volumes, bindDigests }) : null;
 			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
 			this.#note("bins", Object.fromEntries(Object.entries(bins).map(([n, path]): [string, Json] => [n, versions[n] === undefined ? { path } : { path, version: versions[n] }])));
 			this.#note("base", meta?.base ?? baseIdentity());
@@ -605,8 +611,8 @@ export class Session {
 		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs, ...(overlay ? { overlay } : {}), trees: dirs.trees }) };
 	}
 
-	#mountDirs(names: readonly string[]): Record<string, string> {
-		return Object.fromEntries(names.map((n) => [n, this.#mounts[n]!.dir]));
+	#nodeVolumes(sandbox: string | null): readonly ResolvedVolume[] {
+		return sandbox === null ? [] : (this.#volumes[sandbox] ?? []);
 	}
 
 	#preflight(): void {
@@ -754,7 +760,7 @@ export class Session {
 		if (digest === undefined) {
 			const definition =
 				r.type === "call"
-					? { kind: "agent", ...this.#decl.agents[r.agent!], sandbox: this.#decl.agents[r.agent!]?.sandbox ? this.#decl.sandboxes[this.#decl.agents[r.agent!]!.sandbox!] : null }
+					? { kind: "agent", ...this.#decl.agents[r.agent!], env: this.#sandboxDigests[this.#decl.agents[r.agent!]?.sandbox ?? ""] ?? null }
 					: r.type === "command"
 						? { kind: "command", ...this.#decl.commands[r.command!], env: this.#sandboxDigests[this.#decl.commands[r.command!]?.sandbox ?? ""] ?? null }
 						: r.type === "tool"
@@ -961,9 +967,8 @@ export class Session {
 		}
 		let workspace: NodeDirs;
 		try {
-			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
 			// The call's /w: its session's layers, with its own upper dir on top.
-			workspace = prepareNode(this.paths.dir, id, effect.input, declaration.input, this.#mountDirs(mounts), effect.layers, effect.attempt);
+			workspace = prepareNode(this.paths.dir, id, effect.input, declaration.input, this.#nodeVolumes(declaration.sandbox), effect.layers, effect.attempt);
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -1195,7 +1200,7 @@ export class Session {
 		if (!runner) return later(() => failed({ type: "unrunnable", error: "no command runner" }));
 		let workspace: NodeDirs;
 		try {
-			workspace = prepareNode(this.paths.dir, id, effect.input, declaration.input, this.#mountDirs(this.#decl.sandboxes[declaration.sandbox]!.mounts));
+			workspace = prepareNode(this.paths.dir, id, effect.input, declaration.input, this.#nodeVolumes(declaration.sandbox));
 		} catch (error) {
 			return later(() => failed({ type: "unrunnable", error: errorText(error) }));
 		}

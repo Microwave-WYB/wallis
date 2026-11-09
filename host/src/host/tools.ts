@@ -333,7 +333,7 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 		const box = spec.sandbox;
 		/**
 		 * The sandbox view the agent's paths resolve in (`/w`, `/in`,
-		 * `/in/trees/<hex>`, `/mnt/<name>`): one component at a time, never
+		 * `/in/trees/<hex>`, each volume's target): one component at a time, never
 		 * through a host symlink; a symlink is followed inside the view, and one
 		 * that leads out of it is refused (`ViewError`, an error for the model).
 		 */
@@ -341,11 +341,12 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			{ at: LAYOUT.work, stack: ws.work === null ? [ws.scratch] : [ws.work.upper, ...[...ws.work.lowers].reverse()], upper: ws.scratch },
 			{ at: LAYOUT.inputs, stack: [ws.inputs], upper: null },
 			...ws.trees.map((t) => ({ at: t.at, stack: [...t.lowers].reverse(), upper: null })),
-			...Object.entries(ws.mounts).map(([m, dir]) => ({ at: `${LAYOUT.mounts}/${m}`, stack: [dir], upper: null })),
+			...ws.volumes.map((v) => ({ at: v.target, stack: [v.dir], upper: v.kind === "named" ? v.dir : null })),
 		];
 		const view = (path: string, create = false) => locate(roots, path.startsWith("/") ? path : `${LAYOUT.work}/${path}`, true, create);
-		const mounts = Object.keys(ws.mounts).map((m) => `${LAYOUT.mounts}/${m}`).join(", ") || "none";
-		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files) and the mounts ${mounts} are read-only`;
+		const binds = ws.volumes.flatMap((v) => (v.kind === "bind" ? [v.target] : []));
+		const caches = ws.volumes.flatMap((v) => (v.kind === "named" ? [v.target] : []));
+		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files)${binds.length > 0 ? ` and ${binds.join(", ")}` : ""} are read-only${caches.length > 0 ? `; ${caches.join(", ")} ${caches.length > 1 ? "are caches" : "is a cache"} (writable, shared across runs)` : ""}`;
 		const builtins: Record<string, WallisToolRun> = {
 			read: {
 				name: "read",

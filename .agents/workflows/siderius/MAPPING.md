@@ -8,8 +8,8 @@ prompts, `trainer/` and `checks/` are placeholders.
 
 Since round 5 the directory is laid out by who may see what: `trainer/`
 (pyproject, lock, train, evaluate) and `checks/` (Health, fingerprints, the
-deterministic validator, the metric order) are mounted only into the
-sandboxes that run them, and `prompts/` is never mounted anywhere, so no
+deterministic validator, the metric order) are bound only into the
+sandboxes that run them, and `prompts/` is never bound anywhere, so no
 agent or command can read the judge's prompt or the Health code it is
 graded by.
 
@@ -40,20 +40,20 @@ the SIDERIUS code, the code's behavior is noted here.
 | `model_exploration.py::run_workflow` loop, `range(start, start + max_iterations)` | `workflow({ run })`: a `for` loop over `input.maxIterations` |
 | `ChainState` and `research_history.py` | Local variables of the body: `runs`, `knowledgeCache`, `findingsArchive`, `collapseHistory`, `predictionV1`/`predictionV2`/`infoGainV2`, `evidence`, `incumbent`, `lastRejections`. The run returns them as `carried`. |
 | Target check before each iteration (2159) | `atLeast(direction, incumbent.score, target)` on the local `incumbent` |
-| `ResultInterpretationAgent` (route `interpret`) | Agent `interpret`. Its input carries `history` (runs, knowledge cache, collapse history; each `Foldable`) and `prediction_memory`. It reads `advice.md` from the `config` mount (`sandbox: "read-only"`). |
-| `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with `workspace: { access: "exec", sandbox: analysis }`: the data mount read-only and a shell (`bash`), which replaces SIDERIUS's `run_skill` tool. Its input carries the last 4 run summaries. |
+| `ResultInterpretationAgent` (route `interpret`) | Agent `interpret`. Its input carries `history` (runs, knowledge cache, collapse history; each `Foldable`) and `prediction_memory`. It reads `advice.md` from the `/config` volume (`access: "read"`). |
+| `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with `workspace: { access: "exec", sandbox: analysis }`: the `/data` volume read-only and a shell (`bash`), which replaces SIDERIUS's `run_skill` tool. Its input carries the last 4 run summaries. |
 | `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review`: no workspace (no filesystem); `tools: [lit.searchArxiv, lit.searchScholar]`, custom tools in `tools/literature.ts` (read-only, `replay: "safe"`), served by wallis under node from the `literature-tools` sandbox with the network. `S2_API_KEY` reaches only that process. The knowledge cache arrives `Foldable`. |
 | Judge strategies, projection caps (`judge-strategies-contract.md`) | Agent `evidence_judge`, `steerable: false`. `judgeProjection` in body code: the newest 24 entries without self-reported confidence, oldest dropped until the JSON fits 4000 chars, with an `omitted` count. |
 | `JudgeStop` (authored loops), `on_met: "stop"` | `stops.judgeCriterion` plus `verdict.stop.recommend`, with `stops.judgeOnMet: "stop"` |
 | `JudgeStop` `on_met: "request_input"` (pause and ask the operator) | `stops.judgeOnMet: "request_input"`: the orchestrator node `stop_check` carries the iteration, the criterion and the judge's reason; the orchestrator submits `stop` or `continue` (`submit_result`, or `wallis submit`), checked against its answer schema. |
 | `NoImprovementStop` | `stops.noImprovementBodies` |
-| `MLModelProposalAgent` (route `propose`), `max_proposal_attempts = 3` | Agent `propose` in a loop of `input.maxProposalAttempts`, with `history` in its input and the `config` mount. `previous_failures` collects validation errors and physical rejections. |
+| `MLModelProposalAgent` (route `propose`), `max_proposal_attempts = 3` | Agent `propose` in a loop of `input.maxProposalAttempts`, with `history` in its input and the `/config` volume. `previous_failures` collects validation errors and physical rejections. |
 | `MLModelImplementor` and `MLCodeValidatorAgent`, `max_impl_attempts = 3` | `subWorkflow(implement_validate)`: agent `implement` in the `coding` sandbox (the data only, never `trainer/` or `checks/`), then command `check_plugin` (checks 1–7 and 9), then agent `validate` (check 8, the LLM review) in the `review` sandbox (its input artifact only). The loop is bounded and feeds failures back. |
 | A failed iteration still uses a slot | Pushes a `no_candidate` run summary, then `continue` |
 | `HyperparamTuningAgent`, planner and reflector routes | `subWorkflow(tune)` with agents `tune_planner` (the knowledge cache in its input, `Foldable`) and `tune_reflector` |
 | Trial rounds, `force_formal_round`, `formal_round_strategy = full_clone` | `isTrial = round < maxRounds`. The Formal round inherits the best Trial config. |
 | `attempts_per_round = 3`, `attempts_per_formal_round = 5`, `max_fail_rounds = 3` | `input.tuning.*`. OOM and gate refusals count as attempts. The Trial attempts of one round run in parallel (`ctx.map`; resource slots throttle the GPUs) and the round keeps its best scored attempt; Formal attempts stay sequential. |
-| Training, inference and `evaluate_metric` skills | Commands `train` and `evaluate` in the `trainer` sandbox: `uv` and `sh` required, `trainer/` and the data mounted, the env built once by `uv sync --frozen` (setup, cached by digest) and used offline. Trial and formal time and epoch caps are inputs. |
+| Training, inference and `evaluate_metric` skills | Commands `train` and `evaluate` in the `trainer` sandbox: `uv` and `sh` required, `./trainer` and the data bound read-only, the env built once by `uv sync --frozen` (setup, cached by digest) and used offline. Trial and formal time and epoch caps are inputs. |
 | Model plugin and checkpoints on disk (`iteration_NNN/attempt_NNN/impl_NNN/`, plugin dirs) | Artifacts: the implementor exports the plugin (`ModelPlugin`), `train` mounts it with the dataset and returns a `Checkpoint` artifact, which `evaluate` and Health mount. Nodes share no directories. |
 | `resolved_data_scope` data files | Mount `data` (read-only, supplied by the caller or the local profile); its content digest is pinned |
 | Health (`round_health.py`), effective Health config | Command `health` in the `checks` sandbox, run in parallel with `evaluate` on every trained checkpoint, reading `config/health_config.yaml`. |
@@ -66,7 +66,7 @@ the SIDERIUS code, the code's behavior is noted here.
 | `_dedupe_error_signatures` (no cap, inside each cache entry) | `mergeSignatures`: deduped on `(failure_class, top_user_frame, error_type)`, `evidence_iters` unioned, the longer `last_frames` kept, the first message wins; stored in the model's cache entry |
 | `PredictionMemory`: v1 pool, v2 by semantics, v2 information gain, `prediction_evaluation_semantics` | Locals `predictionV1` (the first pool the interpreter reports), `predictionV2` (outcome counts), `infoGainV2`; version 2. The v2 outcome comes from `evaluatePrediction`, the `prediction.py` rule. |
 | `chain_formal_incumbent_reference` | The local `incumbent`, replaced on strict improvement; each replacement is `ctx.observe("incumbent", …)` for monitoring |
-| `run_invariants_lock.json`: `resolved_data_scope`, `health_config_sha256`, `advice_sha256`, `run_seed` | The `config` mount (`data_scope.json`, `health_config.yaml`, `advice.md`) and the `data` mount: their content digests are pinned. The seed, workflow digest and alias table are pinned automatically. A mismatch on resume is refused and names the field. |
+| `run_invariants_lock.json`: `resolved_data_scope`, `health_config_sha256`, `advice_sha256`, `run_seed` | The `/config` bind volume (`data_scope.json`, `health_config.yaml`, `advice.md`) and the `/data` one: their content digests are part of the cache key of every call whose sandbox binds them, so a change re-runs those calls and only those. The seed, workflow digest and alias table are pinned automatically; a mismatch on resume is refused and names the field. |
 | Locked knobs (windows, policies, portions, evidence order …) | Constants in `workflow.ts` are covered by the workflow digest. Values in the run input are recorded in the log's `started` event and replayed on resume, so they cannot drift. |
 | `run_seed`, `probe_seed_context(run_seed, iteration, attempt)`, `SeedCoordinates` | `ctx.seed` and `probeSeed()`. `Math.random` in the body is seeded from the pin. |
 | `llm.json` routes (`interpret`, `data_analysis`, `lit_review.*`, `propose`, `implement`, `validate`, `tune.*`, `judge`, `cache_consolidator`) | `defineModels` alias table. Empty aliases resolve to `default`; callers remap aliases (as `openai-moderate-v1` does). |
@@ -117,7 +117,7 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 7. **Plugins.** Not expressed: staging, promotion to the global loss and model
    library, the capability registry and its cleanup. These are filesystem
    writes across runs; in wallis, writes leave a run only as artifacts and
-   `wallis export`, and mounts are read-only.
+   `wallis export`, and bind volumes are read-only.
 8. **Startup.** Not expressed:
    - launch admission;
    - hardware context;
@@ -160,15 +160,16 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 ### Invariants, budgets, resources
 
 16. **Run invariants.** About 45 canonical fields are locked in SIDERIUS.
-    Here the `config` and `data` mounts (content digests), the seed and the
-    alias table are pinned explicitly; the rest are covered by the workflow
+    Here the seed and the alias table are pinned explicitly, and the
+    `/config` and `/data` volumes' content digests are part of the cache key
+    of the calls that bind them; the rest are covered by the workflow
     digest or the recorded input. Not expressed: provenance fields
     (recorded, never compared), the legacy-lock refusals, and per-output
-    stamp checks. A mount digest hashes every file, with per-file hashes
+    stamp checks. A bind digest hashes every file, with per-file hashes
     cached by path, mtime and size; a content change that keeps all three
     is not detected.
 17. **Advice content.** `interpret` and `propose` read `advice.md` from the
-    `config` mount with their read-only fs tools; the body itself still
+    `/config` volume with their read-only fs tools; the body itself still
     cannot read files.
 18. **Compute budgets.** SIDERIUS budgets wall time per attempt (Trial and
     Formal), VRAM (`trial_vram_budget_gb`, `gpu_pair_ceiling_gib`), epochs
@@ -177,7 +178,7 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
     `evaluate` declare `resources` (GPU, memory) and wait for machine slots;
     VRAM is not measured.
 19. **Resource envelope and access policy for data analysis.** Scripts run
-    under bubblewrap and see only their input artifacts, their mounts and
+    under bubblewrap and see only their input artifacts, their volumes and
     their scratch dir. Not expressed: SIDERIUS's anti-leakage policy
     (which files and columns an analysis may read), per-skill timeouts,
     device and memory envelopes. The analysis agent's `read-only` level is
@@ -205,7 +206,7 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 26. Health now runs on every trained checkpoint, in parallel with
     `evaluate`, not only on scored ones; a round's parallel Trial attempts
     all run (more compute than SIDERIUS's stop-at-first-success).
-27. The `config` mount holds the advice and the Health config together, so
+27. The `/config` volume holds the advice and the Health config together, so
     `interpret` and `propose` (which read the advice) can also read the
     Health config file, though not the Health code.
 28. Nested workflows return their outputs; the main body folds them into

@@ -2,7 +2,7 @@
 // The wallis CLI. Runs live under `.wallis/runs/` of the project (the
 // working directory, or --root).
 //
-//   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--mount name=dir]... [--executor module] [--detach]
+//   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--volume target=dir]... [--executor module] [--detach]
 //   wallis resume <run> [--model a=m]... [--budget kind=limit]... [--executor module] [--detach]
 //   wallis describe <workflow>               its input, agents and the questions it may ask (JSON)
 //   wallis doc                               how to write and orchestrate workflows
@@ -72,7 +72,7 @@ const { values, positionals } = parseArgs({
 		input: { type: "string" },
 		seed: { type: "string" },
 		model: { type: "string", multiple: true },
-		mount: { type: "string", multiple: true },
+		volume: { type: "string", multiple: true },
 		bin: { type: "string", multiple: true },
 		turns: { type: "string" },
 		budget: { type: "string", multiple: true },
@@ -246,7 +246,7 @@ async function main(): Promise<number> {
 				input: values.input ? (JSON.parse(values.input) as Json) : null,
 				seed: values.seed ? Number(values.seed) : undefined,
 				models: pairs(values.model),
-				mounts: pairs(values.mount),
+				volumes: pairs(values.volume),
 				bins: pairs(values.bin),
 				// Binaries resolve against the CALLER's PATH, not the detached host's.
 				callerPath: process.env.PATH,

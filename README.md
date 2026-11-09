@@ -38,8 +38,8 @@ and `wallis doc` for a short guide.
 | `host/examples/two-node/` | A two-node workflow and a runner that can kill itself mid-call |
 | `host/examples/ask/` | Two nodes, the first of which asks the human a question |
 | `host/src/host/pi.ts`, `tools.ts`, `toolsets.ts` | The pi executor (pi-agent-core: retries, per-turn checkpoints, turn quota, compaction) and the wallis tool layer (codemode, workspace file tools, custom toolsets and MCP servers in their own sandboxes, journaled results, caps with spills, the write-rule warnings) |
-| `host/src/host/capability.ts`, `render.ts`, `mounts.ts` | Capabilities (`OwnedRun`, `IdleNode`, `SteerableNode`, `LiveNode`, `ResumableRun`), Foldable input rendering and the window check, read-only mounts |
-| `host/src/host/confine.ts`, `commands.ts`, `slots.ts` | Declared bwrap sandboxes (binaries, setup, mounts); command calls; machine-wide resource and provider slots |
+| `host/src/host/capability.ts`, `render.ts`, `volumes.ts` | Capabilities (`OwnedRun`, `IdleNode`, `SteerableNode`, `LiveNode`, `ResumableRun`), Foldable input rendering and the window check, sandbox volumes (preflight, bind digests) |
+| `host/src/host/confine.ts`, `commands.ts`, `slots.ts` | Declared bwrap sandboxes (binaries, setup, volumes, devices); command calls; machine-wide resource and provider slots |
 | `.agents/workflows/siderius/` | SIDERIUS expressed as a wallis workflow; `MAPPING.md` lists what maps and what does not |
 | `comparison/` | The framework-free alternative and the comparison experiment; see its README |
 | `tools/gleam-codegen.mjs` | Drives `gleam lsp` code actions to generate decoders and JSON encoders |
@@ -59,7 +59,7 @@ Runs live under `.wallis/runs/` of the project. The CLI (run it with
 
 ```sh
 wallis doc | describe <workflow>       # how to write and drive workflows | what a workflow asks (JSON)
-wallis run <workflow> --input '{...}' [--mount name=dir] [--bin name=path] --executor <module>   # until it needs attention
+wallis run <workflow> --input '{...}' [--volume /target=dir] [--bin name=path] --executor <module>   # until it needs attention
 wallis wait <run>        # in the background: returns when a node asks, the run pauses or ends
 wallis wait              # in the background: returns when any of your own runs needs attention
 wallis pending [--json]  # what waits for you here, with the actions that resolve it
@@ -80,7 +80,7 @@ The default executor is pi (`host/src/executors/pi.ts`, pi-ai's built-in
 providers, auth from their usual environment variables). `--executor` takes
 any module whose default export returns `{ executor, commands? }`, such as the
 scripted fake in `host/test/fixtures/fake-executor.ts`. Machine settings
-(mount dirs, binaries, retry delays, provider limits, slots, model remaps) live in the local profile:
+(bind volume dirs by target, binaries, retry delays, provider limits, slots, model remaps) live in the local profile:
 `~/.config/wallis/profile.json` and `.wallis/profile.json`.
 
 ## Acknowledgements

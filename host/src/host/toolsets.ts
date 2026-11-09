@@ -3,7 +3,7 @@
 //
 // - A toolset is bundled with esbuild together with the runner
 //   (toolset-runner.ts) and run under node in the toolset's sandbox, with
-//   the network it declares (default full) and only its named secrets in
+//   the network it declares (default host) and only its named secrets in
 //   its environment.
 // - An MCP server from mcp.json runs in its overlay sandbox, with the
 //   overlay's network; `${VAR}` secrets reach its environment only. It

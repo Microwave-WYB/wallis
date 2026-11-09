@@ -111,11 +111,17 @@ generics or wrappers that add no proof.
   and commands never get network; tool processes do. Every tool result is
   journaled; write-capable tools given to agents are warnings.
 - The sandbox layout is fixed: `/in` (inputs, read-only), `/w` (the
-  workspace; an agent's is an overlay of its session's layers), `/mnt/<name>`
-  (mounts, read-only), `/tmp`. Layers and blobs are written before the event
+  workspace; an agent's is an overlay of its session's layers), each volume
+  at its target, `/tmp`. Layers and blobs are written before the event
   that names them.
-- Sandboxes are declared (`defineSandbox`), bwrap only, nothing implicit:
-  never mount the workflow dir implicitly, never add a writable mount.
+- Sandboxes are declared (`defineSandbox`), bwrap only, nothing implicit,
+  in compose vocabulary: `volumes` (`"./x:/x:ro"` binds, read-only only;
+  `"name:/target"` named caches), `devices`, `network`, `environment`.
+  Never mount the workflow dir implicitly, never add a writable bind. A
+  bind's content digest is part of the cache key of every call that binds
+  it; named volumes are outside every key (results must not depend on
+  them). Volume rules are both a type (`CheckVolume`) and a preflight
+  parse (`parseVolume`, `resolveVolumes`).
 - Recovery is the most important property: keep transient-error retries
   in the executor, per-turn checkpoints, held node failures, and the
   journal as a cache (node digest, input, occurrence) working, with tests.

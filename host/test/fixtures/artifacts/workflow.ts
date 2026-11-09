@@ -1,16 +1,14 @@
 // Test fixture: artifacts handed between commands and an agent, read-only
-// mounts, and a probe of the command sandbox. Nothing is implicit: the
-// commands' code arrives through the `scripts` mount.
+// bind volumes, and a probe of the command sandbox. Nothing is implicit: the
+// commands' code arrives through the `/scripts` volume.
 
-import { Artifact, command, defineAgent, defineModels, defineMounts, defineSandbox, Type, workflow } from "wallis";
+import { Artifact, command, defineAgent, defineModels, defineSandbox, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "fake/default" });
-/** The corpus has no default: the caller or the local profile supplies it. */
-const mounts = defineMounts({ corpus: "", scripts: "./scripts" });
-
-const node = defineSandbox({ mounts }, { name: "node", requires: ["node"], mounts: ["scripts"] });
-const trainer = defineSandbox({ mounts }, { name: "trainer", requires: ["node"], mounts: ["scripts", "corpus"] });
-const writing = defineSandbox({ mounts }, { name: "writing", requires: ["bash"], mounts: ["scripts"] });
+const node = defineSandbox({}, { name: "node", requires: ["node"], volumes: ["./scripts:/scripts:ro"] });
+/** ./corpus does not exist: the caller or the local profile gives the host dir for /corpus. */
+const trainer = defineSandbox({}, { name: "trainer", requires: ["node"], volumes: ["./scripts:/scripts:ro", "./corpus:/corpus:ro"] });
+const writing = defineSandbox({}, { name: "writing", requires: ["bash"], volumes: ["./scripts:/scripts:ro"] });
 
 /** The default protocol: input JSON on stdin; the output JSON (with artifact drafts) on stdout. */
 const make = command({
@@ -18,7 +16,7 @@ const make = command({
 	sandbox: node,
 	input: Type.Object({ text: Type.String() }),
 	output: Type.Object({ model: Artifact("text/plain") }),
-	run: ["node", "/mnt/scripts/make.mjs"],
+	run: ["node", "/scripts/make.mjs"],
 });
 
 /** A typed adapter: argv built from the mounted input, the output parsed from stdout and a file. */
@@ -27,7 +25,7 @@ const train = command({
 	sandbox: trainer,
 	input: Type.Object({ model: Artifact("text/plain") }),
 	output: Type.Object({ checkpoint: Artifact("application/octet-stream"), size: Type.Number() }),
-	run: (i) => ["node", "/mnt/scripts/train.mjs", i.model.path],
+	run: (i) => ["node", "/scripts/train.mjs", i.model.path],
 	parse: (r) => ({ checkpoint: r.file("ckpt.bin", "application/octet-stream"), size: Number(r.stdout.trim()) }),
 	resources: { memoryGb: 1 },
 });
@@ -47,7 +45,7 @@ const probe = command({
 	sandbox: node,
 	input: Type.Object({ model: Artifact("text/plain"), outside: Type.String() }),
 	output: Type.Record(Type.String(), Type.Boolean()),
-	run: ["node", "/mnt/scripts/probe.mjs"],
+	run: ["node", "/scripts/probe.mjs"],
 });
 
 const writer = defineAgent(
@@ -65,7 +63,6 @@ const writer = defineAgent(
 export default workflow({
 	name: "artifacts",
 	models,
-	mounts,
 	agents: [writer],
 	commands: [make, train, lost, probe],
 	input: Type.Object({ outside: Type.String() }),
