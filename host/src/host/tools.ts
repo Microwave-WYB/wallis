@@ -334,7 +334,7 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			...ws.trees.map((t) => ({ at: t.at, stack: [...t.lowers].reverse(), upper: null })),
 			...Object.entries(ws.mounts).map(([m, dir]) => ({ at: `${LAYOUT.mounts}/${m}`, stack: [dir], upper: null })),
 		];
-		const view = (path: string) => locate(roots, path.startsWith("/") ? path : `${LAYOUT.work}/${path}`, true);
+		const view = (path: string, create = false) => locate(roots, path.startsWith("/") ? path : `${LAYOUT.work}/${path}`, true, create);
 		const mounts = Object.keys(ws.mounts).map((m) => `${LAYOUT.mounts}/${m}`).join(", ") || "none";
 		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files) and the mounts ${mounts} are read-only`;
 		const builtins: Record<string, WallisToolRun> = {
@@ -360,7 +360,7 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 				parameters: { type: "object", required: ["path", "content"], properties: { path: { type: "string" }, content: { type: "string" } } },
 				run: async (args) => {
 					const { path, content } = args as { path: string; content: string };
-					writeViewFile(view(path), path, content);
+					writeViewFile(view(path, true), path, content);
 					return { text: `wrote ${content.length} characters to ${path}` };
 				},
 			},

@@ -29,7 +29,9 @@ export const MAX_DEPTH = 16;
 /** One entry of a layer. `whiteout`: deleted here; an `opaque` dir hides the layers below it. */
 export type Entry =
 	| { readonly type: "file"; readonly sha256: string; readonly mode: number; readonly size: number }
-	| { readonly type: "dir"; readonly opaque: boolean }
+	| { readonly type: "dir"; readonly opaque: boolean; readonly mode: number }
+	/** A FIFO, socket or device node: kept as it is (hardlinked in a squash). */
+	| { readonly type: "special"; readonly mode: number }
 	| { readonly type: "symlink"; readonly target: string }
 	| { readonly type: "whiteout" };
 
@@ -91,28 +93,21 @@ export function removeWork(root: string): void {
 	rmSync(root, { recursive: true, force: true });
 }
 
-/** Paths under `dir` marked opaque by overlayfs (xattr user.overlay.opaque = y), relative to it. */
-function opaqueDirs(dir: string): Set<string> {
-	const dump = spawnSync("getfattr", ["-R", "--absolute-names", "-d", "-m", "^user\\.overlay\\.opaque$", dir], { encoding: "utf8" });
-	const found = new Set<string>();
-	let current: string | null = null;
-	for (const line of dump.stdout.split("\n")) {
-		if (line.startsWith("# file: ")) current = line.slice("# file: ".length);
-		else if (current !== null && line === 'user.overlay.opaque="y"') found.add(current.slice(dir.length + 1));
-	}
-	return found;
+/** The xattr tools overlay emulation needs (opaque dirs): a workspace is refused without them. */
+export function xattrToolsMissing(): string | null {
+	for (const tool of ["getfattr", "setfattr"]) if (spawnSync(tool, ["--version"], { stdio: "ignore" }).status !== 0) return tool;
+	return null;
 }
 
-/** Whether this one dir is marked opaque. */
+/** Whether this one dir is marked opaque (asked per dir, with its raw path: nothing is escaped). */
 function opaque(dir: string): boolean {
-	const r = spawnSync("getfattr", ["--only-values", "-n", "user.overlay.opaque", dir], { encoding: "utf8" });
-	return r.status === 0 && r.stdout === "y";
+	const r = spawnSync("getfattr", ["--absolute-names", "--only-values", "-n", "user.overlay.opaque", "--", dir]);
+	return r.status === 0 && r.stdout.toString() === "y";
 }
 
 /** The manifest of an upper dir: only what the call changed is there, so only that is hashed. */
 function manifestOf(upper: string): Manifest {
 	const entries: Record<string, Entry> = {};
-	const opaque = opaqueDirs(upper);
 	const walk = (rel: string) => {
 		for (const name of readdirSync(join(upper, rel)).sort()) {
 			const path = rel === "" ? name : `${rel}/${name}`;
@@ -120,9 +115,11 @@ function manifestOf(upper: string): Manifest {
 			if (st.isCharacterDevice() && st.rdev === 0) entries[path] = { type: "whiteout" };
 			else if (st.isSymbolicLink()) entries[path] = { type: "symlink", target: readlinkSync(join(upper, path)) };
 			else if (st.isDirectory()) {
-				entries[path] = { type: "dir", opaque: opaque.has(path) };
+				entries[path] = { type: "dir", opaque: opaque(join(upper, path)), mode: st.mode & 0o7777 };
 				walk(path);
 			} else if (st.isFile()) entries[path] = { type: "file", sha256: createHash("sha256").update(readFileSync(join(upper, path))).digest("hex"), mode: st.mode & 0o777, size: st.size };
+			// Nothing is dropped: FIFOs, sockets and devices are kept as they are.
+			else entries[path] = { type: "special", mode: st.mode };
 		}
 	};
 	walk("");
@@ -202,7 +199,7 @@ export function squash(runDir: string, layers: readonly string[]): string {
 			// an opaque dir, and a file or symlink over a dir (the kernel leaves no whiteout for those).
 			if (entry.type !== "dir" || entry.opaque) for (const p of [...merged.keys()]) if (under(p)) merged.delete(p);
 			if (entry.type === "whiteout") merged.delete(path);
-			else merged.set(path, { entry: entry.type === "dir" ? { type: "dir", opaque: false } : entry, from: layer });
+			else merged.set(path, { entry: entry.type === "dir" ? { type: "dir", opaque: false, mode: entry.mode } : entry, from: layer });
 		}
 	}
 	const manifest: Manifest = Object.fromEntries([...merged].map(([p, v]) => [p, v.entry]));
@@ -215,9 +212,11 @@ export function squash(runDir: string, layers: readonly string[]): string {
 	for (const [path, { entry, from }] of [...merged].sort(([a], [b]) => (a < b ? -1 : 1))) {
 		const target = join(temp, path);
 		mkdirSync(dirname(target), { recursive: true });
-		if (entry.type === "dir") mkdirSync(target, { recursive: true });
-		else if (entry.type === "symlink") symlinkSync(entry.target, target);
-		else if (entry.type === "file") linkSync(join(layerDir(runDir, from), path), target);
+		if (entry.type === "dir") {
+			mkdirSync(target, { recursive: true });
+			chmodSync(target, entry.mode);
+		} else if (entry.type === "symlink") symlinkSync(entry.target, target);
+		else linkSync(join(layerDir(runDir, from), path), target);
 	}
 	syncTree(temp);
 	writeDurably(`${dir}.json`, text);
@@ -334,7 +333,7 @@ export interface Located {
  * resolving its target again inside the view, so a link that points out of
  * the sandbox roots is refused.
  */
-export function locate(roots: readonly ViewRoot[], path: string, follow: boolean): Located {
+export function locate(roots: readonly ViewRoot[], path: string, follow: boolean, create = false): Located {
 	let target = posix.normalize(path);
 	for (let hops = 0; hops <= 40; hops++) {
 		const root = roots.filter((r) => target === r.at || target.startsWith(`${r.at}/`)).sort((a, b) => b.at.length - a.at.length)[0];
@@ -347,7 +346,8 @@ export function locate(roots: readonly ViewRoot[], path: string, follow: boolean
 			const entry = childOf(current.dirs, parts[i]!);
 			const last = i === parts.length - 1;
 			if (entry === null) {
-				if (last) return { root, rel: parts, entry: null };
+				// Nothing here: a write makes the dirs that are missing (no link can follow them).
+				if (last || create) return { root, rel: parts, entry: null };
 				throw new ViewError(`${path}: no such file or directory`);
 			}
 			if (entry.kind === "symlink" && (!last || follow)) {
@@ -395,6 +395,7 @@ export function listView(located: Located, path: string): string[] {
 export function writeViewFile(located: Located, path: string, content: string | Buffer): void {
 	const upper = located.root.upper;
 	if (upper === null) throw new ViewError(`${path} is read-only: only your workspace (/w) is writable`);
+	// A path made of missing dirs is only written when it was located for a write.
 	if (located.entry !== null && located.entry.kind !== "file") throw new ViewError(`${path} is not a file`);
 	const rel = located.rel;
 	if (rel.length === 0) throw new ViewError(`${path} is not a file`);

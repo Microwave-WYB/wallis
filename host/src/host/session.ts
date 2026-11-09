@@ -40,7 +40,7 @@ import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
 import { putDialogue, readDialogue } from "./dialogues.ts";
-import { commitLayer, layersAfter, type Work } from "./layers.ts";
+import { commitLayer, layersAfter, type Work, xattrToolsMissing } from "./layers.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
 import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
 import { bundleWorkflow } from "./bundle.ts";
@@ -605,6 +605,11 @@ export class Session {
 	}
 
 	#preflight(): void {
+		// A workspace's overlay is emulated for the host's file tools with the xattr tools (opaque dirs).
+		if (Object.values(this.#decl.agents).some((a) => a.access > 0)) {
+			const missing = xattrToolsMissing();
+			if (missing !== null) throw new RunRefused({ type: "requires_missing", name: missing });
+		}
 		const caps = this.#options.executor.capabilities;
 		if (!caps) return;
 		for (const [agent, d] of Object.entries(this.#decl.agents)) {

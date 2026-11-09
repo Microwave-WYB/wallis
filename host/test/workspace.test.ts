@@ -5,6 +5,7 @@
 // upper dir and lists /w through the layers, as the host's file tools do.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -12,7 +13,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runSpawn } from "../src/host/confine.ts";
 import { appendInbox, bwrapAvailable, FakeExecutor, ProcessCommands, runPaths, runWorkflow } from "../src/host/index.ts";
-import { commitLayer, layerDir, listIn, prepareWork, readManifest, resolveIn, squash } from "../src/host/layers.ts";
+import { commitLayer, layerDir, listIn, locate, prepareWork, readManifest, resolveIn, squash, workRoot, writeViewFile } from "../src/host/layers.ts";
 import { tmp } from "./util.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -233,4 +234,51 @@ test("a commit marker restores only its own attempt, from the layer, replacing a
 	const mine = prepareWork(dir, root, [], 2);
 	if ("missing" in mine) throw new Error("no work");
 	assert.deepEqual(readdirSync(mine.upper), ["done.txt"]);
+});
+
+test("overlay emulation: opaque marks on odd names, writes over a deletion, dir modes and special files through a squash", () => {
+	const dir = tmp();
+	// A dir name getfattr -R would escape: its opaque mark is still read.
+	const odd = "we\\ird\nname";
+	const marked = layerOf(dir, (u) => {
+		mkdirSync(join(u, odd));
+		assert.equal(spawnSync("setfattr", ["-n", "user.overlay.opaque", "-v", "y", "--", join(u, odd)]).status, 0);
+	});
+	assert.deepEqual(readManifest(dir, marked)[odd], { type: "dir", opaque: true, mode: statSync(join(layerDir(dir, marked), odd)).mode & 0o7777 });
+	// A lower layer with a file and a dir; the call deleted both (bash rm leaves whiteouts).
+	const lower = layerOf(dir, (u) => {
+		writeFileSync(join(u, "a"), "old");
+		mkdirSync(join(u, "d"), { mode: 0o750 });
+		writeFileSync(join(u, "d", "x"), "old");
+		assert.equal(spawnSync("mkfifo", [join(u, "pipe")]).status, 0);
+	});
+	const root = join(dir, "work", "_9");
+	const work = prepareWork(dir, root, [lower]);
+	if ("missing" in work) throw new Error("no work");
+	for (const name of ["a", "d"]) assert.equal(spawnSync("mknod", [join(work.upper, name), "c", "0", "0"]).status, 0);
+	assert.deepEqual(listIn(work, ""), ["pipe"]);
+	// A write over the deleted file replaces its whiteout; one under the deleted dir makes it anew, opaque.
+	writeViewFile(locate([workRoot(work)], "/w/a", true), "a", "new");
+	writeViewFile(locate([workRoot(work)], "/w/d/y", true, true), "d/y", "new");
+	assert.equal(readFileSync(join(work.upper, "a"), "utf8"), "new");
+	assert.deepEqual(listIn(work, "d"), ["y"]);
+	// The special file is in the manifest, never dropped, and survives a squash with the dir's mode.
+	assert.equal(readManifest(dir, lower).pipe!.type, "special");
+	const squashed = squash(dir, [lower, marked]);
+	assert.ok(statSync(join(layerDir(dir, squashed), "pipe")).isFIFO());
+	assert.equal(statSync(join(layerDir(dir, squashed), "d")).mode & 0o7777, 0o750);
+});
+
+test("a workspace without the xattr tools is refused before the run starts", async () => {
+	const { RunRefused } = await import("../src/host/index.ts");
+	// Only bash (the fixture's sandbox needs it) on the PATH, not the xattr tools.
+	const bin = tmp();
+	symlinkSync("/usr/bin/bash", join(bin, "bash"));
+	const path = process.env.PATH;
+	process.env.PATH = bin;
+	try {
+		await assert.rejects(runWorkflow({ ...opts(join(tmp(), "run"), "branches"), executor: worker() }), (e: unknown) => e instanceof RunRefused && e.refusal.type === "requires_missing" && (e.refusal as { name: string }).name === "getfattr");
+	} finally {
+		process.env.PATH = path;
+	}
 });
