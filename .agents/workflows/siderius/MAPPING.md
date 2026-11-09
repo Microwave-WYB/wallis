@@ -42,10 +42,10 @@ the SIDERIUS code, the code's behavior is noted here.
 | Target check before each iteration (2159) | `atLeast(direction, incumbent.score, target)` on the local `incumbent` |
 | `ResultInterpretationAgent` (route `interpret`) | Agent `interpret`. Its input carries `history` (runs, knowledge cache, collapse history; each `Foldable`) and `prediction_memory`. It reads `advice.md` from the `config` mount (`sandbox: "read-only"`). |
 | `DataAnalysisAgent`, authorized skills | Agent `data_analysis` with the `analysis` sandbox: the data mount read-only and a shell (`bash`), which replaces SIDERIUS's `run_skill` tool. Its input carries the last 4 run summaries. |
-| `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review`: MCP only, no sandbox (no filesystem). `mcp: { arxiv: [...], semantic_scholar: "*" }` over `mcp.json`; each server runs in its own sandbox from the overlay (`arxiv-mcp`, `scholar-mcp`) with its network allowlist. `S2_API_KEY` reaches only the Semantic Scholar server's process. The knowledge cache arrives `Foldable`. |
+| `MLLiteratureReviewAgent`, Semantic Scholar and arXiv | Agent `literature_review`: MCP only, no sandbox (no filesystem). `mcp: { arxiv: [...], semantic_scholar: "*" }` (direct: they only read) over `mcp.json`; each server runs in its own sandbox from the overlay (`arxiv-mcp`, `scholar-mcp`), with the network (MCP servers are the run's only channel outside; agents and commands have none). `S2_API_KEY` reaches only the Semantic Scholar server's process. The knowledge cache arrives `Foldable`. |
 | Judge strategies, projection caps (`judge-strategies-contract.md`) | Agent `evidence_judge`, `steerable: false`. `judgeProjection` in body code: the newest 24 entries without self-reported confidence, oldest dropped until the JSON fits 4000 chars, with an `omitted` count. |
 | `JudgeStop` (authored loops), `on_met: "stop"` | `stops.judgeCriterion` plus `verdict.stop.recommend`, with `stops.judgeOnMet: "stop"` |
-| `JudgeStop` `on_met: "request_input"` (pause and ask the operator) | `stops.judgeOnMet: "request_input"`: agent `stop_check` presents the recommendation and ends its turn with the question. Its node goes `Idle(question)`, and the operator's answer continues the same dialogue; it then submits `stop` or `continue`. |
+| `JudgeStop` `on_met: "request_input"` (pause and ask the operator) | `stops.judgeOnMet: "request_input"`: the orchestrator node `stop_check` carries the iteration, the criterion and the judge's reason; the orchestrator submits `stop` or `continue` (`submit_result`, or `wallis submit`), checked against its answer schema. |
 | `NoImprovementStop` | `stops.noImprovementBodies` |
 | `MLModelProposalAgent` (route `propose`), `max_proposal_attempts = 3` | Agent `propose` in a loop of `input.maxProposalAttempts`, with `history` in its input and the `config` mount. `previous_failures` collects validation errors and physical rejections. |
 | `MLModelImplementor` and `MLCodeValidatorAgent`, `max_impl_attempts = 3` | `subWorkflow(implement_validate)`: agent `implement` in the `coding` sandbox (the data only, never `trainer/` or `checks/`), then command `check_plugin` (checks 1–7 and 9), then agent `validate` (check 8, the LLM review) in the `review` sandbox (its input artifact only). The loop is bounded and feeds failures back. |
@@ -62,7 +62,7 @@ the SIDERIUS code, the code's behavior is noted here.
 | `advance_completed_history` (`research_history.py`) | Step 7 of the body: updates `runs`, `knowledgeCache` and `incumbent` |
 | `cap_knowledge_cache` (keyed by `model_type`) | `capCache`: the current model plus the top 4 others by `rank_score`; ties keep insertion order, unscored last, as `MetricOrder.rank` does |
 | `MetricOrder` / `reconcile_metric_spec` | Command `metric_order` (checks sandbox) gives the direction. `rank_score = sign × score`, so one descending order follows it. |
-| `cache_consolidator` `list_merge` (4 rules, at most 2 calls per model, at most 8 survivors, archive) | Per model concurrently (`ctx.map`); on a cache hit, one `ctx.call(consolidate_findings)` per list (`key_findings`, `bottlenecks`); `rankPrune` (strength, evidence count, latest iteration) keeps 8; overflow goes to `findingsArchive`. A cache miss is not consolidated. |
+| `cache_consolidator` `list_merge` (4 rules, at most 2 calls per model, at most 8 survivors, archive) | Per model concurrently (`ctx.map`); on a cache hit, one `consolidate_findings` call (`ctx.session(...).call`) per list (`key_findings`, `bottlenecks`); `rankPrune` (strength, evidence count, latest iteration) keeps 8; overflow goes to `findingsArchive`. A cache miss is not consolidated. |
 | `_dedupe_error_signatures` (no cap, inside each cache entry) | `mergeSignatures`: deduped on `(failure_class, top_user_frame, error_type)`, `evidence_iters` unioned, the longer `last_frames` kept, the first message wins; stored in the model's cache entry |
 | `PredictionMemory`: v1 pool, v2 by semantics, v2 information gain, `prediction_evaluation_semantics` | Locals `predictionV1` (the first pool the interpreter reports), `predictionV2` (outcome counts), `infoGainV2`; version 2. The v2 outcome comes from `evaluatePrediction`, the `prediction.py` rule. |
 | `chain_formal_incumbent_reference` | The local `incumbent`, replaced on strict improvement; each replacement is `ctx.observe("incumbent", …)` for monitoring |
@@ -94,8 +94,8 @@ These are the gaps between SIDERIUS and this workflow. Each one says why.
 2. **JudgeStop timing.** SIDERIUS consults the judge only after every
    deterministic stop condition said continue, and never at the final
    boundary. Here it is checked mid-iteration, after the evidence stage.
-   `on_met: "request_input"` is expressed (the `stop_check` node asks the
-   operator), but there is no `on_failure` policy: a judge that fails is an
+   `on_met: "request_input"` is expressed (the `stop_check` orchestrator
+   node asks the orchestrator), but there is no `on_failure` policy: a judge that fails is an
    agent failure in the body.
 3. **Interpretation.** SIDERIUS picks active models (top-K 3, last-N 2,
    |Δscore| ≥ 0.05), makes one LLM call per active model plus a synthesis

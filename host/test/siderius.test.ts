@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { Json } from "../src/sdk/index.ts";
-import { type AgentCall, type CommandCall, conversation, FakeCommands, FakeExecutor, runWorkflow } from "../src/host/index.ts";
+import { type AgentCall, type CommandCall, FakeCommands, FakeExecutor, runWorkflow } from "../src/host/index.ts";
 
 const workflow = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.agents/workflows/siderius/workflow.ts");
 
@@ -220,26 +220,34 @@ test("the SIDERIUS workflow runs end to end on scripted agents and commands", as
 	assert.equal(executor.calls.find((c) => c.agent === "literature_review")!.sandbox.type, "none");
 });
 
-test("JudgeStop request_input: the stop-check node asks the operator, and the reply decides", async () => {
+test("JudgeStop request_input: the stop-check orchestrator node asks the orchestrator, and its submitted answer decides", async () => {
 	const root = projectRoot();
 	const dir = join(root, "run");
-	const question = "The judge recommends stopping: the evidence repeats. Stop the loop, or continue?";
 	const make = () =>
 		agents({
 			evidence_judge: { output: { brief: "nothing new", kept: [], stop: { recommend: true, reason: "the evidence repeats" } } },
-			stop_check: conversation({ idle: question }, { submit: { decision: "stop", note: "operator agreed" } }),
 		});
 	const askInput = { ...input, stops: { noImprovementBodies: 0, judgeCriterion: "stop when evidence repeats", judgeOnMet: "request_input" } };
 	const first = await runWorkflow({ ...offline, workflow, dir, executor: make(), commands: scripts(), input: askInput, root, seed: 11, inboxPollMs: null, local, mounts: mountsOf(root) });
 	assert.deepEqual(first.status, { type: "idle", reason: null });
-	const asking = first.run.nodes.find((n) => "agent" in n && n.agent === "stop_check")!;
-	assert.deepEqual(asking.type === "node_idle" && asking.cause, { type: "question", message: question });
+	const asking = first.run.nodes.find((n) => n.type === "orchestrator_pending")!;
+	assert.deepEqual(asking.type === "orchestrator_pending" && [asking.name, asking.input], ["stop_check", { iteration: 1, criterion: "stop when evidence repeats", recommendation: "the evidence repeats" }]);
+	// The pending item carries the answer schema, from run metadata.
+	const { attention, inspectRun } = await import("../src/host/query.ts");
+	const item = attention(inspectRun(dir)).find((i) => i.kind === "orchestrator_pending")!;
+	assert.deepEqual(item.actions.map((a) => a.verb), ["submit_result"]);
 
+	// Submitted through the run's inbox, as the CLI does: an answer that does not match the schema is refused.
+	const { appendInbox, refusedEntry, runPaths } = await import("../src/host/store.ts");
+	appendInbox(runPaths(dir), { id: "s1", type: "submit", node: asking.id, value: { decision: "maybe", note: "" }, by: "human" });
+	appendInbox(runPaths(dir), { id: "s2", type: "submit", node: asking.id, value: { decision: "stop", note: "the orchestrator agreed" }, by: "human" });
 	const executor = make();
-	const done = await runWorkflow({ ...offline, workflow, dir, executor, commands: scripts(), root, local, mounts: mountsOf(root), sends: [{ node: asking.id, text: "yes, stop" }], inboxPollMs: null });
+	const done = await runWorkflow({ ...offline, workflow, dir, executor, commands: scripts(), root, local, mounts: mountsOf(root), inboxPollMs: null });
+	assert.equal(refusedEntry(runPaths(dir), "s1")?.type, "invalid_answer");
+	assert.equal(refusedEntry(runPaths(dir), "s2"), null);
 	const out = (done.outcome as unknown as { value: { stop_reason: string; iterations: number } }).value;
 	assert.equal(out.stop_reason, "operator_stop");
 	assert.equal(out.iterations, 2);
-	// Only the stop-check conversation continued; nothing completed ran again.
-	assert.deepEqual(executor.calls.map((c) => [c.agent, c.transcript.length]), [["stop_check", 2]]);
+	// Nothing completed ran again.
+	assert.deepEqual(executor.calls, []);
 });

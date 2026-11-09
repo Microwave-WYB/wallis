@@ -21,6 +21,7 @@ import {
 	defineMounts,
 	defineSandbox,
 	Foldable,
+	orchestrator,
 	type Ctx,
 	type Static,
 	subWorkflow,
@@ -35,7 +36,6 @@ import implementPrompt from "./prompts/implement.md" with { type: "text" };
 import interpretPrompt from "./prompts/interpret.md" with { type: "text" };
 import literaturePrompt from "./prompts/literature-review.md" with { type: "text" };
 import proposePrompt from "./prompts/propose.md" with { type: "text" };
-import stopCheckPrompt from "./prompts/stop-check.md" with { type: "text" };
 import tunePlannerPrompt from "./prompts/tune-planner.md" with { type: "text" };
 import tuneReflectorPrompt from "./prompts/tune-reflector.md" with { type: "text" };
 import validatePrompt from "./prompts/validate.md" with { type: "text" };
@@ -460,18 +460,15 @@ const tunePlanner = defineAgent(env, {
 });
 
 /**
- * JudgeStop with `on_met: "request_input"`: presents the judge's
- * recommendation, ends its turn with the question (its node goes idle), and
- * submits the operator's decision once they reply.
+ * JudgeStop with `on_met: "request_input"`: an orchestrator node. The run's
+ * orchestrator sees the judge's recommendation (self-contained: the
+ * criterion and the reason) and submits `stop` or `continue`.
  */
-const stopCheck = defineAgent(env, {
+const stopCheck = orchestrator({
 	name: "stop_check",
-	model: "judge",
-	prompt: stopCheckPrompt,
+	description: "The evidence judge recommends stopping the research loop. Decide whether to stop, given the stop criterion and the judge's reason.",
 	input: Type.Object({ iteration: Type.Integer(), criterion: Type.String(), recommendation: Type.String() }),
-	output: Type.Object({ decision: Type.Union([Type.Literal("stop"), Type.Literal("continue")]), note: Type.String() }),
-	maxTurns: 4,
-	needs: { structuredOutput: true },
+	output: Type.Object({ decision: Type.Union([Type.Literal("stop"), Type.Literal("continue")]), note: Type.String() }, { additionalProperties: false }),
 });
 
 const tuneReflector = defineAgent(env, {
@@ -817,7 +814,8 @@ export default workflow({
 	models,
 	mcp,
 	mounts,
-	agents: [interpreter, dataAnalyst, literature, evidenceJudge, stopCheck, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
+	agents: [interpreter, dataAnalyst, literature, evidenceJudge, proposer, implementor, validator, tunePlanner, tuneReflector, consolidator],
+	orchestrators: [stopCheck],
 	commands: [trainScript, evaluateScript, healthScript, fingerprintScript, metricOrderScript, validateScript],
 	// Attention points, not caps: agent turns and command compute minutes.
 	// When one is reached no new call starts (calls in flight finish) and the
@@ -946,8 +944,8 @@ export default workflow({
 						stop = "judge_stop";
 						break;
 					}
-					// request_input: the stop-check node asks the operator and waits for the answer.
-					const decision = await ctx.session(stopCheck).call({ iteration, criterion: input.stops.judgeCriterion, recommendation: verdict.stop.reason });
+					// request_input: the orchestrator decides, through the stop-check node.
+					const decision = await ctx.call(stopCheck, { iteration, criterion: input.stops.judgeCriterion, recommendation: verdict.stop.reason });
 					if (decision.decision === "stop") {
 						stop = "operator_stop";
 						break;
