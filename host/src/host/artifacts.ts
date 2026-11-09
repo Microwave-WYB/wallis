@@ -194,7 +194,7 @@ export function inputPath(dirs: NodeDirs, ref: ArtifactRef): string {
  * input artifacts. An agent call's scratch dir is its session's (`scratch`),
  * which outlives the call.
  */
-export function prepareNode(runDir: string, id: string, input: Json, mounts: Readonly<Record<string, string>>, layers: readonly string[] | null = null, attempt = 1): NodeDirs {
+export function prepareNode(runDir: string, id: string, input: Json, schema: unknown, mounts: Readonly<Record<string, string>>, layers: readonly string[] | null = null, attempt = 1): NodeDirs {
 	const root = join(runDir, "work", nodeDirName(id));
 	verifyRefs(input, runDir);
 	let work: Work | null = null;
@@ -203,7 +203,7 @@ export function prepareNode(runDir: string, id: string, input: Json, mounts: Rea
 		if ("missing" in prepared) throw new ArtifactError(`layer ${prepared.missing} of the session's workspace is not in the store`);
 		work = prepared;
 	}
-	const trees = treesIn(input).map((t) => {
+	const trees = treesIn(input, schema).map((t) => {
 		for (const l of t.layers) if (!existsSync(layerDir(runDir, l))) throw new ArtifactError(`layer ${l} of a tree in the input is not in the store`);
 		return { at: treePath(t), lowers: t.layers.map((l) => layerDir(runDir, l)) };
 	});
@@ -231,16 +231,26 @@ export function isTree(value: unknown): value is TreeRef {
 	return v.kind === "tree" && Array.isArray(v.layers) && v.layers.every((l) => typeof l === "string" && DIGEST.test(l));
 }
 
-/** Every Tree in a JSON value. */
-export function treesIn(value: Json): TreeRef[] {
-	const found: TreeRef[] = [];
-	const walk = (v: Json) => {
-		if (isTree(v)) found.push(v);
-		else if (Array.isArray(v)) v.forEach(walk);
-		else if (v !== null && typeof v === "object") Object.values(v).forEach(walk);
+/**
+ * Every Tree in a value at a position its schema declares one (`TreeValue()`,
+ * marked `wallis: "tree"`): JSON shaped like a Tree anywhere else is data,
+ * never mounted.
+ */
+export function treesIn(value: Json, schema: unknown): TreeRef[] {
+	const found = new Set<TreeRef>();
+	const walk = (s: unknown, v: Json) => {
+		if (s === null || typeof s !== "object") return;
+		const node = s as { wallis?: unknown; anyOf?: unknown[]; type?: unknown; properties?: Record<string, unknown>; items?: unknown };
+		if (node.wallis === "tree") {
+			if (isTree(v)) found.add(v);
+			return;
+		}
+		for (const member of node.anyOf ?? []) walk(member, v);
+		if (node.properties && v !== null && typeof v === "object" && !Array.isArray(v)) for (const [k, p] of Object.entries(node.properties)) walk(p, (v as Record<string, Json>)[k] ?? null);
+		if (node.items && Array.isArray(v)) for (const item of v) walk(node.items, item);
 	};
-	walk(value);
-	return found;
+	walk(schema, value);
+	return [...found];
 }
 
 /** Where a Tree is mounted inside a sandbox: `/in/trees/<hex of its layers>`. */
@@ -248,13 +258,17 @@ export function treePath(tree: TreeRef): string {
 	return `/in/trees/${createHash("sha256").update(tree.layers.join("\n")).digest("hex").slice(0, 16)}`;
 }
 
-/** The input as a command's `run` sees it: every artifact ref and Tree with its `path` inside the sandbox. */
-export function mountedInput(value: Json, inputsAt: string): Json {
-	if (isTree(value)) return { kind: "tree", layers: [...value.layers], path: treePath(value) };
-	if (isRef(value)) return { ...value, path: `${inputsAt}/${value.digest.slice("sha256:".length)}/${value.name}` };
-	if (Array.isArray(value)) return value.map((v) => mountedInput(v, inputsAt));
-	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mountedInput(v, inputsAt)]));
-	return value;
+/** The input as a command's `run` sees it: every artifact ref, and every Tree its schema declares, with its `path` inside the sandbox. */
+export function mountedInput(value: Json, inputsAt: string, schema: unknown): Json {
+	const trees = new Set<unknown>(treesIn(value, schema));
+	const walk = (v: Json): Json => {
+		if (isTree(v) && trees.has(v)) return { kind: "tree", layers: [...v.layers], path: treePath(v) };
+		if (isRef(v)) return { ...v, path: `${inputsAt}/${v.digest.slice("sha256:".length)}/${v.name}` };
+		if (Array.isArray(v)) return v.map(walk);
+		if (v !== null && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
+		return v;
+	};
+	return walk(value);
 }
 
 /** Deletes a done node's dirs: what it did not export (or commit as a layer) is discarded. */

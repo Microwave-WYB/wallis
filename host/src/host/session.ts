@@ -958,7 +958,7 @@ export class Session {
 		try {
 			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
 			// The call's /w: its session's layers, with its own upper dir on top.
-			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), effect.layers, effect.attempt);
+			workspace = prepareNode(this.paths.dir, id, effect.input, declaration.input, this.#mountDirs(mounts), effect.layers, effect.attempt);
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -1003,8 +1003,15 @@ export class Session {
 			// The core decides (and logs) what happens to each; nothing is decided here.
 			decideInFlight: (calls) => {
 				this.#decisions.delete(id);
-				if (current()) this.#later(() => this.#feed({ type: "tool_calls_in_flight", id, calls: [...calls] }));
-				return this.#decisions.get(id) ?? calls.map((c) => ({ type: "error_to_model", call: c.call }));
+				if (!current()) return { refused: { type: "node_not_running", node: id } };
+				let refused: Refusal | undefined;
+				this.#later(() => {
+					refused = this.#feed({ type: "tool_calls_in_flight", id, calls: [...calls] })[0];
+				});
+				const decisions = this.#decisions.get(id);
+				// The core refused: its typed refusal, never a decision made here.
+				if (refused !== undefined || decisions === undefined) return { refused: refused ?? { type: "node_not_running", node: id } };
+				return { decisions };
 			},
 			// Journaled before the model sees it; a result of a restarted call is dropped by the core.
 			record: (call, result) => {
@@ -1183,11 +1190,11 @@ export class Session {
 		if (!runner) return later(() => failed({ type: "unrunnable", error: "no command runner" }));
 		let workspace: NodeDirs;
 		try {
-			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(this.#decl.sandboxes[declaration.sandbox]!.mounts));
+			workspace = prepareNode(this.paths.dir, id, effect.input, declaration.input, this.#mountDirs(this.#decl.sandboxes[declaration.sandbox]!.mounts));
 		} catch (error) {
 			return later(() => failed({ type: "unrunnable", error: errorText(error) }));
 		}
-		const input = mountedInput(effect.input, LAYOUT.inputs);
+		const input = mountedInput(effect.input, LAYOUT.inputs, declaration.input);
 		const argv = this.#sandbox!.argv(effect.command, input);
 		if (!argv.ok) return later(() => failed({ type: "unrunnable", error: `run: ${argv.error}` }));
 		this.#commandAborts.get(id)?.abort();

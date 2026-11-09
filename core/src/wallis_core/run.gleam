@@ -998,23 +998,32 @@ fn deliver(
   case call, entry {
     AgentCall(attempts:, ..), Answered(output) -> {
       let next = ids.next_session(slot, list.length(attempts))
-      let layers = case dict.get(run.sessions, next) {
-        Ok(origin) -> origin.layers
-        Error(Nil) -> []
+      case dict.get(run.sessions, next) {
+        Ok(origin) ->
+          types.Deliver(
+            ids.request_text(id),
+            value.object([
+              #("output", output),
+              #("session", value.JString(ids.session_text(next))),
+              #(
+                "layers",
+                value.JArray(
+                  list.map(origin.layers, fn(l) {
+                    value.JString(ids.digest_text(l))
+                  }),
+                ),
+              ),
+            ]),
+          )
+        // Every answer registers its session first (`settle_agent_with`): a
+        // missing one is a journal the core cannot trust, so it is refused,
+        // never answered with an empty workspace.
+        Error(Nil) ->
+          types.Refuse(
+            Some(ids.request_text(id)),
+            types.UnknownSession(ids.session_text(next)),
+          )
       }
-      types.Deliver(
-        ids.request_text(id),
-        value.object([
-          #("output", output),
-          #("session", value.JString(ids.session_text(next))),
-          #(
-            "layers",
-            value.JArray(
-              list.map(layers, fn(l) { value.JString(ids.digest_text(l)) }),
-            ),
-          ),
-        ]),
-      )
     }
     AgentCall(..), Errored(_) | AgentCall(..), Refused(_) ->
       answer_effect(id, entry)

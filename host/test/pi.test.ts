@@ -57,8 +57,9 @@ function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: Transcri
 		history: null,
 		recorded: new Map(),
 		// As the core decides (tested there): reads run again, sandbox work is an error, unsafe outside calls are unknown.
-		decideInFlight: (calls: readonly InFlightCall[]) =>
-			calls.map((c) => ({ call: c.call, type: c.kind.type === "reads_only" || (c.kind.type === "external_call" && c.kind.replay === "replay_safe") ? ("run_again" as const) : c.kind.type === "sandbox_only" ? ("error_to_model" as const) : ("outcome_is_unknown" as const) })),
+		decideInFlight: (calls: readonly InFlightCall[]) => ({
+			decisions: calls.map((c) => ({ call: c.call, type: c.kind.type === "reads_only" || (c.kind.type === "external_call" && c.kind.replay === "replay_safe") ? ("run_again" as const) : c.kind.type === "sandbox_only" ? ("error_to_model" as const) : ("outcome_is_unknown" as const) })),
+		}),
 		record: () => {},
 		outputSchema: { type: "object", required: ["answer"], properties: { answer: { type: "integer", minimum: 1 } } },
 		workspace: { root: "/nonexistent", inputs: "/nonexistent", scratch: "/nonexistent", work: null, trees: [], mounts: {}, spill: join(tmp(), "spill") },
@@ -423,4 +424,21 @@ test("the file tools never follow a symlink out of the sandbox: escapes are refu
 	assert.equal(readFileSync(join(work.upper, "a.txt"), "utf8"), "changed");
 	assert.equal(readFileSync(join(layerDir(runDir, layer), "a.txt"), "utf8"), "from the layer");
 	assert.deepEqual((await run("ls", {})).value, ["a.txt", "abs", "absolute-inside", "inner", "rel"]);
+});
+
+test("codemode in flight at a crash is as unsafe as the worst tool it can reach", async () => {
+	const kind = async (access: 0 | 1 | 2 | 3, tools: readonly ToolDesc[] = []) => {
+		const { s } = tools.length > 0 ? withSources(tools) : { s: spec() };
+		const ws = { root: tmp(), inputs: tmp(), scratch: tmp(), work: null, trees: [], mounts: {}, spill: tmp() };
+		const built = await buildNodeTools({ ...s, declaration: { ...s.declaration, access }, workspace: ws, sandbox: { type: "unavailable", name: "x", reason: "test" } });
+		try {
+			return built.inFlight("codemode", "0/c", {}).kind;
+		} finally {
+			await built.close();
+		}
+	};
+	assert.deepEqual(await kind(1), { type: "reads_only" });
+	assert.deepEqual(await kind(3), { type: "sandbox_only" }, "with bash it is not safe to run again");
+	assert.deepEqual(await kind(1, [{ kind: "mcp_tool", server: "fx", tool: "search" }]), { type: "external_call", replay: "replay_safe" });
+	assert.deepEqual(await kind(2, [{ kind: "mcp_tool", server: "fx", tool: "post" }]), { type: "external_call", replay: "replay_never" });
 });

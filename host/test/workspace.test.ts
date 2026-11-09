@@ -282,3 +282,17 @@ test("a workspace without the xattr tools is refused before the run starts", asy
 		process.env.PATH = path;
 	}
 });
+
+test("only a Tree at a position its schema declares is mounted; JSON shaped like one elsewhere is data", async () => {
+	const { Type, TreeValue } = await import("../src/sdk/index.ts");
+	const { mountedInput, treesIn } = await import("../src/host/artifacts.ts");
+	const tree = { kind: "tree", layers: [`sha256:${"a".repeat(64)}`] };
+	const lookalike = { kind: "tree", layers: [`sha256:${"b".repeat(64)}`] };
+	const schema = JSON.parse(JSON.stringify(Type.Object({ files: TreeValue(), note: Type.Any(), more: Type.Array(Type.Union([TreeValue(), Type.Null()])) })));
+	const input = { files: tree, note: lookalike, more: [tree, null] };
+	assert.deepEqual(treesIn(input, schema), [tree]);
+	const mounted = mountedInput(input, "/in", schema) as { files: { path?: string }; note: { path?: string }; more: [{ path?: string }, null] };
+	assert.match(mounted.files.path!, /^\/in\/trees\/[0-9a-f]{16}$/);
+	assert.equal(mounted.note.path, undefined);
+	assert.equal(mounted.more[0].path, mounted.files.path);
+});

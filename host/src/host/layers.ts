@@ -22,6 +22,8 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, posix } from "node:path";
+import Type from "typebox";
+import Value from "typebox/value";
 import { crashPoint } from "./artifacts.ts";
 
 export const MAX_DEPTH = 16;
@@ -53,8 +55,22 @@ export function layerDir(runDir: string, digest: string): string {
 	return join(layersDir(runDir), digest.slice("sha256:".length));
 }
 
+const ManifestShape = Type.Record(
+	Type.String(),
+	Type.Union([
+		Type.Object({ type: Type.Literal("file"), sha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), mode: Type.Integer(), size: Type.Integer() }),
+		Type.Object({ type: Type.Literal("dir"), opaque: Type.Boolean(), mode: Type.Integer() }),
+		Type.Object({ type: Type.Literal("special"), mode: Type.Integer() }),
+		Type.Object({ type: Type.Literal("symlink"), target: Type.String() }),
+		Type.Object({ type: Type.Literal("whiteout") }),
+	]),
+);
+
+/** A layer's manifest, checked against its shape when read back. */
 export function readManifest(runDir: string, digest: string): Manifest {
-	return JSON.parse(readFileSync(`${layerDir(runDir, digest)}.json`, "utf8")) as Manifest;
+	const raw: unknown = JSON.parse(readFileSync(`${layerDir(runDir, digest)}.json`, "utf8"));
+	if (!Value.Check(ManifestShape, raw)) throw new Error(`layer ${digest}: its manifest is malformed`);
+	return raw;
 }
 
 /** The call's workspace dirs for these layers (each must be in the store), for this attempt of the call. */

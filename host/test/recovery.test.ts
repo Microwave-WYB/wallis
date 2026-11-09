@@ -85,7 +85,8 @@ test("R2: SIGKILL at turn 3; the resumed node continues at turn 3 and turns 1-2 
 	// The newest checkpoint the log names is a blob, written before the event.
 	const progressed = new EventLog(join(dir, "log.jsonl")).read().filter((e) => e.type === "agent_progressed");
 	const newest = progressed.at(-1) as { dialogue: string };
-	const checkpoint = JSON.parse(readFileSync(blobPath(dir, newest.dialogue), "utf8")) as { turns: number };
+	const { readDialogue } = await import("../src/host/dialogues.ts");
+	const checkpoint = readDialogue(dir, newest.dialogue) as { turns: number };
 	assert.equal(checkpoint.turns, 2);
 	const { provider, executor } = faux();
 	const requests: string[] = [];
@@ -149,8 +150,9 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		history: null,
 		recorded: new Map(),
 		// As the core decides (tested there): reads run again, sandbox work is an error, unsafe outside calls are unknown.
-		decideInFlight: (calls: readonly InFlightCall[]) =>
-			calls.map((c) => ({ call: c.call, type: c.kind.type === "reads_only" || (c.kind.type === "external_call" && c.kind.replay === "replay_safe") ? ("run_again" as const) : c.kind.type === "sandbox_only" ? ("error_to_model" as const) : ("outcome_is_unknown" as const) })),
+		decideInFlight: (calls: readonly InFlightCall[]) => ({
+			decisions: calls.map((c) => ({ call: c.call, type: c.kind.type === "reads_only" || (c.kind.type === "external_call" && c.kind.replay === "replay_safe") ? ("run_again" as const) : c.kind.type === "sandbox_only" ? ("error_to_model" as const) : ("outcome_is_unknown" as const) })),
+		}),
 		record: () => {},
 		model: "faux/faux-1",
 		prompt: "Input",

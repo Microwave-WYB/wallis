@@ -85,6 +85,9 @@ const SPILL_PAGE = 8_000;
 const LS_LIMIT = 500;
 const IMAGES: Readonly<Record<string, string>> = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
 
+/** Change the sandbox (the workspace): in flight at a crash, they are an error the model sees. */
+const MUTATING = new Set(["write", "edit", "bash", "export_artifact"]);
+
 /** Run again after a crash: they only read, only ask, or only record. */
 const RERUN = new Set(["read", "ls", "read_spill", "ask", "submit_result"]);
 
@@ -155,7 +158,13 @@ export class NodeTools {
 		const external = (safe: boolean): InFlightCall["kind"] => ({ type: "external_call", replay: safe ? "replay_safe" : "replay_never" });
 		if (info) return { call: key, tool: info.id, args, kind: external(info.replay === "safe") };
 		if (RERUN.has(name)) return { call: key, tool: name, args, kind: { type: "reads_only" } };
-		if (name === "codemode") return { call: key, tool: name, args, kind: external([...this.external.values()].every((t) => t.replay === "safe")) };
+		if (name === "codemode") {
+			// As unsafe as the worst it can reach: an unsafe outside tool, else a sandbox-mutating one.
+			const outside = [...this.external.values()];
+			if (outside.some((t) => t.replay !== "safe")) return { call: key, tool: name, args, kind: external(false) };
+			if (this.names.some((n) => MUTATING.has(n))) return { call: key, tool: name, args, kind: { type: "sandbox_only" } };
+			return { call: key, tool: name, args, kind: outside.length > 0 ? external(true) : { type: "reads_only" } };
+		}
 		return { call: key, tool: name, args, kind: { type: "sandbox_only" } };
 	}
 

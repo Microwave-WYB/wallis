@@ -31,7 +31,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { estimateTokens, generateSummary } from "@earendil-works/pi-coding-agent";
 import Type from "typebox";
 import Value from "typebox/value";
-import type { Json } from "../sdk/index.ts";
+import type { Json, Refusal } from "../sdk/index.ts";
 import type { Usage } from "./core.ts";
 import type { Capabilities, Executor, NodeSession, NodeSpec, TurnResult } from "./executor.ts";
 import { CHARS_PER_TOKEN } from "./render.ts";
@@ -294,14 +294,16 @@ class PiNodeSession implements NodeSession {
 	 * error the model sees; any other call's outcome is unknown: nothing is
 	 * run, and the node waits for its owner (`outcome_unknown`).
 	 */
-	async #settleInterrupted(): Promise<{ tool: string; args: Json } | null> {
+	async #settleInterrupted(): Promise<{ tool: string; args: Json } | { refused: Refusal } | null> {
 		const messages = this.#agent.state.messages;
 		const last = messages.at(-1);
 		if (last?.role !== "assistant") return null;
 		this.#tools.turn = this.#turns;
 		const calls = last.content.filter((c) => c.type === "toolCall");
 		// The core decides each (a restart of an unknown outcome makes it run again); the decision is logged.
-		const decisions = new Map(this.#spec.decideInFlight(calls.map((c) => this.#tools.inFlight(c.name, this.#tools.key(c.id), c.arguments as Json))).map((d) => [d.call, d.type]));
+		const decided = this.#spec.decideInFlight(calls.map((c) => this.#tools.inFlight(c.name, this.#tools.key(c.id), c.arguments as Json)));
+		if ("refused" in decided) return decided;
+		const decisions = new Map(decided.decisions.map((d) => [d.call, d.type]));
 		const unknown = calls.find((c) => decisions.get(this.#tools.key(c.id)) === "outcome_is_unknown");
 		if (unknown) {
 			this.#spec.log({ kind: "note", text: `${unknown.name} was in flight at a crash and is not safe to make again: its outcome is unknown` });
@@ -390,6 +392,7 @@ class PiNodeSession implements NodeSession {
 			const last = this.#agent.state.messages.at(-1);
 			if (last?.role === "assistant" && last.content.every((c) => c.type !== "toolCall")) return this.#result(before, last);
 			const unknown = await this.#settleInterrupted();
+			if (unknown !== null && "refused" in unknown) return { type: "executor_error", error: `the core refused the calls in flight: ${JSON.stringify(unknown.refused)}` };
 			if (unknown !== null) return { type: "outcome_unknown", ...unknown, usage: { usd: 0, tokens: 0, turns: 0 } };
 			if (this.#tools.pending !== null) return this.#result(before, undefined);
 			start = () => this.#agent.continue();

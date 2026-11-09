@@ -17,7 +17,13 @@ export class EventLog {
 		const lines = text.split("\n");
 		// The last element is empty (text ends with a newline) or a partial line.
 		const complete = lines.slice(0, -1);
-		return complete.filter((l) => l.length > 0).map((l) => JSON.parse(l) as Event);
+		// Parsed at the boundary: each line an object with its type (the core decodes the rest).
+		return complete.flatMap((l, i): Event[] => {
+			if (l.length === 0) return [];
+			const raw: unknown = JSON.parse(l);
+			if (raw === null || typeof raw !== "object" || Array.isArray(raw) || typeof (raw as { type?: unknown }).type !== "string") throw new Error(`${this.path}:${i + 1} is not an event`);
+			return [raw as Event];
+		});
 	}
 
 	/**

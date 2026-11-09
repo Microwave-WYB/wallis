@@ -33,7 +33,7 @@
 //   agent's output schema (and its artifact refs against the store) before
 //   anything is logged.
 
-import type { AgentFailure, ArtifactRef, Json } from "../sdk/index.ts";
+import type { AgentFailure, ArtifactRef, Json, Refusal } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 import { schemaErrors } from "../sdk/validate.ts";
 import type { NodeDirs } from "./artifacts.ts";
@@ -90,7 +90,7 @@ export interface NodeSpec {
 	 * the core (and logged), never by the executor: run again, an error for
 	 * the model, or an unknown outcome (the node waits).
 	 */
-	readonly decideInFlight: (calls: readonly InFlightCall[]) => readonly InFlightDecision[];
+	readonly decideInFlight: (calls: readonly InFlightCall[]) => { readonly decisions: readonly InFlightDecision[] } | { readonly refused: Refusal };
 	/** MCP tool results already journaled for this call, by tool call key. */
 	readonly recorded: ReadonlyMap<string, Json>;
 	/** Journals an MCP tool result of this call before the model sees it. */
