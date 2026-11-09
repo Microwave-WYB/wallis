@@ -301,7 +301,7 @@ pub fn a_non_steerable_node_refuses_steer_interrupt_and_answers_test() {
   let running = [started(basic()), call("#0", "judge", JNull)]
   assert last(list.append(running, [types.Steered("#0", "x", "m", human)]))
     == [Refuse(None, NotSteerable("#0"))]
-  assert last(list.append(running, [types.Interrupted("#0", human)]))
+  assert last(list.append(running, [types.InterruptRequested("#0", human)]))
     == [Refuse(None, NotSteerable("#0"))]
   let asking = list.append(running, [idle("#0", "?")])
   assert last(list.append(asking, [sent("#0", "x")]))
@@ -323,14 +323,14 @@ pub fn interrupt_is_logged_for_a_running_steerable_node_test() {
   let events = [
     started(basic()),
     call("#0", "worker", JNull),
-    types.Interrupted("#0", human),
+    types.InterruptRequested("#0", human),
   ]
   let #(_, effects, log) = replay(events)
   assert effects == [Checkpoint]
   assert list.length(log) == 3
   let assert [NodeRunning(inbox: [InboxMessage(Interrupt, "", 0)], ..)] =
     nodes_after(events)
-  assert last([started(basic()), types.Interrupted("#9", human)])
+  assert last([started(basic()), types.InterruptRequested("#9", human)])
     == [Refuse(None, NodeNotRunning("#9"))]
 }
 
@@ -874,4 +874,178 @@ pub fn interrupted_run_log_equals_uninterrupted_test() {
     ])
   assert list.append(log, log2) == expected_log
   assert run.snapshot(s) == run.snapshot(expected)
+}
+
+// --- Sessions ---
+
+fn input(n) {
+  value.object([#("n", JInt(n))])
+}
+
+pub fn a_session_call_continues_after_its_previous_call_test() {
+  let first = [
+    started(basic()),
+    support.session_call("#0", 0, input(1)),
+    returned("#0:0", summary("a")),
+  ]
+  let assert [CallAgent(previous: Some(prev), ..)] =
+    last(list.append(first, [support.session_call("#0", 1, input(2))]))
+  // The second call continues where the first ended: its slot.
+  let assert [CallAgent(previous: None, digest: first_slot, ..)] =
+    last([started(basic()), support.session_call("#0", 0, input(1))])
+  assert prev == first_slot
+}
+
+pub fn a_later_session_call_is_keyed_by_the_dialogue_before_it_test() {
+  // The same second input after a different first call misses.
+  let run = fn(first) {
+    [
+      started(basic()),
+      support.session_call("#0", 0, input(first)),
+      returned("#0:0", summary("a")),
+      support.session_call("#0", 1, input(9)),
+      returned("#0:1", summary("b")),
+      support.session_call("#0", 1, input(9)),
+    ]
+  }
+  assert last(run(1)) == [Deliver("#0:1", summary("b"))]
+  let #(state, _, _) = replay(run(1))
+  let assert #(_, [Checkpoint, CallAgent(..)]) =
+    run.step(state, support.session_call("#5", 1, input(9)))
+}
+
+pub fn restarting_a_session_call_invalidates_its_later_calls_test() {
+  let events = [
+    started(basic()),
+    support.session_call("#0", 0, input(1)),
+    returned("#0:0", summary("a")),
+    support.session_call("#0", 1, input(2)),
+    failed("#0:1", "boom"),
+    types.BodyFailed(AgentGaveUp("worker", GaveUp("boom"))),
+    // An earlier execution had also recorded call 2 of the session.
+  ]
+  let #(state, _, _) = replay(events)
+  let #(state, effects) =
+    run.step(state, types.Restarted("#0:1", None, human, 0))
+  let assert [Checkpoint, CallAgent(id: "#0:1", previous: Some(_), ..)] =
+    effects
+  let #(_, effects) = run.step(state, returned("#0:1", summary("b2")))
+  assert list.contains(effects, Deliver("#0:1", summary("b2")))
+}
+
+pub fn an_explicit_ask_idles_the_node_and_a_reply_continues_it_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.AgentAsked("#0", "which dataset?", support.usage(), "fake/model"),
+  ]
+  let assert [NodeIdle(cause: types.Asked("which dataset?"), ..)] =
+    nodes_after(events)
+  let assert [Checkpoint, CallAgent(transcript: t, ..)] =
+    run.step(replay(events).0, sent("#0", "digits")).1
+  assert t == [Message(Assistant, "which dataset?"), Message(User, "digits")]
+}
+
+pub fn an_interrupted_turn_idles_the_node_until_a_message_test() {
+  let events = [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.InterruptRequested("#0", human),
+    types.TurnInterrupted("#0", support.usage(), "fake/model"),
+  ]
+  let assert [NodeIdle(cause: types.Interrupted, ..)] = nodes_after(events)
+  let assert [Checkpoint, CallAgent(..)] =
+    run.step(replay(events).0, sent("#0", "go on")).1
+}
+
+// --- Approvals, orchestrator nodes and body tool calls ---
+
+fn approval_pending() {
+  [
+    started(basic()),
+    call("#0", "worker", JNull),
+    types.ApprovalRequested(
+      "#0",
+      "ente",
+      "upload",
+      value.object([#("file", JString("a.jpg"))]),
+      support.usage(),
+      "fake/model",
+    ),
+  ]
+}
+
+pub fn an_approval_takes_a_decision_not_a_message_test() {
+  let #(state, _, _) = replay(approval_pending())
+  let assert [NodeIdle(cause: types.Approval("ente", "upload", _), ..)] =
+    run.nodes(state)
+  assert run.step(state, sent("#0", "yes")).1 == [Refuse(None, NotIdle("#0"))]
+  let approve = value.object([#("type", JString("approve"))])
+  let assert [Checkpoint, CallAgent(transcript: [Message(User, text)], ..)] =
+    run.step(state, types.ResultSubmitted("#0", approve, human)).1
+  assert text == "{\"type\":\"approve\"}"
+}
+
+pub fn a_rejection_needs_a_non_empty_reason_test() {
+  let #(state, _, _) = replay(approval_pending())
+  let reject = fn(reason) {
+    value.object([#("type", JString("reject")), #("reason", JString(reason))])
+  }
+  let assert [Refuse(None, types.InvalidAnswer("#0", _))] =
+    run.step(state, types.ResultSubmitted("#0", reject(" "), human)).1
+  let assert [Refuse(None, types.InvalidAnswer("#0", _))] =
+    run.step(
+      state,
+      types.ResultSubmitted(
+        "#0",
+        value.object([#("type", JString("no"))]),
+        human,
+      ),
+    ).1
+  let assert [Checkpoint, CallAgent(..)] =
+    run.step(state, types.ResultSubmitted("#0", reject("too big"), human)).1
+}
+
+pub fn an_orchestrator_node_waits_for_its_submitted_result_test() {
+  let events = [started(basic()), support.orchestrator("#0", input(1))]
+  let #(state, effects, _) = replay(events)
+  assert effects == [Checkpoint]
+  assert run.status(state) == Some(Idle(None))
+  let assert [types.OrchestratorPending("#0", "pick", _)] = run.nodes(state)
+  let #(state, effects) =
+    run.step(state, types.ResultSubmitted("#0", JString("cool3"), human))
+  assert effects == [Checkpoint, Deliver("#0", JString("cool3"))]
+  let assert [types.OrchestratorDone("#0", "pick")] = run.nodes(state)
+  // Answered once: a replay hits, and a second submit is refused.
+  assert run.step(state, support.orchestrator("#1", input(1))).1
+    == [Deliver("#1", JString("cool3"))]
+  assert run.step(state, types.ResultSubmitted("#0", JString("x"), human)).1
+    == [Refuse(None, types.NotPending("#0"))]
+}
+
+pub fn a_body_tool_call_is_journaled_and_hit_on_replay_test() {
+  let events = [
+    started(basic()),
+    support.tool("#0", input(1)),
+    types.ToolReturned("#0", JString("papers")),
+  ]
+  let #(state, effects, _) = replay(events)
+  assert effects == [Checkpoint, Deliver("#0", JString("papers"))]
+  assert run.step(state, support.tool("#7", input(1))).1
+    == [Deliver("#7", JString("papers"))]
+  let assert [types.CallTool(id: "#0", tool: "search", ..)] =
+    last([started(basic()), support.tool("#0", input(1))])
+}
+
+pub fn agent_tool_results_are_journaled_once_and_reach_a_reissued_call_test() {
+  let rec = types.ToolRecorded("#0", "call-1", JString("r"))
+  let events = [started(basic()), call("#0", "worker", JNull), rec, rec]
+  let #(_, _, log) = replay(events)
+  assert list.length(list.filter(log, fn(e) { e == rec })) == 1
+  // A resume reissues the call with the recorded result.
+  let #(state, _, _) = replay(log)
+  let #(state, _) = run.step(state, Resumed(pin()))
+  let assert [
+    CallAgent(recorded: [types.ToolResult("call-1", JString("r"))], ..),
+  ] = run.step(state, call("#0", "worker", JNull)).1
 }

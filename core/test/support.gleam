@@ -1,6 +1,7 @@
 //// Helpers for event-replay tests.
 
 import gleam/dict
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -23,6 +24,8 @@ pub fn workflow(agents: List(Agent)) -> Workflow {
     name: "test",
     agents:,
     commands: ["train"],
+    orchestrators: ["pick"],
+    tools: ["search"],
     budget: Budget(turns: None, compute_minutes: None),
   )
 }
@@ -48,11 +51,11 @@ pub fn started(wf: Workflow) -> Event {
 }
 
 /// A call whose journal slot is unique to its id, so tests that are not
-/// about the cache keep one slot per request.
+/// about the cache keep one slot per request. Each is a one-call session.
 pub fn call(id: String, agent: String, input: Value) -> Event {
   Requested(
     id:,
-    request: Call(agent:, input:),
+    request: Call(agent:, input:, session: id, index: 0),
     node_digest: agent <> "@" <> id,
     occurrence: 0,
   )
@@ -67,9 +70,37 @@ pub fn cached(
 ) -> Event {
   Requested(
     id:,
-    request: Call(agent: "worker", input:),
+    request: Call(agent: "worker", input:, session: id, index: 0),
     node_digest: node,
     occurrence:,
+  )
+}
+
+/// Call `index` of session `session`, keyed like the host keys it.
+pub fn session_call(session: String, index: Int, input: Value) -> Event {
+  Requested(
+    id: session <> ":" <> int.to_string(index),
+    request: Call(agent: "worker", input:, session:, index:),
+    node_digest: "worker",
+    occurrence: 0,
+  )
+}
+
+pub fn tool(id: String, input: Value) -> Event {
+  Requested(
+    id:,
+    request: types.Tool(tool: "search", input:),
+    node_digest: "search",
+    occurrence: 0,
+  )
+}
+
+pub fn orchestrator(id: String, input: Value) -> Event {
+  Requested(
+    id:,
+    request: types.Orchestrator(name: "pick", input:),
+    node_digest: "pick",
+    occurrence: 0,
   )
 }
 

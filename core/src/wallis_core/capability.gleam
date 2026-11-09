@@ -15,7 +15,7 @@ import gleam/result
 import gleam/string
 import wallis_core/types.{
   type Pin, type Refusal, NodeNotRunning, NotAnAgent, NotIdle, NotLive, NotOwner,
-  NotSteerable, PinMismatch,
+  NotPending, NotSteerable, PinMismatch,
 }
 
 /// The identity that controls every run.
@@ -40,14 +40,21 @@ pub fn check_owner(
 pub type NodeFacts {
   /// In flight with the executor.
   Working(steerable: Bool)
-  /// Ended its turn with a question.
+  /// Ended its turn with a question (or asked, or hit its turn limit, or was
+  /// interrupted): a message continues it.
   Waiting(steerable: Bool)
+  /// Waits for the orchestrator's decision on an `ask`-mode MCP tool.
+  Approving(steerable: Bool)
   /// The executor could not serve it; reissued after a fix.
   Faulted(steerable: Bool)
   /// Held back by a pause or the budget before it was issued.
   Held(steerable: Bool)
   /// A command in flight: no dialogue.
   CommandWorking
+  /// A body MCP tool call in flight.
+  ToolWorking
+  /// An orchestrator node waiting for its result.
+  Pending
   Settled
   Absent
 }
@@ -65,7 +72,7 @@ pub fn check_idle(
   case facts {
     Waiting(steerable: True) -> Ok(IdleNode(node))
     Waiting(steerable: False) -> Error(NotSteerable(node))
-    CommandWorking -> Error(NotAnAgent(node))
+    CommandWorking | ToolWorking | Pending -> Error(NotAnAgent(node))
     _ -> Error(NotIdle(node))
   }
 }
@@ -87,7 +94,7 @@ pub fn check_steerable(
   case facts {
     Working(steerable: True) -> Ok(SteerableNode(node))
     Working(steerable: False) -> Error(NotSteerable(node))
-    CommandWorking -> Error(NotAnAgent(node))
+    CommandWorking | ToolWorking | Pending -> Error(NotAnAgent(node))
     _ -> Error(NodeNotRunning(node))
   }
 }
@@ -100,6 +107,8 @@ pub fn steerable_id(node: SteerableNode) -> String {
 pub type LiveKind {
   LiveAgent(steerable: Bool)
   LiveCommand
+  /// A body MCP tool call: a restart calls the outside world again.
+  LiveTool
 }
 
 pub opaque type LiveNode {
@@ -115,10 +124,12 @@ pub fn check_live(
   case facts {
     Working(steerable:)
     | Waiting(steerable:)
+    | Approving(steerable:)
     | Faulted(steerable:)
     | Held(steerable:) -> Ok(LiveNode(node, LiveAgent(steerable)))
     CommandWorking -> Ok(LiveNode(node, LiveCommand))
-    Settled | Absent -> Error(NotLive(node))
+    ToolWorking -> Ok(LiveNode(node, LiveTool))
+    Pending | Settled | Absent -> Error(NotLive(node))
   }
 }
 
@@ -127,6 +138,40 @@ pub fn live_id(node: LiveNode) -> String {
 }
 
 pub fn live_kind(node: LiveNode) -> LiveKind {
+  node.kind
+}
+
+/// What a submitted result answers.
+pub type SubmitKind {
+  /// An orchestrator node: the value is its result.
+  SubmitAnswer
+  /// An approval: the value is `approve` or `reject` with a reason.
+  SubmitDecision
+}
+
+pub opaque type SubmittableNode {
+  SubmittableNode(node: String, kind: SubmitKind)
+}
+
+/// `submit_result` reaches an orchestrator node waiting for its result, or
+/// an agent node waiting for a decision on an `ask`-mode tool.
+pub fn check_submittable(
+  _owned: OwnedRun,
+  node: String,
+  facts: NodeFacts,
+) -> Result(SubmittableNode, Refusal) {
+  case facts {
+    Pending -> Ok(SubmittableNode(node, SubmitAnswer))
+    Approving(..) -> Ok(SubmittableNode(node, SubmitDecision))
+    _ -> Error(NotPending(node))
+  }
+}
+
+pub fn submittable_id(node: SubmittableNode) -> String {
+  node.node
+}
+
+pub fn submittable_kind(node: SubmittableNode) -> SubmitKind {
   node.kind
 }
 
