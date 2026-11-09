@@ -84,12 +84,10 @@ pub fn slot(
     option.None -> ""
   }
   Slot(
-    sha.hex(
-      string.join(
-        [digest_text(node), kind, name, value.canonical(input), within],
-        "\n",
-      ),
-    )
+    sha.hex(string.join(
+      [digest_text(node), kind, name, value.canonical(input), within],
+      "\n",
+    ))
     <> "#"
     <> occurrence,
   )

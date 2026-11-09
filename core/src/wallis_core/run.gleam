@@ -235,34 +235,96 @@ pub fn new() -> RunState {
   NotYetStarted
 }
 
+/// What an event is to `step`: every variant is named here once, so a new
+/// event must say which it is.
+type Phase {
+  Starting(workflow: Workflow, pin: Pin, input: Value)
+  Resuming(pin: Pin)
+  /// Ownership and host facts: applied even on a finished run.
+  Claiming(owner: String)
+  Noting(key: String, value: Value)
+  /// Everything else: applied to a live run only (`live_event`).
+  Applying
+}
+
+fn phase(event: Event) -> Phase {
+  case event {
+    types.Started(workflow:, pin:, input:) -> Starting(workflow, pin, input)
+    types.Resumed(pin:) -> Resuming(pin)
+    types.Claimed(owner:) -> Claiming(owner)
+    types.Noted(key:, value:) -> Noting(key, value)
+    types.CodeChanged(..)
+    | types.Requested(..)
+    | types.AgentReturned(..)
+    | types.AgentIdle(..)
+    | types.AgentFailed(..)
+    | types.TurnLimitReached(..)
+    | types.ExecutorFailed(..)
+    | types.AgentAsked(..)
+    | types.CallOutcomeUnknown(..)
+    | types.PreviousDialogueMissing(..)
+    | types.AgentProgressed(..)
+    | types.ToolCallsInFlight(..)
+    | types.TurnInterrupted(..)
+    | types.ToolRecorded(..)
+    | types.InputRejected(..)
+    | types.CommandReturned(..)
+    | types.CommandFailed(..)
+    | types.ToolReturned(..)
+    | types.ToolCallUnknown(..)
+    | types.ToolFailed(..)
+    | types.ResultSubmitted(..)
+    | types.Observed(..)
+    | types.Sent(..)
+    | types.Steered(..)
+    | types.InterruptRequested(..)
+    | types.Restarted(..)
+    | types.NodeCancelled(..)
+    | types.AliasRebound(..)
+    | types.BudgetRaised(..)
+    | types.ExecutorChanged(..)
+    | types.RetryUnavailable
+    | types.CancelRequested(..)
+    | types.PauseRequested(..)
+    | types.ResumeRequested(..)
+    | types.BodyFinished(..)
+    | types.BodyFailed(..) -> Applying
+  }
+}
+
 pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect)) {
-  case run, event {
-    NotYetStarted, types.Started(workflow:, pin:, input:) ->
+  case run, phase(event) {
+    NotYetStarted, Starting(workflow:, pin:, input:) ->
       start(workflow, pin, input)
     // Before `Started` every event is refused: there is no run to apply it to.
-    NotYetStarted, _ -> #(run, [types.Refuse(None, types.NotStarted)])
-    Active(_), types.Started(..) -> #(run, [
+    NotYetStarted, Resuming(..)
+    | NotYetStarted, Claiming(..)
+    | NotYetStarted, Noting(..)
+    | NotYetStarted, Applying
+    -> #(run, [types.Refuse(None, types.NotStarted)])
+    Active(_), Starting(..) -> #(run, [
       types.Refuse(None, types.AlreadyStarted),
     ])
-    Active(r), types.Resumed(pin:) ->
+    Active(r), Resuming(pin:) ->
       case capability.check_pin(r.pin, pin) {
         Error(refusal) -> #(run, [types.Refuse(None, refusal)])
         Ok(resumable) -> #(Active(unissued(r)), resume(r, resumable))
       }
     // Ownership and host facts change even on a finished run.
-    Active(r), types.Claimed(owner:) -> #(Active(Run(..r, owner: Some(owner))), [
+    Active(r), Claiming(owner:) -> #(Active(Run(..r, owner: Some(owner))), [
       types.Checkpoint,
     ])
-    Active(r), types.Noted(key:, value:) -> #(Active(note(r, key, value)), [
+    Active(r), Noting(key:, value:) -> #(Active(note(r, key, value)), [
       types.Checkpoint,
     ])
-    // Every other event of a live run: `live_event` matches each one.
-    Active(Run(lifecycle: Live, ..) as r), _ -> {
+    Active(Run(lifecycle: Live, ..) as r), Applying -> {
       let #(r, effects) = live_event(r, event)
       #(Active(r), effects)
     }
     // A finished run takes only ownership and host facts (above).
-    Active(_), _ -> #(run, [types.Refuse(None, types.NotRunning)])
+    Active(Run(lifecycle: Ended(_), ..)), Applying -> #(run, [
+      types.Refuse(None, types.NotRunning),
+    ])
   }
 }
 
@@ -560,14 +622,13 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       types.Checkpoint,
     ])
     types.RetryUnavailable -> retry_unavailable(run)
-    types.Claimed(owner:) -> #(Run(..run, owner: Some(owner)), [
-      types.Checkpoint,
-    ])
-    types.Noted(key:, value:) -> #(note(run, key, value), [types.Checkpoint])
     types.BodyFinished(output:) -> finish(run, types.Done(output))
     types.BodyFailed(reason:) -> body_failed(run, reason)
-    // Handled by `step` before a live run sees them.
-    types.Started(..) | types.Resumed(..) -> #(run, [])
+    // Handled by `step` (`phase`) before a live run sees them.
+    types.Started(..)
+    | types.Resumed(..)
+    | types.Claimed(..)
+    | types.Noted(..) -> #(run, [])
   }
 }
 
@@ -1027,10 +1088,12 @@ fn deliver(
     }
     AgentCall(..), Errored(_) | AgentCall(..), Refused(_) ->
       answer_effect(id, entry)
+    // Whatever the entry: only an agent's answer carries a session value.
     CommandCall(..), _
     | ToolCall(..), _
     | OrchestratorCall(..), _
-    | RefusedCall(..), _ -> answer_effect(id, entry)
+    | RefusedCall(..), _
+    -> answer_effect(id, entry)
   }
 }
 
@@ -1254,6 +1317,7 @@ fn call_effect(
     }
     // Only an agent call with a live attempt is issued as one.
     AgentCall(agent:, ..), Error(Nil) -> Error(types.UnknownAgent(agent))
+    // Whatever its attempt: a call that is not an agent's is never issued as one.
     CommandCall(command:, ..), _ -> Error(types.NotAnAgent(command))
     ToolCall(tool:, ..), _ -> Error(types.NotAnAgent(tool))
     OrchestratorCall(name:, ..), _ -> Error(types.NotAnAgent(name))
@@ -1444,10 +1508,13 @@ fn settle_agent_with(
     }
     AgentCall(..), Errored(_)
     | AgentCall(..), Refused(_)
-    | CommandCall(..), _
+    | // Whatever the entry: only an agent's answer is a new session value.
+      CommandCall(..),
+      _
     | ToolCall(..), _
     | OrchestratorCall(..), _
-    | RefusedCall(..), _ -> run
+    | RefusedCall(..), _
+    -> run
   }
   let run = put(spend(run, usage), slot, call)
   #(run, [deliver(run, call_id(call), slot, call, entry)])
@@ -1501,8 +1568,7 @@ fn layers_of(run: Run, call: Call) -> List(Digest) {
         Error(Nil) -> []
       }
     AgentCall(session: None, from:, ..) -> from
-    CommandCall(..) | ToolCall(..) | OrchestratorCall(..) | RefusedCall(..) ->
-      []
+    CommandCall(..) | ToolCall(..) | OrchestratorCall(..) | RefusedCall(..) -> []
   }
 }
 
@@ -1700,6 +1766,7 @@ fn in_flight_calls(
           let decisions =
             list.map(calls, fn(c) {
               case c.kind, retry {
+                // A retry concerns the outside only: reads and sandbox work decide alone.
                 types.ReadsOnly, _ -> types.RunAgain(c.call)
                 types.SandboxOnly, _ -> types.ErrorToModel(c.call)
                 types.ExternalCall(..), RetryUnknown -> types.RunAgain(c.call)
@@ -2042,6 +2109,7 @@ fn restart(
     // A body tool call is made again: the outside world is asked anew.
     ToolCall(attempts: [Tried(state), ..], ..) ->
       case state, was_held {
+        // Running or in doubt: restartable whether held or not (a held call is settled).
         ToolRunning(..), _ | ToolInDoubt, _ | ToolSettled(..), True -> {
           let call =
             ToolCall(..call, attempts: [
@@ -2055,6 +2123,7 @@ fn restart(
             ]),
           )
         }
+        // Held back: nothing was issued, held failure or not.
         ToolHeld(..), _ | ToolSettled(..), False -> Error(types.NotLive(text))
       }
     // An orchestrator node is asked again.
@@ -2069,6 +2138,7 @@ fn restart(
     // A command reruns with the same input.
     CommandCall(attempts: [Tried(state), ..], ..) ->
       case state, was_held {
+        // Running: restartable whether held or not (a held call is settled).
         CommandRunning(..), _ | CommandSettled(..), True -> {
           let call =
             CommandCall(..call, attempts: [
@@ -2078,6 +2148,7 @@ fn restart(
           let run = add_inbox(put(lifted, slot, call), id, types.Restart, "")
           Ok(#(run, [types.Checkpoint, command_effect(run, slot, call)]))
         }
+        // Held back: nothing was issued, held failure or not.
         CommandHeld(..), _ | CommandSettled(..), False ->
           Error(types.NotLive(text))
       }
@@ -2106,11 +2177,13 @@ fn restart(
               #(put(run, slot, call), [types.Checkpoint, effect])
             }
           }
+        // Live (a held failure is settled): restartable whether held or not.
         AgentRunning(..), _
         | AgentWaiting(..), _
         | AgentUnavailable(..), _
         | AgentSettled(..), True
         -> restart_agent(lifted, id, slot, note, turns)
+        // Held back by a pause or the budget: not issued, nothing to restart.
         AgentHeld(..), _ -> Error(types.NodeNotRunning(text))
         AgentSettled(..), False -> Error(types.NotLive(text))
       }
