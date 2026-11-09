@@ -27,7 +27,7 @@
 // is called twice; preflight lists every tool source and warns about tools
 // given to agents that may write outside.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { type ArtifactRef, type CommandFailure, type Json, type Refusal, type ToolFailure, Type } from "../sdk/index.ts";
@@ -359,13 +359,14 @@ export class Session {
 	cancelNode(node: LiveNode): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
+		// A cancelled call ends its session's turn too: the next call continues from what it left.
+		// Saved before the cancel is journaled, so a crash in between cannot lose it.
+		this.#saveDialogue(id);
 		const refusal = this.#feed({ type: "node_cancelled", node: id, by: node.owned.by })[0];
 		if (refusal) return refusal;
 		this.#nodes.get(id)?.session.interrupt?.();
 		this.#commandAborts.get(id)?.abort();
 		this.#closeNode(id);
-		// A cancelled call ends its session's turn too: the next call continues from what it left.
-		this.#saveDialogue(id);
 		discardNode(this.paths.dir, id);
 		this.#pump();
 		this.#settle();
@@ -871,8 +872,10 @@ export class Session {
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error }, usage: NO_USAGE })));
 
 		this.#agentCalls.set(id, { digest: effect.digest, previous: effect.previous });
-		// A session call continues its previous call's dialogue; a missing one is refused, never a fresh start.
+		// A session call continues its previous call's dialogue; a missing one is recovered from the
+		// previous call's work dir (a crash after its result was journaled), else refused, never a fresh start.
 		const previous = effect.previous === null ? null : this.#dialogue(effect.previous);
+		if (previous !== null && !existsSync(previous)) this.#recoverDialogue(effect.previous!);
 		if (previous !== null && !existsSync(previous)) {
 			log({ kind: "note", text: `the session's previous dialogue ${previous} is missing` });
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "previous_dialogue_missing", id })));
@@ -938,8 +941,8 @@ export class Session {
 			},
 			log,
 		};
+		// The dialogue is saved before the call's end is journaled (`#saveDialogue`), then the node is dropped.
 		const done = () => {
-			this.#saveDialogue(id);
 			this.#closeNode(id);
 			discardNode(this.paths.dir, id);
 		};
@@ -998,11 +1001,13 @@ export class Session {
 								this.#feed({ type: "turn_limit_reached", ...base, used: turn.used, limit: turn.limit, usage });
 								return;
 							case "agent_error":
+								this.#saveDialogue(id);
 								this.#feed({ type: "agent_failed", ...base, failure: turn.failure, usage });
 								done();
 								return;
 							case "submitted": {
 								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
+								this.#saveDialogue(id);
 								if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage });
 								else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
 								done();
@@ -1027,7 +1032,8 @@ export class Session {
 	 * When an agent call ends, on every path (a result, a failure, a cancel,
 	 * a refused input, a workspace failure), its session's dialogue is saved
 	 * for the next call: the call's checkpoint, else its previous dialogue,
-	 * else an empty file (nothing to continue).
+	 * else an empty file (nothing to continue). It is saved before the end is
+	 * journaled.
 	 */
 	#saveDialogue(id: string): void {
 		// Issued in this session, or by an earlier host (its slot is in the call's work dir).
@@ -1042,6 +1048,25 @@ export class Session {
 		if (existsSync(checkpoint)) copyFileSync(checkpoint, this.#dialogue(call.digest));
 		else if (previous !== null && existsSync(previous)) copyFileSync(previous, this.#dialogue(call.digest));
 		else writeFileSync(this.#dialogue(call.digest), "");
+	}
+
+	/**
+	 * The dialogue after the call with this slot, from that call's work dir:
+	 * left there when the host died between journaling the call's end and
+	 * saving its dialogue (or by a host from before saves came first).
+	 */
+	#recoverDialogue(slot: string): void {
+		const work = join(this.paths.dir, "work");
+		if (!existsSync(work)) return;
+		for (const dir of readdirSync(work)) {
+			const file = join(work, dir, "call.json");
+			if (!existsSync(file)) continue;
+			const recorded: unknown = JSON.parse(readFileSync(file, "utf8"));
+			if (!Value.Check(CallSlots, recorded) || recorded.digest !== slot) continue;
+			this.#agentCalls.set(dir, recorded);
+			this.#saveDialogue(dir);
+			return;
+		}
 	}
 
 	/**
