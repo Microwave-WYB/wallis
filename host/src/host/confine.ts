@@ -3,7 +3,8 @@
 //
 // Nothing is implicit. A sandbox sees:
 //   /usr /etc /bin /lib*          the host base, read-only
-//   /run/wallis/bin/<name>        each required binary, alone, read-only
+//   <prefix of each required program>  read-only at its own path: a program is called by its
+//                                 real path, so what it finds relative to itself is there
 //   /run/wallis/env               the setup env ($WALLIS_ENV), read-only
 //   /in/<hex>/<n>                 the call's input artifacts, read-only
 //   /in/trees/<hex>               each Tree in its input, read-only
@@ -31,7 +32,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, release, tmpdir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 
@@ -83,6 +84,23 @@ function onPath(name: string, path: string): string | null {
 		}
 	}
 	return null;
+}
+
+/** The host base every sandbox sees read-only (`systemMounts`). */
+const BASE = ["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64"];
+
+function underBase(path: string): boolean {
+	return BASE.some((b) => path === b || path.startsWith(`${b}/`));
+}
+
+/**
+ * Where a program is installed: the dir above its `bin/` (so `../share`,
+ * `../lib` are found), else its own dir. Never `/` or the home dir itself.
+ */
+export function installPrefix(program: string): string {
+	const dir = dirname(program);
+	const above = dirname(dir);
+	return basename(dir) === "bin" && above !== "/" && above !== homedir() ? above : dir;
 }
 
 /** The host base, recorded in run metadata. */
@@ -202,7 +220,9 @@ export class Sandboxes {
 		if (options.setup || options.network === "full") args.push("--share-net");
 		args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 		if (options.gpu) args.push(...gpuDevices());
-		for (const r of s.requires) args.push("--ro-bind", this.#bins[r.name]!, `${LAYOUT.bin}/${r.name}`);
+		// Each required program stays where it is, called by its real path: its install prefix is
+		// visible read-only at the same path, so files it finds relative to itself are there.
+		for (const prefix of new Set(s.requires.map((r) => installPrefix(this.#bins[r.name]!)))) if (!underBase(prefix)) args.push("--ro-bind", prefix, prefix);
 		if (envDir) args.push(options.setup ? "--bind" : "--ro-bind", envDir, LAYOUT.env);
 		if (dirs.inputs) args.push("--ro-bind", dirs.inputs, LAYOUT.inputs);
 		for (const t of dirs.trees ?? []) {
@@ -222,9 +242,9 @@ export class Sandboxes {
 		for (const m of s.mounts) args.push("--ro-bind", this.#mounts[m]!, `${LAYOUT.mounts}/${m}`);
 		args.push("--chdir", LAYOUT.work, "--");
 		const program = argv[0] ?? "";
-		args.push(program in this.#bins || s.requires.some((r) => r.name === program) ? `${LAYOUT.bin}/${program}` : program, ...argv.slice(1));
+		args.push(s.requires.some((r) => r.name === program) && this.#bins[program] ? this.#bins[program]! : program, ...argv.slice(1));
 		const env: Record<string, string> = {
-			PATH: [LAYOUT.bin, ...(envDir ? [`${LAYOUT.env}/bin`] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
+			PATH: [...new Set(s.requires.map((r) => dirname(this.#bins[r.name]!))), ...(envDir ? [`${LAYOUT.env}/bin`] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
 			HOME: LAYOUT.work,
 			LANG: "C.UTF-8",
 			WALLIS_SCRATCH: LAYOUT.work,

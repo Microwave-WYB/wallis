@@ -296,3 +296,16 @@ test("only a Tree at a position its schema declares is mounted; JSON shaped like
 	assert.equal(mounted.note.path, undefined);
 	assert.equal(mounted.more[0].path, mounted.files.path);
 });
+
+test("a required program is called by its real path, so it finds its data relative to itself", bwrap, async () => {
+	const prefix = join(tmp(), "opt", "reloc");
+	mkdirSync(join(prefix, "bin"), { recursive: true });
+	mkdirSync(join(prefix, "share", "reloc"), { recursive: true });
+	writeFileSync(join(prefix, "share", "reloc", "data"), "found my share");
+	writeFileSync(join(prefix, "bin", "reloc"), '#!/bin/sh\nhere=$(dirname "$(readlink -f "$0")")\ncat "$here/../share/reloc/data"\n', { mode: 0o755 });
+	// Given through a symlink elsewhere, as programs often are.
+	const link = join(tmp(), "reloc");
+	symlinkSync(join(prefix, "bin", "reloc"), link);
+	const done = await runWorkflow({ ...real(join(tmp(), "run"), "reloc"), workflow: resolve(here, "fixtures/reloc/workflow.ts"), input: null, bins: { reloc: link }, executor: shell() });
+	assert.deepEqual(done.outcome, { type: "done", value: { out: "found my share" } });
+});
