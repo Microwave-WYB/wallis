@@ -2,7 +2,7 @@
 // derived `stopped`, what needs attention, and agent-readable summaries.
 
 import { spawnSync } from "node:child_process";
-import { constants, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
 import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
@@ -334,8 +334,9 @@ export async function waitForAttention(dir: string, options: { timeoutMs?: numbe
 
 /**
  * Copies a run into a new one: its whole journal (a cache), blobs and
- * work dirs, so
- * the fork re-executes the body and every unchanged call hits. Only the
+ * layers (everything the log names), so the fork re-executes the body and
+ * every unchanged call hits. The source's live work dirs (calls in flight
+ * or waiting, tool connections) are not copied: they are the source's. Only the
  * events that ended the source are left out. The cache is per run and its
  * forks; it is never shared implicitly with other runs.
  */
@@ -348,9 +349,6 @@ export function forkRun(source: string, target: string): RunPaths {
 	// Blobs and layers first: the log names them. Both are immutable, so hardlinks share them.
 	shareBlobs(from.dir, to.dir);
 	if (existsSync(join(from.dir, "layers"))) spawnSync("cp", ["-al", join(from.dir, "layers"), join(to.dir, "layers")]);
-	// The work dirs (session scratch dirs): later session calls see their /w. Reflinked where
-	// the filesystem can, else copied.
-	if (existsSync(join(from.dir, "work"))) cpSync(join(from.dir, "work"), join(to.dir, "work"), { recursive: true, mode: constants.COPYFILE_FICLONE });
 	// Where the fork comes from is a fact of its own log; meta.json is derived from it.
 	const at = events.length;
 	events.push({ type: "noted", key: "created", value: new Date().toISOString() }, { type: "noted", key: "forked_from", value: { run_id: from.id, at } });

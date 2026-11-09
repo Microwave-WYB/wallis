@@ -228,15 +228,15 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 		kill: async () => killHost(project.root, id),
 		outcome: async () => status().status.outcome!,
 		midway: async () => {
-			// A fork keeps the work dirs: the idle call's checkpoint and the session's scratch dir.
+			// A fork has what the log names (the idle call's checkpoint), not the source's live work dirs.
 			const forked = ok(w("fork", id));
 			const forkId = /into (\S+)\./.exec(forked)![1]!;
 			const forkDir = runDir(project.root, forkId);
 			const checkpoints = lines(join(forkDir, "log.jsonl")).filter((e) => e.type === "agent_progressed" && e.id === "#2");
 			assert.ok(checkpoints.length > 0 && existsSync(blobPath(forkDir, String(checkpoints.at(-1)!.dialogue))), "the idle call's checkpoint is in the fork");
-			// Node dirs only: a tool connection's scratch dir is its own (the live run keeps opening connections).
-			const nodeDirs = (run: string) => readdirSync(join(runDir(project.root, run), "work")).filter((d) => !/^(mcp|toolset)-/.test(d)).sort();
-			assert.deepEqual(nodeDirs(forkId), nodeDirs(id));
+			// The source's idle call keeps its work dir; the fork (which does not reissue it) has none.
+			assert.ok(existsSync(join(runDir(project.root, id), "work", "_2")));
+			assert.ok(!existsSync(join(forkDir, "work", "_2")), "the fork copies no work dirs");
 			assert.deepEqual(status(forkId).attention.map(label), ["ended_without_result:#2"]);
 			ok(w("cancel", forkId));
 		},
