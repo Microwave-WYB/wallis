@@ -335,7 +335,7 @@ pub fn interrupt_is_logged_for_a_running_steerable_node_test() {
     types.InterruptRequested("#0", human),
   ]
   let #(_, effects, log) = replay(events)
-  assert effects == [Checkpoint]
+  assert effects == [Checkpoint, types.InterruptTurn("#0", 1)]
   assert list.length(log) == 3
   let assert [NodeRunning(inbox: [InboxMessage(Interrupt, "", 0)], ..)] =
     nodes_after(events)
@@ -1368,4 +1368,77 @@ pub fn cancelling_an_unknown_outcome_tells_the_body_test() {
     Checkpoint,
     Fail("#0", AgentGaveUp("worker", types.UnknownOutcome("upload", _))),
   ] = step(state, types.NodeCancelled("#0", human)).1
+}
+
+// --- Decisions the core makes, not the host ---
+
+fn in_flight(call, tool, kind) {
+  types.InFlightCall(call:, tool:, args: value.object([]), kind:)
+}
+
+pub fn the_core_decides_each_tool_call_in_flight_at_a_crash_test() {
+  let journaled =
+    value.object([
+      #("tool", JString("mcp:fx/post")),
+      #("args", value.object([])),
+      #("outcome", JString("posted")),
+    ])
+  let #(state, _, _) =
+    replay([
+      started(basic()),
+      call("#0", "worker", JNull),
+      types.ToolRecorded("#0", "0/c4", journaled),
+      Resumed(pin()),
+      call("#0", "worker", JNull),
+    ])
+  let #(_, effects) =
+    run.step(
+      state,
+      types.ToolCallsInFlight("#0", [
+        in_flight("0/c1", "read", types.ReadsOnly),
+        in_flight("0/c2", "bash", types.SandboxOnly),
+        in_flight("0/c3", "mcp:fx/search", types.ExternalCall(types.ReplaySafe)),
+        in_flight("0/c4", "mcp:fx/post", types.ExternalCall(types.ReplayNever)),
+        in_flight("0/c5", "mcp:fx/wipe", types.ExternalCall(types.ReplayNever)),
+      ]),
+    )
+  // Logged, so a replay decides the same.
+  assert effects
+    == [
+      Checkpoint,
+      types.InFlightDecided("#0", [
+        types.RunAgain("0/c1"),
+        types.ErrorToModel("0/c2"),
+        types.RunAgain("0/c3"),
+        types.RunAgain("0/c4"),
+        types.OutcomeIsUnknown("0/c5"),
+      ]),
+    ]
+}
+
+pub fn a_retry_of_an_unknown_outcome_survives_a_crash_before_it_resumes_test() {
+  let #(state, _, _) = replay(unknown_agent_call())
+  let #(state, _) = run.step(state, types.Restarted("#0", None, human, 0))
+  // The host dies before the retried call resumes: a new host reissues it.
+  let #(state, _) = run.step(state, Resumed(pin()))
+  let #(state, _) = run.step(state, call("#0", "worker", JNull))
+  let unsafe = [in_flight("1/c0", "upload", types.ExternalCall(types.ReplayNever))]
+  let #(state, effects) =
+    run.step(state, types.ToolCallsInFlight("#0", unsafe))
+  assert effects
+    == [Checkpoint, types.InFlightDecided("#0", [types.RunAgain("1/c0")])]
+  // The retry is spent on that decision.
+  let assert [Checkpoint, types.InFlightDecided("#0", [types.OutcomeIsUnknown(_)])] =
+    run.step(state, types.ToolCallsInFlight("#0", unsafe)).1
+}
+
+pub fn an_interrupt_names_the_attempt_it_is_for_test() {
+  let #(state, _, _) = replay([started(basic()), call("#0", "worker", JNull)])
+  let assert [Checkpoint, types.InterruptTurn("#0", 1)] =
+    run.step(state, types.InterruptRequested("#0", human)).1
+  let #(state, effects) =
+    run.step(state, types.Restarted("#0", None, human, 0))
+  let assert [Checkpoint, CallAgent(attempt: 2, ..)] = effects
+  let assert [Checkpoint, types.InterruptTurn("#0", 2)] =
+    run.step(state, types.InterruptRequested("#0", human)).1
 }

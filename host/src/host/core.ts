@@ -29,6 +29,8 @@ export type Event =
 	| { type: "previous_dialogue_missing"; id: string }
 	/** A running agent call's dialogue so far: a blob written before this event. */
 	| { type: "agent_progressed"; id: string; dialogue: string }
+	/** A resumed agent call's tool calls in flight at a crash: the core decides each. */
+	| { type: "tool_calls_in_flight"; id: string; calls: InFlightCall[] }
 	| { type: "turn_interrupted"; id: string; usage: Usage; model: string }
 	| { type: "tool_recorded"; id: string; call: string; result: Json }
 	| { type: "input_rejected"; id: string; field: string | null; chars: number; limit: number }
@@ -121,6 +123,16 @@ export type LiveNodeState = RunningNode | IdleNodeState | HeldNode | CommandRunn
 /** One call of an agent or a command; each variant carries only what is meaningful in that state. */
 export type Node = AgentNode | HeldNode | CommandNode | CommandHeld | ToolNode | OrchestratorNode | RefusedNode;
 
+/** A tool call in flight at a crash: its journal key, the tool (an id for custom and MCP tools), its arguments, and its kind. */
+export type InFlightCall = {
+	call: string;
+	tool: string;
+	args: Json;
+	kind: { type: "external_call"; replay: "replay_safe" | "replay_never" } | { type: "reads_only" } | { type: "sandbox_only" };
+};
+
+export type InFlightDecision = { type: "run_again"; call: string } | { type: "error_to_model"; call: string } | { type: "outcome_is_unknown"; call: string };
+
 export type Observation = { at: string; label: string; value: Json };
 
 export type Snapshot = {
@@ -162,6 +174,8 @@ export type CallAgentEffect = {
 	checkpoint: string | null;
 	/** MCP tool results already journaled for this call. */
 	recorded: { call: string; result: Json }[];
+	/** The attempt this call is for (1 for the first): what results and interrupts are matched against. */
+	attempt: number;
 };
 
 export type Effect =
@@ -171,6 +185,9 @@ export type Effect =
 	| { type: "call_tool"; id: string; tool: string; input: Json; slot: string }
 	/** A body tool call in flight at a crash, not safe to repeat: step `tool_call_unknown`, so the log has it. */
 	| { type: "log_unknown_tool"; id: string }
+	/** Abort the current turn of this attempt of an agent call, now or when it starts. */
+	| { type: "interrupt_turn"; id: string; attempt: number }
+	| { type: "in_flight_decided"; id: string; decisions: InFlightDecision[] }
 	| { type: "deliver"; id: string; value: Json }
 	| { type: "fail"; id: string; reason: FailReason }
 	| { type: "refuse"; id: string | null; refusal: Refusal }

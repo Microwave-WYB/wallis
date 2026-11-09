@@ -300,9 +300,9 @@ class PiNodeSession implements NodeSession {
 		if (last?.role !== "assistant") return null;
 		this.#tools.turn = this.#turns;
 		const calls = last.content.filter((c) => c.type === "toolCall");
-		// A restart of the unknown outcome retries it: the unknown call runs again, the journaled ones replay.
-		const retry = this.#spec.retryUnknown;
-		const unknown = retry ? undefined : calls.find((c) => this.#tools.crashPolicy(c.name, this.#tools.key(c.id), c.arguments as Json) === "unknown");
+		// The core decides each (a restart of an unknown outcome makes it run again); the decision is logged.
+		const decisions = new Map(this.#spec.decideInFlight(calls.map((c) => this.#tools.inFlight(c.name, this.#tools.key(c.id), c.arguments as Json))).map((d) => [d.call, d.type]));
+		const unknown = calls.find((c) => decisions.get(this.#tools.key(c.id)) === "outcome_is_unknown");
 		if (unknown) {
 			this.#spec.log({ kind: "note", text: `${unknown.name} was in flight at a crash and is not safe to make again: its outcome is unknown` });
 			return { tool: unknown.name, args: unknown.arguments as Json };
@@ -311,8 +311,7 @@ class PiNodeSession implements NodeSession {
 			let text: string;
 			let isError: boolean;
 			let details: { wallis_pending: Pending } | undefined;
-			const policy = this.#tools.crashPolicy(call.name, this.#tools.key(call.id), call.arguments as Json);
-			if (policy === "rerun" || (retry && policy === "unknown")) {
+			if (decisions.get(this.#tools.key(call.id)) === "run_again") {
 				const r = await this.#tools.invoke(call.name, call.arguments as Json, false, undefined, this.#tools.key(call.id));
 				text = this.#tools.cap(r.text);
 				isError = r.isError === true;

@@ -35,6 +35,7 @@ import { type McpClient, toLlmContent } from "@earendil-works/pi-mcp";
 import { type Json, Type } from "../sdk/index.ts";
 import Value from "typebox/value";
 import { LAYOUT, runSpawn } from "./confine.ts";
+import type { InFlightCall } from "./core.ts";
 import { listIn, resolveIn } from "./layers.ts";
 import { type NodeSpec, validateSubmission } from "./executor.ts";
 import { canonical } from "./render.ts";
@@ -67,7 +68,6 @@ const Outcome = Type.Object({ text: Type.String(), value: Type.Optional(Type.Unk
 const Recorded = Type.Object({ tool: Type.String(), args: Type.Unknown(), outcome: Outcome });
 
 /** What a tool call in flight at a crash does when the call is reissued. */
-export type CrashPolicy = "rerun" | "sandbox" | "unknown";
 
 export interface ToolLayerOptions {
 	/** Tool calls one node may make, nested calls included. Default: 10 per allowed turn. */
@@ -144,18 +144,19 @@ export class NodeTools {
 	}
 
 	/**
-	 * A call in flight at a crash: run it again if it only reads, asks or
-	 * records, if it is an external tool that is safe or already journaled,
-	 * or if it is codemode and every external tool is safe; give the model an
-	 * error if it worked only on the sandbox; else its outcome is unknown.
+	 * A call in flight at a crash, as the facts the core decides it by: an
+	 * external tool (by its id) with its replay safety; codemode, which is as
+	 * safe as its least safe external tool; a tool that only reads, asks or
+	 * records; or one that works on the sandbox only.
 	 */
-	crashPolicy(name: string, key: string, args: Json): CrashPolicy {
+	inFlight(name: string, key: string, args: Json): InFlightCall {
 		// External tools first: a built-in's name never decides for one.
 		const info = this.external.get(name);
-		if (info) return info.replay === "safe" || this.recorded(key, info, args) !== null ? "rerun" : "unknown";
-		if (RERUN.has(name)) return "rerun";
-		if (name === "codemode") return [...this.external.values()].every((t) => t.replay === "safe") ? "rerun" : "unknown";
-		return "sandbox";
+		const external = (safe: boolean): InFlightCall["kind"] => ({ type: "external_call", replay: safe ? "replay_safe" : "replay_never" });
+		if (info) return { call: key, tool: info.id, args, kind: external(info.replay === "safe") };
+		if (RERUN.has(name)) return { call: key, tool: name, args, kind: { type: "reads_only" } };
+		if (name === "codemode") return { call: key, tool: name, args, kind: external([...this.external.values()].every((t) => t.replay === "safe")) };
+		return { call: key, tool: name, args, kind: { type: "sandbox_only" } };
 	}
 
 	/** Every call, direct or nested, goes through here. */

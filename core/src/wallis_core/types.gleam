@@ -233,6 +233,9 @@ pub type Event {
   /// The agent call's dialogue so far, written as a content-addressed blob
   /// before this event: a reissued attempt resumes from the newest one.
   AgentProgressed(id: String, dialogue: String)
+  /// A reissued agent call found these tool calls in flight in its
+  /// checkpoint (the host died during them): the core decides each.
+  ToolCallsInFlight(id: String, calls: List(InFlightCall))
   /// The owner's interrupt aborted the turn: the node waits, progress kept.
   TurnInterrupted(id: String, usage: Usage, model: String)
   /// The result of an MCP tool an agent call made, journaled so a reissued
@@ -370,6 +373,11 @@ pub fn event_to_json(event: Event) -> json.Json {
       #("type", json.string("agent_progressed")),
       #("id", json.string(id)),
       #("dialogue", json.string(dialogue)),
+    ])
+    ToolCallsInFlight(id:, calls:) -> json.object([
+      #("type", json.string("tool_calls_in_flight")),
+      #("id", json.string(id)),
+      #("calls", json.array(calls, in_flight_call_to_json)),
     ])
     TurnInterrupted(id:, usage:, model:) -> json.object([
       #("type", json.string("turn_interrupted")),
@@ -601,6 +609,11 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use dialogue <- decode.field("dialogue", decode.string)
       decode.success(AgentProgressed(id:, dialogue:))
     }
+    "tool_calls_in_flight" -> {
+      use id <- decode.field("id", decode.string)
+      use calls <- decode.field("calls", decode.list(in_flight_call_decoder()))
+      decode.success(ToolCallsInFlight(id:, calls:))
+    }
     "turn_interrupted" -> {
       use id <- decode.field("id", decode.string)
       use usage <- decode.field("usage", usage_decoder())
@@ -742,6 +755,114 @@ pub fn event_decoder() -> decode.Decoder(Event) {
 
 
 
+
+
+
+/// A tool call in flight at a crash: its journal key, the tool (its id for
+/// a custom or MCP tool), its arguments, and what kind of call it is.
+pub type InFlightCall {
+  InFlightCall(call: String, tool: String, args: Value, kind: InFlightKind)
+}
+
+pub fn in_flight_call_to_json(in_flight_call: InFlightCall) -> json.Json {
+  let InFlightCall(call:, tool:, args:, kind:) = in_flight_call
+  json.object([
+    #("call", json.string(call)),
+    #("tool", json.string(tool)),
+    #("args", json_value.to_json(args)),
+    #("kind", in_flight_kind_to_json(kind)),
+  ])
+}
+
+pub fn in_flight_call_decoder() -> decode.Decoder(InFlightCall) {
+  use call <- decode.field("call", decode.string)
+  use tool <- decode.field("tool", decode.string)
+  use args <- decode.field("args", json_value.decoder())
+  use kind <- decode.field("kind", in_flight_kind_decoder())
+  decode.success(InFlightCall(call:, tool:, args:, kind:))
+}
+
+pub type InFlightKind {
+  /// Reaches the outside (a custom or MCP tool, or codemode, which may call
+  /// them): made again only if safe to replay or already journaled.
+  ExternalCall(replay: Replay)
+  /// Only reads, asks or records: made again.
+  ReadsOnly
+  /// Works on the sandbox only: the model gets an error and decides.
+  SandboxOnly
+}
+
+pub fn in_flight_kind_to_json(in_flight_kind: InFlightKind) -> json.Json {
+  case in_flight_kind {
+    ExternalCall(replay:) -> json.object([
+      #("type", json.string("external_call")),
+      #("replay", replay_to_json(replay)),
+    ])
+    ReadsOnly -> json.object([
+      #("type", json.string("reads_only")),
+    ])
+    SandboxOnly -> json.object([
+      #("type", json.string("sandbox_only")),
+    ])
+  }
+}
+
+pub fn in_flight_kind_decoder() -> decode.Decoder(InFlightKind) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "external_call" -> {
+      use replay <- decode.field("replay", replay_decoder())
+      decode.success(ExternalCall(replay:))
+    }
+    "reads_only" -> decode.success(ReadsOnly)
+    "sandbox_only" -> decode.success(SandboxOnly)
+    _ -> decode.failure(ReadsOnly, "InFlightKind")
+  }
+}
+
+/// What happens to a tool call that was in flight at a crash.
+pub type InFlightDecision {
+  RunAgain(call: String)
+  ErrorToModel(call: String)
+  /// Not safe to make again: the node waits, its outcome unknown.
+  OutcomeIsUnknown(call: String)
+}
+
+pub fn in_flight_decision_to_json(in_flight_decision: InFlightDecision) -> json.Json {
+  case in_flight_decision {
+    RunAgain(call:) -> json.object([
+      #("type", json.string("run_again")),
+      #("call", json.string(call)),
+    ])
+    ErrorToModel(call:) -> json.object([
+      #("type", json.string("error_to_model")),
+      #("call", json.string(call)),
+    ])
+    OutcomeIsUnknown(call:) -> json.object([
+      #("type", json.string("outcome_is_unknown")),
+      #("call", json.string(call)),
+    ])
+  }
+}
+
+pub fn in_flight_decision_decoder() -> decode.Decoder(InFlightDecision) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "run_again" -> {
+      use call <- decode.field("call", decode.string)
+      decode.success(RunAgain(call:))
+    }
+    "error_to_model" -> {
+      use call <- decode.field("call", decode.string)
+      decode.success(ErrorToModel(call:))
+    }
+    "outcome_is_unknown" -> {
+      use call <- decode.field("call", decode.string)
+      decode.success(OutcomeIsUnknown(call:))
+    }
+    _ -> decode.failure(RunAgain(call: ""), "InFlightDecision")
+  }
+}
 
 pub type Request {
   /// A call of a session value: `session` is its id (`None` for a new
@@ -1149,6 +1270,9 @@ pub type Effect {
     checkpoint: Option(String),
     /// MCP tool results already journaled for this call.
     recorded: List(ToolResult),
+    /// The attempt this effect is for (1 for the first): results, steers
+    /// and interrupts are for one attempt only.
+    attempt: Int,
   )
   RunCommand(
     id: String,
@@ -1162,6 +1286,11 @@ pub type Effect {
   /// Log that this body tool call's outcome is unknown: the host steps
   /// `ToolCallUnknown(id)`.
   LogUnknownTool(id: String)
+  /// Abort the current turn of this attempt of an agent call (now, or as
+  /// soon as it starts).
+  InterruptTurn(id: String, attempt: Int)
+  /// The core's decision for each tool call in flight (`ToolCallsInFlight`).
+  InFlightDecided(id: String, decisions: List(InFlightDecision))
   Deliver(id: String, value: Value)
   Fail(id: String, reason: FailReason)
   /// `Some(id)`: the body's request is refused. `None`: the event itself is
@@ -1175,7 +1304,7 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
     Checkpoint -> json.object([
       #("type", json.string("checkpoint")),
     ])
-    CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, layers:, history:, checkpoint:, recorded:) -> json.object([
+    CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, layers:, history:, checkpoint:, recorded:, attempt:) -> json.object([
       #("type", json.string("call_agent")),
       #("id", json.string(id)),
       #("agent", json.string(agent)),
@@ -1203,6 +1332,7 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
         option.Some(value) -> json.string(value)
       }),
       #("recorded", json.array(recorded, tool_result_to_json)),
+      #("attempt", json.int(attempt)),
     ])
     RunCommand(id:, command:, input:, compute_minutes:, slot:) -> json.object([
       #("type", json.string("run_command")),
@@ -1225,6 +1355,16 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
     LogUnknownTool(id:) -> json.object([
       #("type", json.string("log_unknown_tool")),
       #("id", json.string(id)),
+    ])
+    InterruptTurn(id:, attempt:) -> json.object([
+      #("type", json.string("interrupt_turn")),
+      #("id", json.string(id)),
+      #("attempt", json.int(attempt)),
+    ])
+    InFlightDecided(id:, decisions:) -> json.object([
+      #("type", json.string("in_flight_decided")),
+      #("id", json.string(id)),
+      #("decisions", json.array(decisions, in_flight_decision_to_json)),
     ])
     Deliver(id:, value:) -> json.object([
       #("type", json.string("deliver")),
@@ -1270,7 +1410,8 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
       use history <- decode.field("history", decode.optional(decode.string))
       use checkpoint <- decode.field("checkpoint", decode.optional(decode.string))
       use recorded <- decode.field("recorded", decode.list(tool_result_decoder()))
-      decode.success(CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, layers:, history:, checkpoint:, recorded:))
+      use attempt <- decode.field("attempt", decode.int)
+      decode.success(CallAgent(id:, agent:, model:, input:, turn:, turn_limit:, slot:, transcript:, note:, session:, layers:, history:, checkpoint:, recorded:, attempt:))
     }
     "run_command" -> {
       use id <- decode.field("id", decode.string)
@@ -1290,6 +1431,16 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
     "log_unknown_tool" -> {
       use id <- decode.field("id", decode.string)
       decode.success(LogUnknownTool(id:))
+    }
+    "interrupt_turn" -> {
+      use id <- decode.field("id", decode.string)
+      use attempt <- decode.field("attempt", decode.int)
+      decode.success(InterruptTurn(id:, attempt:))
+    }
+    "in_flight_decided" -> {
+      use id <- decode.field("id", decode.string)
+      use decisions <- decode.field("decisions", decode.list(in_flight_decision_decoder()))
+      decode.success(InFlightDecided(id:, decisions:))
     }
     "deliver" -> {
       use id <- decode.field("id", decode.string)
@@ -1313,6 +1464,10 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
     _ -> decode.failure(Checkpoint, "Effect")
   }
 }
+
+
+
+
 
 
 

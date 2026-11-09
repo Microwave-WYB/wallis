@@ -45,7 +45,7 @@ import type { McpClient } from "@earendil-works/pi-mcp";
 import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
 import { bundleWorkflow } from "./bundle.ts";
 import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode, SubmittableNode } from "./capability.ts";
-import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
+import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type InFlightDecision, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
@@ -200,10 +200,10 @@ export class Session {
 	#listing = new Map<string, ToolInfo[]>();
 	/** The body's connections: one per source for the run (this session). */
 	readonly #bodyClients = new Map<string, Promise<McpClient>>();
-	/** Interrupts that came before the call's executor session opened. */
-	readonly #interruptBeforeStart = new Set<string>();
-	/** Restarted agent calls whose unknown tool call is to be made again. */
-	readonly #retryUnknown = new Set<string>();
+	/** Interrupts the core sent for an attempt whose executor session is not open yet: by call, the attempt. */
+	readonly #pendingInterrupts = new Map<string, number>();
+	/** The core's decisions on tool calls in flight, as it emits them (read by `decideInFlight`). */
+	readonly #decisions = new Map<string, InFlightDecision[]>();
 	/** Aborts a command call in flight (restart, cancel). */
 	readonly #commandAborts = new Map<string, AbortController>();
 	#resumed = false;
@@ -290,13 +290,8 @@ export class Session {
 	interrupt(node: SteerableNode): Refusal | null {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
-		const refusal = this.#feed({ type: "interrupt_requested", node: id, by: node.owned.by })[0];
-		if (refusal) return refusal;
-		// Its executor session may not be open yet: then the turn is interrupted as it starts.
-		const open = this.#nodes.get(id);
-		if (open) open.session.interrupt?.();
-		else this.#interruptBeforeStart.add(id);
-		return null;
+		// The core names the attempt it is for (`interrupt_turn`); the effect reaches that attempt only.
+		return this.#feed({ type: "interrupt_requested", node: id, by: node.owned.by })[0] ?? null;
 	}
 
 	/**
@@ -328,11 +323,9 @@ export class Session {
 		if (this.#settled) return { type: "not_running" };
 		const id = node.node.id;
 		const held = this.#core.snapshot().held === id;
-		this.#interruptBeforeStart.delete(id);
-		// An unknown outcome is retried where it stopped: its checkpoint and journaled tool results stay.
+		// An unknown outcome is retried where it stopped (the core keeps the retry): its work dir stays.
 		const retry = node.node.type === "node_idle" && node.node.cause.type === "outcome_unknown";
-		if (retry) this.#retryUnknown.add(id);
-		else {
+		if (!retry) {
 			// The old session (or process) and dirs go first: the reissued call creates fresh ones.
 			this.#nodes.get(id)?.session.interrupt?.();
 			this.#commandAborts.get(id)?.abort();
@@ -341,7 +334,6 @@ export class Session {
 		}
 		this.#transcriptLog(id)({ kind: "note", text: retry ? "restarted: the unknown call is made again" : `restarted${note === undefined ? "" : `: ${note}`}` });
 		const refusal = this.#feed({ type: "restarted", node: id, note: note ?? null, by: node.owned.by, turns })[0] ?? null;
-		if (refusal !== null) this.#retryUnknown.delete(id);
 		// A held failure: the body had stopped on it, so it runs again.
 		if (refusal === null && held) void this.#restartBody();
 		this.#pump();
@@ -356,7 +348,7 @@ export class Session {
 		// A cancelled call ends its session's turn too: the next call continues from its newest checkpoint.
 		const refusal = this.#feed({ type: "node_cancelled", node: id, by: node.owned.by })[0];
 		if (refusal) return refusal;
-		this.#interruptBeforeStart.delete(id);
+		this.#pendingInterrupts.delete(id);
 		// A start still pending is superseded: its session is closed when it opens.
 		this.#generation.set(id, (this.#generation.get(id) ?? 0) + 1);
 		this.#nodes.get(id)?.session.interrupt?.();
@@ -869,6 +861,16 @@ export class Session {
 			case "call_tool":
 				this.#callTool(effect);
 				return;
+			case "interrupt_turn": {
+				// Only the attempt the core names: an earlier one opening late never takes it.
+				const open = this.#nodes.get(effect.id);
+				if (open && open.attempt === effect.attempt) open.session.interrupt?.();
+				else this.#pendingInterrupts.set(effect.id, effect.attempt);
+				return;
+			}
+			case "in_flight_decided":
+				this.#decisions.set(effect.id, effect.decisions);
+				return;
 			case "log_unknown_tool":
 				// Stepped next, so the log (and every state rebuilt from it) has the unknown outcome.
 				this.#transcriptLog(effect.id)({ kind: "note", text: "in flight at a crash and not safe to make again: its outcome is unknown" });
@@ -909,7 +911,7 @@ export class Session {
 	}
 
 	/** The node's open executor session, kept while the node is idle. */
-	readonly #nodes = new Map<string, { session: NodeSession; model: string }>();
+	readonly #nodes = new Map<string, { session: NodeSession; model: string; attempt: number }>();
 
 	#transcriptLog(id: string): (entry: TranscriptEntry) => void {
 		const file = join(this.paths.dir, "nodes", `${nodeDirName(id)}.jsonl`);
@@ -936,8 +938,6 @@ export class Session {
 		const failed = (error: string) =>
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error }, usage: NO_USAGE })));
 
-		// An interrupt is for the turn it was made against; one left by an earlier attempt is not this call's.
-		this.#interruptBeforeStart.delete(id);
 		// A session call continues its previous call's dialogue, and a reissued attempt its newest
 		// checkpoint: blobs the journal names. A missing one is refused, never a fresh start.
 		const history = effect.history === null ? null : readDialogue(this.paths.dir, effect.history);
@@ -995,7 +995,12 @@ export class Session {
 			transcript: message === undefined ? effect.transcript : effect.transcript.slice(0, -1),
 			history,
 			recorded: new Map(effect.recorded.map((r) => [r.call, r.result])),
-			retryUnknown: this.#retryUnknown.delete(id),
+			// The core decides (and logs) what happens to each; nothing is decided here.
+			decideInFlight: (calls) => {
+				this.#decisions.delete(id);
+				if (current()) this.#later(() => this.#feed({ type: "tool_calls_in_flight", id, calls: [...calls] }));
+				return this.#decisions.get(id) ?? calls.map((c) => ({ type: "error_to_model", call: c.call }));
+			},
 			// Journaled before the model sees it; a result of a restarted call is dropped by the core.
 			record: (call, result) => {
 				if (current()) this.#later(() => this.#feed({ type: "tool_recorded", id, call, result }));
@@ -1035,13 +1040,17 @@ export class Session {
 				started.close();
 				throw new Error("superseded while starting");
 			}
-			this.#nodes.set(id, { session: started, model: effect.model });
+			this.#nodes.set(id, { session: started, model: effect.model, attempt: effect.attempt });
 			return started;
 		};
 		if (message !== undefined) log({ kind: "user", text: message });
 		session()
 			.then((s) => {
-				if (this.#interruptBeforeStart.delete(id)) s.interrupt?.();
+				// An interrupt the core sent for this attempt before it opened.
+				if (this.#pendingInterrupts.get(id) === effect.attempt) {
+					this.#pendingInterrupts.delete(id);
+					s.interrupt?.();
+				}
 				return s.turn(message, effect.turn_limit);
 			})
 			.then(
@@ -1051,7 +1060,6 @@ export class Session {
 							log({ kind: "note", text: `discarded the ${turn.type} turn of a call that was restarted or cancelled` });
 							return;
 						}
-						this.#interruptBeforeStart.delete(id);
 						if (turn.type === "executor_error") {
 							this.#closeNode(id);
 							log({ kind: "turn", result: `executor_error: ${turn.error}` });
@@ -1096,7 +1104,6 @@ export class Session {
 				(error: unknown) =>
 					this.#later(() => {
 						if (!current()) return;
-						this.#interruptBeforeStart.delete(id);
 						this.#closeNode(id);
 						this.#feed({ type: "executor_failed", id, error: errorText(error) });
 					}),

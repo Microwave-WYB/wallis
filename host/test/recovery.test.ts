@@ -11,6 +11,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import type { InFlightCall } from "../src/host/core.ts";
 import type { NodeSpec, TranscriptEntry } from "../src/host/executor.ts";
 import { appendInbox, EventLog, FakeCommands, FakeExecutor, PiExecutor, runPaths, runWorkflow, startSession } from "../src/host/index.ts";
 import { blobPath } from "../src/host/artifacts.ts";
@@ -147,7 +148,9 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		declaration: { model: "default", prompt: "p", input: {}, output: {}, tools: [], access: 3, skills: [], needs: {}, sandbox: null, steerable: true, compaction: true, max_turns: 6 },
 		history: null,
 		recorded: new Map(),
-		retryUnknown: false,
+		// As the core decides (tested there): reads run again, sandbox work is an error, unsafe outside calls are unknown.
+		decideInFlight: (calls: readonly InFlightCall[]) =>
+			calls.map((c) => ({ call: c.call, type: c.kind.type === "reads_only" || (c.kind.type === "external_call" && c.kind.replay === "replay_safe") ? ("run_again" as const) : c.kind.type === "sandbox_only" ? ("error_to_model" as const) : ("outcome_is_unknown" as const) })),
 		record: () => {},
 		model: "faux/faux-1",
 		prompt: "Input",

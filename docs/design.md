@@ -28,6 +28,10 @@ bugs are the classes this removes.
   then `agent_progressed(id, dialogue)`; a reissued attempt resumes from
   its newest (`call_agent.checkpoint`), and the session's next call starts
   from what its previous call left (`call_agent.history`).
+- **The host decides nothing.** It executes effects and feeds events back:
+  which tool calls in flight at a crash run again, which attempt an
+  interrupt is for, and whether a restart retries an unknown outcome are
+  core state and events (foundation round).
 - **Run metadata is a cache.** The host notes facts about a run (workflow
   path, root, executor module, binaries, base, confinement, warnings,
   answer schemas, toolset digests, fork origin) as `noted(key, value)`
@@ -532,9 +536,10 @@ Prototype choices:
   message are not run ("not run: this turn waits for the reply"). It
   cannot run from codemode.
 - An interrupt wins over a question asked in the same turn (the
-  placeholder stays, and the next message answers it). An interrupt that
-  arrives before the call's turn has started is kept and applied when it
-  starts.
+  placeholder stays, and the next message answers it). The core names the
+  attempt an interrupt is for (`interrupt_turn(id, attempt)`; every
+  `call_agent` carries its attempt); one that arrives before that attempt's
+  turn has started is applied when it starts, and never to another attempt.
 - `Sent` and `Steered` carry a sender-chosen `message_id`, so each inbox
   entry applies once. An interrupt is logged as `InterruptRequested`, then
   `TurnInterrupted` once the aborted turn has ended. A CLI `send` is an
@@ -757,10 +762,13 @@ Prototype choices:
   missing model) are not retried.
 - **In-node durability: every turn is checkpointed.** After every completed
   model step the node's whole conversation (messages, tool calls, results)
-  is saved in its work dir. A reissued or resumed call continues from the
-  last completed turn; earlier turns are never requested again. The node's
-  scratch dir lives until the node is done, so the conversation and the
-  files stay consistent. A tool call in flight at a crash runs again if it
+  is a blob named by `agent_progressed`. A reissued or resumed call
+  continues from the last completed turn; earlier turns are never requested
+  again. The call's upper dir lives until the call is done, so the
+  conversation and the files stay consistent. **The core decides** each
+  tool call in flight at a crash (the executor reports them as
+  `tool_calls_in_flight`; the core answers `in_flight_decided`, logged): a
+  call runs again if it
   only reads (`read`, `ls`, `read_spill`), only asks (`ask`), is an
   external tool that is safe to repeat (`replay: "safe"`, `readOnlyHint`)
   or whose result is already journaled (same tool and arguments), or is
@@ -768,7 +776,9 @@ Prototype choices:
   worked only on the sandbox (`write`, `edit`, `bash`) becomes an error the
   model sees ("may or may not have taken effect"). Any other call's
   outcome is unknown: nothing runs, and the node waits for its owner
-  (`Idle(outcome_unknown)`: restart retries it, cancel fails it). A body
+  (`Idle(outcome_unknown)`: restart retries it, cancel fails it). The
+  retry is core state (the running attempt says so), so a crash between
+  the restart and the reissue keeps it; it is spent on the next decision. A body
   tool call in flight at a crash is reissued only if safe; otherwise its
   node waits the same way.
 - **An uncaught node failure blocks only its dependents.** When the body

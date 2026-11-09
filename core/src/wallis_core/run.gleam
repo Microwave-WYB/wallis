@@ -167,7 +167,9 @@ type AgentState {
   /// Held back by a pause or the budget before it is issued; `note` is the
   /// operator note of the restart that opened it.
   AgentHeld(reason: IdleReason, note: Option(String))
-  AgentRunning(dialogue: Dialogue, issued: Issued)
+  /// In flight. `retry`: a restart of an unknown outcome, so the tool call
+  /// that was in doubt is made again when the attempt resumes.
+  AgentRunning(dialogue: Dialogue, issued: Issued, retry: Retry)
   /// The agent asked, ended its turn, hit its turn limit, was interrupted,
   /// or a tool call's outcome is unknown: waiting for its owner.
   AgentWaiting(dialogue: Dialogue, model: String, cause: types.IdleCause)
@@ -196,6 +198,13 @@ type ToolState {
 type OrchestratorState {
   OrchestratorWaiting
   OrchestratorSettled(entry: Entry)
+}
+
+/// Whether a resumed attempt makes its call in doubt again (the owner
+/// restarted an unknown outcome) or decides calls in flight as usual.
+type Retry {
+  Fresh
+  RetryUnknown
 }
 
 /// Whether a running call's effect was emitted in this host session: a
@@ -331,10 +340,13 @@ fn unissued(run: Run) -> Run {
       case call {
         AgentCall(attempts: [Tried(a), ..older], ..) ->
           case a.state {
-            AgentRunning(dialogue:, ..) ->
+            AgentRunning(dialogue:, retry:, ..) ->
               AgentCall(..call, attempts: [
                 Tried(
-                  AgentAttempt(..a, state: AgentRunning(dialogue, NotIssued)),
+                  AgentAttempt(
+                    ..a,
+                    state: AgentRunning(dialogue, NotIssued, retry),
+                  ),
                 ),
                 ..older
               ])
@@ -415,6 +427,7 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       })
     types.AgentProgressed(id:, dialogue:) ->
       progressed(run, rid(id), ids.digest(dialogue))
+    types.ToolCallsInFlight(id:, calls:) -> in_flight_calls(run, rid(id), calls)
     types.TurnInterrupted(id:, usage:, model:) ->
       agent_idle(run, rid(id), fn(_, _) { types.Interrupted }, usage, model)
     types.ToolRecorded(id:, call:, result:) ->
@@ -492,7 +505,16 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
           node_facts(run, rid(node)),
         ))
         let id = capability.steerable_id(node)
-        #(add_inbox(run, id, types.Interrupt, ""), [types.Checkpoint])
+        let run = add_inbox(run, id, types.Interrupt, "")
+        let attempt = case lookup(run, id) {
+          Ok(#(_, call)) -> attempt_number(call)
+          Error(Nil) -> 1
+        }
+        // For this attempt only: an earlier attempt opening late never takes it.
+        #(run, [
+          types.Checkpoint,
+          types.InterruptTurn(ids.request_text(id), attempt),
+        ])
       })
     types.Restarted(node:, note:, by:, turns:) ->
       intervene(run, by, fn(owned) {
@@ -889,7 +911,7 @@ fn reissue(run: Run, slot: Slot) -> #(Run, List(Effect)) {
       case call {
         AgentCall(
           attempts: [
-            Tried(AgentAttempt(state: AgentRunning(d, NotIssued), ..)),
+            Tried(AgentAttempt(state: AgentRunning(d, NotIssued, _), ..)),
             ..
           ],
           ..,
@@ -945,8 +967,8 @@ fn reissue(run: Run, slot: Slot) -> #(Run, List(Effect)) {
 fn mark_issued(call: Call) -> Call {
   update_agent(call, fn(a) {
     case a.state {
-      AgentRunning(dialogue:, ..) ->
-        AgentAttempt(..a, state: AgentRunning(dialogue, IssuedNow))
+      AgentRunning(dialogue:, retry:, ..) ->
+        AgentAttempt(..a, state: AgentRunning(dialogue, IssuedNow, retry))
       AgentHeld(..)
       | AgentWaiting(..)
       | AgentUnavailable(..)
@@ -1106,7 +1128,7 @@ fn begin(
             Ok(Nil) -> {
               let d = Dialogue([], None, None)
               // Recorded first: the effect reads the call's place in its session.
-              let call = call(AgentRunning(d, IssuedNow))
+              let call = call(AgentRunning(d, IssuedNow, Fresh))
               let run = put(run, slot, call)
               case call_effect(run, slot, call, d) {
                 Error(refusal) ->
@@ -1218,6 +1240,7 @@ fn call_effect(
         history: history_of(run, call) |> option.map(ids.digest_text),
         checkpoint: dialogue.checkpoint |> option.map(ids.digest_text),
         recorded: list.reverse(a.tools),
+        attempt: attempt_number(call),
       ))
     }
     // Only an agent call with a live attempt is issued as one.
@@ -1226,6 +1249,18 @@ fn call_effect(
     ToolCall(tool:, ..), _ -> Error(types.NotAnAgent(tool))
     OrchestratorCall(name:, ..), _ -> Error(types.NotAnAgent(name))
     RefusedCall(id:, ..), _ -> Error(types.NotAnAgent(ids.request_text(id)))
+  }
+}
+
+/// The live attempt's number, from the first (1): what results, steers and
+/// interrupts are matched against.
+fn attempt_number(call: Call) -> Int {
+  case call {
+    AgentCall(attempts:, ..) -> list.length(attempts)
+    CommandCall(attempts:, ..) -> list.length(attempts)
+    ToolCall(attempts:, ..) -> list.length(attempts)
+    OrchestratorCall(attempts:, ..) -> list.length(attempts)
+    RefusedCall(..) -> 1
   }
 }
 
@@ -1572,7 +1607,7 @@ fn retry_unavailable(run: Run) -> #(Run, List(Effect)) {
         Ok(AgentAttempt(state: AgentUnavailable(dialogue:, ..), ..)) -> {
           let call =
             update_agent(call, fn(a) {
-              AgentAttempt(..a, state: AgentRunning(dialogue, IssuedNow))
+              AgentAttempt(..a, state: AgentRunning(dialogue, IssuedNow, Fresh))
             })
           case call_effect(run, slot, call, dialogue) {
             Ok(effect) -> #(
@@ -1607,7 +1642,7 @@ fn progressed(
   case lookup(run, id) {
     Ok(#(slot, call)) ->
       case agent_attempt(call) {
-        Ok(AgentAttempt(state: AgentRunning(dialogue: d, issued:), ..)) -> {
+        Ok(AgentAttempt(state: AgentRunning(dialogue: d, issued:, retry:), ..)) -> {
           let call =
             update_agent(call, fn(a) {
               AgentAttempt(
@@ -1615,6 +1650,7 @@ fn progressed(
                 state: AgentRunning(
                   Dialogue(..d, checkpoint: Some(dialogue)),
                   issued,
+                  retry,
                 ),
               )
             })
@@ -1628,6 +1664,73 @@ fn progressed(
       }
     Error(Nil) -> refused
   }
+}
+
+/// After a crash, the tool calls a resumed attempt found in flight: one that
+/// only reads is made again; one on the sandbox only is an error the model
+/// sees; one that reaches the outside is made again if it is safe to
+/// replay, already journaled (same tool and arguments), or the owner
+/// restarted its unknown outcome; otherwise its outcome is unknown and the
+/// node waits. The decision is logged, so a replay decides the same.
+fn in_flight_calls(
+  run: Run,
+  id: RequestId,
+  calls: List(types.InFlightCall),
+) -> #(Run, List(Effect)) {
+  let refused = #(run, [
+    types.Refuse(None, types.NodeNotRunning(ids.request_text(id))),
+  ])
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case agent_attempt(call) {
+        Ok(AgentAttempt(
+          state: AgentRunning(dialogue:, issued:, retry:),
+          tools:,
+          ..,
+        )) -> {
+          let decisions =
+            list.map(calls, fn(c) {
+              case c.kind, retry {
+                types.ReadsOnly, _ -> types.RunAgain(c.call)
+                types.SandboxOnly, _ -> types.ErrorToModel(c.call)
+                types.ExternalCall(..), RetryUnknown -> types.RunAgain(c.call)
+                types.ExternalCall(replay: types.ReplaySafe), Fresh ->
+                  types.RunAgain(c.call)
+                types.ExternalCall(replay: types.ReplayNever), Fresh ->
+                  case journaled(tools, c) {
+                    True -> types.RunAgain(c.call)
+                    False -> types.OutcomeIsUnknown(c.call)
+                  }
+              }
+            })
+          // The retry is spent on this decision.
+          let call =
+            update_agent(call, fn(a) {
+              AgentAttempt(..a, state: AgentRunning(dialogue, issued, Fresh))
+            })
+          #(put(run, slot, call), [
+            types.Checkpoint,
+            types.InFlightDecided(ids.request_text(id), decisions),
+          ])
+        }
+        Ok(AgentAttempt(state: AgentHeld(..), ..))
+        | Ok(AgentAttempt(state: AgentWaiting(..), ..))
+        | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
+        | Ok(AgentAttempt(state: AgentSettled(..), ..))
+        | Error(Nil) -> refused
+      }
+    Error(Nil) -> refused
+  }
+}
+
+/// A result journaled for this call key, of the same tool and arguments.
+fn journaled(tools: List(types.ToolResult), c: types.InFlightCall) -> Bool {
+  list.any(tools, fn(t) {
+    t.call == c.call
+    && value.get(t.result, "tool") == Some(value.JString(c.tool))
+    && option.map(value.get(t.result, "args"), value.canonical)
+    == Some(value.canonical(c.args))
+  })
 }
 
 /// The session's dialogue after an agent call's live attempt ends: its
@@ -1842,7 +1945,7 @@ fn continue_with(
             )
           let call =
             update_agent(call, fn(a) {
-              AgentAttempt(..a, state: AgentRunning(d, IssuedNow))
+              AgentAttempt(..a, state: AgentRunning(d, IssuedNow, Fresh))
             })
           case call_effect(run, slot, call, d) {
             Ok(effect) -> #(put(run, slot, call), [types.Checkpoint, effect])
@@ -1870,7 +1973,7 @@ fn steer(run: Run, node: SteerableNode, text: String) -> #(Run, List(Effect)) {
   case lookup(run, id) {
     Ok(#(slot, call)) ->
       case agent_attempt(call) {
-        Ok(AgentAttempt(state: AgentRunning(dialogue: d, issued:), ..)) -> {
+        Ok(AgentAttempt(state: AgentRunning(dialogue: d, issued:, retry:), ..)) -> {
           let d =
             Dialogue(
               ..d,
@@ -1880,7 +1983,7 @@ fn steer(run: Run, node: SteerableNode, text: String) -> #(Run, List(Effect)) {
             )
           let call =
             update_agent(call, fn(a) {
-              AgentAttempt(..a, state: AgentRunning(d, issued))
+              AgentAttempt(..a, state: AgentRunning(d, issued, retry))
             })
           #(put(run, slot, call), [types.Checkpoint])
         }
@@ -1982,9 +2085,13 @@ fn restart(
               use #(_, call) <- result.try(
                 lookup(run, id) |> result.replace_error(types.NotLive(text)),
               )
+              // The core keeps the retry: a crash before it resumes does not lose it.
               let call =
                 update_agent(call, fn(a) {
-                  AgentAttempt(..a, state: AgentRunning(d, IssuedNow))
+                  AgentAttempt(
+                    ..a,
+                    state: AgentRunning(d, IssuedNow, RetryUnknown),
+                  )
                 })
               use effect <- result.map(call_effect(run, slot, call, d))
               #(put(run, slot, call), [types.Checkpoint, effect])
@@ -2044,7 +2151,7 @@ fn restart_agent(
           )
         Ok(Nil) -> {
           let d = Dialogue([], note, None)
-          let call = attempt(AgentRunning(d, IssuedNow))
+          let call = attempt(AgentRunning(d, IssuedNow, Fresh))
           use effect <- result.map(call_effect(run, slot, call, d))
           #(put(run, slot, call), [types.Checkpoint, effect])
         }
@@ -2191,7 +2298,7 @@ fn unblock(run: Run) -> #(Run, List(Effect)) {
             let d = Dialogue([], note, None)
             let call =
               update_agent(call, fn(a) {
-                AgentAttempt(..a, state: AgentRunning(d, IssuedNow))
+                AgentAttempt(..a, state: AgentRunning(d, IssuedNow, Fresh))
               })
             case call_effect(run, slot, call, d) {
               Ok(effect) -> #(

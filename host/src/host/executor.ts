@@ -41,7 +41,7 @@ import type { CommandCall, CommandRun, CommandRunner } from "./commands.ts";
 import type { Spawn } from "./confine.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
 import type { Source } from "./toolsets.ts";
-import type { Message, Usage } from "./core.ts";
+import type { Message, Usage, InFlightCall, InFlightDecision } from "./core.ts";
 
 export type AgentDeclaration = Declarations["agents"][string];
 
@@ -85,8 +85,12 @@ export interface NodeSpec {
 	readonly transcript: readonly Message[];
 	/** The session's dialogue after its previous call (the executor's checkpoint format), or null for its first call. */
 	readonly history: Json | null;
-	/** The owner restarted an unknown outcome: make the unknown tool call again (once) instead of reporting it. */
-	readonly retryUnknown: boolean;
+	/**
+	 * After a crash: the tool calls the checkpoint shows in flight, decided by
+	 * the core (and logged), never by the executor: run again, an error for
+	 * the model, or an unknown outcome (the node waits).
+	 */
+	readonly decideInFlight: (calls: readonly InFlightCall[]) => readonly InFlightDecision[];
 	/** MCP tool results already journaled for this call, by tool call key. */
 	readonly recorded: ReadonlyMap<string, Json>;
 	/** Journals an MCP tool result of this call before the model sees it. */
