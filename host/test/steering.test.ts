@@ -76,15 +76,15 @@ test("steer a running node: only its output is journaled; replay after a kill is
 	const dir = join(root, "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" }, seed: 5 });
-	await untilOpen(gated, "#0:0");
-	assert.equal(session.steer(steerable(session, "#0:0"), "go left"), null);
+	await untilOpen(gated, "#0");
+	assert.equal(session.steer(steerable(session, "#0"), "go left"), null);
 	const result = await session.result;
 	assert.equal(result.outcome?.type, "done");
 	assert.equal((result.outcome as unknown as { value: { note: string } }).value.note, "planned go left");
 	const log = new EventLog(join(dir, "log.jsonl")).read();
 	const at = log.findIndex((e) => e.type === "steered");
 	assert.ok(at > 0);
-	assert.deepEqual(log[at], { type: "steered", node: "#0:0", text: "go left", message_id: (log[at] as { message_id: string }).message_id, by: "human" });
+	assert.deepEqual(log[at], { type: "steered", node: "#0", text: "go left", message_id: (log[at] as { message_id: string }).message_id, by: "human" });
 	// The node's journal entry records the message and its step.
 	const node = result.run.nodes[0]!;
 	assert.deepEqual("inbox" in node && node.inbox, [{ kind: "steer", text: "go left", step: 0 }]);
@@ -98,8 +98,8 @@ test("steer a running node: only its output is journaled; replay after a kill is
 	assert.equal(resumed.snapshot, result.snapshot);
 	assert.equal(readFileSync(join(cut, "log.jsonl"), "utf8"), readFileSync(join(dir, "log.jsonl"), "utf8"));
 	// The transcript records the steer; monitoring sees the tree and the log.
-	assert.match(nodeTranscript(dir, "#0:0").items.map((e) => e.entry).join("\n"), /\[steer\] go left/);
-	assert.match(renderTree(inspectRun(dir)), /#0:0  planner  fake\/default  done \(submitted\)  inbox: steer@0/);
+	assert.match(nodeTranscript(dir, "#0").items.map((e) => e.entry).join("\n"), /\[steer\] go left/);
+	assert.match(renderTree(inspectRun(dir)), /#0  planner  fake\/default  done \(submitted\)  inbox: steer@0/);
 	assert.match(renderTree(inspectRun(dir)), /~0  observe outline = \["go left"\]/);
 	assert.equal(runLog(dir, 0, 2).items.length, 2);
 	assert.equal(runLog(dir, 0, 2).next, 2);
@@ -109,13 +109,13 @@ test("interrupt aborts the turn: the node goes Idle(interrupted), progress kept;
 	const dir = join(tmp(), "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" } });
-	await untilOpen(gated, "#0:0");
-	assert.equal(session.interrupt(steerable(session, "#0:0")), null);
+	await untilOpen(gated, "#0");
+	assert.equal(session.interrupt(steerable(session, "#0")), null);
 	const idle = await session.result;
 	const node = idle.run.nodes[0]!;
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "interrupted" });
 	// Interrupt and redirect: the message is delivered to the idle node.
-	const result = await runWorkflow({ ...base(dir, gated), sends: [{ node: "#0:0", text: "go right" }] });
+	const result = await runWorkflow({ ...base(dir, gated), sends: [{ node: "#0", text: "go right" }] });
 	assert.equal(result.outcome?.type, "done");
 	assert.equal((result.outcome as unknown as { value: { note: string } }).value.note, "planned go right");
 	const types = new EventLog(join(dir, "log.jsonl")).read().map((e) => e.type);
@@ -128,22 +128,22 @@ test("send reports how it was delivered: a steer to a running node, a reply to a
 	const dir = join(tmp(), "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" } });
-	await untilOpen(gated, "#0:0");
+	await untilOpen(gated, "#0");
 	// More turns go only to an idle node: with a running one they are refused, not ignored.
-	assert.deepEqual(session.send(owned(session), "#0:0", "go left", "m0", 2), { refusal: { type: "not_idle", node: "#0:0" } });
-	assert.deepEqual(session.send(owned(session), "#0:0", "go left", "m1"), { delivered: "steer" });
+	assert.deepEqual(session.send(owned(session), "#0", "go left", "m0", 2), { refusal: { type: "not_idle", node: "#0" } });
+	assert.deepEqual(session.send(owned(session), "#0", "go left", "m1"), { delivered: "steer" });
 	await session.result;
 	const { deliveryOf } = await import("../src/host/query.ts");
-	assert.equal(deliveryOf(dir, "m1"), "queued as steer after the current turn of #0:0");
+	assert.equal(deliveryOf(dir, "m1"), "queued as steer after the current turn of #0");
 });
 
 test("restart discards progress and reissues the call with its input and the note; a stale turn is discarded", async () => {
 	const dir = join(tmp(), "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" } });
-	await untilOpen(gated, "#0:0");
-	const stale = gated.open.get("#0:0")!;
-	assert.equal(session.restart(live(session, "#0:0"), "be brief"), null);
+	await untilOpen(gated, "#0");
+	const stale = gated.open.get("#0")!;
+	assert.equal(session.restart(live(session, "#0"), "be brief"), null);
 	// The first session's turn finishes late: it must not count.
 	stale({ type: "submitted", output: { outline: ["old"], note: "old" } });
 	const result = await session.result;
@@ -155,7 +155,7 @@ test("restart discards progress and reissues the call with its input and the not
 	const log = new EventLog(join(dir, "log.jsonl")).read();
 	assert.ok(log.some((e) => e.type === "restarted" && e.note === "be brief"));
 	assert.equal(log.filter((e) => e.type === "agent_returned").length, 2, "planner once (after the restart), writer once");
-	assert.match(nodeTranscript(dir, "#0:0").items.map((e) => e.entry).join("\n"), /discarded the (ended|submitted|interrupted) turn of a call that was restarted/);
+	assert.match(nodeTranscript(dir, "#0").items.map((e) => e.entry).join("\n"), /discarded the (ended|submitted|interrupted) turn of a call that was restarted/);
 });
 
 test("a non-steerable node accepts only cancel and a restart without a note", async () => {
@@ -200,15 +200,15 @@ test("pause issues no new calls (Idle(PausedByUser)); resume continues", async (
 	const dir = join(tmp(), "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" } });
-	await untilOpen(gated, "#0:0");
+	await untilOpen(gated, "#0");
 	session.pause(owned(session));
-	gated.open.get("#0:0")!({ type: "submitted", output: { outline: ["a"], note: "n" } });
+	gated.open.get("#0")!({ type: "submitted", output: { outline: ["a"], note: "n" } });
 	const paused = await session.result;
 	assert.deepEqual(paused.status, { type: "idle", reason: { type: "paused_by_user" } });
 	assert.deepEqual(paused.run.nodes.map((n) => [n.type, "agent" in n ? n.agent : ""]), [["node_done", "planner"], ["node_held", "writer"]], "the writer is held back, not issued");
 	// A held-back call is live: the host's check lets the owner cancel it, as the core does.
 	const o = OwnedRun.check(paused.run, "human");
-	assert.ok(o instanceof OwnedRun && LiveNode.check(o, "#1:0") instanceof LiveNode);
+	assert.ok(o instanceof OwnedRun && LiveNode.check(o, "#1") instanceof LiveNode);
 	const done = await runWorkflow({ ...base(dir, new Gated()), unpause: true });
 	assert.equal(done.outcome?.type, "done");
 });
@@ -217,8 +217,8 @@ test("cancel --node fails that node as a typed agent failure for the body", asyn
 	const dir = join(tmp(), "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" } });
-	await untilOpen(gated, "#0:0");
-	assert.equal(session.cancelNode(live(session, "#0:0")), null);
+	await untilOpen(gated, "#0");
+	assert.equal(session.cancelNode(live(session, "#0")), null);
 	const result = await session.result;
 	assert.deepEqual(result.outcome, { type: "failed", reason: { type: "agent_gave_up", agent: "planner", failure: { type: "cancelled_by_owner" } } });
 });
@@ -227,7 +227,7 @@ test("interventions need the owner: another caller is refused, typed", async () 
 	const dir = join(tmp(), "run");
 	const gated = new Gated();
 	const session = await startSession({ ...base(dir, gated), input: { topic: "x" }, owner: "harness:a" });
-	await untilOpen(gated, "#0:0");
+	await untilOpen(gated, "#0");
 	assert.deepEqual(session.owned("harness:b"), { type: "not_owner", by: "harness:b", owner: "harness:a" });
 	const mine = session.owned("harness:a");
 	assert.ok(mine instanceof OwnedRun);
@@ -266,9 +266,9 @@ test("an interrupt made while a restarted call starts reaches that call, not the
 		assert.equal(starts.length, n);
 	};
 	await started(1);
-	assert.equal(session.restart(live(session, "#0:0")), null);
+	assert.equal(session.restart(live(session, "#0")), null);
 	await started(2);
-	assert.equal(session.interrupt(steerable(session, "#0:0")), null);
+	assert.equal(session.interrupt(steerable(session, "#0")), null);
 	// The replaced attempt opens late: it must neither take the interrupt nor become the node's session.
 	starts[0]!.open();
 	await new Promise((r) => setTimeout(r, 20));
@@ -278,7 +278,7 @@ test("an interrupt made while a restarted call starts reaches that call, not the
 		starts.map((s) => s.interrupted),
 		[false, true],
 	);
-	const planner = () => inspectRun(dir).run.nodes.find((n) => n.id === "#0:0")!;
+	const planner = () => inspectRun(dir).run.nodes.find((n) => n.id === "#0")!;
 	for (let i = 0; i < 200 && planner().type !== "node_idle"; i++) await new Promise((r) => setTimeout(r, 10));
 	const node = planner();
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "interrupted" }, JSON.stringify(node));

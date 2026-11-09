@@ -17,7 +17,7 @@ test("only the owner answers; reads work for anyone; claim hands a run over", ()
 
 	// beta may read, not answer or wait.
 	assert.equal(wallis(root, ["status", id, "--json"], as("harness:beta")).status, 0);
-	const send = wallis(root, ["send", id, "#0:0", "hi"], as("harness:beta"));
+	const send = wallis(root, ["send", id, "#0", "hi"], as("harness:beta"));
 	assert.equal(send.status, 1);
 	assert.match(send.stderr, /is owned by harness:alpha, not by harness:beta.*npx wallis claim/);
 	assert.match(wallis(root, ["wait", id], as("harness:beta")).stderr, /is owned by harness:alpha/);
@@ -28,8 +28,8 @@ test("only the owner answers; reads work for anyone; claim hands a run over", ()
 	// beta claims it (a logged event) and can answer.
 	assert.equal(wallis(root, ["claim", id], as("harness:beta")).status, 0);
 	assert.deepEqual(logOf(root, id).filter((e) => e.type === "claimed").at(-1), { type: "claimed", owner: "harness:beta" });
-	assert.match(wallis(root, ["send", id, "#0:0", "alpha"], as("harness:alpha")).stderr, /owned by harness:beta/);
-	assert.equal(wallis(root, ["send", id, "#0:0", "newcomers"], as("harness:beta")).status, 0);
+	assert.match(wallis(root, ["send", id, "#0", "alpha"], as("harness:alpha")).stderr, /owned by harness:beta/);
+	assert.equal(wallis(root, ["send", id, "#0", "newcomers"], as("harness:beta")).status, 0);
 	assert.match(wallis(root, ["wait", id, "--timeout", "30"], as("harness:beta")).stdout, /finished, done/);
 });
 
@@ -44,7 +44,7 @@ test("the human owns everything; wait with no run waits on the caller's own runs
 	// beta has no runs: a bare wait times out.
 	assert.equal(wallis(root, ["wait", "--timeout", "1"], as("harness:beta")).status, 2);
 	// The human may answer any run.
-	assert.equal(wallis(root, ["send", id, "#0:0", "newcomers"], as("human")).status, 0);
+	assert.equal(wallis(root, ["send", id, "#0", "newcomers"], as("human")).status, 0);
 	assert.match(wallis(root, ["wait", id, "--timeout", "30"], as("human")).stdout, /finished, done/);
 });
 

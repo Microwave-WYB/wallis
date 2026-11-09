@@ -471,7 +471,7 @@ export type Refusal =
 	| { readonly type: "unknown_bin"; readonly name: string }
 	| { readonly type: "unknown_alias"; readonly alias: string }
 	| { readonly type: "journal_missing"; readonly request: string }
-	| { readonly type: "foreign_session"; readonly session: string }
+	| { readonly type: "unknown_session"; readonly session: string }
 	| { readonly type: "dialogue_missing"; readonly node: string }
 	| { readonly type: "retry_takes_no_note"; readonly node: string }
 	| { readonly type: "tool_name_taken"; readonly agent: string; readonly name: string }
@@ -693,15 +693,18 @@ export type CallableNode<I extends TSchema = TSchema, O extends TSchema = TSchem
 declare const SESSION_TYPES: unique symbol;
 
 /**
- * A conversation with one agent: each `ctx.call(session, input)` appends its
- * input to the same dialogue as a new message and returns the agent's
- * validated output. A session is data, not a process; its identity is where
- * it was created. Calls run one after another, in the order they were made;
- * a call made before the previous one returned waits for it.
+ * A conversation with one agent, as a value: `ctx.call(session, input)`
+ * appends the input to the session's dialogue as a new message and returns
+ * the agent's validated output and the session value after the call. The
+ * value it was called on is unchanged: calling it again is a branch from
+ * the same dialogue. Session values are plain data: keep them, pass them to
+ * any branch. `id` is null for a new session (no call yet); after a call it
+ * is a hash chain over the session it continued and the call.
  */
 export interface Session<I extends TSchema = TSchema, O extends TSchema = TSchema> {
-	readonly id: string;
+	readonly kind: "session";
 	readonly agent: string;
+	readonly id: string | null;
 	/** Types only: the agent's input and output. */
 	readonly [SESSION_TYPES]?: { readonly input: I; readonly output: O };
 }
@@ -729,11 +732,23 @@ export interface Ctx {
 	 */
 	call<I extends TSchema, O extends TSchema>(node: CallableNode<I, O>, input: Static<I>): Promise<Static<O>>;
 	/**
-	 * Calls an agent through a session, only with the ctx that created it:
-	 * `Refused(foreign_session)` from any other (a `parallel` or `map` branch,
-	 * a nested workflow), so a session's calls are numbered in one ctx's order.
+	 * Calls an agent through a session value: `[output, next]`, where `next`
+	 * is the session after the call. `s` itself is unchanged, so
+	 * `ctx.call(s, a)` and `ctx.call(s, b)` are two branches from the same
+	 * dialogue. Throws `AgentFailed` when the agent gives up (or is
+	 * cancelled), `Refused` when the core refuses the call.
+	 *
+	 * ```ts
+	 * let s = ctx.session(colorist);
+	 * let look;
+	 * [look, s] = await ctx.call(s, { sheet });
+	 * [look, s] = await ctx.call(s, { feedback: "too yellow" });
+	 * ```
+	 *
+	 * Without semicolons, a line that starts with `[` continues the line
+	 * before it: end that line with `;`.
 	 */
-	call<I extends TSchema, O extends TSchema>(session: Session<I, O>, input: Static<I>): Promise<Static<O>>;
+	call<I extends TSchema, O extends TSchema>(session: Session<I, O>, input: Static<I>): Promise<[Static<O>, Session<I, O>]>;
 	/**
 	 * Calls a tool from the body (journaled: replay never calls it again):
 	 * a toolset tool, typed by its parameters, returns its validated
@@ -745,7 +760,7 @@ export interface Ctx {
 	call<P, S extends TSchema>(tool: CustomTool<P, unknown>, input: NoInfer<P>, schema: S): Promise<Static<S>>;
 	call(tool: McpTool | undefined, input: { readonly [key: string]: Json }): Promise<unknown>;
 	call<S extends TSchema>(tool: McpTool | undefined, input: { readonly [key: string]: Json }, schema: S): Promise<Static<S>>;
-	/** Opens a session with an agent: the only way to call one. It takes its id now, like a call. */
+	/** A new session with an agent (no call yet): the only way to call one. A value: it takes no request id. */
 	session<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>): Session<I, O>;
 	/** Runs branches concurrently; each gets its own request ids. */
 	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(

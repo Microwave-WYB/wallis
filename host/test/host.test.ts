@@ -91,7 +91,7 @@ test("parallel branches, a nested workflow, an explicit merge call, commands, ob
 	assert.equal(scripts.calls.length, 1);
 
 	const ids = executor.calls.map((c) => c.id);
-	assert.deepEqual(ids, ["#0.a#0:0", "#0.b#0:0", "#1:0", "#2:0", "#3>retry#0:0", "#3>retry#1:0"]);
+	assert.deepEqual(ids, ["#0.a#0", "#0.b#0", "#1", "#2", "#3>retry#0", "#3>retry#1"]);
 	// Agents get what they need in their input: the judge sees both branches' errors.
 	const judge = executor.calls.find((c) => c.agent === "judge")!;
 	assert.deepEqual(judge.input, { errors: ["E-a", "E-b"] });

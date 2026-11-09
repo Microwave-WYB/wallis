@@ -33,7 +33,7 @@ const codemode = (code: string) => fauxAssistantMessage([fauxToolCall("codemode"
 const submit = (args: Record<string, unknown>) => fauxAssistantMessage([fauxToolCall("submit_result", args as never)], { stopReason: "toolUse" });
 const failure = (message: string) => fauxAssistantMessage([fauxText("")], { stopReason: "error", errorMessage: message });
 
-function transcript(dir: string, node = "_0_0"): TranscriptEntry[] {
+function transcript(dir: string, node = "_0"): TranscriptEntry[] {
 	return readFileSync(join(dir, "nodes", `${node}.jsonl`), "utf8")
 		.trim()
 		.split("\n")
@@ -142,7 +142,7 @@ test("R2: a tool call in flight at a crash is re-run if it only reads, else beco
 		},
 	]);
 	const spec = {
-		id: "#0:0",
+		id: "#0",
 		agent: "a",
 		declaration: { model: "default", prompt: "p", input: {}, output: {}, tools: [], access: 3, skills: [], needs: {}, sandbox: null, steerable: true, compaction: true, max_turns: 6 },
 		history: null,
@@ -211,7 +211,7 @@ test("pi: reaching the turn limit stops the node (turn_limit) with its progress;
 	const first = await runWorkflow({ workflow: limited, dir, executor, confine: "off", input: { topic: "t", notes: [] }, inboxPollMs: null });
 	const node = first.run.nodes[0]!;
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "turn_limit", used: 2, limit: 2 });
-	const done = await runWorkflow({ workflow: limited, dir, executor, confine: "off", sends: [{ node: "#0:0", text: "Continue.", turns: 2 }], inboxPollMs: null });
+	const done = await runWorkflow({ workflow: limited, dir, executor, confine: "off", sends: [{ node: "#0", text: "Continue.", turns: 2 }], inboxPollMs: null });
 	assert.deepEqual(done.outcome, { type: "done", value: { summary: "done" } });
 	assert.equal(provider.state.callCount, 3, "nothing requested twice");
 });
@@ -234,19 +234,19 @@ test("R3: an uncaught node failure holds the run on that node; the independent s
 	const executor = failingScout();
 	const r = await runWorkflow({ workflow: fanout, dir, executor, commands: fakeTrain(), confine: "off", input: null, inboxPollMs: null });
 	assert.equal(r.outcome, null, "not finished");
-	assert.deepEqual(r.status, { type: "idle", reason: { type: "node_failure", node: "#0.a#0:0", reason: { type: "agent_gave_up", agent: "scout", failure: { type: "gave_up", error: "could not read the area" } } } });
-	assert.equal(r.run.held, "#0.a#0:0");
-	const sibling = r.run.nodes.find((n) => n.id === "#0.b#0:0")!;
+	assert.deepEqual(r.status, { type: "idle", reason: { type: "node_failure", node: "#0.a#0", reason: { type: "agent_gave_up", agent: "scout", failure: { type: "gave_up", error: "could not read the area" } } } });
+	assert.equal(r.run.held, "#0.a#0");
+	const sibling = r.run.nodes.find((n) => n.id === "#0.b#0")!;
 	assert.equal(sibling.type === "node_done" && sibling.outcome.type, "submitted");
 	const { attention, describe } = await import("../src/host/query.ts");
 	const { inspectRun } = await import("../src/host/index.ts");
-	assert.match(describe(attention(inspectRun(dir))), /node #0\.a#0:0 failed and the workflow did not handle it[\s\S]*npx wallis restart/);
+	assert.match(describe(attention(inspectRun(dir))), /node #0\.a#0 failed and the workflow did not handle it[\s\S]*npx wallis restart/);
 });
 
 test("R3: restart the held node: it reruns, the body runs again against the journal, and the run completes", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ workflow: fanout, dir, executor: failingScout(), commands: fakeTrain(), confine: "off", input: null, inboxPollMs: null });
-	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0.a#0:0", note: "the area is fine now", by: "human" });
+	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0.a#0", note: "the area is fine now", by: "human" });
 	const fixed = new FakeExecutor({
 		scout: { output: { errors: ["E-a"] } },
 		judge: { output: { findings: [] } },
@@ -258,14 +258,14 @@ test("R3: restart the held node: it reruns, the body runs again against the jour
 	assert.deepEqual((done.outcome as unknown as { value: { errors: string[] } }).value.errors, ["E-a", "E-b"]);
 	// The restarted scout ran with its note; the completed sibling was not called again.
 	const scouts = fixed.calls.filter((c) => c.agent === "scout");
-	assert.deepEqual(scouts.map((c) => [c.id, c.note]), [["#0.a#0:0", "the area is fine now"]]);
+	assert.deepEqual(scouts.map((c) => [c.id, c.note]), [["#0.a#0", "the area is fine now"]]);
 	assert.ok(new EventLog(join(dir, "log.jsonl")).read().some((e) => e.type === "restarted"));
 });
 
 test("R3: cancel the held node: the failure propagates and the run finishes failed", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ workflow: fanout, dir, executor: failingScout(), commands: fakeTrain(), confine: "off", input: null, inboxPollMs: null });
-	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#0.a#0:0", by: "human" });
+	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#0.a#0", by: "human" });
 	const r = await runWorkflow({ workflow: fanout, dir, executor: failingScout(), commands: fakeTrain(), confine: "off", inboxPollMs: null });
 	assert.deepEqual(r.outcome, { type: "failed", reason: { type: "agent_gave_up", agent: "scout", failure: { type: "gave_up", error: "could not read the area" } } });
 });
@@ -317,7 +317,7 @@ const models = defineModels({ default: "fake/default" });
 const fx = defineMcp(m);
 const flaky = defineAgent({ models }, { name: "flaky", model: "default", prompt: "p", input: Type.Null(), output: Type.Object({ ok: Type.Boolean() }) });
 export default workflow({ name: "inflight", models, mcp: fx, agents: [flaky], input: Type.Null(), output: Type.Any(),
-	run: async (ctx) => ctx.parallel({ slow: (c) => c.call(fx.fx.slow, {}), flaky: (c) => c.call(c.session(flaky), null) }) });
+	run: async (ctx) => ctx.parallel({ slow: (c) => c.call(fx.fx.slow, {}), flaky: async (c) => (await c.call(c.session(flaky), null))[0] }) });
 `,
 	);
 	let calls = 0;
@@ -328,10 +328,10 @@ export default workflow({ name: "inflight", models, mcp: fx, agents: [flaky], in
 		const session = await startSession({ workflow: join(dir, "wf", "workflow.ts"), dir: run, executor, confine: "off", input: null, inboxPollMs: 20 });
 		// The flaky branch fails and the run is held on it while the slow tool call is still in flight.
 		for (let i = 0; i < 100 && session.snapshot().held === null; i++) await new Promise((r) => setTimeout(r, 20));
-		assert.equal(session.snapshot().held, "#0.flaky#0:0");
+		assert.equal(session.snapshot().held, "#0.flaky#0");
 		// The server has the call before the body runs again.
 		for (let i = 0; i < 100 && !existsSync(count); i++) await new Promise((r) => setTimeout(r, 20));
-		appendInbox(runPaths(run), { id: "r1", type: "restart", node: "#0.flaky#0:0", by: "human" });
+		appendInbox(runPaths(run), { id: "r1", type: "restart", node: "#0.flaky#0", by: "human" });
 		const done = await session.result;
 		assert.deepEqual(done.outcome, { type: "done", value: { slow: { done: true }, flaky: { ok: true } } });
 		assert.deepEqual(existsSync(count) ? read(count, "utf8").trim().split("\n") : [], ["slow"], "the outside world saw the call once");

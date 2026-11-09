@@ -1,7 +1,7 @@
 // Compile-time checks of the SDK's and the host's typing. `tsc --noEmit`
 // fails if any `@ts-expect-error` line stops being an error.
 
-import { ask, command, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
+import { type Session as SessionValue, ask, command, defineAgent, defineMcp, defineModels, defineMounts, defineSandbox, Foldable, orchestrator, subWorkflow, toolset, Type, workflow } from "wallis";
 import { IdleNode, LiveNode, OwnedRun, SteerableNode, SubmittableNode } from "../src/host/capability.ts";
 import type { CommandRunning, IdleNodeState, Node, RunningNode, Snapshot } from "../src/host/core.ts";
 import type { Session } from "../src/host/session.ts";
@@ -112,7 +112,7 @@ export default workflow({
 	output: Type.Number(),
 	run: async (ctx) => {
 		// One `ctx.call` for every kind of node.
-		const out = await ctx.call(ctx.session(ok), { q: "?", papers: [] });
+		const [out, after] = await ctx.call(ctx.session(ok), { q: "?", papers: [] });
 		const trained = await ctx.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: 2 });
 		const n: number = await ctx.call(inner, null);
 		const answer: string = out.answer;
@@ -134,11 +134,17 @@ export default workflow({
 		const raw: number = await ctx.call(mcp.arxiv.search_papers, { query: "folds" });
 		void url;
 		void raw;
-		// A session is a handle: every call continues the same dialogue.
-		const s = ctx.session(ok);
-		await ctx.call(s, { q: "and then?", papers: [] });
-		// @ts-expect-error: a session is called through the ctx that created it, not by itself
+		// A session is a value: the call returns the next one; the value called is unchanged,
+		// so calling it again is a branch.
+		const [, next] = await ctx.call(after, { q: "and then?", papers: [] });
+		const [again] = await ctx.call(after, { q: "or else?", papers: [] });
+		const s: SessionValue<typeof ok.input, typeof ok.output> = next;
+		const said: string = again.answer;
+		void said;
+		// @ts-expect-error: a session value has no call of its own
 		await s.call({ q: "and then?", papers: [] });
+		// @ts-expect-error: the next session is the same agent's, typed the same
+		await ctx.call(next, { q: 1, papers: [] });
 		void picked;
 		void pickedWrong;
 		void ids;

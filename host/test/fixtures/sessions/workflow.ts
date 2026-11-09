@@ -1,8 +1,8 @@
-// Sessions: two calls of one session (the second continues the first's
-// dialogue); a call made while the previous one is in flight (it waits);
-// a call from a parallel branch (refused); a call after a cancelled one.
+// Sessions as values: a call of the session value the first call answered
+// with (it continues that dialogue); the same value called again, in this
+// ctx and in parallel ones (branches); a call after a cancelled one.
 
-import { ask, AgentFailed, defineAgent, defineModels, Refused, type Session, Type, workflow } from "wallis";
+import { ask, AgentFailed, defineAgent, defineModels, Refused, Type, workflow } from "wallis";
 
 const models = defineModels({ default: "faux/faux-1" });
 const chat = defineAgent(
@@ -21,39 +21,30 @@ export default workflow({
 	name: "sessions",
 	models,
 	agents: [chat],
-	input: Type.Object({ mode: Type.Union([Type.Literal("two"), Type.Literal("queued"), Type.Literal("foreign"), Type.Literal("cancel")]) }),
+	input: Type.Object({ mode: Type.Union([Type.Literal("two"), Type.Literal("branch"), Type.Literal("cancel")]) }),
 	output: Type.Any(),
 	run: async (ctx, input) => {
-		const s = ctx.session(chat);
 		const refusal = (e: unknown) => (e instanceof Refused ? e.refusal.type : e instanceof AgentFailed ? e.failure.type : String(e));
+		// Each call answers with the session after it; the value called is unchanged.
+		const [one, s1] = await ctx.call(ctx.session(chat), { say: "one" });
 		switch (input.mode) {
-			case "queued": {
-				// Made before the first returned: it waits for it, in the order the calls were made.
-				const first = ctx.call(s, { say: "one" });
-				const second = ctx.call(s, { say: "quiet" });
-				return { first: await first, second: await second };
-			}
-			case "foreign": {
-				// Only the ctx that made a session calls it: not a branch it started, not a sibling branch.
-				let made: Session | undefined;
-				const branches = await ctx.parallel({
-					a: (b) => b.call(s, { say: "one" }).then(() => "accepted", refusal),
-					x: async (b) => {
-						made = b.session(chat);
-						return "made";
-					},
-					y: (b) => (made === undefined ? Promise.resolve("not made") : b.call(made, { say: "one" }).then(() => "accepted", refusal)),
-				});
-				return { branch: branches.a, sibling: branches.y, after: await ctx.call(s, { say: "one" }) };
+			case "branch": {
+				// The same value, called again: branches from one dialogue, in this ctx and in parallel ones.
+				const [[here], [there], [other]] = await Promise.all([
+					ctx.call(s1, { say: "quiet" }),
+					ctx.parallel({ x: (b) => b.call(s1, { say: "quiet" }) }).then((r) => r.x),
+					ctx.map([0], (b) => b.call(s1, { say: "quiet" })).then((r) => r[0]!),
+				]);
+				return { one, here, there, other };
 			}
 			case "cancel": {
-				const one = await ctx.call(s, { say: "one" });
-				const two = await ctx.call(s, { say: "two" }).catch(refusal);
-				return { one, two, three: await ctx.call(s, { say: "quiet" }) };
+				const two = await ctx.call(s1, { say: "two" }).then(([out]) => out, refusal);
+				// A cancelled call answers with no session: the next call is of s1 again.
+				const [three] = await ctx.call(s1, { say: "quiet" });
+				return { one, two, three };
 			}
 			case "two": {
-				const one = await ctx.call(s, { say: "one" });
-				const two = await ctx.call(s, { say: "two" });
+				const [two] = await ctx.call(s1, { say: "two" });
 				return { one, two };
 			}
 		}

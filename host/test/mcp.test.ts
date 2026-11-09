@@ -59,18 +59,18 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 		assert.equal(before.data.nodes[0].type, "node_idle");
 		assert.deepEqual(before.data.nodes[0].cause, { type: "question", message: "Who is the audience: experts or newcomers?" });
 
-		const refused = await call("send", { run_id: runId, node_id: "#1:0", text: "hi" });
+		const refused = await call("send", { run_id: runId, node_id: "#1", text: "hi" });
 		assert.equal(refused.isError, true);
-		assert.deepEqual(refused.data.refusal, { type: "not_idle", node: "#1:0" });
-		const notRunning = await call("interrupt", { run_id: runId, node_id: "#0:0", agent: "scout" });
-		assert.deepEqual(notRunning.data.refusal, { type: "node_not_running", node: "#0:0" });
+		assert.deepEqual(refused.data.refusal, { type: "not_idle", node: "#1" });
+		const notRunning = await call("interrupt", { run_id: runId, node_id: "#0", agent: "scout" });
+		assert.deepEqual(notRunning.data.refusal, { type: "node_not_running", node: "#0" });
 		// The pending item, structured: its kind, question and actions.
 		const items = (await call("pending", {})).data as unknown as { kind: string; question: string; actions: { verb: string }[] }[];
 		assert.deepEqual(items.map((i) => [i.kind, i.question, i.actions.map((a) => a.verb)]), [["agent_ask", "Who is the audience: experts or newcomers?", ["send", "restart", "cancel"]]]);
 
-		const sent = await call("send", { run_id: runId, node_id: "#0:0", text: "newcomers" });
+		const sent = await call("send", { run_id: runId, node_id: "#0", text: "newcomers" });
 		assert.equal(sent.isError, false, sent.text);
-		assert.match(sent.text, /Sent: delivered to #0:0 as the reply to: Who is the audience/);
+		assert.match(sent.text, /Sent: delivered to #0 as the reply to: Who is the audience/);
 		const done = await call("wait", { run_id: runId, timeout_s: 10 });
 		assert.match(done.text, /finished, done/);
 		const after = await call("get_run", { run_id: runId });
@@ -80,13 +80,16 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 
 		// Monitoring for the owner: runs, tree, log and transcript, capped with cursors.
 		assert.match((await call("list_runs", {})).text, new RegExp(`${runId}  ask  finished`));
-		assert.match((await call("run_tree", { run_id: runId })).text, /#0  session scout\n {4}#0:0  scout  fake\/default  done \(submitted\)  inbox: answer@1\n {2}#1  session writer/);
+		// Calls, then the session values as a tree: each a new session here (one call each).
+		const tree = (await call("run_tree", { run_id: runId })).text;
+		assert.match(tree, /\n {2}#0  scout  fake\/default  done \(submitted\)  inbox: answer@1\n {2}#1  writer /);
+		assert.match(tree, /\n {2}sessions\n {4}s[0-9a-f]{8}  scout  after #0 \(new session\)\n {4}s[0-9a-f]{8}  writer  after #1 \(new session\)/);
 		const log1 = await call("run_log", { run_id: runId, limit: 3 });
 		assert.equal(log1.data.items.length, 3);
 		assert.equal(log1.data.next, 3);
 		const log2 = await call("run_log", { run_id: runId, since: log1.data.next });
 		assert.equal(log2.data.items[0].seq, 3);
-		const transcript = await call("node_transcript", { run_id: runId, node_id: "#0:0" });
+		const transcript = await call("node_transcript", { run_id: runId, node_id: "#0" });
 		assert.match(transcript.text, /"kind":"user","text":"newcomers"/);
 
 		// wait returns "still running" at its cap; cancel ends an idle run.
@@ -141,7 +144,7 @@ test("MCP: runs belong to the server's harness; another harness may read but not
 		const read = await theirs.call("get_run", { run_id: runId });
 		assert.equal(read.isError, false);
 		assert.match(read.text, /Nothing else is pending/, "pending lists only own runs");
-		const send = await theirs.call("send", { run_id: runId, node_id: "#0:0", text: "hi" });
+		const send = await theirs.call("send", { run_id: runId, node_id: "#0", text: "hi" });
 		assert.equal(send.isError, true);
 		assert.match(send.text, /owned by harness:mine/);
 	} finally {

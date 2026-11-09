@@ -28,7 +28,7 @@ const call = (name: string, args: Record<string, unknown>) => fauxAssistantMessa
 function spec(overrides: Partial<NodeSpec> = {}): NodeSpec & { entries: TranscriptEntry[] } {
 	const entries: TranscriptEntry[] = [];
 	return {
-		id: "#0:0",
+		id: "#0",
 		agent: "answerer",
 		declaration: {
 			model: "default",
@@ -140,11 +140,11 @@ test("pi in a workflow: the scout asks, the reply continues it, the run finishes
 	const first = await runWorkflow({ ...opts, input: { topic: "folds" } });
 	const node = first.run.nodes[0]!;
 	assert.equal(node.type === "node_idle" && node.cause.type === "question" && node.cause.message, "Who is the audience?");
-	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0:0", text: "newcomers" }] });
+	const done = await runWorkflow({ workflow: ask, dir, executor, inboxPollMs: null, sends: [{ node: "#0", text: "newcomers" }] });
 	assert.equal(done.outcome?.type, "done", JSON.stringify(done.status));
 	// The new session resumed from the node's checkpoint: the reply is the ask's result, with the quota on it.
 	assert.match(prompts[0]!, /"toolName":"ask","content":\[\{"type":"text","text":"newcomers\\n\\n\[Turn 2 of 16\]/);
-	const transcript = readFileSync(join(dir, "nodes", "_0_0.jsonl"), "utf8");
+	const transcript = readFileSync(join(dir, "nodes", "_0.jsonl"), "utf8");
 	assert.match(transcript, /"kind":"tool_call","tool":"ask","args":\{"message":"Who is the audience\?"\}/);
 	assert.match(transcript, /"kind":"user","text":"newcomers"/);
 	assert.match(transcript, /"kind":"tool_call","tool":"submit_result"/);
@@ -167,13 +167,13 @@ test("pi codemode: every agent gets codemode; its script reads the full input (f
 	assert.match(prompts[0]!, /folded.*array.*items.*30/);
 	assert.match(prompts[0]!, /Folded fields.*\/notes/);
 	assert.doesNotMatch(prompts[0]!, /note number 29/);
-	const transcript = readFileSync(join(dir, "nodes", "_0_0.jsonl"), "utf8")
+	const transcript = readFileSync(join(dir, "nodes", "_0.jsonl"), "utf8")
 		.trim()
 		.split("\n")
 		.map((l) => JSON.parse(l));
 	const calls = transcript.filter((e) => e.kind === "tool_call").map((e) => [e.tool, e.nested]);
 	assert.deepEqual(calls, [["codemode", false], ["submit_result", true]]);
-	assert.ok(!existsSync(join(dir, "work", "_0_0")), "the node's dir is gone");
+	assert.ok(!existsSync(join(dir, "work", "_0")), "the node's dir is gone");
 });
 
 test("pi: a dialogue over the window is compacted (logged); with compaction off it fails as context_exhausted", async () => {

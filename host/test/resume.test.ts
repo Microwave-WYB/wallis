@@ -34,8 +34,8 @@ test("a killed run resumes to the same state and log as an uninterrupted run", (
 	const killed = run(["--dir", killedDir, "--exec-log", join(dir, "exec-killed.jsonl"), "--kill-on", "writer"]);
 	assert.equal(killed.signal, "SIGKILL");
 	const atKill = lines(killedLog) as { type: string; id?: string }[];
-	assert.ok(atKill.some((e) => e.type === "agent_returned" && e.id === "#0:0"), "planner completed before the kill");
-	assert.ok(!atKill.some((e) => e.type === "agent_returned" && e.id === "#1:0"), "writer was in flight");
+	assert.ok(atKill.some((e) => e.type === "agent_returned" && e.id === "#0"), "planner completed before the kill");
+	assert.ok(!atKill.some((e) => e.type === "agent_returned" && e.id === "#1"), "writer was in flight");
 
 	const resumed = run(["--dir", killedDir, "--exec-log", join(dir, "exec-resumed.jsonl")]);
 	assert.equal(resumed.status, 0, resumed.stderr);
@@ -48,10 +48,10 @@ test("a killed run resumes to the same state and log as an uninterrupted run", (
 
 	// The completed planner call was answered from the journal, not re-executed.
 	assert.deepEqual(lines(join(dir, "exec-killed.jsonl")), [
-		{ id: "#0:0", agent: "planner" },
-		{ id: "#1:0", agent: "writer" },
+		{ id: "#0", agent: "planner" },
+		{ id: "#1", agent: "writer" },
 	]);
-	assert.deepEqual(lines(join(dir, "exec-resumed.jsonl")), [{ id: "#1:0", agent: "writer" }]);
+	assert.deepEqual(lines(join(dir, "exec-resumed.jsonl")), [{ id: "#1", agent: "writer" }]);
 });
 
 test("resuming a finished run reports its outcome without executing anything", () => {

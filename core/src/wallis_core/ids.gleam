@@ -68,31 +68,42 @@ pub opaque type Slot {
 }
 
 /// The journal slot of a call: the node's definition digest, the request's
-/// kind, name and canonical input, the slot it continues (a session's
-/// previous call) and its occurrence in this execution of the body.
+/// kind, name and canonical input, the session it continues (`None` for a
+/// new session, and for calls that are not session calls), and its
+/// occurrence in its branch of the body.
 pub fn slot(
   node: Digest,
   kind: String,
   name: String,
   input: Value,
-  previous: Option(Slot),
-  occurrence: Int,
+  within: Option(SessionId),
+  occurrence: String,
 ) -> Slot {
-  let previous = case previous {
-    option.Some(Slot(text)) -> text
+  let within = case within {
+    option.Some(SessionId(text)) -> text
     option.None -> ""
   }
   Slot(
-    sha.hex(string.join(
-      [digest_text(node), kind, name, value.canonical(input), previous],
-      "\n",
-    ))
+    sha.hex(
+      string.join(
+        [digest_text(node), kind, name, value.canonical(input), within],
+        "\n",
+      ),
+    )
     <> "#"
-    <> int.to_string(occurrence),
+    <> occurrence,
   )
 }
 
 pub fn slot_text(slot: Slot) -> String {
   let Slot(text) = slot
   text
+}
+
+/// The session value after a call: a hash chain over the session it
+/// continued, the call's slot and the attempt that answered, so a new
+/// attempt (a restart) yields a new session and everything after it misses.
+pub fn next_session(slot: Slot, attempt: Int) -> SessionId {
+  let Slot(text) = slot
+  SessionId("s" <> sha.hex(text <> "\n" <> int.to_string(attempt)))
 }

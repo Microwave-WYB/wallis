@@ -50,13 +50,13 @@ pub fn started(wf: Workflow) -> Event {
 }
 
 /// A call whose journal slot is unique to its id, so tests that are not
-/// about the cache keep one slot per request. Each is a one-call session.
+/// about the cache keep one slot per request. Each is a new session's call.
 pub fn call(id: String, agent: String, input: Value) -> Event {
   Requested(
     id:,
-    request: Call(agent:, input:, session: id, index: 0),
+    request: Call(agent:, input:, session: None),
     node_digest: agent <> "@" <> id,
-    occurrence: 0,
+    occurrence: "0",
   )
 }
 
@@ -69,20 +69,51 @@ pub fn cached(
 ) -> Event {
   Requested(
     id:,
-    request: Call(agent: "worker", input:, session: id, index: 0),
+    request: Call(agent: "worker", input:, session: None),
     node_digest: node,
-    occurrence:,
+    occurrence: int.to_string(occurrence),
   )
 }
 
-/// Call `index` of session `session`, keyed like the host keys it.
-pub fn session_call(session: String, index: Int, input: Value) -> Event {
+/// A call of a session value (`None`: a new session), keyed like the host
+/// keys it.
+pub fn session_call(id: String, session: Option(String), input: Value) -> Event {
   Requested(
-    id: session <> ":" <> int.to_string(index),
-    request: Call(agent: "worker", input:, session:, index:),
+    id:,
+    request: Call(agent: "worker", input:, session:),
     node_digest: "worker",
-    occurrence: 0,
+    occurrence: "0",
   )
+}
+
+/// The session value an agent call answered with, in these effects.
+pub fn session_of(effects: List(Effect)) -> Option(String) {
+  list.find_map(effects, fn(e) {
+    case e {
+      types.Deliver(value: value.JObject(entries), ..) ->
+        case list.key_find(entries, "session") {
+          Ok(value.JString(id)) -> Ok(id)
+          _ -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  })
+  |> option.from_result
+}
+
+/// The effects with an agent call's answer as its output alone (the session
+/// value it carries is a hash), so tests compare outputs.
+pub fn outputs(effects: List(Effect)) -> List(Effect) {
+  list.map(effects, fn(e) {
+    case e {
+      types.Deliver(id:, value: value.JObject(entries)) ->
+        case list.key_find(entries, "output"), list.key_find(entries, "session") {
+          Ok(output), Ok(_) -> types.Deliver(id, output)
+          _, _ -> e
+        }
+      _ -> e
+    }
+  })
 }
 
 pub fn tool(id: String, input: Value) -> Event {
@@ -90,7 +121,7 @@ pub fn tool(id: String, input: Value) -> Event {
     id:,
     request: types.Tool(tool: "search", input:, replay: types.ReplaySafe),
     node_digest: "search",
-    occurrence: 0,
+    occurrence: "0",
   )
 }
 
@@ -99,7 +130,7 @@ pub fn orchestrator(id: String, input: Value) -> Event {
     id:,
     request: types.Orchestrator(name: "pick", input:),
     node_digest: "pick",
-    occurrence: 0,
+    occurrence: "0",
   )
 }
 
@@ -108,12 +139,18 @@ pub fn command(id: String, input: Value) -> Event {
     id:,
     request: types.Command(command: "train", input:),
     node_digest: "train@" <> id,
-    occurrence: 0,
+    occurrence: "0",
   )
 }
 
 pub fn returned(id: String, output: Value) -> Event {
-  types.AgentReturned(id:, output:, usage: usage(), model: "fake/model")
+  types.AgentReturned(
+    id:,
+    output:,
+    usage: usage(),
+    model: "fake/model",
+    dialogue: None,
+  )
 }
 
 pub fn idle(id: String, message: String) -> Event {
@@ -141,7 +178,7 @@ pub fn replay_from(
       True -> list.append(log, [event])
       False -> log
     }
-    #(state, effects, log)
+    #(state, outputs(effects), log)
   })
 }
 

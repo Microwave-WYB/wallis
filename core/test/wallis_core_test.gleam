@@ -28,7 +28,7 @@ pub fn step_json_roundtrip_test() {
   let #(s, effects) =
     wallis_core.step_json(
       s,
-      "{\"type\":\"requested\",\"id\":\"#0\",\"node_digest\":\"nd\",\"occurrence\":0,\"request\":{\"type\":\"call\",\"agent\":\"a\",\"input\":{\"x\":1},\"session\":\"#0\",\"index\":0}}",
+      "{\"type\":\"requested\",\"id\":\"#0\",\"node_digest\":\"nd\",\"occurrence\":\"0\",\"request\":{\"type\":\"call\",\"agent\":\"a\",\"input\":{\"x\":1},\"session\":null}}",
     )
   assert string.contains(effects, "\"type\":\"call_agent\"")
   assert string.contains(effects, "\"model\":\"fake/m\"")
@@ -37,10 +37,10 @@ pub fn step_json_roundtrip_test() {
   let #(s, effects) =
     wallis_core.step_json(
       s,
-      "{\"type\":\"agent_returned\",\"id\":\"#0\",\"output\":{\"summary\":\"s1\"},\"usage\":{\"usd\":0.1,\"tokens\":5,\"turns\":1},\"model\":\"fake/m\"}",
+      "{\"type\":\"agent_returned\",\"id\":\"#0\",\"output\":{\"summary\":\"s1\"},\"usage\":{\"usd\":0.1,\"tokens\":5,\"turns\":1},\"model\":\"fake/m\",\"dialogue\":null}",
     )
   assert effects
-    == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"#0\",\"value\":{\"summary\":\"s1\"}}]"
+    == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"#0\",\"value\":{\"output\":{\"summary\":\"s1\"},\"session\":\"sa43deac0d9c6dfcc\"}}]"
   let snapshot = wallis_core.snapshot_json(s)
   assert string.contains(
     snapshot,

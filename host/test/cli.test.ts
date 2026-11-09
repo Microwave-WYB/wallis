@@ -21,7 +21,7 @@ function askAndReply(root: string, env: Record<string, string> = {}) {
 	const started = wallis(root, ask);
 	assert.equal(started.status, 0, started.stderr);
 	const id = onlyRun(root);
-	const sent = wallis(root, ["send", id, "#0:0", "newcomers"], env);
+	const sent = wallis(root, ["send", id, "#0", "newcomers"], env);
 	assert.equal(sent.status, 0, sent.stderr + sent.stdout);
 	const waited = wallis(root, ["wait", id, "--timeout", "30"]);
 	return { id, started, waited };
@@ -32,8 +32,8 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	const execLog = join(tmp(), "exec.jsonl");
 	const started = wallis(root, ask, { WALLIS_FAKE_EXEC_LOG: execLog });
 	assert.equal(started.status, 0, started.stderr);
-	assert.match(started.stdout, /node #0:0 \(scout\) asks:\n  > Who is the audience: experts or newcomers\?/);
-	assert.match(started.stdout, /npx wallis send .* '#0:0' "<message>"/);
+	assert.match(started.stdout, /node #0 \(scout\) asks:\n  > Who is the audience: experts or newcomers\?/);
+	assert.match(started.stdout, /npx wallis send .* '#0' "<message>"/);
 	const id = onlyRun(root);
 	assert.deepEqual(status(root, id).status, { type: "idle", reason: null });
 	assert.equal(status(root, id).stopped, true, "an idle run with no driver is resumable");
@@ -43,11 +43,11 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	assert.equal(wallis(project(), ["pending"]).stdout, "");
 
 	// Sending to a node that is not idle is refused.
-	const refused = wallis(root, ["send", id, "#1:0", "hello"]);
+	const refused = wallis(root, ["send", id, "#1", "hello"]);
 	assert.equal(refused.status, 1);
 	assert.match(refused.stdout, /not_idle/);
 
-	assert.equal(wallis(root, ["send", id, "#0:0", "newcomers"], { WALLIS_FAKE_EXEC_LOG: execLog }).status, 0);
+	assert.equal(wallis(root, ["send", id, "#0", "newcomers"], { WALLIS_FAKE_EXEC_LOG: execLog }).status, 0);
 	const waited = wallis(root, ["wait", id, "--timeout", "30"]);
 	assert.equal(waited.status, 0, waited.stderr);
 	assert.match(waited.stdout, /finished, done/);
@@ -55,15 +55,15 @@ test("a node asks, the run idles, a reply continues the same conversation", () =
 	assert.equal(wallis(root, ["pending"]).stdout, "");
 	// Monitoring.
 	assert.match(wallis(root, ["ls"]).stdout, new RegExp(`${id}  ask  finished \\(done\\)`));
-	assert.match(wallis(root, ["tree", id]).stdout, /#0:0  scout/);
+	assert.match(wallis(root, ["tree", id]).stdout, /#0  scout/);
 	assert.match(wallis(root, ["log", id, "--since", "1", "--limit", "1"]).stdout, /^1\t\{"type":"noted","key":"workflow"/);
 	assert.match(wallis(root, ["log", id, "--follow"]).stdout, /"type":"body_finished"/);
-	assert.match(wallis(root, ["show", id, "#0:0"]).stdout, /"kind":"user","text":"newcomers"/);
+	assert.match(wallis(root, ["show", id, "#0"]).stdout, /"kind":"user","text":"newcomers"/);
 
 	const log = logOf(root, id);
 	const sentEvents = log.filter((e) => e.type === "sent");
 	assert.equal(sentEvents.length, 1);
-	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0:0", text: "newcomers", message_id: "<id>", by: sentEvents[0]!.by, turns: 0 });
+	assert.deepEqual({ ...sentEvents[0], message_id: "<id>" }, { type: "sent", node: "#0", text: "newcomers", message_id: "<id>", by: sentEvents[0]!.by, turns: 0 });
 	assert.match(String(sentEvents[0]!.by), /^(human|harness:.+)$/, "the sender's identity is logged");
 	assert.ok(log.some((e) => e.type === "agent_asked" && e.message === "Who is the audience: experts or newcomers?"));
 	// The idle turn was not replayed: the reply continued the conversation.
@@ -81,7 +81,7 @@ test("killed while answering: the run is stopped, resumes, and its log equals an
 	assert.equal(started.status, 0, started.stderr);
 	const id = onlyRun(root);
 	// The detached driver dies while the continued scout call is in flight.
-	assert.equal(wallis(root, ["send", id, "#0:0", "newcomers"], { WALLIS_FAKE_EXEC_LOG: execLog, WALLIS_FAKE_KILL_ON: "scout:1" }).status, 0);
+	assert.equal(wallis(root, ["send", id, "#0", "newcomers"], { WALLIS_FAKE_EXEC_LOG: execLog, WALLIS_FAKE_KILL_ON: "scout:1" }).status, 0);
 	const waited = wallis(root, ["wait", id, "--timeout", "30"]);
 	assert.match(waited.stdout, /stopped: no process drives it/);
 	const stopped = status(root, id);
@@ -112,7 +112,7 @@ test("an alias rebind on resume re-executes no completed call and records the mo
 	assert.equal(resumed.status, 0, resumed.stderr);
 	const s = status(root, id);
 	assert.equal(s.status.type, "finished");
-	assert.deepEqual(s.nodes.map((n) => [n.id, n.agent, n.model]), [["#0:0", "planner", "fake/default"], ["#1:0", "writer", "other/model"]]);
+	assert.deepEqual(s.nodes.map((n) => [n.id, n.agent, n.model]), [["#0", "planner", "fake/default"], ["#1", "writer", "other/model"]]);
 	assert.deepEqual(lines(execLog).map((e) => [e.agent, e.model]), [["planner", "fake/default"], ["writer", "fake/default"], ["writer", "other/model"]]);
 	const log = logOf(root, id);
 	assert.deepEqual(log.find((e) => e.type === "alias_rebound"), { type: "alias_rebound", alias: "writer", from: "fake/default", to: "other/model" });

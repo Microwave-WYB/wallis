@@ -82,32 +82,32 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	await o.start();
 	// An ask, through the ask tool.
 	let items = await o.items();
-	assert.deepEqual(items.map(label), ["agent_ask:#1:0"]);
+	assert.deepEqual(items.map(label), ["agent_ask:#1"]);
 	assert.equal(items[0]!.question, "Which colour should the sheet use?");
 	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["send", "restart", "cancel"]);
-	assert.match(await o.send("#1:0", "blue"), /delivered to #1:0 as the reply to: Which colour should the sheet use\?/);
+	assert.match(await o.send("#1", "blue"), /delivered to #1 as the reply to: Which colour should the sheet use\?/);
 	// The turn budget (2) holds the next call.
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["run_idle:budget_reached"]);
 	await o.resume({ budget: { turns: 100 } });
 	// The turn ended with neither a result nor a question, in the same session.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["ended_without_result:#1:1"]);
+	assert.deepEqual(items.map(label), ["ended_without_result:#2"]);
 	assert.equal(items[0]!.text, "I could not decide between the warm and the cool variant.");
 	await o.midway?.();
-	assert.match(await o.send("#1:1", "the cool one"), /delivered to #1:1 as the reply to: I could not decide/);
+	assert.match(await o.send("#2", "the cool one"), /delivered to #2 as the reply to: I could not decide/);
 	// The turn limit: more turns with the message.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["turn_limit:#2:0"]);
-	assert.match(await o.send("#2:0", "finish", 2), /with 2 more turns/);
+	assert.deepEqual(items.map(label), ["turn_limit:#3"]);
+	assert.match(await o.send("#3", "finish", 2), /with 2 more turns/);
 	// Paused while a node runs, then the node is interrupted.
-	for (let i = 0; i < 300 && !(await o.nodes()).some((n) => n.id === "#3:0" && n.type === "node_running"); i++) await new Promise((r) => setTimeout(r, 100));
+	for (let i = 0; i < 300 && !(await o.nodes()).some((n) => n.id === "#4" && n.type === "node_running"); i++) await new Promise((r) => setTimeout(r, 100));
 	await o.pause();
-	await o.interrupt("#3:0", "worker");
+	await o.interrupt("#4", "worker");
 	items = await o.wait();
-	assert.deepEqual(items.map(label).sort(), ["interrupted:#3:0", "run_idle:paused_by_user"]);
+	assert.deepEqual(items.map(label).sort(), ["interrupted:#4", "run_idle:paused_by_user"]);
 	await o.resume();
-	assert.match(await o.send("#3:0", "carry on"), /delivered to #3:0 after its interrupt/);
+	assert.match(await o.send("#4", "carry on"), /delivered to #4 after its interrupt/);
 	// The host dies while the upload tool runs: the run is stopped; on resume the call is not
 	// safe to repeat, so its outcome is unknown; a restart retries it.
 	for (let i = 0; i < 300 && !project.count().includes("upload"); i++) await new Promise((r) => setTimeout(r, 100));
@@ -116,25 +116,25 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	assert.deepEqual(items.map(label), ["stopped:"]);
 	await o.resume();
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["outcome_unknown:#4:0"]);
+	assert.deepEqual(items.map(label), ["outcome_unknown:#5"]);
 	assert.equal(items[0]!.tool, "upload");
 	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["restart", "cancel"]);
-	await o.restart("#4:0");
+	await o.restart("#5");
 	// An orchestrator node: an invalid submit is refused and it stays pending; then a valid one.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["orchestrator_pending:#5"]);
+	assert.deepEqual(items.map(label), ["orchestrator_pending:#6"]);
 	const answer = items[0]!.actions[0]!.args as { properties: { value: { properties: { choice: unknown } } } };
 	assert.ok(answer.properties.value.properties.choice, "the action carries the answer schema");
 	assert.deepEqual(items[0]!.actions.map((a) => a.verb), ["submit_result", "restart", "cancel"]);
-	assert.equal((await o.submit("#5", { choice: "c" }))?.type, "invalid_answer");
-	assert.deepEqual((await o.items()).map(label), ["orchestrator_pending:#5"]);
-	assert.equal(await o.submit("#5", { choice: "a" }), null);
+	assert.equal((await o.submit("#6", { choice: "c" }))?.type, "invalid_answer");
+	assert.deepEqual((await o.items()).map(label), ["orchestrator_pending:#6"]);
+	assert.equal(await o.submit("#6", { choice: "a" }), null);
 	// Another one is asked again (restart), then cancelled: the body catches the typed failure.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["orchestrator_pending:#6"]);
-	await o.restart("#6");
-	assert.deepEqual((await o.items()).map(label), ["orchestrator_pending:#6"]);
-	await o.cancelNode("#6");
+	assert.deepEqual(items.map(label), ["orchestrator_pending:#7"]);
+	await o.restart("#7");
+	assert.deepEqual((await o.items()).map(label), ["orchestrator_pending:#7"]);
+	await o.cancelNode("#7");
 	// The executor cannot serve an alias: rebind it.
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["run_idle:executor_unavailable"]);
@@ -142,8 +142,8 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	await o.resume({ models: { flaky: "faux/faux-1" } });
 	// A failure the body does not handle holds the run; a restart with a note fixes it.
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["node_failed:#8:0"]);
-	await o.restart("#8:0", "try again");
+	assert.deepEqual(items.map(label), ["node_failed:#9"]);
+	await o.restart("#9", "try again");
 	// The host dies during the body's publish call, which is not safe to repeat: after the
 	// resume its outcome is unknown, and the orchestrator sees it (the log has it).
 	for (let i = 0; i < 300 && !project.count().includes("publish"); i++) await new Promise((r) => setTimeout(r, 100));
@@ -152,9 +152,9 @@ async function scenario(o: Orchestrator, project: ReturnType<typeof acceptProjec
 	assert.deepEqual(items.map(label), ["stopped:"]);
 	await o.resume();
 	items = await o.wait();
-	assert.deepEqual(items.map(label), ["outcome_unknown:#9"]);
+	assert.deepEqual(items.map(label), ["outcome_unknown:#10"]);
 	assert.equal(items[0]!.tool, "custom:./tools/lib.ts#publish");
-	await o.restart("#9");
+	await o.restart("#10");
 	items = await o.wait();
 	assert.deepEqual(items.map(label), ["finished:"]);
 	assert.deepEqual(await o.outcome(), {
@@ -232,12 +232,12 @@ test("acceptance through the CLI: every attention kind, entered and resolved", {
 			const forked = ok(w("fork", id));
 			const forkId = /into (\S+)\./.exec(forked)![1]!;
 			const forkDir = runDir(project.root, forkId);
-			const checkpoints = lines(join(forkDir, "log.jsonl")).filter((e) => e.type === "agent_progressed" && e.id === "#1:1");
+			const checkpoints = lines(join(forkDir, "log.jsonl")).filter((e) => e.type === "agent_progressed" && e.id === "#2");
 			assert.ok(checkpoints.length > 0 && existsSync(blobPath(forkDir, String(checkpoints.at(-1)!.dialogue))), "the idle call's checkpoint is in the fork");
 			// Node dirs only: a tool connection's scratch dir is its own (the live run keeps opening connections).
 			const nodeDirs = (run: string) => readdirSync(join(runDir(project.root, run), "work")).filter((d) => !/^(mcp|toolset)-/.test(d)).sort();
 			assert.deepEqual(nodeDirs(forkId), nodeDirs(id));
-			assert.deepEqual(status(forkId).attention.map(label), ["ended_without_result:#1:1"]);
+			assert.deepEqual(status(forkId).attention.map(label), ["ended_without_result:#2"]);
 			ok(w("cancel", forkId));
 		},
 	};

@@ -2,20 +2,20 @@
 // attention kind, for the orchestrator to resolve (test/accept.test.ts).
 //
 //   #0    search    a body call of an MCP tool (journaled)
-//   #1:0  ask       the worker calls `ask`                          agent_ask
-//   #1:1  implicit  held by the turn budget, then ends its turn     run_idle (budget_reached),
-//                   without a result, in the same session            ended_without_result
-//   #2:0  limit     codemode until its 2 turns run out              turn_limit
-//   #3:0  slow      runs until interrupted (paused first)           interrupted, run_idle (paused)
-//   #4:0  upload    the host dies during a custom tool call that    stopped, then outcome_unknown
+//   #1    ask       the worker calls `ask`                          agent_ask
+//   #2    implicit  held by the turn budget, then ends its turn     run_idle (budget_reached),
+//                   without a result, of the session #1 left        ended_without_result
+//   #3    limit     codemode until its 2 turns run out              turn_limit
+//   #4    slow      runs until interrupted (paused first)           interrupted, run_idle (paused)
+//   #5    upload    the host dies during a custom tool call that    stopped, then outcome_unknown
 //                   is not safe to repeat; a restart retries it
-//   #5    pick      an orchestrator node                            orchestrator_pending
-//   #6    confirm   an orchestrator node, asked again, cancelled    orchestrator_pending
-//   #7:0  flaky     a model the executor cannot serve               run_idle (executor_unavailable)
-//   #8:0  fragile   gives up until restarted with a note            node_failed
-//   #9    publish   the body's outward write, a custom tool; the host   stopped, then outcome_unknown
+//   #6    pick      an orchestrator node                            orchestrator_pending
+//   #7    confirm   an orchestrator node, asked again, cancelled    orchestrator_pending
+//   #8    flaky     a model the executor cannot serve               run_idle (executor_unavailable)
+//   #9    fragile   gives up until restarted with a note            node_failed
+//   #10   publish   the body's outward write, a custom tool; the host   stopped, then outcome_unknown
 //                   dies during it; a restart retries it
-//   #10:0 last                                                      finished
+//   #11   last                                                      finished
 
 import { defineAgent, defineMcp, defineModels, OrchestratorCancelled, orchestrator, ask, toolset, Type, workflow, defineSandbox } from "wallis";
 import mcpConfig from "./mcp.json" with { type: "json" };
@@ -56,12 +56,12 @@ export default workflow({
 	output: Type.Any(),
 	run: async (ctx) => {
 		const found = await ctx.call(fx.fx.search, { q: "looks" }, Type.Object({ hits: Type.Array(Type.String()) }));
-		const w = ctx.session(worker);
-		const asked = await ctx.call(w, { step: "ask" });
-		const implicit = await ctx.call(w, { step: "implicit" });
-		const limit = await ctx.call(ctx.session(slow), { step: "limit" });
-		const slowed = await ctx.call(ctx.session(worker), { step: "slow" });
-		const uploaded = await ctx.call(ctx.session(poster), { step: "upload" });
+		// The worker's second call continues the session its first call left.
+		const [asked, w] = await ctx.call(ctx.session(worker), { step: "ask" });
+		const [implicit] = await ctx.call(w, { step: "implicit" });
+		const [limit] = await ctx.call(ctx.session(slow), { step: "limit" });
+		const [slowed] = await ctx.call(ctx.session(worker), { step: "slow" });
+		const [uploaded] = await ctx.call(ctx.session(poster), { step: "upload" });
 		const picked = await ctx.call(pick, { question: "Look a (warm) or b (cool)?" });
 		let confirmed: string;
 		try {
@@ -70,10 +70,10 @@ export default workflow({
 			if (!(error instanceof OrchestratorCancelled)) throw error;
 			confirmed = "cancelled";
 		}
-		const flakyOk = await ctx.call(ctx.session(flaky), { step: "flaky" });
-		const fragileOk = await ctx.call(ctx.session(fragile), { step: "fragile" });
+		const [flakyOk] = await ctx.call(ctx.session(flaky), { step: "flaky" });
+		const [fragileOk] = await ctx.call(ctx.session(fragile), { step: "fragile" });
 		const published = await ctx.call(lib.publish, { text: `look ${picked.choice}` });
-		const last = await ctx.call(ctx.session(worker), { step: "last" });
+		const [last] = await ctx.call(ctx.session(worker), { step: "last" });
 		return { found: found.hits, asked: asked.ok, implicit: implicit.ok, limit: limit.ok, slowed: slowed.ok, uploaded: uploaded.ok, picked: picked.choice, confirmed, flaky: flakyOk.ok, fragile: fragileOk.ok, published: published.id, last: last.ok };
 	},
 });

@@ -25,6 +25,13 @@ fn summary(s) {
   value.object([#("summary", JString(s))])
 }
 
+/// A step whose agent answers are compared by output (the session value
+/// they carry is a hash; the session tests look at it).
+fn step(state, event) {
+  let #(state, effects) = run.step(state, event)
+  #(state, support.outputs(effects))
+}
+
 fn failed(id, error) {
   types.AgentFailed(id, GaveUp(error), support.usage(), "fake/model")
 }
@@ -122,7 +129,7 @@ pub fn an_input_too_large_for_the_window_is_a_journaled_refusal_test() {
   // A refused call is a node too, with its refusal.
   let assert [types.NodeRefused("#0", InputTooLarge(..))] = nodes_after(events)
   let #(s, _, _) = replay(events)
-  let #(_, effects) = run.step(s, call("#0", "worker", JNull))
+  let #(_, effects) = step(s, call("#0", "worker", JNull))
   assert effects == [Refuse(Some("#0"), refusal)]
 }
 
@@ -156,8 +163,8 @@ pub fn observations_are_logged_once_and_never_diverge_test() {
       ]),
     ])
   // Replayed, even with another value: not logged again, nothing refused.
-  let #(s, _) = run.step(s, Resumed(pin()))
-  let #(_, effects) = run.step(s, types.Observed("#0~0", "incumbent", JInt(4)))
+  let #(s, _) = step(s, Resumed(pin()))
+  let #(_, effects) = step(s, types.Observed("#0~0", "incumbent", JInt(4)))
   assert effects == []
 }
 
@@ -228,9 +235,9 @@ pub fn an_answer_survives_a_kill_test() {
     ])
   let #(expected, _, expected_log) = replay(whole)
   let #(s, _, log) = replay(list.append(asked(), [sent("#0", "the 2024 one")]))
-  let #(s, effects) = run.step(s, Resumed(pin()))
+  let #(s, effects) = step(s, Resumed(pin()))
   assert effects == []
-  let #(s, effects) = run.step(s, call("#0", "worker", JNull))
+  let #(s, effects) = step(s, call("#0", "worker", JNull))
   let assert [CallAgent(transcript: [_, Message(User, "the 2024 one")], ..)] =
     effects
   let #(s, _, log2) =
@@ -241,7 +248,7 @@ pub fn an_answer_survives_a_kill_test() {
 
 pub fn replaying_an_idle_node_does_nothing_test() {
   let #(s, _, _) = replay(asked())
-  let #(_, effects) = run.step(s, call("#0", "worker", JNull))
+  let #(_, effects) = step(s, call("#0", "worker", JNull))
   assert effects == []
 }
 
@@ -285,11 +292,11 @@ pub fn steering_a_running_node_is_logged_and_joins_its_dialogue_test() {
   assert effects == [Checkpoint]
   assert list.length(log) == 3
   // A reissue after a kill carries the steering message.
-  let #(s2, _) = run.step(s, Resumed(pin()))
+  let #(s2, _) = step(s, Resumed(pin()))
   let assert #(
     _,
     [CallAgent(transcript: [Message(User, "focus on recall")], ..)],
-  ) = run.step(s2, call("#0", "worker", JNull))
+  ) = step(s2, call("#0", "worker", JNull))
   let done = list.append(events, [returned("#0", summary("recall first"))])
   let assert [Deliver("#0", _)] = last(done)
   let assert [NodeDone(inbox: [InboxMessage(Steer, "focus on recall", 0)], ..)] =
@@ -348,9 +355,9 @@ pub fn restart_discards_progress_and_reissues_with_the_note_test() {
   let #(s, _, log) = replay(events)
   assert list.length(log) == 4
   // Killed after the restart: the reissue carries the note, not the old dialogue.
-  let #(s, _) = run.step(s, Resumed(pin()))
+  let #(s, _) = step(s, Resumed(pin()))
   let assert #(_, [CallAgent(transcript: [], note: Some(_), ..)]) =
-    run.step(s, call("#0", "worker", JNull))
+    step(s, call("#0", "worker", JNull))
   let done = list.append(events, [returned("#0", summary("s"))])
   let assert [
     NodeDone(inbox: [InboxMessage(Restart, "use the 2024 data", 1)], ..),
@@ -430,6 +437,7 @@ pub fn usd_and_tokens_are_recorded_and_never_hold_a_call_test() {
       summary("s"),
       Usage(999.5, 10_000_000, 1),
       "fake/model",
+      None,
     ),
     call("#1", "worker", JNull),
   ]
@@ -573,8 +581,8 @@ pub fn alias_rebind_reaches_later_calls_only_test() {
   assert support.node(s, 1) |> value.get("model")
     == Some(JString("other/model"))
   // The completed call is answered from the journal, not re-executed.
-  let #(s, _) = run.step(s, Resumed(pin()))
-  let #(_, effects) = run.step(s, call("#0", "worker", JNull))
+  let #(s, _) = step(s, Resumed(pin()))
+  let #(_, effects) = step(s, call("#0", "worker", JNull))
   assert effects == [Deliver("#0", summary("s0"))]
 }
 
@@ -596,7 +604,7 @@ pub fn resume_accepts_a_changed_alias_table_test() {
   let #(s, _, _) = replay(asked())
   let other =
     Pin(..pin(), models: dict.from_list([#("default", "other/model")]))
-  let #(s, effects) = run.step(s, Resumed(other))
+  let #(s, effects) = step(s, Resumed(other))
   assert effects == []
   // Bindings change only through AliasRebound.
   assert snapshot_get(s, "models.default") == JString("fake/model")
@@ -617,26 +625,32 @@ pub fn executor_error_pauses_and_retry_reissues_test() {
     )
   // A replay alone does not reissue it.
   let #(s, _, _) = replay(events)
-  let #(s, _) = run.step(s, Resumed(pin()))
-  let #(s, effects) = run.step(s, call("#0", "worker", JNull))
+  let #(s, _) = step(s, Resumed(pin()))
+  let #(s, effects) = step(s, call("#0", "worker", JNull))
   assert effects == []
   // After a rebind, the retry reissues it with the new model.
   let #(s, _) =
-    run.step(s, AliasRebound("default", "fake/model", "other/model"))
-  let #(s, effects) = run.step(s, RetryUnavailable)
+    step(s, AliasRebound("default", "fake/model", "other/model"))
+  let #(s, effects) = step(s, RetryUnavailable)
   let assert [Checkpoint, CallAgent(id: "#0", model: "other/model", ..)] =
     effects
   let #(_, effects) =
-    run.step(
+    step(
       s,
-      types.AgentReturned("#0", summary("s"), support.usage(), "other/model"),
+      types.AgentReturned(
+        "#0",
+        summary("s"),
+        support.usage(),
+        "other/model",
+        None,
+      ),
     )
   let assert [Checkpoint, Deliver("#0", _)] = effects
 }
 
 pub fn retry_without_unavailable_calls_logs_nothing_test() {
   let #(s, _, _) = replay([started(basic())])
-  let #(_, effects) = run.step(s, RetryUnavailable)
+  let #(_, effects) = step(s, RetryUnavailable)
   assert effects == []
 }
 
@@ -664,14 +678,14 @@ pub fn refold_of_log_reproduces_state_test() {
 
 pub fn resume_with_same_pin_is_accepted_test() {
   let #(s, _, _) = replay(first_run())
-  let #(_, effects) = run.step(s, Resumed(pin()))
+  let #(_, effects) = step(s, Resumed(pin()))
   assert effects == []
 }
 
 pub fn resume_with_changed_input_file_is_refused_typed_test() {
   let #(s, _, _) = replay(first_run())
   let changed = Pin(..pin(), inputs: dict.from_list([#("advice.md", "a2")]))
-  let #(s2, effects) = run.step(s, Resumed(changed))
+  let #(s2, effects) = step(s, Resumed(changed))
   assert effects
     == [
       Refuse(
@@ -686,7 +700,7 @@ pub fn resume_with_changed_input_file_is_refused_typed_test() {
 pub fn resume_names_each_result_defining_field_test() {
   let #(s, _, _) = replay(first_run())
   let refusal = fn(p) {
-    let assert #(_, [Refuse(None, r)]) = run.step(s, Resumed(p))
+    let assert #(_, [Refuse(None, r)]) = step(s, Resumed(p))
     r
   }
   assert refusal(Pin(..pin(), seed: 8)) == PinMismatch("seed", "7", "8")
@@ -704,16 +718,22 @@ pub fn resume_names_each_result_defining_field_test() {
 pub fn replayed_request_is_answered_from_journal_test() {
   let #(s, _, _) = replay(first_run())
   let #(s, _, _) = replay_from(s, [Resumed(pin())])
-  let #(s, effects) = run.step(s, call("#0", "worker", JInt(0)))
+  let #(s, effects) = step(s, call("#0", "worker", JInt(0)))
   assert effects == [Deliver("#0", summary("s0"))]
-  let #(_, effects) = run.step(s, call("#1", "worker", JInt(1)))
+  let #(_, effects) = step(s, call("#1", "worker", JInt(1)))
   let assert [CallAgent(id: "#1", input: JInt(1), ..)] = effects
 }
 
 // --- The journal is a cache: (node digest, input, occurrence) ---
 
 fn ok(id, result) {
-  types.AgentReturned(id, JString(result), support.usage(), "fake/model")
+  types.AgentReturned(
+    id,
+    JString(result),
+    support.usage(),
+    "fake/model",
+    None,
+  )
 }
 
 pub fn a_changed_input_misses_an_unchanged_one_hits_whatever_the_id_test() {
@@ -725,19 +745,19 @@ pub fn a_changed_input_misses_an_unchanged_one_hits_whatever_the_id_test() {
     ok("#1", "w"),
   ]
   let #(s, _, _) = replay(first)
-  let #(s, _) = run.step(s, Resumed(pin()))
+  let #(s, _) = step(s, Resumed(pin()))
   // An inserted node runs; its neighbours still hit under their new ids.
-  let #(s, effects) = run.step(s, cached("#0", "check", JNull, 0))
+  let #(s, effects) = step(s, cached("#0", "check", JNull, 0))
   let assert [CallAgent(id: "#0", ..)] =
     list.filter(effects, fn(e) { e != Checkpoint })
-  let #(s, _) = run.step(s, ok("#0", "c"))
-  let #(s, effects) = run.step(s, cached("#1", "plan", JInt(1), 0))
+  let #(s, _) = step(s, ok("#0", "c"))
+  let #(s, effects) = step(s, cached("#1", "plan", JInt(1), 0))
   assert effects == [Deliver("#1", JString("p"))]
   // A changed upstream result changes the downstream input: a miss.
-  let #(_, effects) = run.step(s, cached("#2", "write", JString("other"), 0))
+  let #(_, effects) = step(s, cached("#2", "write", JString("other"), 0))
   let assert [Checkpoint, CallAgent(..)] = effects
   // An unchanged result keeps the downstream hit.
-  let #(_, effects) = run.step(s, cached("#2", "write", JString("p"), 0))
+  let #(_, effects) = step(s, cached("#2", "write", JString("p"), 0))
   assert effects == [Deliver("#2", JString("w"))]
 }
 
@@ -748,7 +768,7 @@ pub fn a_changed_node_definition_misses_test() {
       cached("#0", "plan-v1", JInt(1), 0),
       ok("#0", "p"),
     ])
-  let #(_, effects) = run.step(s, cached("#0", "plan-v2", JInt(1), 0))
+  let #(_, effects) = step(s, cached("#0", "plan-v2", JInt(1), 0))
   let assert [Checkpoint, CallAgent(..)] = effects
 }
 
@@ -764,11 +784,11 @@ pub fn identical_calls_get_their_own_recorded_results_by_occurrence_test() {
   ]
   let #(_, _, log) = replay(events)
   let #(refolded, _, _) = replay(log)
-  let #(s, _) = run.step(refolded, Resumed(pin()))
+  let #(s, _) = step(refolded, Resumed(pin()))
   // Issue order may differ (ids too): occurrence n gets the nth result.
-  let #(s, e0) = run.step(s, cached("x", "n", JNull, 0))
-  let #(s, e1) = run.step(s, cached("y", "n", JNull, 1))
-  let #(_, e2) = run.step(s, cached("z", "n", JNull, 2))
+  let #(s, e0) = step(s, cached("x", "n", JNull, 0))
+  let #(s, e1) = step(s, cached("y", "n", JNull, 1))
+  let #(_, e2) = step(s, cached("z", "n", JNull, 2))
   assert [e0, e1, e2]
     == [
       [Deliver("x", JString("a"))],
@@ -779,19 +799,19 @@ pub fn identical_calls_get_their_own_recorded_results_by_occurrence_test() {
 
 pub fn a_crash_resume_reissues_only_what_was_in_flight_and_logs_a_moved_id_test() {
   let #(s, _, _) = replay([started(basic()), cached("#0.a#0", "n", JInt(1), 0)])
-  let #(s, _) = run.step(s, Resumed(pin()))
+  let #(s, _) = step(s, Resumed(pin()))
   // The same call under another id (a reordered parallel): the record moves, logged, and is reissued once.
-  let #(s, effects) = run.step(s, cached("#0.b#0", "n", JInt(1), 0))
+  let #(s, effects) = step(s, cached("#0.b#0", "n", JInt(1), 0))
   let assert [Checkpoint, CallAgent(id: "#0.b#0", ..)] = effects
-  let #(_, effects) = run.step(s, cached("#0.b#0", "n", JInt(1), 0))
+  let #(_, effects) = step(s, cached("#0.b#0", "n", JInt(1), 0))
   assert effects == []
 }
 
 pub fn a_code_change_is_logged_and_never_refused_test() {
   let #(s, _, _) = replay(first_run())
-  let #(s, effects) = run.step(s, types.CodeChanged("wf1", "wf2"))
+  let #(s, effects) = step(s, types.CodeChanged("wf1", "wf2"))
   assert effects == [Checkpoint]
-  let #(s, effects) = run.step(s, Resumed(Pin(..pin(), workflow_digest: "wf2")))
+  let #(s, effects) = step(s, Resumed(Pin(..pin(), workflow_digest: "wf2")))
   assert effects == []
   assert snapshot_get(s, "status.type") == JString("running")
 }
@@ -833,9 +853,9 @@ pub fn restarting_a_held_node_reissues_it_and_the_body_runs_again_test() {
   let fixed = list.append(restarted, [returned("#0.a#0", summary("a"))])
   // The body runs again against the journal: both calls hit.
   let #(s, _, _) = replay(fixed)
-  let #(s, e) = run.step(s, call("#0.a#0", "worker", JNull))
+  let #(s, e) = step(s, call("#0.a#0", "worker", JNull))
   assert e == [Deliver("#0.a#0", summary("a"))]
-  let #(_, e) = run.step(s, call("#0.b#0", "worker", JInt(1)))
+  let #(_, e) = step(s, call("#0.b#0", "worker", JInt(1)))
   assert e == [Deliver("#0.b#0", summary("b"))]
 }
 
@@ -854,7 +874,7 @@ pub fn a_failure_the_owner_cancelled_ends_the_run_test() {
 
 pub fn resumed_finished_run_reports_outcome_test() {
   let #(s, _, _) = replay([started(basic()), types.BodyFinished(JInt(5))])
-  let #(_, effects) = run.step(s, Resumed(pin()))
+  let #(_, effects) = step(s, Resumed(pin()))
   assert effects == [Finish(Done(JInt(5)))]
 }
 
@@ -884,31 +904,52 @@ fn input(n) {
   value.object([#("n", JInt(n))])
 }
 
-pub fn a_session_call_continues_after_its_previous_call_test() {
-  let first = [
-    started(basic()),
-    support.session_call("#0", 0, input(1)),
-    types.AgentProgressed("#0:0", "dialogue-a"),
-    returned("#0:0", summary("a")),
-  ]
-  // The second call continues where the first ended: its dialogue blob.
-  let assert [CallAgent(history: Some("dialogue-a"), checkpoint: None, ..)] =
-    last(list.append(first, [support.session_call("#0", 1, input(2))]))
-  let assert [CallAgent(history: None, checkpoint: None, ..)] =
-    last([started(basic()), support.session_call("#0", 0, input(1))])
+/// A new session's first call, answered: the session value it answered with.
+fn first_call(dialogue: String) -> #(run.RunState, String) {
+  let #(state, effects) =
+    run.step(
+      replay([
+        started(basic()),
+        support.session_call("#0", None, input(1)),
+        types.AgentProgressed("#0", dialogue),
+      ]).0,
+      returned("#0", summary("a")),
+    )
+  let assert Some(session) = support.session_of(effects)
+  #(state, session)
 }
 
-pub fn a_call_that_never_took_a_step_passes_its_history_on_test() {
-  // Call 1 is refused before its first step: call 2 continues from call 0.
-  let assert [CallAgent(id: "#0:2", history: Some("dialogue-a"), ..)] =
+pub fn a_call_of_a_session_value_continues_its_dialogue_test() {
+  let #(state, s1) = first_call("dialogue-a")
+  // A call of the session value continues where the call that made it ended.
+  let assert [Checkpoint, CallAgent(history: Some("dialogue-a"), checkpoint: None, session: Some(from), ..)] =
+    run.step(state, support.session_call("#1", Some(s1), input(2))).1
+  assert from == s1
+  // A new session starts from nothing.
+  let assert [CallAgent(history: None, checkpoint: None, session: None, ..)] =
+    last([started(basic()), support.session_call("#0", None, input(1))])
+}
+
+pub fn calling_a_session_value_again_is_a_branch_test() {
+  let #(state, s1) = first_call("dialogue-a")
+  // Two calls of the same value: two calls, each from the same dialogue.
+  let #(state, a) = run.step(state, support.session_call("#1", Some(s1), input(2)))
+  let #(state, b) = run.step(state, support.session_call("#2", Some(s1), input(3)))
+  let assert [Checkpoint, CallAgent(id: "#1", history: Some("dialogue-a"), ..)] = a
+  let assert [Checkpoint, CallAgent(id: "#2", history: Some("dialogue-a"), ..)] = b
+  // Their answers are different session values, both from s1.
+  let #(state, a) = run.step(state, returned("#1", summary("x")))
+  let #(state, b) = run.step(state, returned("#2", summary("y")))
+  assert support.session_of(a) != support.session_of(b)
+  let assert Ok(JArray(sessions)) = Ok(support.snapshot_get(state, "sessions"))
+  assert list.length(sessions) == 3
+}
+
+pub fn a_session_value_the_run_never_answered_with_is_refused_test() {
+  let assert [Refuse(Some("#0"), types.UnknownSession("s-made-up"))] =
     last([
       started(basic()),
-      support.session_call("#0", 0, input(1)),
-      types.AgentProgressed("#0:0", "dialogue-a"),
-      returned("#0:0", summary("a")),
-      support.session_call("#0", 1, input(2)),
-      types.InputRejected("#0:1", None, 10, 5),
-      support.session_call("#0", 2, input(3)),
+      support.session_call("#0", Some("s-made-up"), input(1)),
     ])
 }
 
@@ -960,86 +1001,69 @@ pub fn host_facts_are_noted_even_after_the_end_test() {
   )
 }
 
-pub fn a_later_session_call_is_keyed_by_the_dialogue_before_it_test() {
-  // Calls 0 (input 1) and 1 (input 9) are journaled.
-  let #(state, _, _) =
-    replay([
-      started(basic()),
-      support.session_call("#0", 0, input(1)),
-      returned("#0:0", summary("a")),
-      support.session_call("#0", 1, input(9)),
-      returned("#0:1", summary("b")),
-    ])
-  // Another execution of the body with the same first call: both hit.
+pub fn a_later_session_call_is_keyed_by_the_session_before_it_test() {
+  // Calls 0 (input 1) and 1 (input 9, of call 0's session) are journaled.
+  let #(state, s1) = first_call("dialogue-a")
+  let #(state, _) = run.step(state, support.session_call("#1", Some(s1), input(9)))
+  let #(state, _) = run.step(state, returned("#1", summary("b")))
+  // Another execution of the body with the same first call: both hit, and
+  // the first answers with the same session value.
   let #(same, effects) =
-    run.step(state, support.session_call("#0", 0, input(1)))
-  assert effects == [Deliver("#0:0", summary("a"))]
-  assert run.step(same, support.session_call("#0", 1, input(9))).1
-    == [Deliver("#0:1", summary("b"))]
+    run.step(state, support.session_call("#0", None, input(1)))
+  assert support.outputs(effects) == [Deliver("#0", summary("a"))]
+  assert support.session_of(effects) == Some(s1)
+  assert support.outputs(
+      run.step(same, support.session_call("#1", Some(s1), input(9))).1,
+    )
+    == [Deliver("#1", summary("b"))]
   // With a different first call, the same second input misses: it is keyed
-  // by the dialogue before it.
-  let #(other, _) = run.step(state, support.session_call("#0", 0, input(2)))
-  let #(other, _) = run.step(other, returned("#0:0", summary("c")))
-  let assert [Checkpoint, CallAgent(id: "#0:1", ..)] =
-    run.step(other, support.session_call("#0", 1, input(9))).1
+  // by the session value before it.
+  let #(other, _) =
+    run.step(state, support.session_call("#2", None, input(2)))
+  let #(other, effects) = run.step(other, returned("#2", summary("c")))
+  let assert Some(s2) = support.session_of(effects)
+  let assert [Checkpoint, CallAgent(id: "#3", ..)] =
+    run.step(other, support.session_call("#3", Some(s2), input(9))).1
 }
 
-pub fn restarting_a_session_call_rewinds_the_session_test() {
-  // An earlier execution journaled calls 0 and 1 of session #0.
+pub fn a_restarted_call_answers_with_a_new_session_value_test() {
+  // The same call answered on its first attempt, and on a second.
+  let events = [started(basic()), support.session_call("#0", None, input(1))]
+  let #(once, _, _) = replay(events)
+  let #(_, first) = run.step(once, returned("#0", summary("a")))
+  let #(twice, _) = run.step(once, types.Restarted("#0", None, human, 0))
+  let #(twice, second) = run.step(twice, returned("#0", summary("a")))
+  assert support.outputs(first) == support.outputs(second)
+  // A new attempt is a new value: every call after it misses.
+  assert support.session_of(first) != support.session_of(second)
+  assert run.attempts(twice, "#0") == ["answered by fake/model", "open"]
+}
+
+pub fn restarting_a_held_session_call_reissues_it_from_its_session_test() {
+  let #(state, s1) = first_call("dialogue-a")
   let #(state, _, _) =
-    replay([
-      started(basic()),
-      support.session_call("#0", 0, input(1)),
-      returned("#0:0", summary("a")),
-      support.session_call("#0", 1, input(9)),
-      returned("#0:1", summary("b")),
+    replay_from(state, [
+      support.session_call("#1", Some(s1), input(2)),
+      failed("#1", "boom"),
+      types.BodyFailed(AgentGaveUp("worker", GaveUp("boom"))),
     ])
-  // This execution's call 0 has another input: it is in flight, and restarted.
-  let #(state, _) = run.step(state, support.session_call("#0", 0, input(2)))
   let #(state, effects) =
-    run.step(state, types.Restarted("#0:0", None, human, 0))
-  let assert [Checkpoint, CallAgent(id: "#0:0", history: None, ..)] = effects
-  // The session's later calls are forgotten: the old call 1 is not live in
-  // the journal, even when it is requested after the old call 0 again (its
-  // attempt is kept, under the forgotten mark).
-  let #(state, _) = run.step(state, support.session_call("#0", 0, input(1)))
-  let #(state, effects) =
-    run.step(state, support.session_call("#0", 1, input(9)))
-  let assert [Checkpoint, CallAgent(id: "#0:1", ..)] = effects
-  assert run.attempts(state, "#0:1")
-    == ["open", "forgotten", "answered by fake/model"]
-}
-
-pub fn restarting_a_held_session_call_reissues_it_after_its_previous_call_test() {
-  let events = [
-    started(basic()),
-    support.session_call("#0", 0, input(1)),
-    types.AgentProgressed("#0:0", "dialogue-a"),
-    returned("#0:0", summary("a")),
-    support.session_call("#0", 1, input(2)),
-    failed("#0:1", "boom"),
-    types.BodyFailed(AgentGaveUp("worker", GaveUp("boom"))),
-  ]
-  let #(state, _, _) = replay(events)
-  let #(state, effects) =
-    run.step(state, types.Restarted("#0:1", None, human, 0))
-  let assert [
-    Checkpoint,
-    CallAgent(id: "#0:1", history: Some("dialogue-a"), ..),
-  ] = effects
-  let #(_, effects) = run.step(state, returned("#0:1", summary("b2")))
-  assert list.contains(effects, Deliver("#0:1", summary("b2")))
+    run.step(state, types.Restarted("#1", None, human, 0))
+  let assert [Checkpoint, CallAgent(id: "#1", history: Some("dialogue-a"), ..)] =
+    effects
+  let #(_, effects) = run.step(state, returned("#1", summary("b2")))
+  assert list.contains(support.outputs(effects), Deliver("#1", summary("b2")))
 }
 
 pub fn a_previous_dialogue_missing_is_a_typed_refusal_test() {
-  let assert [Refuse(Some("#0:1"), types.DialogueMissing("#0:1"))] =
-    last([
-      started(basic()),
-      support.session_call("#0", 0, input(1)),
-      returned("#0:0", summary("a")),
-      support.session_call("#0", 1, input(2)),
-      types.PreviousDialogueMissing("#0:1"),
+  let #(state, s1) = first_call("dialogue-a")
+  let #(_, effects, _) =
+    replay_from(state, [
+      support.session_call("#1", Some(s1), input(2)),
+      types.PreviousDialogueMissing("#1"),
     ])
+  let assert [Checkpoint, Refuse(Some("#1"), types.DialogueMissing("#1"))] =
+    effects
 }
 
 // --- Asks, ends, interrupts, unknown outcomes ---
@@ -1053,7 +1077,7 @@ pub fn an_ask_idles_the_node_with_its_question_and_a_reply_continues_it_test() {
   let assert [NodeIdle(cause: types.Question("which dataset?"), ..)] =
     nodes_after(events)
   let assert [Checkpoint, CallAgent(transcript: t, ..)] =
-    run.step(replay(events).0, sent("#0", "digits")).1
+    step(replay(events).0, sent("#0", "digits")).1
   assert t == [Message(Assistant, "which dataset?"), Message(User, "digits")]
 }
 
@@ -1075,7 +1099,7 @@ pub fn an_interrupted_turn_idles_the_node_until_a_message_test() {
   ]
   let assert [NodeIdle(cause: types.Interrupted, ..)] = nodes_after(events)
   let assert [Checkpoint, CallAgent(..)] =
-    run.step(replay(events).0, sent("#0", "go on")).1
+    step(replay(events).0, sent("#0", "go on")).1
 }
 
 pub fn an_unknown_outcome_takes_a_restart_or_a_cancel_not_a_message_test() {
@@ -1093,10 +1117,10 @@ pub fn an_unknown_outcome_takes_a_restart_or_a_cancel_not_a_message_test() {
   let #(state, _, _) = replay(events)
   let assert [NodeIdle(cause: types.OutcomeUnknown("upload", _), ..)] =
     run.nodes(state)
-  assert run.step(state, sent("#0", "it worked")).1
+  assert step(state, sent("#0", "it worked")).1
     == [Refuse(None, NotIdle("#0"))]
   let assert [Checkpoint, CallAgent(..)] =
-    run.step(state, types.Restarted("#0", None, human, 0)).1
+    step(state, types.Restarted("#0", None, human, 0)).1
 }
 
 // --- Orchestrator nodes and body tool calls ---
@@ -1108,13 +1132,13 @@ pub fn an_orchestrator_node_waits_for_its_submitted_result_test() {
   assert run.status(state) == Some(Idle(None))
   let assert [types.OrchestratorPending("#0", "pick", _)] = run.nodes(state)
   let #(state, effects) =
-    run.step(state, types.ResultSubmitted("#0", JString("cool3"), human))
+    step(state, types.ResultSubmitted("#0", JString("cool3"), human))
   assert effects == [Checkpoint, Deliver("#0", JString("cool3"))]
   let assert [types.OrchestratorDone("#0", "pick")] = run.nodes(state)
   // Answered once: a replay hits, and a second submit is refused.
-  assert run.step(state, support.orchestrator("#1", input(1))).1
+  assert step(state, support.orchestrator("#1", input(1))).1
     == [Deliver("#1", JString("cool3"))]
-  assert run.step(state, types.ResultSubmitted("#0", JString("x"), human)).1
+  assert step(state, types.ResultSubmitted("#0", JString("x"), human)).1
     == [Refuse(None, types.NotPending("#0"))]
 }
 
@@ -1122,11 +1146,11 @@ pub fn an_orchestrator_node_can_be_asked_again_or_cancelled_test() {
   let #(state, _, _) =
     replay([started(basic()), support.orchestrator("#0", input(1))])
   let #(asked_again, effects) =
-    run.step(state, types.Restarted("#0", None, human, 0))
+    step(state, types.Restarted("#0", None, human, 0))
   assert effects == [Checkpoint]
   let assert [types.OrchestratorPending("#0", "pick", _)] =
     run.nodes(asked_again)
-  assert run.step(state, types.NodeCancelled("#0", human)).1
+  assert step(state, types.NodeCancelled("#0", human)).1
     == [Checkpoint, Fail("#0", types.OrchestratorCancelled("pick"))]
 }
 
@@ -1138,7 +1162,7 @@ pub fn a_body_tool_call_is_journaled_and_hit_on_replay_test() {
   ]
   let #(state, effects, _) = replay(events)
   assert effects == [Checkpoint, Deliver("#0", JString("papers"))]
-  assert run.step(state, support.tool("#7", input(1))).1
+  assert step(state, support.tool("#7", input(1))).1
     == [Deliver("#7", JString("papers"))]
   let assert [types.CallTool(id: "#0", tool: "search", ..)] =
     last([started(basic()), support.tool("#0", input(1))])
@@ -1150,18 +1174,18 @@ pub fn a_body_tool_call_in_flight_at_a_crash_is_reissued_only_if_safe_test() {
       "#0",
       types.Tool("upload", input(1), types.ReplayNever),
       "upload",
-      0,
+      "0",
     )
   let #(_, _, log) =
     replay([started(basic()), support.tool("#1", input(1)), unsafe])
-  let #(state, _) = run.step(support.refold(log), Resumed(pin()))
+  let #(state, _) = step(support.refold(log), Resumed(pin()))
   // The safe one is made again; the unsafe one waits, its outcome unknown.
   let assert [types.CallTool(id: "#1", ..)] =
-    run.step(state, support.tool("#1", input(1))).1
-  let #(state, _) = run.step(state, types.ToolReturned("#1", JString("p")))
+    step(state, support.tool("#1", input(1))).1
+  let #(state, _) = step(state, types.ToolReturned("#1", JString("p")))
   // The unsafe one is not made again: the host is told to log its unknown outcome.
-  assert run.step(state, unsafe).1 == [types.LogUnknownTool("#0")]
-  let #(state, effects) = run.step(state, types.ToolCallUnknown("#0"))
+  assert step(state, unsafe).1 == [types.LogUnknownTool("#0")]
+  let #(state, effects) = step(state, types.ToolCallUnknown("#0"))
   assert effects == [Checkpoint]
   let assert [types.ToolOutcomeUnknown("#0", "upload", _)] =
     list.filter(run.nodes(state), fn(n) {
@@ -1173,7 +1197,7 @@ pub fn a_body_tool_call_in_flight_at_a_crash_is_reissued_only_if_safe_test() {
   assert run.status(state) == Some(Idle(None))
   // A restart calls it again.
   let assert [Checkpoint, types.CallTool(id: "#0", tool: "upload", ..)] =
-    run.step(state, types.Restarted("#0", None, human, 0)).1
+    step(state, types.Restarted("#0", None, human, 0)).1
 }
 
 pub fn an_agent_tool_result_journaled_again_replaces_the_first_test() {
@@ -1181,10 +1205,10 @@ pub fn an_agent_tool_result_journaled_again_replaces_the_first_test() {
   let second = types.ToolRecorded("#0", "0/call_0", JString("r2"))
   let #(_, _, log) =
     replay([started(basic()), call("#0", "worker", JNull), first, second])
-  let #(state, _) = run.step(support.refold(log), Resumed(pin()))
+  let #(state, _) = step(support.refold(log), Resumed(pin()))
   let assert [
     CallAgent(recorded: [types.ToolResult("0/call_0", JString("r2"))], ..),
-  ] = run.step(state, call("#0", "worker", JNull)).1
+  ] = step(state, call("#0", "worker", JNull)).1
 }
 
 pub fn a_body_tool_call_in_flight_is_not_issued_again_in_the_same_session_test() {
@@ -1196,11 +1220,11 @@ pub fn a_body_tool_call_in_flight_is_not_issued_again_in_the_same_session_test()
       "#1",
       types.Tool("upload", input(1), types.ReplayNever),
       "upload",
-      0,
+      "0",
     )
   let #(state, _, _) = replay([started(basic()), safe, unsafe])
-  assert run.step(state, safe).1 == []
-  let #(state, effects) = run.step(state, unsafe)
+  assert step(state, safe).1 == []
+  let #(state, effects) = step(state, unsafe)
   assert effects == []
   // Still running, not an unknown outcome.
   let assert [
@@ -1215,7 +1239,7 @@ pub fn a_body_tool_calls_unknown_outcome_is_rebuilt_from_the_log_test() {
       "#0",
       types.Tool("upload", input(1), types.ReplayNever),
       "upload",
-      0,
+      "0",
     )
   let #(state, _, log) =
     replay([started(basic()), unsafe, types.ToolCallUnknown("#0")])
@@ -1223,7 +1247,7 @@ pub fn a_body_tool_calls_unknown_outcome_is_rebuilt_from_the_log_test() {
   assert run.nodes(support.refold(log)) == run.nodes(state)
   let assert [types.ToolOutcomeUnknown("#0", "upload", _)] = run.nodes(state)
   // A cancel tells the body the outcome is unknown, not that it never ran.
-  assert run.step(state, types.NodeCancelled("#0", human)).1
+  assert step(state, types.NodeCancelled("#0", human)).1
     == [
       Checkpoint,
       Fail("#0", types.ToolCrashed("upload", types.ToolUnknownOutcome)),
@@ -1244,14 +1268,14 @@ pub fn held_back_calls_are_nodes_and_can_be_cancelled_test() {
     types.CommandHeld(id: "#1", reason: types.PausedByUser, ..),
     types.ToolHeld(id: "#2", reason: types.PausedByUser, ..),
   ] = run.nodes(state)
-  assert run.step(state, types.NodeCancelled("#0", human)).1
+  assert step(state, types.NodeCancelled("#0", human)).1
     == [Checkpoint, Fail("#0", AgentGaveUp("worker", CancelledByOwner))]
-  assert run.step(state, types.NodeCancelled("#1", human)).1
+  assert step(state, types.NodeCancelled("#1", human)).1
     == [
       Checkpoint,
       Fail("#1", types.CommandCrashed("train", types.CommandCancelled)),
     ]
-  assert run.step(state, types.NodeCancelled("#2", human)).1
+  assert step(state, types.NodeCancelled("#2", human)).1
     == [
       Checkpoint,
       Fail("#2", types.ToolCrashed("search", types.ToolCancelled)),
@@ -1293,8 +1317,8 @@ pub fn restarting_an_unknown_outcome_retries_where_it_stopped_test() {
       recorded: [types.ToolResult("0/c0", JString("posted"))],
       ..,
     ),
-  ] = run.step(state, types.Restarted("#0", None, human, 0)).1
-  assert run.step(state, types.Restarted("#0", Some("try"), human, 0)).1
+  ] = step(state, types.Restarted("#0", None, human, 0)).1
+  assert step(state, types.Restarted("#0", Some("try"), human, 0)).1
     == [Refuse(None, types.RetryTakesNoNote("#0"))]
 }
 
@@ -1303,5 +1327,5 @@ pub fn cancelling_an_unknown_outcome_tells_the_body_test() {
   let assert [
     Checkpoint,
     Fail("#0", AgentGaveUp("worker", types.UnknownOutcome("upload", _))),
-  ] = run.step(state, types.NodeCancelled("#0", human)).1
+  ] = step(state, types.NodeCancelled("#0", human)).1
 }

@@ -10,7 +10,7 @@
 ////
 //// Every call the body made is kept by its slot (node, input, occurrence),
 //// with its attempts, newest first. The journal only grows: a restart opens
-//// a new attempt, a rewind adds a `Forgotten` mark, and the newest attempt
+//// a new attempt, a forget adds a `Forgotten` mark, and the newest attempt
 //// is the live one. A request for a slot whose live attempt settled is a
 //// hit, answered from the journal; one whose live attempt is open is the
 //// same call (reissued after a crash if it is not issued in this host
@@ -81,10 +81,9 @@ type Run {
     /// The slot each request id named. A call that moved to a new id keeps
     /// the old one here; `lookup` answers only for the call's current id.
     ids: Dict(RequestId, Slot),
-    /// The slot of each session call (`<session>:<index>`) in this
-    /// execution of the body: call k's slot includes call k-1's, so a
-    /// session's later calls are keyed by everything before them.
-    chain: Dict(String, Slot),
+    /// Every session value an agent call answered with: the call and
+    /// attempt it comes after, so a call of it continues that dialogue.
+    sessions: Dict(SessionId, Origin),
     /// A failed call the body did not handle: its slot and the body's reason.
     hold: Option(#(Slot, FailReason)),
     spent: Spent,
@@ -95,6 +94,13 @@ type Run {
   )
 }
 
+/// Where a session value comes from: the call (slot) and attempt that
+/// answered with it, and the first call of its lineage (whose workspace it
+/// shares until workspaces are layers).
+type Origin {
+  Origin(after: Slot, attempt: Int, root: Slot)
+}
+
 type Spent {
   Spent(usd: Float, tokens: Int, turns: Int, compute_minutes: Float)
 }
@@ -102,13 +108,12 @@ type Spent {
 /// A call of the body, by kind. `inbox` (newest first) lists the
 /// interventions it received. `attempts` are newest first and never empty.
 type Call {
-  /// Call `index` of the session created at `session`.
+  /// A call of a session value (`None`: a new session).
   AgentCall(
     id: RequestId,
     agent: String,
     input: Value,
-    session: SessionId,
-    index: Int,
+    session: Option(SessionId),
     inbox: List(InboxMessage),
     attempts: List(Attempt(AgentAttempt)),
   )
@@ -138,7 +143,7 @@ type Call {
   RefusedCall(id: RequestId, refusal: Refusal)
 }
 
-/// One attempt at a call. `Forgotten`: a rewind left the slot without a
+/// One attempt at a call. `Forgotten`: a forget left the slot without a
 /// live attempt, so its next request is a new attempt.
 type Attempt(state) {
   Forgotten
@@ -287,7 +292,7 @@ fn start(
         admission: Admitting,
         calls: dict.new(),
         ids: dict.new(),
-        chain: dict.new(),
+        sessions: dict.new(),
         hold: None,
         spent: Spent(0.0, 0, 0, 0.0),
         observations: [],
@@ -373,8 +378,15 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       ),
       [types.Checkpoint],
     )
-    types.AgentReturned(id:, output:, usage:, model:) ->
-      agent_settled(run, rid(id), usage, model, fn(_) { Answered(output) })
+    types.AgentReturned(id:, output:, usage:, model:, dialogue:) ->
+      agent_returned(
+        run,
+        rid(id),
+        output,
+        usage,
+        model,
+        option.map(dialogue, ids.digest),
+      )
     types.AgentFailed(id:, failure:, usage:, model:) ->
       agent_settled(run, rid(id), usage, model, fn(name) {
         Errored(types.AgentGaveUp(name, failure))
@@ -791,34 +803,22 @@ fn replace_head(attempts: List(Attempt(s)), state: s) -> List(Attempt(s)) {
 
 // --- Requests ------------------------------------------------------------------
 
-fn chain_key(session: SessionId, index: Int) -> String {
-  ids.session_text(session) <> ":" <> int.to_string(index)
-}
-
-/// The slot of the previous call in a session call's session.
-fn previous_of(run: Run, request: Request) -> Option(Slot) {
-  case request {
-    types.Call(session:, index:, ..) if index > 0 ->
-      dict.get(run.chain, chain_key(ids.session_id(session), index - 1))
-      |> option.from_result
-    types.Call(..)
-    | types.Command(..)
-    | types.Tool(..)
-    | types.Orchestrator(..) -> None
-  }
-}
-
 /// The journal slot of a request: see `ids.slot`. A session call's slot
-/// includes its previous call's slot, so it depends on the whole dialogue
-/// before it.
-fn slot_of(run: Run, node: Digest, request: Request, occurrence: Int) -> Slot {
-  let #(kind, name, body) = case request {
-    types.Call(agent:, input:, ..) -> #("call", agent, input)
-    types.Command(command:, input:) -> #("command", command, input)
-    types.Tool(tool:, input:, ..) -> #("tool", tool, input)
-    types.Orchestrator(name:, input:) -> #("orchestrator", name, input)
+/// includes its session's id, a hash chain over every call before it, so
+/// it depends on the whole dialogue before it.
+fn slot_of(node: Digest, request: Request, occurrence: String) -> Slot {
+  let #(kind, name, body, within) = case request {
+    types.Call(agent:, input:, session:) -> #(
+      "call",
+      agent,
+      input,
+      option.map(session, ids.session_id),
+    )
+    types.Command(command:, input:) -> #("command", command, input, None)
+    types.Tool(tool:, input:, ..) -> #("tool", tool, input, None)
+    types.Orchestrator(name:, input:) -> #("orchestrator", name, input, None)
   }
-  ids.slot(node, kind, name, body, previous_of(run, request), occurrence)
+  ids.slot(node, kind, name, body, within, occurrence)
 }
 
 /// The journal is a cache. A slot whose live attempt settled is a hit:
@@ -830,26 +830,14 @@ fn requested(
   id: RequestId,
   request: Request,
   node: Digest,
-  occurrence: Int,
+  occurrence: String,
 ) -> #(Run, List(Effect)) {
-  let slot = slot_of(run, node, request, occurrence)
-  let run = case request {
-    types.Call(session:, index:, ..) ->
-      Run(
-        ..run,
-        chain: dict.insert(
-          run.chain,
-          chain_key(ids.session_id(session), index),
-          slot,
-        ),
-      )
-    types.Command(..) | types.Tool(..) | types.Orchestrator(..) -> run
-  }
+  let slot = slot_of(node, request, occurrence)
   case dict.get(run.calls, slot) {
     Error(Nil) -> new_attempt(run, id, slot, request, [])
     Ok(call) ->
       case live(call) {
-        LiveSettled(entry) -> #(run, [answer_effect(id, entry)])
+        LiveSettled(entry) -> #(run, [deliver(id, slot, call, entry)])
         LiveOpen -> {
           let moved = call_id(call) != id
           let run = put(run, slot, with_id(call, id))
@@ -961,6 +949,32 @@ fn answer_effect(id: RequestId, entry: Entry) -> Effect {
   }
 }
 
+/// The answer of a settled call. An agent call answers with its output and
+/// the session value after it.
+fn deliver(id: RequestId, slot: Slot, call: Call, entry: Entry) -> Effect {
+  case call, entry {
+    AgentCall(attempts:, ..), Answered(output) ->
+      types.Deliver(
+        ids.request_text(id),
+        value.object([
+          #("output", output),
+          #(
+            "session",
+            value.JString(
+              ids.session_text(ids.next_session(slot, list.length(attempts))),
+            ),
+          ),
+        ]),
+      )
+    AgentCall(..), Errored(_) | AgentCall(..), Refused(_) ->
+      answer_effect(id, entry)
+    CommandCall(..), _
+    | ToolCall(..), _
+    | OrchestratorCall(..), _
+    | RefusedCall(..), _ -> answer_effect(id, entry)
+  }
+}
+
 fn refuse_call(
   run: Run,
   id: RequestId,
@@ -1017,7 +1031,7 @@ fn prior_orchestrator(prior: List(Call)) -> List(Attempt(OrchestratorState)) {
   }
 }
 
-/// A new attempt at a slot (`prior`: the call there, if a rewind left it).
+/// A new attempt at a slot (`prior`: the call there, if it was forgotten).
 fn begin(
   run: Run,
   id: RequestId,
@@ -1026,17 +1040,28 @@ fn begin(
   prior: List(Call),
 ) -> #(Run, List(Effect)) {
   case request {
-    types.Call(agent: name, input:, session:, index:) ->
-      case find_agent(run.workflow, name) {
-        Error(Nil) -> refuse_call(run, id, slot, types.UnknownAgent(name))
-        Ok(agent) -> {
+    types.Call(agent: name, input:, session:) -> {
+      // A session value is one this run answered with (or a new one).
+      let known = case session {
+        Some(s) -> dict.has_key(run.sessions, ids.session_id(s))
+        None -> True
+      }
+      case find_agent(run.workflow, name), known {
+        Error(Nil), _ -> refuse_call(run, id, slot, types.UnknownAgent(name))
+        Ok(_), False ->
+          refuse_call(
+            run,
+            id,
+            slot,
+            types.UnknownSession(option.unwrap(session, "")),
+          )
+        Ok(agent), True -> {
           let call = fn(state) {
             AgentCall(
               id:,
               agent: name,
               input:,
-              session: ids.session_id(session),
-              index:,
+              session: option.map(session, ids.session_id),
               inbox: [],
               attempts: [
                 Tried(AgentAttempt(0, agent.max_turns, [], state)),
@@ -1070,6 +1095,7 @@ fn begin(
           }
         }
       }
+    }
     types.Command(command:, input:) ->
       case
         list.contains(run.workflow.commands, command),
@@ -1139,7 +1165,7 @@ fn call_effect(
   dialogue: Dialogue,
 ) -> Result(Effect, Refusal) {
   case call, agent_attempt(call) {
-    AgentCall(id:, agent: name, input:, ..), Ok(a) -> {
+    AgentCall(id:, agent: name, input:, session:, ..), Ok(a) -> {
       use agent <- result.try(
         find_agent(run.workflow, name)
         |> result.replace_error(types.UnknownAgent(name)),
@@ -1158,6 +1184,8 @@ fn call_effect(
         slot: ids.slot_text(slot),
         transcript: dialogue.transcript,
         note: dialogue.note,
+        session: option.map(session, ids.session_text),
+        lineage: ids.slot_text(lineage(run, slot, call)),
         history: history_of(run, call) |> option.map(ids.digest_text),
         checkpoint: dialogue.checkpoint |> option.map(ids.digest_text),
         recorded: list.reverse(a.tools),
@@ -1296,7 +1324,19 @@ fn settle_agent(
   served: Option(String),
   usage: Usage,
 ) -> #(Run, List(Effect)) {
-  let dialogue = dialogue_after(run, call)
+  settle_agent_with(run, slot, call, entry, served, usage, dialogue_after(run, call))
+}
+
+fn settle_agent_with(
+  run: Run,
+  slot: Slot,
+  call: Call,
+  entry: Entry,
+  served: Option(String),
+  usage: Usage,
+  dialogue: Option(Digest),
+) -> #(Run, List(Effect)) {
+  let root = lineage(run, slot, call)
   let call =
     update_agent(call, fn(a) {
       AgentAttempt(
@@ -1305,7 +1345,82 @@ fn settle_agent(
         state: AgentSettled(entry, served, dialogue),
       )
     })
-  #(put(spend(run, usage), slot, call), [answer_effect(call_id(call), entry)])
+  // An answer is a new session value: what a call of it continues.
+  let run = case call, entry {
+    AgentCall(attempts:, ..), Answered(_) -> {
+      let n = list.length(attempts)
+      Run(
+        ..run,
+        sessions: dict.insert(
+          run.sessions,
+          ids.next_session(slot, n),
+          Origin(slot, n, root),
+        ),
+      )
+    }
+    AgentCall(..), Errored(_)
+    | AgentCall(..), Refused(_)
+    | CommandCall(..), _
+    | ToolCall(..), _
+    | OrchestratorCall(..), _
+    | RefusedCall(..), _ -> run
+  }
+  #(put(spend(run, usage), slot, call), [
+    deliver(call_id(call), slot, call, entry),
+  ])
+}
+
+/// A returned agent call: the dialogue it names is the session's after it.
+fn agent_returned(
+  run: Run,
+  id: RequestId,
+  output: Value,
+  usage: Usage,
+  model: String,
+  dialogue: Option(Digest),
+) -> #(Run, List(Effect)) {
+  case lookup(run, id) {
+    Ok(#(slot, call)) ->
+      case in_flight(call) {
+        Error(Nil) -> #(run, [])
+        Ok(_) -> {
+          let served = case model {
+            "" -> None
+            m -> Some(m)
+          }
+          let dialogue = option.or(dialogue, dialogue_after(run, call))
+          let #(run, effects) =
+            settle_agent_with(
+              run,
+              slot,
+              call,
+              Answered(output),
+              served,
+              usage,
+              dialogue,
+            )
+          #(run, [types.Checkpoint, ..effects])
+        }
+      }
+    Error(Nil) -> #(run, [])
+  }
+}
+
+/// The first call of a session value's lineage: its workspace, until
+/// workspaces are layers.
+fn lineage(run: Run, slot: Slot, call: Call) -> Slot {
+  case call {
+    AgentCall(session: Some(s), ..) ->
+      case dict.get(run.sessions, s) {
+        Ok(origin) -> origin.root
+        Error(Nil) -> slot
+      }
+    AgentCall(session: None, ..)
+    | CommandCall(..)
+    | ToolCall(..)
+    | OrchestratorCall(..)
+    | RefusedCall(..) -> slot
+  }
 }
 
 /// A result, a failure or a rejected input completes the call. Results for
@@ -1491,33 +1606,42 @@ fn dialogue_after(run: Run, call: Call) -> Option(Digest) {
   }
 }
 
-/// The session's dialogue before an agent call: what its previous call
-/// left (`None` for a session's first call).
+/// The session's dialogue before an agent call: what the call its session
+/// value comes after left (`None` for a new session).
 fn history_of(run: Run, call: Call) -> Option(Digest) {
   case call {
-    AgentCall(session:, index:, ..) if index > 0 ->
-      case dict.get(run.chain, chain_key(session, index - 1)) {
-        Ok(previous) ->
-          case dict.get(run.calls, previous) {
-            Ok(before) ->
-              case agent_attempt(before) {
-                Ok(AgentAttempt(state: AgentSettled(dialogue:, ..), ..)) ->
-                  dialogue
-                Ok(AgentAttempt(state: AgentHeld(..), ..))
-                | Ok(AgentAttempt(state: AgentRunning(..), ..))
-                | Ok(AgentAttempt(state: AgentWaiting(..), ..))
-                | Ok(AgentAttempt(state: AgentUnavailable(..), ..))
-                | Error(Nil) -> None
-              }
-            Error(Nil) -> None
-          }
+    AgentCall(session: Some(s), ..) ->
+      case dict.get(run.sessions, s) {
+        Ok(Origin(after:, attempt:, ..)) -> dialogue_at(run, after, attempt)
         Error(Nil) -> None
       }
-    AgentCall(..)
+    AgentCall(session: None, ..)
     | CommandCall(..)
     | ToolCall(..)
     | OrchestratorCall(..)
     | RefusedCall(..) -> None
+  }
+}
+
+/// The dialogue the `attempt`th attempt (from the first) at a slot left.
+fn dialogue_at(run: Run, slot: Slot, attempt: Int) -> Option(Digest) {
+  case dict.get(run.calls, slot) {
+    Ok(AgentCall(attempts:, ..)) ->
+      case list.drop(attempts, list.length(attempts) - attempt) {
+        [Tried(AgentAttempt(state: AgentSettled(dialogue:, ..), ..)), ..] ->
+          dialogue
+        [Tried(AgentAttempt(state: AgentHeld(..), ..)), ..]
+        | [Tried(AgentAttempt(state: AgentRunning(..), ..)), ..]
+        | [Tried(AgentAttempt(state: AgentWaiting(..), ..)), ..]
+        | [Tried(AgentAttempt(state: AgentUnavailable(..), ..)), ..]
+        | [Forgotten, ..]
+        | [] -> None
+      }
+    Ok(CommandCall(..))
+    | Ok(ToolCall(..))
+    | Ok(OrchestratorCall(..))
+    | Ok(RefusedCall(..))
+    | Error(Nil) -> None
   }
 }
 
@@ -1846,7 +1970,8 @@ fn restart(
 
 /// A new attempt of an agent call: its progress starts over (the turn count
 /// and allowance, and without its journaled tool results: the outside is
-/// asked anew), and the session's later calls are forgotten.
+/// asked anew). Its answer will be a new session value, so every call after
+/// it misses.
 fn restart_agent(
   run: Run,
   id: RequestId,
@@ -1859,13 +1984,12 @@ fn restart_agent(
     lookup(run, id) |> result.replace_error(types.NotLive(ids.request_text(id))),
   )
   case call {
-    AgentCall(agent:, session:, index:, attempts:, ..) -> {
+    AgentCall(agent:, attempts:, ..) -> {
       let allowed = case turns > 0, find_agent(run.workflow, agent) {
         True, _ -> turns
         False, Ok(a) -> a.max_turns
         False, Error(Nil) -> 0
       }
-      let run = rewind(run, session, index)
       let attempt = fn(state) {
         AgentCall(..call, attempts: [
           Tried(AgentAttempt(0, allowed, [], state)),
@@ -1890,65 +2014,6 @@ fn restart_agent(
     // `restart` calls this for agent calls only.
     CommandCall(..) | ToolCall(..) | OrchestratorCall(..) | RefusedCall(..) ->
       Error(types.NotAnAgent(ids.request_text(id)))
-  }
-}
-
-/// A session call restarts from the session's state before it: every later
-/// call of the session is forgotten (its attempts stay), so a later request
-/// is a new attempt, not a stale record.
-fn rewind(run: Run, session: SessionId, index: Int) -> Run {
-  let prefix = ids.session_text(session) <> ":"
-  run.chain
-  |> dict.to_list
-  |> list.filter_map(fn(e) {
-    case string.starts_with(e.0, prefix) {
-      True ->
-        case int.parse(string.drop_start(e.0, string.length(prefix))) {
-          Ok(i) if i > index -> Ok(e.1)
-          Ok(_) | Error(Nil) -> Error(Nil)
-        }
-      False -> Error(Nil)
-    }
-  })
-  |> list.fold(run, forget)
-}
-
-fn forget(run: Run, slot: Slot) -> Run {
-  case dict.get(run.calls, slot) {
-    Ok(call) ->
-      case live(call) {
-        LiveForgotten -> run
-        LiveSettled(_) | LiveOpen ->
-          case call {
-            // A refused call has no result to keep: it is asked again as is.
-            RefusedCall(..) -> run
-            AgentCall(attempts:, ..) ->
-              put(
-                run,
-                slot,
-                AgentCall(..call, attempts: [Forgotten, ..attempts]),
-              )
-            CommandCall(attempts:, ..) ->
-              put(
-                run,
-                slot,
-                CommandCall(..call, attempts: [Forgotten, ..attempts]),
-              )
-            ToolCall(attempts:, ..) ->
-              put(
-                run,
-                slot,
-                ToolCall(..call, attempts: [Forgotten, ..attempts]),
-              )
-            OrchestratorCall(attempts:, ..) ->
-              put(
-                run,
-                slot,
-                OrchestratorCall(..call, attempts: [Forgotten, ..attempts]),
-              )
-          }
-      }
-    Error(Nil) -> run
   }
 }
 
@@ -2638,8 +2703,42 @@ pub fn snapshot(run: RunState) -> json.Json {
           ),
         ),
         #("owner", json.nullable(r.owner, json.string)),
+        #("sessions", json.array(session_branches(r), fn(x) { x })),
       ])
   }
+}
+
+/// Every session value the run answered with, by the call that made it:
+/// the session it continued (`from`, null for a new one), so the values
+/// form a tree of branches.
+fn session_branches(r: Run) -> List(json.Json) {
+  r.sessions
+  |> dict.to_list
+  |> list.filter_map(fn(e) {
+    let #(id, Origin(after:, ..)) = e
+    case dict.get(r.calls, after) {
+      Ok(AgentCall(id: call, agent:, session:, ..)) ->
+        Ok(#(
+          ids.request_text(call),
+          json.object([
+            #("id", json.string(ids.session_text(id))),
+            #("agent", json.string(agent)),
+            #("call", json.string(ids.request_text(call))),
+            #(
+              "from",
+              json.nullable(option.map(session, ids.session_text), json.string),
+            ),
+          ]),
+        ))
+      Ok(CommandCall(..))
+      | Ok(ToolCall(..))
+      | Ok(OrchestratorCall(..))
+      | Ok(RefusedCall(..))
+      | Error(Nil) -> Error(Nil)
+    }
+  })
+  |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
+  |> list.map(fn(e) { e.1 })
 }
 
 fn sorted_object(d: Dict(String, a), encode: fn(a) -> json.Json) -> json.Json {

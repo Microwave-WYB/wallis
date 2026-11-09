@@ -642,13 +642,13 @@ const implementAndValidate = subWorkflow({
 		let feedback = input.previous_failure;
 		const signatures: Static<typeof RawSignature>[] = [];
 		for (let attempt = 1; attempt <= input.max_attempts; attempt++) {
-			const impl = await ctx.call(ctx.session(implementor), {
+			const [impl] = await ctx.call(ctx.session(implementor), {
 				proposal: input.proposal,
 				previous_validation_failure: feedback,
 				probe_seed: probeSeed(input.seed, input.iteration, attempt),
 			});
 			const report = await ctx.call(validateScript, { model: impl.model, probe_seed: probeSeed(input.seed, input.iteration, attempt) });
-			const review = await ctx.call(ctx.session(validator), { model: impl.model, deterministic_report: report });
+			const [review] = await ctx.call(ctx.session(validator), { model: impl.model, deterministic_report: report });
 			signatures.push(...review.error_signatures);
 			if (review.passed) {
 				return { passed: true, model: impl.model, attempts: attempt, last_error: null, error_signatures: signatures };
@@ -707,7 +707,7 @@ const tune = subWorkflow({
 		for (let round = 1; round <= input.max_rounds; round++) {
 			// force_formal_round: the last round is Formal (formal_round_strategy full_clone).
 			const isTrial = round < input.max_rounds;
-			const plan: Static<typeof tunePlanner.output> = await ctx.call(ctx.session(tunePlanner), {
+			const [plan]: [Static<typeof tunePlanner.output>, unknown] = await ctx.call(ctx.session(tunePlanner), {
 				round,
 				is_trial: isTrial,
 				baseline_config: input.baseline_config,
@@ -781,7 +781,7 @@ const tune = subWorkflow({
 				if (health.valid && better(input.direction, scored.score, bestValidFormal)) bestValidFormal = scored.score;
 			}
 
-			const reflection = await ctx.call(ctx.session(tuneReflector), { round, is_trial: isTrial, result: { score: scored.score, health } });
+			const [reflection] = await ctx.call(ctx.session(tuneReflector), { round, is_trial: isTrial, result: { score: scored.score, health } });
 			notes.push(reflection.notes);
 			rejections.push(...reflection.physical_rejections);
 		}
@@ -876,7 +876,7 @@ export default workflow({
 			ctx.observe("iteration", iteration);
 
 			// 2. Interpretation of the previous iteration (cold start on the first).
-			const interpretation: Static<typeof interpreter.output> = await ctx.call(ctx.session(interpreter), {
+			const [interpretation]: [Static<typeof interpreter.output>, unknown] = await ctx.call(ctx.session(interpreter), {
 				iteration,
 				cold_start: iteration === 0,
 				metric_direction: direction,
@@ -900,7 +900,7 @@ export default workflow({
 					const incoming = found.filter((f) => f.kind === kind);
 					if (incoming.length === 0) continue;
 					const list = kind === "finding" ? "key_findings" : "bottlenecks";
-					const merged = await c.call(c.session(consolidator), { model_type: modelType, kind, current: entry[list], incoming, max: MAX_SURVIVORS });
+					const [merged] = await c.call(c.session(consolidator), { model_type: modelType, kind, current: entry[list], incoming, max: MAX_SURVIVORS });
 					const pruned = rankPrune(merged.items);
 					updated[list] = pruned.kept;
 					archived.push(...merged.archived, ...pruned.archived);
@@ -923,19 +923,19 @@ export default workflow({
 				const order = input.evidence.order ?? "parallel";
 				if (order === "parallel") {
 					const r = await ctx.parallel({
-						analysis: async (c) => (input.evidence.dataAnalysis ? c.call(c.session(dataAnalyst), analysis()) : null),
-						literature: async (c) => (input.evidence.literature ? c.call(c.session(literature), lit()) : null),
+						analysis: async (c) => (input.evidence.dataAnalysis ? (await c.call(c.session(dataAnalyst), analysis()))[0] : null),
+						literature: async (c) => (input.evidence.literature ? (await c.call(c.session(literature), lit()))[0] : null),
 					});
 					found.push(...(r.analysis?.evidence ?? []), ...(r.literature?.evidence ?? []));
 				} else {
 					for (const node of order === "analysis_then_literature" ? ["analysis", "literature"] : ["literature", "analysis"]) {
-						if (node === "analysis" && input.evidence.dataAnalysis) found.push(...(await ctx.call(ctx.session(dataAnalyst), analysis())).evidence);
-						if (node === "literature" && input.evidence.literature) found.push(...(await ctx.call(ctx.session(literature), lit())).evidence);
+						if (node === "analysis" && input.evidence.dataAnalysis) found.push(...(await ctx.call(ctx.session(dataAnalyst), analysis()))[0].evidence);
+						if (node === "literature" && input.evidence.literature) found.push(...(await ctx.call(ctx.session(literature), lit()))[0].evidence);
 					}
 				}
 				evidence.push(...found);
 				const projection = judgeProjection(evidence);
-				const verdict = await ctx.call(ctx.session(evidenceJudge), { iteration, stop_criterion: input.stops.judgeCriterion, evidence: projection.items, omitted: projection.omitted });
+				const [verdict] = await ctx.call(ctx.session(evidenceJudge), { iteration, stop_criterion: input.stops.judgeCriterion, evidence: projection.items, omitted: projection.omitted });
 				evidenceBrief = verdict.brief;
 				if (input.stops.judgeCriterion !== "" && iteration > 0 && verdict.stop.recommend) {
 					if (input.stops.judgeOnMet === "stop") {
@@ -957,7 +957,7 @@ export default workflow({
 			let candidate: { proposal: Static<typeof Proposal>; model: Static<typeof ModelPlugin> } | null = null;
 			for (let attempt = 1; attempt <= input.maxProposalAttempts && candidate === null; attempt++) {
 				try {
-					const proposal = await ctx.call(ctx.session(proposer), {
+					const [proposal] = await ctx.call(ctx.session(proposer), {
 						iteration,
 						task: input.task,
 						evidence_brief: evidenceBrief,

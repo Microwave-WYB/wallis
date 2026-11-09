@@ -78,7 +78,7 @@ test("detached run hosts start as systemd user units and exit when the run is id
 	// The unit ran and is gone (collected) once its host exited at the idle run.
 	const unit = spawnSync("systemctl", ["--user", "is-active", `wallis-run-${id}`], { encoding: "utf8" });
 	assert.notEqual(unit.stdout.trim(), "active");
-	const sent = wallis(root, ["send", id, "#0:0", "newcomers"], env);
+	const sent = wallis(root, ["send", id, "#0", "newcomers"], env);
 	assert.equal(sent.status, 0, sent.stderr);
 	const finished = wallis(root, ["wait", id, "--timeout", "30"], env);
 	assert.equal(finished.status, 0, finished.stderr);

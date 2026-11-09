@@ -394,44 +394,55 @@ Prototype choices:
 
 An agent call is `(input, inbox) → dialogue → Submitted(output) | AgentFailure`.
 
-- **Sessions (round 6) are the only way to call an agent:**
-  `ctx.call(ctx.session(agent), input)`. `ctx.call(agent, …)` is a type error,
-  and a typed refusal (`session_required`) at run time. A one-off call is a
-  session used once; a dialogue reuses the handle:
+- **Sessions are values (foundation round), the only way to call an
+  agent:** `ctx.call(ctx.session(agent), input)` returns `[output, next]`,
+  where `next` is the session after the call. `ctx.call(agent, …)` is a
+  type error, and a typed refusal (`session_required`) at run time.
 
   ```ts
-  const colorist = ctx.session(lookAgent);
-  let look = await ctx.call(colorist, { sheet, measure });
-  look = await ctx.call(colorist, { feedback: "too yellow" });   // same conversation
+  let s = ctx.session(lookAgent);
+  let look;
+  [look, s] = await ctx.call(s, { sheet, measure });
+  [look, s] = await ctx.call(s, { feedback: "too yellow" });   // same conversation
   ```
 
+  Without semicolons, a line that starts with `[` continues the line
+  before it: end the line before with `;`.
+
   - Each call's input is checked against the agent's input schema and
-    appended to the same conversation as a new message; each output is
+    appended to the session's dialogue as a new message; each output is
     validated. Budgets and `maxTurns` are per call.
-  - A session's identity is where it was created in the call tree, taken
-    synchronously like a request id, so replay matches. Its calls are its
-    children: `#3:0`, `#3:1`.
-  - Calls run in the order they were made: a call made while the previous
-    one is in flight waits for it (its index is taken when it is made). Only
-    the ctx that created a session may call it: a call through any other
-    ctx (a `ctx.parallel` or `ctx.map` branch, a sibling branch, a nested
-    workflow) is refused (`foreign_session`), deterministically (round 7
-    fixes): across ctxs the order would depend on arrival. The handle is
-    opaque (an id and the agent's name); it has no `call` of its own.
+  - **A session value is plain data** (`{ kind: "session", agent, id }`):
+    keep it, pass it to any branch, call it from anywhere. The value called
+    is unchanged, so **calling the same value again is a branch** from the
+    same dialogue, allowed implicitly (there is no `branch` API, no
+    queueing and no `foreign_session`).
+  - **Identity.** A call is keyed by (node digest, parent session id, input
+    digest, occurrence); the occurrence counts calls of the same node,
+    session and input within one branch of the body (`<branch path>/<n>`),
+    in program order, like request ids, so it never depends on arrival
+    order. The session after a call is a hash chain over the call's slot
+    (which includes the parent session id) and the attempt that answered:
+    `s<hash>`. A new session (`ctx.session(agent)`) has `id: null`; two are
+    equal. A session id the run never answered with is refused
+    (`unknown_session`).
+  - **The dialogue is a content-addressed blob**: a delta from the parent
+    session's dialogue (how many of its messages it keeps, and the rest),
+    or whole after a compaction or when the chain of bases is deep.
+    `agent_returned` names the dialogue the call left; a call of the
+    session after it starts from there.
+  - **A restart of a call is calling its parent value again**: a new
+    attempt at the same slot. Its answer is a new session value (the
+    attempt is in the hash), so every call after it misses. A cancelled or
+    failed call answers with no session value: the body calls the value
+    before it again.
   - A session is data, not a process: between calls nothing runs, and the
-    next call rebuilds the agent from the dialogue its previous call left.
-    There is no `close()`. Each call gets a fresh sandbox process
-    (background processes die with it); the scratch dir belongs to the
-    session and persists across its calls, cleaned with the run.
-  - **Restarting a call rewinds its session** to before that call; the
-    session's later calls are invalidated (the core decides what is on the
-    live path). The session's scratch dir is not rewound: files the
-    discarded attempt wrote stay.
-  - When a call ends, on every path (a result, a failure, a cancel, a
-    refused input, a workspace failure), its dialogue is saved for the
-    session's next call. A next call whose previous dialogue is missing is
-    refused (`dialogue_missing`), never started fresh. A question the
-    previous call left unanswered is closed ("no reply"), not inherited.
+    next call rebuilds the agent from the dialogue blob. There is no
+    `close()`. Each call gets a fresh sandbox process (background processes
+    die with it). Until workspaces are layers, a lineage of sessions (calls
+    descending from one new session's first call) shares one scratch dir.
+  - `wallis tree` lists the calls, then the session values as a tree of
+    branches (each the session after a call of its parent).
 - **`ask` (round 6; opt-in since round 7: `tools: [ask]`).** `ask(message)`
   takes plain language, no schema. The question goes to the agent's caller, the body,
   which forwards it to the orchestrator (later, a parent agent may answer
@@ -482,23 +493,16 @@ Prototype choices:
   already journaled for the call (`recorded`). An answer to a node at its
   turn limit without more turns is refused (`no_turns_left`); a restart
   resets the allowance to `maxTurns`, or to `--turns`.
-- A session call's journal slot includes its previous call's slot, so a
-  later call is keyed by the whole dialogue before it. The core keeps the
-  chain (`<session>:<index>` → slot) for the current execution of the body.
-- Every checkpoint of a call is a blob named by `agent_progressed`; when a
-  call ends, its newest checkpoint is the session's dialogue for the next
-  call (a call that never took a step passes on the dialogue it started
-  from). A blob the journal names that the store does not have is refused
-  (`dialogue_missing`), never a fresh start. A restart is a new attempt
-  without a checkpoint, so it starts from its previous call's dialogue
-  again. The session's scratch dir
-  (`work/<session>/scratch`) is not rewound.
-- `foreign_session` is checked in the workflow VM, by identity: each
-  handle keeps the ctx that created it, and `ctx.call` compares it with
-  itself. A session called from a ctx's own concurrent code outside
-  `parallel`/`map`, after an `await` (or through the parent's ctx captured
-  in a branch), has the caveat every concurrent call has there (see
-  Concurrency).
+- The core keeps every session value an agent call answered with (the
+  call and attempt it comes after); a call of it gets that attempt's
+  dialogue as `history`. Every checkpoint of a call is a blob named by
+  `agent_progressed`; a blob the journal names that the store does not
+  have is refused (`dialogue_missing`), never a fresh start. A restart is
+  a new attempt without a checkpoint, so it starts from its session's
+  dialogue again.
+- Calls of one session value made from plain concurrent code in one ctx
+  (after an `await`, outside `parallel`/`map`) have the caveat every
+  concurrent call has there (see Concurrency).
 - `ask` ends the turn (pi's `finishTurn`) with a placeholder tool result
   marked in its details; the reply replaces it when it arrives, wherever
   it sits among the message's tool results. Later tool calls of that

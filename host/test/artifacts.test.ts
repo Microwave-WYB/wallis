@@ -78,8 +78,10 @@ test("artifacts flow between commands and agents by ref; argv and parse are type
 	assert.doesNotMatch(log, /"artifact":/);
 	assert.doesNotMatch(log, /not-exported/);
 	// Calls' dirs are discarded; only the writer session's scratch dir stays, cleaned with the run.
-	assert.deepEqual(existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [], ["_4"]);
-	assert.deepEqual(readdirSync(join(s.dir, "work", "_4")), ["scratch"]);
+	const left = existsSync(join(s.dir, "work")) ? readdirSync(join(s.dir, "work")) : [];
+	assert.equal(left.length, 1);
+	assert.match(left[0]!, /^lineage-[0-9a-f]{16}$/);
+	assert.deepEqual(readdirSync(join(s.dir, "work", left[0]!)), ["scratch"]);
 	const started = new EventLog(join(s.dir, "log.jsonl")).read()[0] as { pin: { inputs: Record<string, string> } };
 	assert.match(started.pin.inputs["mount.corpus"]!, /^mount:sha256:[0-9a-f]{64}$/);
 	// Run metadata: resolved binaries with versions, and the base.
@@ -176,8 +178,10 @@ test("a session's scratch dir outlives its calls; a done call's own dir is delet
 		});
 	const idle = await run(s, { executor: executor() });
 	const node = idle.run.nodes.find((n) => n.type === "node_idle")!;
-	const session = node.id.slice(0, node.id.lastIndexOf(":"));
-	const scratch = join(s.dir, "work", session.replace(/[^A-Za-z0-9._-]/g, "_"), "scratch");
+	// The session's lineage keeps one scratch dir (named by its first call's slot).
+	const lineage = readdirSync(join(s.dir, "work")).filter((d) => d.startsWith("lineage-"));
+	assert.equal(lineage.length, 1);
+	const scratch = join(s.dir, "work", lineage[0]!, "scratch");
 	const own = join(s.dir, "work", node.id.replace(/[^A-Za-z0-9._-]/g, "_"));
 	assert.equal(readFileSync(join(scratch, "draft.md"), "utf8"), "draft");
 	assert.ok(existsSync(own));

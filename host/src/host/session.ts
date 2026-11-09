@@ -35,10 +35,11 @@ import { dirname, join, resolve } from "node:path";
 import { type ArtifactRef, type CommandFailure, type Json, type Refusal, type ToolFailure, Type } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
-import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, putBlob, readBlob, resolveDrafts, verifyRefs } from "./artifacts.ts";
+import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
 import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
+import { putDialogue, readDialogue } from "./dialogues.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
 import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
 import { bundleWorkflow } from "./bundle.ts";
@@ -739,8 +740,8 @@ export class Session {
 
 	/**
 	 * The journal key of a request: its node's definition digest, and its
-	 * occurrence among calls with the same node and input in this execution
-	 * of the body (issue order, which is synchronous and deterministic).
+	 * occurrence among calls with the same node, session and input in its
+	 * branch of this execution of the body.
 	 */
 	#keyed(event: Extract<Event, { type: "requested" }>): Event {
 		const r = event.request as { type: string; agent?: string; command?: string; tool?: string; name?: string; input?: Json };
@@ -758,9 +759,14 @@ export class Session {
 			digest = createHash("sha256").update(canonical(JSON.parse(JSON.stringify(definition)) as Json)).digest("hex");
 			this.#nodeDigests.set(name, digest);
 		}
-		const key = `${digest}\n${canonical(r.input ?? null)}`;
-		const occurrence = this.#occurrences.get(key) ?? 0;
-		this.#occurrences.set(key, occurrence + 1);
+		// Counted per branch (the id's path): within one branch calls are made in program order, so
+		// the count never depends on the order other branches' results arrive in.
+		const branch = event.id.slice(0, event.id.lastIndexOf("#"));
+		const session = r.type === "call" ? ((event.request as { session?: Json }).session ?? null) : null;
+		const key = `${branch}\n${digest}\n${canonical(session)}\n${canonical(r.input ?? null)}`;
+		const n = this.#occurrences.get(key) ?? 0;
+		this.#occurrences.set(key, n + 1);
+		const occurrence = `${branch}/${n}`;
 		// A body tool call carries whether it may be made again after a crash.
 		const request = r.type === "tool" ? { ...(event.request as object), replay: this.#bodyTool(r.tool!)?.replay === "safe" ? "replay_safe" : "replay_never" } : event.request;
 		return { ...event, request: request as Json, node_digest: digest, occurrence };
@@ -932,8 +938,10 @@ export class Session {
 		this.#interruptBeforeStart.delete(id);
 		// A session call continues its previous call's dialogue, and a reissued attempt its newest
 		// checkpoint: blobs the journal names. A missing one is refused, never a fresh start.
-		const history = effect.history === null ? null : this.#dialogueBlob(effect.history);
-		const resume = effect.checkpoint === null ? null : this.#dialogueBlob(effect.checkpoint);
+		const history = effect.history === null ? null : readDialogue(this.paths.dir, effect.history);
+		const resume = effect.checkpoint === null ? null : readDialogue(this.paths.dir, effect.checkpoint);
+		/** This attempt's newest checkpoint: the session's dialogue after it, named when it returns. */
+		let newest: string | null = effect.checkpoint;
 		if (history === undefined || resume === undefined) {
 			log({ kind: "note", text: `a dialogue blob the journal names is missing (${effect.history ?? ""} ${effect.checkpoint ?? ""})` });
 			queueMicrotask(() => this.#later(() => this.#feed({ type: "previous_dialogue_missing", id })));
@@ -942,9 +950,8 @@ export class Session {
 		let workspace: NodeDirs;
 		try {
 			const mounts = declaration.sandbox === null ? [] : this.#decl.sandboxes[declaration.sandbox]!.mounts;
-			// The scratch dir belongs to the session (`#3` for call `#3:1`) and outlives its calls.
-			const session = id.slice(0, id.lastIndexOf(":"));
-			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), join(this.paths.dir, "work", nodeDirName(session), "scratch"));
+			// The scratch dir belongs to the session's lineage (its first call) and outlives its calls.
+			workspace = prepareNode(this.paths.dir, id, effect.input, this.#mountDirs(mounts), join(this.paths.dir, "work", `lineage-${effect.lineage.slice(0, 16)}`, "scratch"));
 		} catch (error) {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
@@ -976,7 +983,9 @@ export class Session {
 			// The blob first, then the event naming it, synchronously: a crash in between leaves an unreferenced blob.
 			checkpoint: (state) => {
 				if (!current()) return;
-				const dialogue = putBlob(this.paths.dir, JSON.stringify(state));
+				// A delta from the session's dialogue before the call, where it extends it.
+				const dialogue = putDialogue(this.paths.dir, state, effect.history !== null && history !== null ? { digest: effect.history, state: history } : null);
+				newest = dialogue;
 				this.#later(() => this.#feed({ type: "agent_progressed", id, dialogue }));
 			},
 			resume,
@@ -1071,7 +1080,7 @@ export class Session {
 								return;
 							case "submitted": {
 								const parsed = this.#parseOutput(turn.output, declaration.output, workspace.scratch);
-								if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage });
+								if (parsed.ok) this.#feed({ type: "agent_returned", ...base, output: parsed.value, usage, dialogue: newest });
 								else this.#feed({ type: "agent_failed", ...base, failure: { type: "gave_up", error: parsed.error }, usage });
 								done();
 							}
@@ -1085,12 +1094,6 @@ export class Session {
 						this.#feed({ type: "executor_failed", id, error: errorText(error) });
 					}),
 			);
-	}
-
-	/** A dialogue blob the journal names, parsed; undefined when the store does not have it. */
-	#dialogueBlob(digest: string): Json | undefined {
-		const text = readBlob(this.paths.dir, digest);
-		return text === null ? undefined : (JSON.parse(text) as Json);
 	}
 
 	/**

@@ -34,9 +34,10 @@ export default workflow({
   name: "roll", models, mcp, toolsets: [lib], agents: [colorist], orchestrators: [confirm],
   input: Type.Object({ sheet: Type.String() }), output: Type.Any(),
   run: async (ctx, input) => {
-    const s = ctx.session(colorist);                    // agents only through sessions
-    let look = await ctx.call(s, { sheet: input.sheet });
-    look = await ctx.call(s, { sheet: "too yellow" });       // same conversation
+    let s = ctx.session(colorist);                      // agents only through session values
+    let look;
+    [look, s] = await ctx.call(s, { sheet: input.sheet });  // the session after the call
+    [look, s] = await ctx.call(s, { sheet: "too yellow" }); // same conversation
     const { ok } = await ctx.call(confirm, look);       // asking first is code
     if (ok) await ctx.call(lib.upload, { look: look.look });   // the outward write, in the body
     return look;
@@ -54,8 +55,10 @@ export default workflow({
   unknown).
 - `ctx.call` takes commands, nested workflows, orchestrator nodes and tool
   values (`lib.x` typed by its schemas; `mcp.server.tool` returns unknown
-  unless a schema is passed as third argument). A session's calls run in
-  the order made; calling it from a `parallel`/`map` branch is refused.
+  unless a schema is passed as third argument). `ctx.call(s, input)` on a
+  session value returns `[output, next]`; `s` is unchanged, so calling it
+  again (anywhere, in any branch) is a branch from the same dialogue. A
+  line starting with `[` needs a `;` at the end of the line before it.
 - MCP servers never see the agent's files: use the workspace or custom
   tools for files.
 

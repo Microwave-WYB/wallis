@@ -76,7 +76,8 @@ generics or wrappers that add no proof.
   need `maxTurns >= 2`. `maxTurns` is an orchestration point
   (`Idle(turn_limit)`), not a failure.
 - One node union (agent | command | workflow | MCP tool | orchestrator);
-  agents are called through `ctx.call(ctx.session(agent), input)` only, every
+  agents are called through session values only (`[out, next] = await
+  ctx.call(ctx.session(agent), input)`), every
   other node (and tool values) with `ctx.call`. Agents' `tools` are `ask`,
   toolset tools and MCP tools only; file tools come from `workspace`
   access; commands are called by workflow code only. Multi-step concurrent

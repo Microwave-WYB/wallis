@@ -95,18 +95,33 @@ export function toolId(desc: { kind: "custom"; toolset: string; export: string }
 	return desc.kind === "custom" ? `custom:${desc.toolset}#${desc.export}` : `mcp:${desc.server}/${desc.tool}`;
 }
 
-/** Every session handle: the ctx that created it and its calls. A handle is opaque to the body. */
-const sessions = new WeakMap<object, { readonly id: string; readonly ctx: Ctx; call(input: unknown): Promise<unknown> }>();
+/** The workflow's agents, by name: a session value names its agent. */
+const agents = new Map<string, AgentDef>();
+
+/** What an agent call answers with: its output and the session value after it. */
+const ANSWER = { type: "object", required: ["output", "session"], properties: { session: { type: "string" } } };
+
+/** A session value, checked: plain data the body may keep, pass to any branch and call again. */
+function asSession(value: unknown): Session | null {
+	if (typeof value !== "object" || value === null || (value as { kind?: unknown }).kind !== "session") return null;
+	const v = value as { agent?: unknown; id?: unknown };
+	return typeof v.agent === "string" && (v.id === null || typeof v.id === "string") ? (value as Session) : null;
+}
 
 function makeCtx(path: string, seed: number): Ctx {
 	let counter = 0;
 	let observed = 0;
 	const next = () => `${path}#${counter++}`;
-	const callAgent = async (id: string, agent: AgentDef, input: unknown, session: string, index: number) => {
-		const output = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json, session, index }));
+	/** An agent call of a session value: its output, and the session value after it. */
+	const callAgent = async (id: string, agent: AgentDef, input: unknown, session: Session) => {
+		const answer = unwrap(await request(id, { type: "call", agent: agent.name, input: input as Json, session: session.id }));
+		const shape = schemaErrors(ANSWER, answer);
+		if (shape.length > 0) throw new SchemaError(`answer of agent ${agent.name}`, shape);
+		const { output, session: next } = answer as { output: Json; session: string };
 		const errors = schemaErrors(agent.output, output);
 		if (errors.length > 0) throw new AgentFailed(agent.name, { type: "gave_up", error: `output does not match its schema: ${errors.join("; ")}` });
-		return output;
+		const after: Session = { kind: "session", agent: agent.name, id: next };
+		return [output, after];
 	};
 	/** An orchestrator node: its answer is checked against `output` here too. */
 	const callOrchestrator = async (id: string, node: { name: string; output: unknown }, input: unknown) => {
@@ -143,17 +158,21 @@ function makeCtx(path: string, seed: number): Ctx {
 		seed,
 		// One implementation behind the typed overloads: nodes, then tool values.
 		call: ((node: CallableNode | Session | Tool | undefined, input: unknown, schema?: TSchema) => {
-			const session = node === undefined ? undefined : sessions.get(node);
-			if (session !== undefined) {
-				// Only the ctx that created it: its calls are numbered in one ctx's order, whatever arrives first.
-				if (session.ctx !== ctx) return Promise.reject(new Refused({ type: "foreign_session", session: session.id }));
-				return session.call(input) as never;
-			}
 			if (node === undefined || !("kind" in node)) {
 				const desc = toolDesc(node);
 				if (desc === null) return Promise.reject(new SchemaError("ctx.call", ["not a node or a tool"]));
 				if (desc.kind !== "custom" && desc.kind !== "mcp_tool") return Promise.reject(new SchemaError("ctx.call", ["only toolset tools and MCP tools can be called from the body"]));
 				return callTool(next(), toolId(desc), input, schema) as never;
+			}
+			// A session value: plain data, so its shape is checked like any input.
+			if (node.kind === "session") {
+				const session = asSession(node);
+				if (session === null) return Promise.reject(new SchemaError("ctx.call", ["not a session value"]));
+				const agent = agents.get(session.agent);
+				if (agent === undefined) return Promise.reject(new Refused({ type: "unknown_agent", name: session.agent }));
+				const errors = schemaErrors(agent.input, input);
+				if (errors.length > 0) return Promise.reject(new SchemaError(`input of agent ${agent.name}`, errors));
+				return callAgent(next(), agent, input, session) as never;
 			}
 			// Agents are called through sessions only; the type says so, and so does the runtime.
 			if ((node as { kind: string }).kind === "agent") return Promise.reject(new Refused({ type: "session_required", agent: node.name }));
@@ -171,33 +190,9 @@ function makeCtx(path: string, seed: number): Ctx {
 					return callOrchestrator(id, node, input) as never;
 			}
 		}) as unknown as Ctx["call"],
+		// A new session is a value: no id is taken, and two are equal.
 		session(agent) {
-			// The session's identity is where it was created, taken now like a request id.
-			const id = next();
-			let index = 0;
-			// Calls run in the order they are made: one made while another is in flight waits for it.
-			let tail: Promise<unknown> | null = null;
-			const session: Session = { id, agent: agent.name };
-			sessions.set(session, {
-				id,
-				ctx,
-				call(input) {
-					const errors = schemaErrors(agent.input, input);
-					if (errors.length > 0) return Promise.reject(new SchemaError(`input of agent ${agent.name}`, errors));
-					const k = index++;
-					const go = () => callAgent(`${id}:${k}`, agent, input, id, k);
-					const run = tail === null ? go() : tail.then(go, go);
-					const settled: Promise<unknown> = run.then(
-						() => undefined,
-						() => undefined,
-					);
-					tail = settled;
-					void settled.then(() => {
-						if (tail === settled) tail = null;
-					});
-					return run;
-				},
-			});
+			const session: Session = { kind: "session", agent: agent.name, id: null };
 			return session as never;
 		},
 		parallel(branches) {
@@ -336,6 +331,7 @@ function commandsOf(def: WorkflowDef): Map<string, CommandDef> {
 export function install(def: WorkflowDef): void {
 	const g = globalThis as Record<string, unknown>;
 	const commands = commandsOf(def);
+	for (const a of def.spec.agents) agents.set(a.name, a);
 	g.__wallis_declare = () => JSON.stringify(declarations(def));
 	// False when no request of this body waits for `id` (a result for an
 	// earlier execution of the body; it is in the journal and hits later).

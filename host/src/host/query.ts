@@ -451,8 +451,7 @@ export function runLine(v: RunView): string {
  */
 export function renderTree(v: RunView): string {
 	const lines = [runLine(v)];
-	const depthOf = (id: string) => (id.match(/[.>:]/g) ?? []).length;
-	const sessions = new Set<string>();
+	const depthOf = (id: string) => (id.match(/[.>]/g) ?? []).length;
 	for (const node of v.run.nodes) {
 		const indent = "  ".repeat(depthOf(node.id) + 1);
 		const inbox = "inbox" in node && node.inbox.length > 0 ? `  inbox: ${node.inbox.map((m) => `${m.kind}@${m.step}`).join(",")}` : "";
@@ -480,12 +479,6 @@ export function renderTree(v: RunView): string {
 			case "node_idle":
 			case "node_held":
 			case "node_done": {
-				// A session is the parent of its calls (`#3` of `#3:0`, `#3:1`).
-				const session = node.id.slice(0, node.id.lastIndexOf(":"));
-				if (!sessions.has(session)) {
-					sessions.add(session);
-					lines.push(`${"  ".repeat(depthOf(session) + 1)}${session}  session ${node.agent}`);
-				}
 				const cause = node.type === "node_idle" ? node.cause : null;
 				const status =
 					node.type === "node_held"
@@ -509,6 +502,18 @@ export function renderTree(v: RunView): string {
 	}
 	for (const o of v.run.observations) {
 		lines.push(`${"  ".repeat(depthOf(o.at) + 1)}${o.at}  observe ${o.label} = ${truncate(JSON.stringify(o.value), 120)}`);
+	}
+	// Session values, as a tree of branches: each is the session after a call of its parent.
+	const sessions = v.run.sessions ?? [];
+	if (sessions.length > 0) {
+		lines.push("  sessions");
+		const branch = (from: string | null, depth: number): void => {
+			for (const s of sessions.filter((x) => x.from === from)) {
+				lines.push(`${"  ".repeat(depth + 2)}${s.id.slice(0, 9)}  ${s.agent}  after ${s.call}${from === null ? " (new session)" : ""}`);
+				branch(s.id, depth + 1);
+			}
+		};
+		branch(null, 0);
 	}
 	return lines.join("\n");
 }

@@ -3,6 +3,7 @@
 // a second call in flight is refused; a pending `ask` survives the host.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -43,24 +44,29 @@ function executor() {
 
 const opts = (dir: string) => ({ workflow, dir, confine: "off" as const, inboxPollMs: null });
 
-test("a session's second call continues its first call's dialogue; a pending ask survives a host restart", async () => {
+test("a call of the session value a call answered with continues its dialogue; a pending ask survives a host restart", async () => {
 	const dir = join(tmp(), "run");
 	const asking = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "two" } });
-	const node = asking.run.nodes.find((n) => n.id === "#0:1")!;
+	const node = asking.run.nodes.find((n) => n.id === "#1")!;
 	assert.deepEqual(node.type === "node_idle" && node.cause, { type: "question", message: "Louder?" });
 	// A new host, a new executor: the dialogue is rebuilt from the checkpoint and the reply is the ask's result.
-	const done = await runWorkflow({ ...opts(dir), executor: executor(), sends: [{ node: "#0:1", text: "yes, louder" }] });
+	const done = await runWorkflow({ ...opts(dir), executor: executor(), sends: [{ node: "#1", text: "yes, louder" }] });
 	assert.deepEqual(done.outcome, {
 		type: "done",
 		value: { one: { heard: 1, saw_ask: false, reply: "" }, two: { heard: 2, saw_ask: true, reply: "yes, louder" } },
 	});
+	// The second call's checkpoint is a delta from the first call's dialogue, not a copy of it.
+	const { EventLog } = await import("../src/host/log.ts");
+	const { blobPath } = await import("../src/host/artifacts.ts");
+	const second = new EventLog(join(dir, "log.jsonl")).read().filter((e) => e.type === "agent_progressed" && e.id === "#1").at(-1) as { dialogue: string };
+	assert.match(readFileSync(blobPath(dir, second.dialogue), "utf8"), /"wallis_delta":\{"base":"sha256:[0-9a-f]{64}","keep":\d+/);
 });
 
-test("restarting a session call rewinds the session to before that call", async () => {
+test("restarting a session call is calling its session value again: the call before it is kept", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "two" } });
 	const { appendInbox, runPaths } = await import("../src/host/store.ts");
-	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0:1", note: "no need to ask", by: "human" });
+	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#1", note: "no need to ask", by: "human" });
 	const done = await runWorkflow({ ...opts(dir), executor: executor() });
 	// The first call's dialogue is kept (heard 2); the discarded attempt's ask is gone.
 	assert.deepEqual(done.outcome, {
@@ -69,41 +75,36 @@ test("restarting a session call rewinds the session to before that call", async 
 	});
 });
 
-test("a call made while the session's previous call is in flight waits for it: calls run in the order they were made", async () => {
+test("calling one session value again is a branch, in this ctx or a parallel one, deterministically on fork and replay", async () => {
 	const dir = join(tmp(), "run");
-	const done = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "queued" } });
-	assert.deepEqual(done.outcome, { type: "done", value: { first: { heard: 1, saw_ask: false, reply: "" }, second: { heard: 2, saw_ask: false, reply: "" } } });
-	// A fork re-executes against the journal: the same ids and slots, every call a hit.
-	const { forkRun } = await import("../src/host/query.ts");
-	const fork = forkRun(dir, join(tmp(), "fork"));
-	const forked = await runWorkflow({ ...opts(fork.dir), executor: executor() });
-	assert.deepEqual(forked.outcome, done.outcome);
-});
-
-test("a session called from a ctx that did not create it (a branch, a sibling branch) is refused (foreign_session), the same way on fork and replay", async () => {
-	const dir = join(tmp(), "run");
-	const done = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "foreign" } });
-	const expected = { type: "done", value: { branch: "foreign_session", sibling: "foreign_session", after: { heard: 1, saw_ask: false, reply: "" } } };
+	const done = await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "branch" } });
+	const quiet = { heard: 2, saw_ask: false, reply: "" };
+	const expected = { type: "done", value: { one: { heard: 1, saw_ask: false, reply: "" }, here: quiet, there: quiet, other: quiet } };
 	assert.deepEqual(done.outcome, expected);
-	// A fork re-executes the body against the journal: the same refusals, the same call ids.
+	// Three calls, each its own branch from the first call's session value.
+	const sessions = done.run.sessions;
+	const first = sessions.find((s) => s.call === "#0")!;
+	assert.equal(first.from, null);
+	assert.deepEqual(sessions.filter((s) => s.from === first.id).map((s) => s.call).sort(), ["#1", "#2.x#0", "#3.0#0"]);
+	// A fork re-executes the body against the journal: every call a hit, the same values.
 	const { forkRun } = await import("../src/host/query.ts");
 	const fork = forkRun(dir, join(tmp(), "fork"));
 	const forked = await runWorkflow({ ...opts(fork.dir), executor: executor() });
 	assert.deepEqual(forked.outcome, expected);
-	// A replay of the same run (a new host on the finished run) reports it unchanged.
+	assert.deepEqual(forked.run.sessions, sessions);
 	const replayed = await runWorkflow({ ...opts(dir), executor: executor() });
 	assert.deepEqual(replayed.outcome, expected);
 });
 
-test("a call after a cancelled one continues the dialogue the cancelled call left", async () => {
+test("a cancelled call answers with no session value: the next call is of the value before it", async () => {
 	const dir = join(tmp(), "run");
 	await runWorkflow({ ...opts(dir), executor: executor(), input: { mode: "cancel" } });
 	const { appendInbox, runPaths } = await import("../src/host/store.ts");
-	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#0:1", by: "human" });
+	appendInbox(runPaths(dir), { id: "c1", type: "cancel_node", node: "#1", by: "human" });
 	const done = await runWorkflow({ ...opts(dir), executor: executor() });
 	assert.deepEqual(done.outcome, {
 		type: "done",
-		value: { one: { heard: 1, saw_ask: false, reply: "" }, two: "cancelled_by_owner", three: { heard: 3, saw_ask: true, reply: "" } },
+		value: { one: { heard: 1, saw_ask: false, reply: "" }, two: "cancelled_by_owner", three: { heard: 2, saw_ask: false, reply: "" } },
 	});
 });
 
@@ -114,9 +115,9 @@ test("a session call whose previous dialogue blob is missing is refused (dialogu
 	const { EventLog } = await import("../src/host/log.ts");
 	const { blobPath } = await import("../src/host/artifacts.ts");
 	// Every dialogue blob call 0 left: the store lost them.
-	for (const e of new EventLog(join(dir, "log.jsonl")).read()) if (e.type === "agent_progressed" && e.id === "#0:0") rmSync(blobPath(dir, e.dialogue), { force: true });
+	for (const e of new EventLog(join(dir, "log.jsonl")).read()) if (e.type === "agent_progressed" && e.id === "#0") rmSync(blobPath(dir, e.dialogue), { force: true });
 	const { appendInbox, runPaths } = await import("../src/host/store.ts");
-	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#0:1", by: "human" });
+	appendInbox(runPaths(dir), { id: "r1", type: "restart", node: "#1", by: "human" });
 	const done = await runWorkflow({ ...opts(dir), executor: executor() });
 	assert.equal(done.outcome?.type, "failed");
 	assert.match(JSON.stringify(done.outcome), /refused: dialogue_missing/);
