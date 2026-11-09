@@ -13,9 +13,19 @@ an infinite product that folds term by term toward π. A wallis run works the
 same way: it is a fold of the workflow body over its journal of agent and
 script results, one call at a time.
 
-Status: an experimental prototype, not published to npm. Its tests pass, but no
-workflow has been run against a real model at length. See
-[docs/design.md](docs/design.md) for the design and every prototype choice.
+A run has no outward side effects except through MCP tools in `ask` mode,
+each approved by the orchestrator (the agent or human driving the run) and
+journaled, so replay never repeats it. Agent sandboxes and commands have no
+network; MCP servers are the only channel outside. Agents are called through
+sessions, ask their caller with a built-in `ask` tool, and workflows can put
+typed questions to the orchestrator (orchestrator nodes).
+
+Status: an experimental prototype, not published to npm. Round 6 (sessions,
+MCP `ask` mode, orchestrator nodes, structured pending items) is built and
+its tests pass, including a state-coverage acceptance test driven through the
+CLI and MCP with pi's faux provider; no workflow has been run against a real
+model at length. See [docs/design.md](docs/design.md) for the design and
+every prototype choice, and `wallis doc` for a short guide.
 
 The repository also holds an experiment on whether a framework is needed at
 all: [`comparison/`](comparison/) contains a framework-free alternative (a
@@ -52,21 +62,22 @@ Runs live under `.wallis/runs/` of the project. The CLI (run it with
 `node host/src/cli/main.ts`; `npx wallis` once installed):
 
 ```sh
+wallis doc | describe <workflow>       # how to write and drive workflows | what a workflow asks (JSON)
 wallis run <workflow> --input '{...}' [--mount name=dir] [--bin name=path] --executor <module>   # until it needs attention
 wallis wait <run>        # in the background: returns when a node asks, the run pauses or ends
 wallis wait              # in the background: returns when any of your own runs needs attention
-wallis pending           # your idle nodes and runs here; prints nothing when there are none
+wallis pending [--json]  # what waits for you here, with the actions that resolve it
 wallis claim <run>       # take over a run (a logged event); others' runs are read-only
-wallis send <run> <node> [text] [--turns N]   # answer an idle node, or grant more turns
-wallis steer <run> <node> <text>       # a running node of a steerable agent, at its next step
+wallis send <run> <node> [text] [--turns N]   # idle: the reply (or more turns); running: a steer after its turn
+wallis submit <run> <node> '<json>'    # an orchestrator node's result, or an approval decision
 wallis restart <run> <node> [note] [--turns N] [--model a=m]   # rerun a node (also a held failed one)
 wallis resume <run> [--model alias=provider/model:thinking] [--budget turns=500]   # code changes are fine
 wallis fork <run> [--model ...]        # copies the journal (a cache); unchanged calls hit
 wallis cancel <run> | wallis status <run> [--json]
 wallis export <run> <artifact> <dir>   # copy an artifact out of a run
 wallis ls | tree <run> | log <run> [--follow] | show <run> [<node>]   # monitoring, observations
-wallis interrupt <run> <node> [text] | pause <run> | cancel <run> --node <node>   # steering
-wallis serve --executor <module>   # stdio MCP server: run, send, steer, interrupt, restart, get_run, cancel, wait, ...
+wallis interrupt <run> <node> | pause <run> | cancel <run> --node <node>   # steering
+wallis serve --executor <module>   # stdio MCP server: run, describe, send, submit_result, interrupt, restart, get_run, pending, wait, ...
 ```
 
 The default executor is pi (`host/src/executors/pi.ts`, pi-ai's built-in

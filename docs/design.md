@@ -1,6 +1,6 @@
 # wallis design
 
-Status as of 2026-11-07 (round 5). Sections are marked **decided** (agreed with the
+Status as of 2026-11-08 (round 6). Sections are marked **decided** (agreed with the
 owner), **proposed** (drafted, not yet confirmed) or **open**. Details the
 first prototype had to fix are marked **prototype choice**: the simplest
 option consistent with the section they sit in, not yet confirmed.
@@ -26,9 +26,10 @@ Three rules, kept minimal (no generics or wrappers that add no proof):
    | Capability | Check | Needed for |
    | --- | --- | --- |
    | `OwnedRun` | `checkOwner` (the human, or the run's owner) | every intervention |
-   | `IdleNode` | idle node of a steerable agent (never a command); takes an `OwnedRun` | answer |
-   | `SteerableNode` | running node of a steerable agent (never a command); takes an `OwnedRun` | steer, interrupt |
+   | `IdleNode` | idle node of a steerable agent (never a command), not waiting for an approval; takes an `OwnedRun` | send to an idle node |
+   | `SteerableNode` | running node of a steerable agent (never a command); takes an `OwnedRun` | send to a running node (steer), interrupt |
    | `LiveNode` | a node that is not done, or a held failed one; takes an `OwnedRun` | restart, cancel one node |
+   | `SubmittableNode` | an orchestrator node waiting for its result, or an agent waiting for an approval; takes an `OwnedRun` | submit_result |
    | `ResumableRun` | `checkPin` | replaying a resumed run |
 
    The host checks before it sends an event; the core checks again when it
@@ -38,6 +39,43 @@ Three rules, kept minimal (no generics or wrappers that add no proof):
    model output, command output, MCP and CLI arguments, and artifact refs
    (verified against the run's store). No `as` casts at those boundaries.
    (The core's own JSON, produced by generated encoders, is trusted.)
+
+## Positioning and the effect model (decided, round 6)
+
+A wallis run has no outward side effects except through MCP tools in
+`ask` mode, each approved by the orchestrator at the point of action and
+journaled, so replay never repeats it. Agent sandboxes and commands have no
+network, and MCP servers are the only channel to the outside. Every call's
+result is journaled, so runs resume, fork and reproduce.
+
+- **The orchestrator** is whoever owns the run: in practice an agent in a
+  harness (Claude Code, Codex, ...), driving wallis over MCP or the CLI. It
+  answers what the run asks (agent questions, orchestrator nodes, tool
+  approvals) and decides on budgets, failures and models.
+- **Internal and external nodes** (a distinction for the docs, not a type
+  hierarchy). Agent sessions, commands and nested workflows are internal:
+  fresh and re-executable from their input. MCP tools and orchestrator
+  nodes are external: they reach a stateful outside, so the journal is the
+  only truth about them. Consequences:
+  - a question to the orchestrator must be self-contained: it sees only the
+    item, not the run's context;
+  - forks share the same orchestrator, so its answers can contaminate
+    ablations (an answer given in one fork is a fact of the world for it);
+  - restarting an external node, or a node that used one, asks the outside
+    again (a tool is called again, an approval is asked again): that is not
+    reproduction, and `restart` says so.
+- **MCP tools, by mode.** An agent selects each tool as direct (it runs when
+  called) or `ask` (it runs only after the orchestrator approves the call;
+  a rejection's reason is the tool's result). A tool whose annotations say
+  it writes outside (`destructiveHint`, or not read-only and open-world)
+  must be in `ask` mode: preflight refuses it otherwise
+  (`tool_writes_outside`). The body may call MCP tools as nodes
+  (`mcpTool`), direct only. Every MCP result is journaled before anyone
+  sees it.
+- **Network.** Agents and commands never have network. An MCP server's
+  overlay declares `network: "none" | "full"` (default `"full"`); sandbox
+  `setup` keeps its network (logged). The round-3 domain allowlist and the
+  overlay's `allowWrites` are gone.
 
 ## Goal (decided)
 
@@ -66,9 +104,10 @@ layer (carried history, resume, run invariants, accounting) maps onto wallis.
   bundler inlines them, so the workflow digest covers prompt content.
 - MCP: `import m from "./mcp.json" with { type: "json" }`, wrapped by
   `defineMcp(m, overlay)`, where the TS overlay gives each stdio server its
-  sandbox (and network allowlist). Agents select a subset of servers and
-  tools: `mcp: { arxiv: ["search", "fetch"], scholar: "*" }`. `${VAR}` in
-  `env` is a secret reference.
+  sandbox (and its network, `"none" | "full"`). Agents select a subset of
+  servers and tools, each direct or `ask`: `mcp: { arxiv: ["search",
+  "fetch"], scholar: "*", ente: { ask: ["upload"] } }`. `${VAR}` in `env`
+  is a secret reference.
 - Nothing in the workflow dir is visible to a sandbox unless it is mounted
   by name (`defineMounts({ trainer: "./trainer" })`).
 - The workflow directory name is the workflow name and its MCP tool name.
@@ -100,8 +139,9 @@ pub fn step(run: RunState, event: Event) -> #(RunState, List(Effect))
 
 The workflow is a pure program over journaled calls. The body is
 deterministic, and its only interface to the world is `ctx.call(node,
-input)` on a node (an agent, a command or a nested workflow), plus
-`ctx.parallel` and `ctx.map` for concurrency. Each call affects the body
+input)` on a node (a command, a nested workflow, an MCP tool or an
+orchestrator node), `ctx.session(agent).call(input)` for agents (round 6),
+plus `ctx.parallel` and `ctx.map` for concurrency. Each call affects the body
 only through its return value. **Run memory is the body's local
 variables**, rebuilt by re-executing the body against the journal. Agents
 never pull workflow memory: the body pushes everything an agent needs into
@@ -116,23 +156,28 @@ As built (`core/src/wallis_core/types.gleam`):
 
 ```gleam
 // Event:  Started(workflow, pin, input) | Resumed(pin) | CodeChanged(from, to)
-//       | Requested(id, Call | Command, node_digest, occurrence)
-//       | AgentReturned | AgentIdle(id, message, ..) | TurnLimitReached(id, used, limit, ..)
-//       | AgentFailed(id, AgentFailure, ..) | ExecutorFailed(id, error)
+//       | Requested(id, Call(agent, input, session, index) | Command | Tool | Orchestrator, node_digest, occurrence)
+//       | AgentReturned | AgentIdle(id, message, ..) | AgentAsked(id, message, ..)
+//       | ApprovalRequested(id, server, tool, args, ..) | TurnInterrupted(id, ..) | TurnLimitReached(id, used, limit, ..)
+//       | AgentFailed(id, AgentFailure, ..) | ExecutorFailed(id, error) | ToolRecorded(id, call, result)
 //       | InputRejected(id, field?, chars, limit)
 //       | CommandReturned(id, output, minutes) | CommandFailed(id, CommandFailure, minutes)
+//       | ToolReturned(id, output) | ToolFailed(id, ToolFailure)
 //       | Observed(at, label, value)
-//       | Sent(.., turns) | Steered | Interrupted | Restarted(.., turns) | NodeCancelled   (each with `by`)
+//       | Sent(.., turns) | Steered | InterruptRequested | Restarted(.., turns) | NodeCancelled
+//       | ResultSubmitted(node, value)   (each with `by`)
 //       | CancelRequested(by) | PauseRequested(by) | ResumeRequested(by) | Claimed(owner)
 //       | AliasRebound | BudgetRaised | ExecutorChanged | RetryUnavailable
 //       | BodyFinished(output) | BodyFailed(FailReason)
-// Effect: Checkpoint | CallAgent(id, agent, model, input, turn, turn_limit, digest, transcript, note)
-//       | RunCommand(id, command, input, compute_minutes, digest) | Deliver | Fail | Refuse | Finish
+// Effect: Checkpoint | CallAgent(id, agent, model, input, turn, turn_limit, digest, transcript, note, previous, recorded)
+//       | RunCommand(id, command, input, compute_minutes, digest) | CallTool(id, tool, input, digest)
+//       | Deliver | Fail | Refuse | Finish
 // AgentFailure   = GaveUp(error) | ContextExhausted | CancelledByOwner
 // CommandFailure = ExitCode(code, stderr_head) | OutputMismatch(errors) | TimedOut(minutes)
 //                | MissingFile(name) | Unrunnable(error) | CommandCancelled
+// ToolFailure    = ToolError(message) | ToolOutputMismatch(errors) | ToolUnreachable(error) | ToolCancelled
 // FailReason     = BodyError | AgentGaveUp(agent, AgentFailure) | CommandCrashed(command, CommandFailure)
-//                | WorkflowFailed(workflow, FailReason)
+//                | ToolCrashed(tool, ToolFailure) | WorkflowFailed(workflow, FailReason)
 ```
 
 - Removed in round 4: workflow state, views, reducers, `emit`, `writes`,
@@ -140,15 +185,18 @@ As built (`core/src/wallis_core/types.gleam`):
   in round 5: `ctx.script`, `ctx.sub`, `defineScript`, `defineTool`, the
   `scripts/` lookup, the max_turns agent failure, budget reservation and
   USD budgets, position-based journal matching, `PathDiverged`,
-  `--code-changed` and `fork --at`.
+  `--code-changed` and `fork --at`. Removed in round 6: `ctx.call` on an
+  agent (sessions), the `steer` verb (`send` covers it), the interrupt
+  message, the overlay's `allowWrites`, the sandbox `network` option.
 - **`ctx.observe(label, value)`** is monitoring only: logged for `status`,
   `tree` and `show`, never returned to the body, never matched.
 
 Prototype choices:
 
 - Every request is answered in one of three ways: `Deliver`; `Fail(id,
-  FailReason)`, which the SDK throws as `AgentFailed`, `CommandFailed` or
-  `WorkflowFailed`; or `Refuse(Some(id), Refusal)`, thrown as `Refused`.
+  FailReason)`, which the SDK throws as `AgentFailed`, `CommandFailed`,
+  `ToolFailed` or `WorkflowFailed`; or `Refuse(Some(id), Refusal)`, thrown
+  as `Refused`.
   `Refuse(None, Refusal)` means the event itself was refused and not
   applied: a refused `Resumed` ends the session; a refused intervention is
   reported to its sender (inbox entries: `inbox.jsonl.refused`).
@@ -158,8 +206,9 @@ Prototype choices:
   replayed observations, `Resumed` and refused events are not logged.
 - Request ids are for display and interventions only: `#0`, `#2.a#0`
   (branch `a` of the parallel at `#2`), `#3.1#0` (item 1 of the map at
-  `#3`), `#4>tune#0` (the nested workflow `tune` at `#4`). Observations
-  take their own counter (`~0`).
+  `#3`), `#4>tune#0` (the nested workflow `tune` at `#4`), `#5:1` (call 1
+  of the session created at `#5`). Observations take their own counter
+  (`~0`).
 - Intervention events carry `by`. The core applies them only through
   `check_owner` and the node checks; `Claimed` is not owner-checked, since
   who may claim depends on whether the owner process is alive.
@@ -185,12 +234,15 @@ Prototype choices:
   - `Outcome = Done(value) | Failed(FailReason) | Cancelled`.
   - `IdleReason = BudgetReached(kind, spent, limit) | ExecutorUnavailable(alias, error) | PausedByUser | NodeFailure(node, reason)`.
 - Node, by kind:
-  - agent: `NodeRunning | NodeIdle(IdleCause) | NodeDone(Submitted | NodeFailed(AgentFailure))`,
-    with `IdleCause = Question(message) | TurnLimit(used, limit)`; every
-    variant carries `id`, `agent`, `model`, `steerable` and `inbox`;
+  - agent (one call of a session): `NodeRunning | NodeIdle(IdleCause) | NodeDone(Submitted | NodeFailed(AgentFailure))`,
+    with `IdleCause = Question(message) | Asked(message) | TurnLimit(used, limit) | Interrupted | Approval(server, tool, args)`;
+    every variant carries `id`, `agent`, `model`, `steerable` and `inbox`;
   - command: `CommandRunning | CommandDone(Succeeded | FailedWith(CommandFailure))`,
     with `id`, `command` and `inbox`; no dialogue, so no idle state;
-  - workflow: no status of its own; its subtree (ids under `>name`) is its status.
+  - MCP tool (body): `ToolRunning | ToolDone(ToolSucceeded | ToolFailedWith(ToolFailure))`;
+  - orchestrator node: `OrchestratorPending(input) | OrchestratorDone`;
+  - workflow: no status of its own; its subtree (ids under `>name`) is its status;
+    a session has none either: its calls (`#n:k`) are its children in the tree.
 - A refused resume or intervention does not change the persisted status.
 - `stopped` is derived at query time: not finished and no live process
   holds the run's lock. It is never logged.
@@ -208,11 +260,46 @@ Prototype choices:
   `node.type === "node_running" && node.steerable` narrows; command
   variants have no `steerable` field at all.
 
-## An agent is a function (decided, rounds 4 and 5)
+## An agent is a function, called through sessions (decided, rounds 4 to 6)
 
 An agent call is `(input, inbox) → dialogue → Submitted(output) | AgentFailure`.
 
-- Ending a turn without `submit_result` makes the node `Idle(question)`.
+- **Sessions (round 6) are the only way to call an agent:**
+  `ctx.session(agent).call(input)`. `ctx.call(agent, …)` is a type error,
+  and a typed refusal (`session_required`) at run time. A one-off call is a
+  session used once; a dialogue reuses the handle:
+
+  ```ts
+  const colorist = ctx.session(lookAgent);
+  let look = await colorist.call({ sheet, measure });
+  look = await colorist.call({ feedback: "too yellow" });   // same conversation
+  ```
+
+  - Each `.call` input is checked against the agent's input schema and
+    appended to the same conversation as a new message; each output is
+    validated. Budgets and `maxTurns` are per call.
+  - A session's identity is where it was created in the call tree, taken
+    synchronously like a request id, so replay matches. Its calls are its
+    children: `#3:0`, `#3:1`.
+  - A second `.call` while one is in flight is refused (`session_busy`).
+  - A session is data, not a process: between calls nothing runs, and the
+    next call rebuilds the agent from the dialogue its previous call left.
+    There is no `close()`. Each call gets a fresh sandbox process
+    (background processes die with it); the scratch dir belongs to the
+    session and persists across its calls, cleaned with the run.
+  - **Restarting a call rewinds its session** to before that call; the
+    session's later calls are invalidated (the core decides what is on the
+    live path).
+- **`ask` (round 6).** Every agent has a built-in `ask(message)` tool: plain
+  language, no schema. The question goes to the agent's caller, the body,
+  which forwards it to the orchestrator (later, a parent agent may answer
+  it; the semantics stay "answered by the caller"). The node goes
+  `Idle(asked)`; the agent stays in the same loop and the reply becomes the
+  tool's result, also after a host exit (the conversation is rebuilt up to
+  the pending call and the reply is delivered as its result).
+- Ending a turn without `submit_result` or `ask` is an implicit ask: its
+  text is the question (`Idle(question)`), and the reply arrives as the next
+  user message. There is no nudging.
 - **Turns are an orchestration point, not a cut-off.** Every turn the model
   sees its quota, "Turn k of N", appended to the end of the newest message
   (the latest tool result or user message), never the system prompt, so
@@ -222,36 +309,107 @@ An agent call is `(input, inbox) → dialogue → Submitted(output) | AgentFailu
   `send` more turns (`--turns N`, MCP `turns`, optionally with a message),
   `restart` it (with a note), or `cancel` it (an agent failure to the body).
 - Executor errors are not agent failures (see Recovery).
-- The inbox:
+- The verbs (round 6):
 
-  | Message | Reaches | Effect | Capability |
+  | Verb | Reaches | Effect | Capability |
   | --- | --- | --- | --- |
-  | `answer` (+ turns) | an idle agent node | continues the dialogue | `IdleNode` |
-  | `steer` | a running agent node | delivered at the next step boundary | `SteerableNode` |
-  | `interrupt` | a running agent node | aborts the current step, then delivers the message | `SteerableNode` |
-  | `restart` | a live node, or a held failed one | discards progress; reissues with the original input (+ note for steerable agents, + turns); a command reruns | `LiveNode` |
+  | `send` (+ turns) | an idle agent node (asked, question, turn limit with turns, interrupted) | delivered: the dialogue continues | `IdleNode` |
+  | `send` | a running agent node of a steerable agent | queued as a steer after the current turn | `SteerableNode` |
+  | `interrupt` | a running agent node of a steerable agent | aborts the current turn, its tool calls included: `Idle(interrupted)`, progress kept | `SteerableNode` |
+  | `submit_result` | an orchestrator node, or an agent node waiting for an approval | its result (checked against the answer schema), or the decision | `SubmittableNode` |
+  | `restart` | a live node, or a held failed one | discards progress; reissues with the original input (+ note for steerable agents, + turns); a command reruns; a tool is called again | `LiveNode` |
   | cancel one node | a live node, or a held failed one | a typed failure for the body (accepting a held one propagates it) | `LiveNode` |
 
+  `send`'s result says how it was delivered ("delivered as the reply to:
+  <question>", "queued as steer after the current turn"), so the
+  orchestrator can notice a race. "Interrupt and redirect" is `interrupt`,
+  then `send`. `pause` and `resume` are unchanged.
 - `steerable: boolean` on agents (default true). A non-steerable node
   accepts only cancel and a restart without a note. A command has no
-  dialogue: answers, steers, interrupts and notes are refused
-  (`not_an_agent`); `SteerableNode` holds only agent nodes, so steering a
-  command does not compile.
+  dialogue: messages, interrupts and notes are refused (`not_an_agent`);
+  `SteerableNode` holds only agent nodes, so steering a command does not
+  compile.
 
 Prototype choices:
 
 - `CallAgent` carries the transcript after the first prompt (questions,
-  answers, steers), the node's turns so far and its allowance. An answer
-  to a node at its turn limit without more turns is refused
-  (`no_turns_left`); a restart resets the allowance to `maxTurns`, or to
-  `--turns`.
+  answers, steers, decisions), the node's turns so far and its allowance,
+  the slot of the session's previous call (`previous`) and the MCP results
+  already journaled for the call (`recorded`). An answer to a node at its
+  turn limit without more turns is refused (`no_turns_left`); a restart
+  resets the allowance to `maxTurns`, or to `--turns`.
+- A session call's journal slot includes its previous call's slot, so a
+  later call is keyed by the whole dialogue before it. The core keeps the
+  chain (`<session>:<index>` → slot) for the current execution of the body.
+- When a call ends, the host copies its checkpoint to
+  `sessions/<slot>.json`; the session's next call starts from it (a fork
+  copies `sessions/`). A restart discards the call's own checkpoint, so it
+  starts from its previous call's dialogue again. The session's scratch dir
+  (`work/<session>/scratch`) is not rewound.
+- `session_busy` is checked in the workflow VM, where it is deterministic
+  (a replayed hit arrives as late as the original result did).
+- `ask` and `ask`-mode tools end the turn (pi's `finishTurn`) with a
+  placeholder tool result marked in its details; the reply or decision
+  replaces it when it arrives. They cannot run from codemode (a pausing
+  call is refused there, typed as a tool error for the model), and a turn
+  waits on at most one.
 - `Sent` and `Steered` carry a sender-chosen `message_id`, so each inbox
-  entry applies once. An interrupt is logged as `Interrupted`; its message
-  follows as an answer once the aborted turn has ended.
+  entry applies once. An interrupt is logged as `InterruptRequested`, then
+  `TurnInterrupted` once the aborted turn has ended. A CLI `send` is an
+  inbox entry the driver resolves when it applies it (idle: an answer;
+  running: a steer); the CLI reads the outcome from the log.
 - On restart the host closes the node's session (or kills its process) and
   deletes its dirs before the core reissues the call; a result of the old
   session is discarded with a note in the transcript.
 - The step of an inbox message is the node's model turns as the core knows them.
+
+## Orchestrator nodes (decided, round 6)
+
+- `orchestrator({ name, input, output })` declares a node the orchestrator
+  completes. The body calls it with `ctx.call`; the workflow lists it
+  (`orchestrators: [pickLook, approveUpload]`), so `wallis describe` and
+  MCP `describe` show which questions a workflow may ask and the answer
+  schema of each.
+- The orchestrator answers with `submit_result({ run, node, value })` (MCP)
+  or `wallis submit <run> <node> '<json>'`. The value is checked against
+  the node's output schema; a mismatch is refused with the errors
+  (`invalid_answer`) and the node stays pending. Artifact refs in a value
+  are verified against the run's store.
+- Its input may carry artifact refs; the pending item lists each with its
+  blob path and the `wallis export` command.
+- Built in: the agent-ask forwarding (string → string, answered with
+  `send`), and the MCP tool approval (`{ server, tool, args }` → `{ type:
+  "approve" }` | `{ type: "reject", reason }`, the reason non-empty; the
+  core re-checks the decision's shape).
+
+Prototype choices:
+
+- An orchestrator node is never held back by a pause or the budget, and is
+  not live: there is nothing to restart or cancel while it waits.
+- The answer schemas are written to run metadata (`meta.json` `answers`)
+  so queries list them without bundling the workflow.
+- A body MCP tool is direct only: a tool that writes outside is refused in
+  preflight. Outward actions go through an agent's `ask`-mode tool.
+
+## Structured pending (decided, round 6)
+
+Attention is structured JSON for programmatic orchestrators: MCP `wait`,
+`get_run` and `pending` return it, and the CLI prints it with `--json`
+(`status`, `wait`, `pending`); the text `describe` stays for humans. Each
+item has its kind, run, node, the question or input, and `actions`: the
+allowed verbs with their arguments as JSON Schema and the CLI form.
+
+| Kind | What waits | Actions |
+| --- | --- | --- |
+| `agent_ask` (`via`: `ask_tool` or `end_of_turn`) | an agent's question | `send`, `restart`, `cancel` |
+| `turn_limit` | an agent at its turn limit | `send` with `turns`, `restart`, `cancel` |
+| `interrupted` | an interrupted agent | `send`, `restart`, `cancel` |
+| `approval_pending` | an `ask`-mode MCP call (`server`, `tool`, `args`) | `submit_result` with the decision, `restart`, `cancel` |
+| `orchestrator_pending` | an orchestrator node (`input`, `artifacts`) | `submit_result` with its answer schema |
+| `run_idle` | `budget_reached`, `executor_unavailable`, `paused_by_user` | `resume` (with `budget` or `models`) |
+| `node_failed` | a held failure | `restart`, `cancel` |
+| `stopped` | no process drives the run | `resume` |
+| `finished` | the outcome | none |
 
 ## Notification and the MCP server (decided)
 
@@ -260,9 +418,10 @@ Prototype choices:
 - `wallis pending` lists idle nodes and idle runs under the current
   directory, and prints nothing when there are none (for a
   UserPromptSubmit-style hook).
-- `wallis serve` is a stdio MCP server with the tools `run`, `send`,
-  `get_run`, `cancel` and `wait`. `wait` is a long poll with a server-side
-  cap. Every result appends what is pending. The `run` result and the
+- `wallis serve` is a stdio MCP server with the tools `run`, `describe`,
+  `send`, `submit_result`, `interrupt`, `restart`, `get_run`, `pending`,
+  `cancel`, `pause`, `resume` (with `budget` or `models`) and `wait`, plus
+  the monitoring tools. `wait` is a long poll with a server-side cap. Every result appends what is pending. The `run` result and the
   server instructions tell the caller to run `npx wallis wait <run_id>` in
   the background.
 
@@ -273,7 +432,7 @@ Prototype choices:
   `<workflow>-<UTC stamp>-<4 hex>`.
 - A session drives a run until it is finished or idle, then releases the
   lock and exits. The next session resumes it.
-- `send` and `cancel` append an inbox entry. A live driver polls the inbox
+- `send`, `submit`, `interrupt` and `cancel` append an inbox entry. A live driver polls the inbox
   every 100 ms. If no process holds the lock, the CLI starts a detached
   driver. The command returns once the entry is taken: its send is logged,
   or it is marked done.
@@ -291,8 +450,8 @@ Prototype choices:
 ## Ownership and notification (decided, round 3)
 
 - A run records its owner. A run started over MCP is owned by the harness
-  process: the parent of `wallis serve`. A CLI caller's owner is its nearest
-  harness ancestor, or the human when there is none.
+  that runs `wallis serve`. A CLI caller's owner is its nearest harness
+  ancestor, or the human when there is none.
 - `wallis wait` with no run waits on the caller's own runs. `wait <run>`,
   `send`, `cancel`, `resume` and `fork` work only on own runs, with a clear
   error otherwise.
@@ -309,7 +468,12 @@ Prototype choices:
 Prototype choices:
 
 - Identities are `human` or `harness:<name>:<pid>:<start time>`, read from
-  `/proc` (the start time makes a reused pid a different owner).
+  `/proc` (the start time makes a reused pid a different owner). `wallis
+  serve` takes its nearest harness ancestor, like a CLI caller, and its
+  parent only when there is none: harnesses start it through wrappers
+  (`npx`, `sh -c`, `mise exec`), and the orchestrator's MCP runs must be
+  its own for its shell's `npx wallis wait` (round 6; before, the wrapper
+  owned them).
   `WALLIS_OWNER` overrides the caller's identity, for tests and scripted
   callers.
 - Harness names: claude, codex, cursor-agent, cursor, gemini, pi, opencode,
@@ -332,16 +496,17 @@ Prototype choices:
   prints the latest value per label, `wallis tree` shows each one at its
   position, `wallis show <run>` lists them.
 - **CLI:** `wallis ls`, `wallis tree <run>`, `wallis log <run> [--follow]`,
-  `wallis show <run> [<node>]`; interventions `send` (answer), `steer`,
-  `interrupt`, `restart`, `cancel --node`, `pause`, `resume`.
+  `wallis show <run> [<node>]`, `wallis describe <workflow>`, `wallis doc`;
+  interventions `send`, `submit`, `interrupt`, `restart`, `cancel --node`,
+  `pause`, `resume`.
 - **MCP tools for the owner:** `list_runs`, `run_tree`,
   `node_transcript(run, node, since?, limit?)` and `run_log(run, since?)`,
-  all capped with cursors; `send`, `steer`, `interrupt`, `restart`,
-  `pause`, `resume`, and `cancel` with an optional `node_id`.
+  all capped with cursors; `send`, `submit_result`, `interrupt`,
+  `restart`, `pause`, `resume`, and `cancel` with an optional `node_id`.
 - **`pause` and `resume`:** pause issues no new calls, and the run goes
   `Idle(PausedByUser)` once in-flight work ends; resume continues.
-- Steering changes only the node's eventual output, which is journaled, so
-  workflow replay stays deterministic.
+- Steering (a `send` to a running node) changes only the node's eventual
+  output, which is journaled, so workflow replay stays deterministic.
 
 Prototype choices:
 
@@ -409,10 +574,11 @@ Prototype choices:
   is saved in its work dir. A reissued or resumed call continues from the
   last completed turn; earlier turns are never requested again. The node's
   scratch dir lives until the node is done, so the conversation and the
-  files stay consistent. A tool call in flight at a crash runs again if it
-  only reads (`read_file`, `list_dir`, `read_spill`, codemode); any other
-  call's result becomes an error the model sees ("may or may not have
-  taken effect").
+  files stay consistent. - A tool call in flight at a crash runs again if it
+  only reads (`read_file`, `list_dir`, `read_spill`, codemode), only asks
+  (`ask`, an `ask`-mode tool), or its MCP result is already journaled; any
+  other call's result becomes an error the model sees ("may or may not
+  have taken effect").
 - **An uncaught node failure blocks only its dependents.** When the body
   fails because of a node failure it did not handle, the run is not
   finished: the failure is held (`Idle(NodeFailure)` once nothing else can
@@ -423,7 +589,9 @@ Prototype choices:
   completed is a hit and it continues. Or the owner `cancel`s it: only then
   does the failure propagate, and the run finishes Failed if the body does
   not handle it. Commands work the same way (a restart reruns them, e.g.
-  after fixing a `requires` or mount problem).
+  after fixing a `requires` or mount problem). A restart re-executes the
+  node: MCP tools it calls and approvals it asks for reach the outside
+  again, which is recovery, not reproduction.
 - **Code changes are allowed.** Resume re-executes the body with the new
   bundle against the journal (see "The journal is a cache"); the change is
   logged (`CodeChanged`, old and new digests, both in the pin) and the host
@@ -449,7 +617,8 @@ Prototype choices:
   itself (atomically, after every assistant message and every turn) and
   restores from it. A reply that failed or was aborted is never progress
   and is dropped on restore.
-- The semantics version is `wallis-core/4`.
+- The semantics version is `wallis-core/5` (round 6: sessions, MCP
+  journaling, asks, approvals, orchestrator nodes).
 - Resume order: refold; `Resumed` (pinned fields compared); `CodeChanged`
   if the bundle differs; `ExecutorChanged`, `AliasRebound`; re-execute the
   body; `BudgetRaised`, `RetryUnavailable`, answers, the inbox.
@@ -569,8 +738,7 @@ Prototype choices:
     requires: ["uv"],                     // binaries the base must provide
     setup: [["uv", "sync", "--frozen"]],  // optional: once per digest, WITH network
     mounts: ["trainer", "data"],          // read-only only, by name from defineMounts
-    network: [],                          // runtime allowlist (domains); default none
-  });
+  });                                     // no network option: agents and commands never have one
   ```
 
   Nothing is implicit: the workflow dir is not mounted; whatever a sandbox
@@ -627,14 +795,15 @@ Prototype choices:
   `LANG`, `WALLIS_SCRATCH`, `WALLIS_INPUTS`, `WALLIS_ENV`,
   `WALLIS_COMPUTE_MINUTES` (and, for MCP servers, their secrets); secrets
   never appear on a command line.
-- A non-empty `network` shares the host network: bwrap cannot restrict it
-  per domain, so the list is recorded and a warning is printed. Enforcing
-  domains needs a later backend.
+- No sandbox an agent or a command runs in has network (round 6: the
+  domain allowlist is gone; filtering it per domain was premature). An MCP
+  server's spawn shares the host network when its overlay says `"full"`
+  (the default), and `setup` always does.
 - A command whose sandbox cannot be built (no bwrap) fails as
   `unrunnable`; agents' `bash` reports it. `confine: "off"` (tests,
-  development) skips the sandbox preflight and the MCP containment check
-  and runs MCP servers unconfined; binaries are still resolved and
-  recorded.
+  development; an executor kit may set it) skips the sandbox preflight and
+  the MCP annotation check and runs MCP servers unconfined; binaries are
+  still resolved and recorded.
 - Setup envs live in `$XDG_CACHE_HOME/wallis/envs/<digest>/`, ready once
   `.wallis-ready` is written. A setup step's argv is the same as a run's
   (`argv[0]` a required binary).
@@ -683,7 +852,12 @@ Prototype choices:
 - **Resume re-executes the body against the cache.** Unchanged calls hit;
   anything changed misses and executes; downstream calls miss
   automatically when their inputs change. There is no path divergence.
-- **Restart invalidates that node's entry** (logged), so it executes again.
+- **Restart invalidates that node's entry** (logged), so it executes again;
+  a session call's restart also invalidates the session's later calls and
+  drops the call's journaled MCP results: the outside is asked again.
+- **MCP calls are journaled** like every call: a body MCP node's result is
+  its entry; an agent's MCP results join its call's record. Replay,
+  resume, the restart of an unrelated node and fork reuse them.
 - **Fork copies the cache** into a new run; the cache is never shared
   implicitly across runs.
 - Request ids are only display and intervention identities.
@@ -738,22 +912,28 @@ Prototype choices:
 
 The `wallis` package in `host/` exports `defineModels`, `defineMcp(config,
 overlay)`, `defineMounts`, `defineSandbox(env, spec)`, `defineAgent(env,
-spec)`, `command(spec)`, `subWorkflow`, `workflow`, `Foldable`, `Artifact`,
-TypeBox's `Type`, and the typed errors `Refused`, `AgentFailed` (`agent`,
-`failure`), `CommandFailed` (`command`, `failure`), `WorkflowFailed`
-(`workflow`, `reason`) and `SchemaError`. Every node is
-`Node<I, O> = AgentDef | CommandDef | WorkflowNode`, discriminated by
-`kind`.
+spec)`, `command(spec)`, `mcpTool(env, spec)`, `orchestrator(spec)`,
+`subWorkflow`, `workflow`, `Foldable`, `Artifact`, `Decision`, TypeBox's
+`Type`, and the typed errors `Refused`, `AgentFailed` (`agent`,
+`failure`), `CommandFailed` (`command`, `failure`), `ToolFailed` (`tool`,
+`failure`), `WorkflowFailed` (`workflow`, `reason`) and `SchemaError`.
+Every node is `Node<I, O> = AgentDef | CommandDef | WorkflowNode |
+OrchestratorDef | McpToolDef`, discriminated by `kind`; `ctx.call` takes
+every kind but an agent (`CallableNode`).
 
-The body gets `ctx.call(node, input)`, `ctx.parallel`, `ctx.map`,
-`ctx.observe` and `ctx.seed`; nothing else. Agents declare `model` (an
-alias), `prompt`, `input`, `output`, `mcp` (their only tools besides
-codemode and `submit_result`), `sandbox?`, `steerable`, `compaction`,
-`maxTurns` (default 16, at least 2) and `needs`.
+The body gets `ctx.call(node, input)`, `ctx.session(agent)`,
+`ctx.parallel`, `ctx.map`, `ctx.observe` and `ctx.seed`; nothing else.
+Agents declare `model` (an alias), `prompt`, `input`, `output`, `mcp`
+(their only tools besides codemode, `ask` and `submit_result`: per server
+a list or `"*"` for direct tools, or `{ direct?, ask? }`), `sandbox?`,
+`steerable`, `compaction`, `maxTurns` (default 16, at least 2) and
+`needs`. The workflow lists its `agents`, `commands`, `orchestrators` and
+`mcpTools`.
 
-An uncaught failure ends the body as `AgentGaveUp`, `CommandCrashed` or
-`WorkflowFailed` (a nested workflow's failure, with its cause), which the
-core holds (see Recovery); anything else is `BodyError`. There are no
+An uncaught failure ends the body as `AgentGaveUp`, `CommandCrashed`,
+`ToolCrashed` or `WorkflowFailed` (a nested workflow's failure, with its
+cause), which the core holds (see Recovery); anything else is
+`BodyError`. There are no
 workflow version declarations (owner decision).
 
 ## Executors (decided, round 3; revised rounds 4 and 5)
@@ -782,13 +962,18 @@ Recovery and "An agent is a function").
 The tool layer (`host/src/host/tools.ts`) builds every tool per node,
 enforces the allowlist, logs every call, counts calls against a per-node
 budget and caps every result. The tools:
-- `codemode` and `submit_result` (validated: schema and output cap), always;
+- `codemode`, `ask` and `submit_result` (validated: schema and output cap), always;
 - `read_spill`, which pages output spilled at the context cap;
 - with a sandbox: `bash` (run in the agent's sandbox), `read_file`,
   `list_dir`, `write_file` and `export_artifact`, on the sandbox's paths
   (`/w` scratch, `/w/<mount>` read-only, `/run/wallis/inputs` read-only);
   without one, no filesystem at all;
-- the allowlisted tools of upstream MCP servers, through `@earendil-works/pi-mcp`.
+- the allowlisted tools of upstream MCP servers, through `@earendil-works/pi-mcp`:
+  direct ones run when called; `ask`-mode ones pause the turn for the
+  orchestrator's approval and run (or carry the rejection's reason) when it
+  arrives. Every MCP result is journaled (`ToolRecorded`) before the model
+  sees it, and a reissued call answers a recorded tool call from the
+  journal instead of calling the server again.
 
 Agents' tools are MCP tools and built-ins only: a custom tool means an MCP
 server, and a command cannot be handed to an agent. Codemode is always on
@@ -798,13 +983,16 @@ fs or network) with the full input as `input`. A codemode call costs a
 turn, so `maxTurns` is at least 2.
 
 **MCP servers run in a sandbox.** Each stdio server in mcp.json gets the
-sandbox the TS overlay gives it, with its own network allowlist. `${VAR}`
+sandbox the TS overlay gives it, with the overlay's network (`"full"` by
+default). `${VAR}`
 secrets go into the server process's environment only, never into an
 agent's sandbox. **Containment:** agent side effects stay inside its
-sandbox and the outside world is read-only for agents, so preflight
-refuses an allowlisted MCP tool whose annotations say it writes outside
-(`destructiveHint` true, or `readOnlyHint` false with `openWorldHint` true)
-unless the overlay's `allowWrites` names it (`tool_writes_outside`).
+sandbox, and the outside world changes only through `ask`-mode tools the
+orchestrator approves, so preflight refuses a tool used directly (by an
+agent, or by the body as a node) whose annotations say it writes outside
+(`destructiveHint` true, or `readOnlyHint` false with `openWorldHint` true):
+`tool_writes_outside`. It must be declared under `ask`. Annotations are the
+server's own claim: this is a sanity check, not a proof.
 
 Later rounds (not built): an **ACP executor** and a **Claude Agent SDK
 executor**. Notes for Claude Code 2.1.301: `--bare` gives the cleanest
@@ -844,9 +1032,11 @@ Built:
   and host (`host/`);
 - sessions with a lock, the CLI and the stdio MCP server;
 - the pi executor (retries, per-turn checkpoints, quota, turn limit,
-  compaction), the wallis tool layer, bwrap sandboxes with binaries and
-  setup, commands, mounts, artifacts, machine slots, sandboxed MCP servers
-  and the containment check;
+  compaction, sessions, `ask`, approvals), the wallis tool layer, bwrap
+  sandboxes with binaries and setup, commands, mounts, artifacts, machine
+  slots, sandboxed MCP servers (direct and `ask` modes, journaled), body MCP
+  tool nodes, orchestrator nodes, structured pending, and the annotation
+  check;
 - the fake executor and fake command runner;
 - examples: `two-node` and `ask`;
 - the SIDERIUS example (`.agents/workflows/siderius/`, see its `MAPPING.md`).
@@ -854,7 +1044,10 @@ Built:
 Not built yet:
 - the ACP and Claude Agent SDK executors;
 - a container backend (`base`), and per-domain network enforcement;
-- declaration approval on first run or digest change (setup is only logged).
+- declaration approval on first run or digest change (setup is only logged);
+- file inputs and image inputs for agents;
+- nested orchestration (a parent agent answering its child's `ask`);
+- `ask` mode for body MCP nodes (outward body actions go through an agent).
 
 ## Open
 
