@@ -1174,9 +1174,13 @@ reads as a subset of a compose service.
   and agent call whose sandbox binds it (through the sandbox digest in the
   node digest). It is no longer pinned.
 - **A run snapshots its binds when it starts** (foundation 9): each host
-  dir is copied into the run, `<run>/binds/<hex>` (`cp -a
-  --reflink=auto`: a reflink on filesystems that have them, else a plain
-  copy), named by its digest and noted (`binds`: host dir -> digest).
+  dir is hashed, and a snapshot with that digest in the project's store,
+  `.wallis/binds/<hex>` (shared by its runs and forks), is reused; else it
+  is copied there (`cp -a --reflink=auto`: a reflink on filesystems that
+  have them, else a plain copy) and named by its digest (review fixes).
+  The digest is noted (`binds`: host dir -> digest). A bind that contains
+  or is inside the project's `.wallis` or the run is refused
+  (`invalid_volume`): a snapshot would copy itself.
   Calls bind the snapshot, so an edit while the run goes on never reaches
   it; every later host of the run reuses the snapshot (a noted one that is
   gone is `volume_missing`, never retaken). A fork takes a new snapshot:

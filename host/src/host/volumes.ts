@@ -67,7 +67,13 @@ export function resolveVolumes(
 	workflow: string,
 	workflowDir: string,
 	sandboxes: Readonly<Record<string, { readonly volumes: readonly Volume[] }>>,
-	options: { readonly root: string; readonly callTime?: Readonly<Record<string, string>>; readonly profile?: VolumeProfile },
+	options: {
+		readonly root: string;
+		readonly callTime?: Readonly<Record<string, string>>;
+		readonly profile?: VolumeProfile;
+		/** Dirs no bind may contain or be inside (the project's `.wallis`, the run): a snapshot would copy itself. */
+		readonly stores?: readonly string[];
+	},
 ): Record<string, ResolvedVolume[]> {
 	const binds = new Set(Object.values(sandboxes).flatMap((s) => s.volumes.flatMap((v) => (v.kind === "bind" ? [v.target] : []))));
 	for (const target of Object.keys(options.callTime ?? {})) if (!binds.has(target)) throw new VolumeError({ type: "unknown_volume", target });
@@ -93,6 +99,11 @@ export function resolveVolumes(
 					const given = options.callTime?.[target] || options.profile?.workflows?.[workflow]?.[target] || options.profile?.global?.[target];
 					const dir = given ? resolve(options.root, given) : v.host.startsWith("~/") ? join(homedir(), v.host.slice(2)) : resolve(workflowDir, v.host);
 					if (!existsSync(dir) || !statSync(dir).isDirectory()) throw new VolumeError({ type: "volume_missing", sandbox, target, path: dir });
+					const real = realpathSync(dir);
+					for (const store of options.stores ?? []) {
+						const s = existsSync(store) ? realpathSync(store) : resolve(store);
+						if (overlaps(real, s)) refuse(`the host dir ${dir} ${s.startsWith(`${real}/`) || s === real ? "contains" : "is inside"} ${store}, wallis's own store`);
+					}
 					resolved.push({ kind: "bind", target, dir });
 				} else {
 					const dir = join(namedVolumesDir(), v.name);
@@ -202,20 +213,24 @@ export function storeCommandOutputs(runDir: string, scratch: string): string {
 	return digest;
 }
 
-/** Where a run keeps the snapshot of a bind by its digest. */
-export function bindSnapshotDir(runDir: string, digest: string): string {
-	return join(runDir, "binds", digest.slice(digest.lastIndexOf(":") + 1));
+/** Where a snapshot store keeps the snapshot of a bind by its digest. */
+export function bindSnapshotDir(store: string, digest: string): string {
+	return join(store, digest.slice(digest.lastIndexOf(":") + 1));
 }
 
 /**
- * Snapshots a bind's host dir into the run: a copy (`cp -a
- * --reflink=auto`: a reflink where the filesystem has them, else a plain
- * copy), named by its digest; an identical snapshot already there is
- * reused. Returns the digest.
+ * Snapshots a bind's host dir into a content-addressed store (the
+ * project's `.wallis/binds`, shared by its runs and forks). The dir is
+ * hashed first: a snapshot with that digest is reused, never copied
+ * again. Otherwise it is copied (`cp -a --reflink=auto`: a reflink where
+ * the filesystem has them, else a plain copy) and named by the copy's own
+ * digest. Returns the digest.
  */
-export function snapshotBind(runDir: string, dir: string): string {
-	mkdirSync(join(runDir, "binds"), { recursive: true });
-	const temp = join(runDir, "binds", `.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`);
+export function snapshotBind(store: string, dir: string): string {
+	const before = bindDigest(dir);
+	if (existsSync(bindSnapshotDir(store, before))) return before;
+	mkdirSync(store, { recursive: true });
+	const temp = join(store, `.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`);
 	const copied = spawnSync("cp", ["-a", "--reflink=auto", "--no-target-directory", dir, temp], { encoding: "utf8" });
 	if (copied.status !== 0) {
 		rmSync(temp, { recursive: true, force: true });
@@ -223,7 +238,7 @@ export function snapshotBind(runDir: string, dir: string): string {
 	}
 	// File hashes come from the cache of the host dir: `cp -a` keeps mtimes and sizes.
 	const digest = bindDigest(temp, dir);
-	const target = bindSnapshotDir(runDir, digest);
+	const target = bindSnapshotDir(store, digest);
 	if (existsSync(target)) rmSync(temp, { recursive: true, force: true });
 	else renameSync(temp, target);
 	return digest;

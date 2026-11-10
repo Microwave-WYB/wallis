@@ -434,7 +434,12 @@ export class Session {
 		try {
 			// The caller's host dirs for bind volumes of a new run are noted, and reused by every later host of the run.
 			const callTime = o.volumes ?? readMeta(this.paths)?.volumes;
-			this.#volumes = resolveVolumes(decl.core.name, dirname(this.#workflow), decl.sandboxes, { root: this.#root, callTime, profile: this.#local.volumes });
+			this.#volumes = resolveVolumes(decl.core.name, dirname(this.#workflow), decl.sandboxes, {
+				root: this.#root,
+				callTime,
+				profile: this.#local.volumes,
+				stores: [join(resolve(this.#root), ".wallis"), this.paths.dir],
+			});
 			checkDevices(decl.sandboxes);
 			checkEnvironments(decl);
 			if (callTime !== undefined && Object.keys(callTime).length > 0) {
@@ -655,13 +660,16 @@ export class Session {
 	 */
 	#snapshotBinds(volumes: Record<string, ResolvedVolume[]>): Record<string, ResolvedVolume[]> {
 		const taken: Record<string, string> = { ...(readMeta(this.paths)?.binds ?? {}) };
+		// The project's snapshot store, shared by its runs; a run from before it kept its own.
+		const store = join(resolve(this.#root), ".wallis", "binds");
+		const at = (digest: string) => [bindSnapshotDir(store, digest), bindSnapshotDir(join(this.paths.dir, "binds"), digest)].find((d) => existsSync(d)) ?? bindSnapshotDir(store, digest);
 		const out = Object.fromEntries(
 			Object.entries(volumes).map(([sandbox, vs]) => [
 				sandbox,
 				vs.map((v): ResolvedVolume => {
 					if (v.kind !== "bind") return v;
-					const digest = (taken[v.dir] ??= snapshotBind(this.paths.dir, v.dir));
-					const dir = bindSnapshotDir(this.paths.dir, digest);
+					const digest = (taken[v.dir] ??= snapshotBind(store, v.dir));
+					const dir = at(digest);
 					if (!existsSync(dir)) throw new VolumeError({ type: "volume_missing", sandbox, target: v.target, path: dir });
 					return { kind: "bind", target: v.target, dir, digest };
 				}),

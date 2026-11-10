@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { sandboxDigest } from "../src/host/confine.ts";
@@ -391,4 +391,33 @@ export default workflow({ name: "d", models: defineModels({ default: "fake/defau
 	assert.match((refused({ ...ok, commands: { c: { ...ok.commands.c, sandbox: "ghost" } } }) as { message: string }).message, /sandbox ghost is not declared/);
 	assert.equal((refused({ ...ok, sandboxes: { box: { ...ok.sandboxes.box, network: "full" } } }) as { type: string }).type, "invalid_declaration", "malformed: refused, typed");
 	assert.equal((refused("not declarations") as { type: string }).type, "invalid_declaration");
+});
+
+test("bind snapshots are hashed first and shared by content; a bind that holds wallis's own store is refused, typed", async () => {
+	const { snapshotBind, bindSnapshotDir } = await import("../src/host/volumes.ts");
+	const { statSync } = await import("node:fs");
+	const store = join(tmp(), "binds");
+	const dir = tmp();
+	writeFileSync(join(dir, "a.py"), "print(1)");
+	const first = snapshotBind(store, dir);
+	const ino = statSync(join(bindSnapshotDir(store, first), "a.py")).ino;
+	// Another run (or a fork) of the same content: the same snapshot, not a second copy.
+	assert.equal(snapshotBind(store, dir), first);
+	assert.equal(statSync(join(bindSnapshotDir(store, first), "a.py")).ino, ino);
+	assert.deepEqual(readdirSync(store), [first.slice(first.lastIndexOf(":") + 1)], "one snapshot, no temp left behind");
+	// A bind of a dir that holds the project's .wallis (or the run) would copy into itself.
+	const root = tmp("wallis-root-");
+	mkdirSync(join(root, ".wallis", "runs", "r1"), { recursive: true });
+	const refusal = (host: string) => {
+		try {
+			resolveVolumes("w", root, { box: { volumes: [{ kind: "bind", host, target: "/data" }] } }, { root, stores: [join(root, ".wallis"), join(root, ".wallis", "runs", "r1")] });
+			return null;
+		} catch (e) {
+			return e instanceof VolumeError ? e.refusal : String(e);
+		}
+	};
+	assert.equal((refusal("./") as { type: string }).type, "invalid_volume", "the project root holds .wallis");
+	assert.match((refusal("./.wallis/runs") as { reason: string }).reason, /inside|contains/);
+	mkdirSync(join(root, "data"));
+	assert.equal(refusal("./data"), null);
 });
