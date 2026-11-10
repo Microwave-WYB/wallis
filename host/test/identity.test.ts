@@ -227,3 +227,20 @@ export default workflow({ name: "te", models: defineModels({ default: "fake/defa
 	assert.equal(digests.length, 2, "the fork's tool call is a new call");
 	assert.notEqual(digests[1], digests[0]);
 });
+
+test("a toolset's runner is written whole and checked: a half-written one is replaced, never run", async () => {
+	const { readdirSync, readFileSync: read, writeFileSync: write } = await import("node:fs");
+	const p = project();
+	const dir = join(p.root, "run");
+	await runWorkflow({ ...base, workflow: p.workflow, dir, root: p.root, input: null, executor: new FakeExecutor({ writer: { submit: { ok: true } } }), commands: new FakeCommands({ echo: { stdout: '{"n":1}' } }) });
+	const [hex] = readdirSync(join(dir, "toolsets"));
+	const runner = join(dir, "toolsets", hex!, "runner.mjs");
+	const whole = read(runner, "utf8");
+	assert.ok(!readdirSync(join(dir, "toolsets", hex!)).some((f) => f.endsWith(".tmp")));
+	// As a crash mid-write would have left it.
+	write(runner, whole.slice(0, 100));
+	answer(dir);
+	const done = await runWorkflow({ ...base, workflow: p.workflow, dir, root: p.root, executor: new FakeExecutor({}) });
+	assert.equal(done.outcome?.type, "done");
+	assert.equal(read(runner, "utf8"), whole);
+});

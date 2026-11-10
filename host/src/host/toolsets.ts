@@ -28,7 +28,7 @@
 // Unannotated tools count as writes, per MCP's defaults.
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpClient, StdioTransport, StreamableHttpTransport } from "@earendil-works/pi-mcp";
@@ -277,7 +277,14 @@ export class ToolSources {
 				this.#digests.set(path, blob);
 				const dir = join(this.#runDir, "toolsets", blob.slice("sha256:".length, "sha256:".length + 16));
 				mkdirSync(dir, { recursive: true });
-				if (!existsSync(join(dir, "runner.mjs"))) writeFileSync(join(dir, "runner.mjs"), code);
+				// Written whole (temp, then rename), and checked against its digest: a runner a crash left
+				// half-written is never run.
+				const runner = join(dir, "runner.mjs");
+				if (!existsSync(runner) || `sha256:${digest(readFileSync(runner, "utf8"))}` !== blob) {
+					const temp = `${runner}.${process.pid}.tmp`;
+					writeFileSync(temp, code);
+					renameSync(temp, runner);
+				}
 				return dir;
 			})();
 			this.#bundles.set(path, bundled);
