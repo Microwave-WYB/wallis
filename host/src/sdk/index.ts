@@ -81,9 +81,14 @@ export type WallisTool<P extends TSchema = TSchema> = AgentTool<P> & { readonly 
 type ParamsOf<T> = T extends { readonly parameters: infer P extends TSchema } ? Static<P> : never;
 type OutputOf<T> = T extends { readonly outputSchema: infer O extends TSchema } ? Static<O> : unknown;
 
-/** A tool of a toolset: for agents' `tools`, and for `ctx.call` with its parameters (and output, if it declares `outputSchema`). */
-export interface CustomTool<P = unknown, O = unknown> extends Tool<{ readonly kind: "custom"; readonly toolset: string; readonly export: string }> {
-	readonly __types?: { readonly params: P; readonly output: O };
+/**
+ * A tool of a toolset: for agents' `tools`, and for `ctx.call` with its
+ * parameters (and output, if it declares `outputSchema`). `M`, its module's
+ * type, is invariant, so `ctx.call` takes only tools of declared toolsets.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: the default accepts every module.
+export interface CustomTool<P = unknown, O = unknown, M = any> extends Tool<{ readonly kind: "custom"; readonly toolset: string; readonly export: string }> {
+	readonly __types?: { readonly params: P; readonly output: O; readonly module: (m: M) => M };
 }
 
 const TOOLSET: unique symbol = Symbol("wallis.toolset");
@@ -97,9 +102,17 @@ export interface ToolsetOptions {
 	readonly network?: "none" | "host";
 }
 
-export type Toolset<M> = { readonly [K in keyof M as M[K] extends { readonly execute: unknown; readonly parameters: unknown } ? K & string : never]: CustomTool<ParamsOf<M[K]>, OutputOf<M[K]>> } & {
+export type Toolset<M> = { readonly [K in keyof M as M[K] extends { readonly execute: unknown; readonly parameters: unknown } ? K & string : never]: CustomTool<ParamsOf<M[K]>, OutputOf<M[K]>, M> } & ToolsetRef<M>;
+
+/** A toolset as a workflow declares it; `M` (types only) is its module's type. */
+// biome-ignore lint/suspicious/noExplicitAny: the default accepts every module.
+export interface ToolsetRef<M = any> {
 	readonly [TOOLSET]: { readonly path: string } & ToolsetOptions;
-};
+	readonly __module?: (m: M) => M;
+}
+
+/** The module types of declared toolsets. */
+export type ModuleOf<T> = T extends { readonly __module?: (m: infer M) => unknown } ? M : never;
 
 /**
  * Loads a tool module: `toolset<typeof import("./tools/x.ts")>("./tools/x.ts", { sandbox })`.
@@ -130,10 +143,10 @@ export interface McpConfig {
  * `noUncheckedIndexedAccess` the property reads as `McpTool | undefined`;
  * `tools` and `ctx.call` take that (the value is never undefined).
  */
-export type McpTool = Tool<{ readonly kind: "mcp_tool"; readonly server: string; readonly tool: string }>;
+export type McpTool<S extends string = string> = Tool<{ readonly kind: "mcp_tool"; readonly server: S; readonly tool: string }>;
 
 /** A whole server, for agents: only its tools annotated `readOnlyHint: true` (the others are listed in a warning). */
-export type McpServer<S extends string = string> = Tool<{ readonly kind: "mcp_server"; readonly server: S }> & { readonly [tool: string]: McpTool };
+export type McpServer<S extends string = string> = Tool<{ readonly kind: "mcp_server"; readonly server: S }> & { readonly [tool: string]: McpTool<S> };
 
 const MCP: unique symbol = Symbol("wallis.mcp");
 
@@ -300,8 +313,8 @@ export interface CommandResult {
 /** An argv whose program is one of the sandbox's required binaries. */
 export type Argv<R extends string> = readonly [R, ...string[]];
 
-export interface CommandSpec<R extends string, I extends TSchema, O extends TSchema> {
-	readonly name: string;
+export interface CommandSpec<R extends string, I extends TSchema, O extends TSchema, N extends string = string> {
+	readonly name: N;
 	readonly description?: string;
 	readonly sandbox: SandboxDef<R>;
 	readonly input: I;
@@ -314,9 +327,9 @@ export interface CommandSpec<R extends string, I extends TSchema, O extends TSch
 	readonly resources?: Resources;
 }
 
-export interface CommandDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+export interface CommandDef<I extends TSchema = TSchema, O extends TSchema = TSchema, N extends string = string> {
 	readonly kind: "command";
-	readonly name: string;
+	readonly name: N;
 	readonly description: string;
 	readonly sandbox: SandboxDef;
 	readonly input: I;
@@ -327,7 +340,7 @@ export interface CommandDef<I extends TSchema = TSchema, O extends TSchema = TSc
 }
 
 /** A command: a typed adapter around a program in a sandbox. Only workflow code calls it, with `ctx.call`. */
-export function command<const R extends string, I extends TSchema, O extends TSchema>(spec: CommandSpec<R, I, O>): CommandDef<I, O> {
+export function command<const R extends string, I extends TSchema, O extends TSchema, const N extends string>(spec: CommandSpec<R, I, O, N>): CommandDef<I, O, N> {
 	return {
 		kind: "command",
 		name: spec.name,
@@ -347,8 +360,8 @@ export interface Env<M extends ModelTable> {
 	readonly models: Models<M>;
 }
 
-interface AgentBase<M extends ModelTable, I extends TSchema, O extends TSchema> {
-	readonly name: string;
+interface AgentBase<M extends ModelTable, I extends TSchema, O extends TSchema, N extends string = string> {
+	readonly name: N;
 	readonly model: keyof M & string;
 	/** Prompt text, usually `import p from "./prompts/p.md" with { type: "text" }`. */
 	readonly prompt: string;
@@ -392,14 +405,14 @@ const RANK = { read: 1, write: 2, exec: 3 } as const;
  * and submit_result (always there): `ask`, toolset tools, MCP tools or
  * servers. Without `workspace` the agent has no filesystem at all.
  */
-export type AgentSpec<M extends ModelTable, I extends TSchema, O extends TSchema> = AgentBase<M, I, O> & {
+export type AgentSpec<M extends ModelTable, I extends TSchema, O extends TSchema, N extends string = string> = AgentBase<M, I, O, N> & {
 	readonly tools?: readonly (Tool | McpTool | undefined)[];
 	readonly workspace?: Workspace;
 };
 
-export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSchema, N extends string = string> {
 	readonly kind: "agent";
-	readonly name: string;
+	readonly name: N;
 	readonly model: string;
 	readonly prompt: string;
 	readonly input: I;
@@ -415,7 +428,7 @@ export interface AgentDef<I extends TSchema = TSchema, O extends TSchema = TSche
 	readonly compaction: boolean;
 }
 
-export function defineAgent<const M extends ModelTable, I extends TSchema, O extends TSchema>(_env: Env<M>, spec: AgentSpec<M, I, O>): AgentDef<I, O> {
+export function defineAgent<const M extends ModelTable, I extends TSchema, O extends TSchema, const N extends string>(_env: Env<M>, spec: AgentSpec<M, I, O, N>): AgentDef<I, O, N> {
 	const maxTurns = spec.maxTurns ?? 16;
 	// Codemode is always offered and a codemode call is a turn.
 	if (maxTurns < 2) throw new Error(`agent ${spec.name}: maxTurns must be at least 2 (a codemode call is a turn)`);
@@ -673,15 +686,15 @@ export interface WorkflowNode<I extends TSchema = TSchema, O extends TSchema = T
  * self-contained: the orchestrator sees only the input. A restart asks
  * again; a cancel is `OrchestratorCancelled` for the body.
  */
-export interface OrchestratorDef<I extends TSchema = TSchema, O extends TSchema = TSchema> {
+export interface OrchestratorDef<I extends TSchema = TSchema, O extends TSchema = TSchema, N extends string = string> {
 	readonly kind: "orchestrator";
-	readonly name: string;
+	readonly name: N;
 	readonly description: string;
 	readonly input: I;
 	readonly output: O;
 }
 
-export function orchestrator<I extends TSchema, O extends TSchema>(spec: { readonly name: string; readonly description?: string; readonly input: I; readonly output: O }): OrchestratorDef<I, O> {
+export function orchestrator<I extends TSchema, O extends TSchema, const N extends string>(spec: { readonly name: N; readonly description?: string; readonly input: I; readonly output: O }): OrchestratorDef<I, O, N> {
 	return { kind: "orchestrator", name: spec.name, description: spec.description ?? "", input: spec.input, output: spec.output };
 }
 
@@ -741,7 +754,32 @@ export interface Session<I extends TSchema = TSchema, O extends TSchema = TSchem
  * QuickJS has no async context tracking, so ids taken after an `await` in
  * plain concurrent code would depend on arrival order.
  */
-export interface Ctx {
+/**
+ * What a workflow declares, as types: a typed `ctx` takes only these
+ * nodes, sessions of these agents, and tools of these toolsets and MCP
+ * servers. The default takes anything (a nested workflow's `ctx`); the
+ * runtime refuses an undeclared node either way (`Refused`).
+ */
+export interface Declared {
+	// biome-ignore lint/suspicious/noExplicitAny: the default declares everything.
+	readonly agents: AgentDef<any, any, string>;
+	// biome-ignore lint/suspicious/noExplicitAny: the default declares everything.
+	readonly commands: CommandDef<any, any, string>;
+	// biome-ignore lint/suspicious/noExplicitAny: the default declares everything.
+	readonly orchestrators: OrchestratorDef<any, any, string>;
+	/** Module types of the declared toolsets. */
+	readonly toolsets: unknown;
+	/** Names of the declared MCP servers. */
+	readonly servers: string;
+}
+
+/** A tool of one of these modules (distributed, since a tool's module is invariant). */
+type ToolOf<P, O, T> = T extends unknown ? CustomTool<P, O, T> : never;
+
+// biome-ignore lint/suspicious/noExplicitAny: the permissive default (any module).
+type AnyDeclared = Declared & { readonly toolsets: any };
+
+export interface Ctx<D extends Declared = AnyDeclared> {
 	/** Run seed from the pin. `Math.random` is already seeded from it. */
 	readonly seed: number;
 	/**
@@ -751,7 +789,7 @@ export interface Ctx {
 	 * fails, `Refused` when the core refuses it. A reached budget holds the
 	 * call instead.
 	 */
-	call<I extends TSchema, O extends TSchema>(node: CallableNode<I, O>, input: Static<I>): Promise<Static<O>>;
+	call<N extends D["commands"] | D["orchestrators"] | WorkflowNode>(node: N, input: Static<N["input"]>): Promise<Static<N["output"]>>;
 	/**
 	 * Calls an agent through a session value: `[output, next]`, where `next`
 	 * is the session after the call. `s` itself is unchanged, so
@@ -777,24 +815,24 @@ export interface Ctx {
 	 * `schema`); an MCP tool returns `unknown` unless `schema` parses it.
 	 * Throws `ToolFailed`.
 	 */
-	call<P, O>(tool: CustomTool<P, O>, input: NoInfer<P>): Promise<O>;
-	call<P, S extends TSchema>(tool: CustomTool<P, unknown>, input: NoInfer<P>, schema: S): Promise<Static<S>>;
-	call(tool: McpTool | undefined, input: { readonly [key: string]: Json }): Promise<unknown>;
-	call<S extends TSchema>(tool: McpTool | undefined, input: { readonly [key: string]: Json }, schema: S): Promise<Static<S>>;
+	call<P, O>(tool: ToolOf<P, O, D["toolsets"]>, input: NoInfer<P>): Promise<O>;
+	call<P, S extends TSchema>(tool: ToolOf<P, unknown, D["toolsets"]>, input: NoInfer<P>, schema: S): Promise<Static<S>>;
+	call(tool: McpTool<D["servers"]> | undefined, input: { readonly [key: string]: Json }): Promise<unknown>;
+	call<S extends TSchema>(tool: McpTool<D["servers"]> | undefined, input: { readonly [key: string]: Json }, schema: S): Promise<Static<S>>;
 	/**
 	 * A new session with an agent (no call yet): the only way to call one. A
 	 * value: it takes no request id. `from` seeds its workspace with a Tree
 	 * (copy-on-write).
 	 */
-	session<I extends TSchema, O extends TSchema>(agent: AgentDef<I, O>, options?: { readonly from?: Tree }): Session<I, O>;
+	session<A extends D["agents"]>(agent: A, options?: { readonly from?: Tree }): Session<A["input"], A["output"]>;
 	/** A session's workspace as a Tree, without copying. */
 	files(session: Session): Tree;
 	/** Runs branches concurrently; each gets its own request ids. */
-	parallel<const B extends { readonly [key: string]: (ctx: Ctx) => Promise<unknown> }>(
+	parallel<const B extends { readonly [key: string]: (ctx: Ctx<D>) => Promise<unknown> }>(
 		branches: B,
 	): Promise<{ -readonly [K in keyof B]: Awaited<ReturnType<B[K]>> }>;
 	/** One branch per item, concurrently, each with its own request ids; results in item order. */
-	map<T, U>(items: readonly T[], each: (ctx: Ctx, item: T, index: number) => Promise<U>): Promise<U[]>;
+	map<T, U>(items: readonly T[], each: (ctx: Ctx<D>, item: T, index: number) => Promise<U>): Promise<U[]>;
 	/**
 	 * A typed fold: runs `body` on the state until it returns `done(value)`;
 	 * `next(state)` goes round again. The state (`S`, from `init`) and the
@@ -805,10 +843,10 @@ export interface Ctx {
 	 * the loop and its iterations (`tree`, `status`). There is no iteration
 	 * cap: the budget governs long loops.
 	 */
-	loop<S, O>(init: S, body: (ctx: Ctx, state: S) => Promise<Step<NoInfer<S>, O>>): Promise<O>;
+	loop<S, O>(init: S, body: (ctx: Ctx<D>, state: S) => Promise<Step<NoInfer<S>, O>>): Promise<O>;
 	// The same, inferred: O is the union of the `done(...)` values (TS infers one candidate for O
 	// from several object types, so the step type is inferred and its endings extracted).
-	loop<S, R extends Step<NoInfer<S>, unknown>>(init: S, body: (ctx: Ctx, state: S) => Promise<R>): Promise<Extract<R, { readonly type: "done" }>["value"]>;
+	loop<S, R extends Step<NoInfer<S>, unknown>>(init: S, body: (ctx: Ctx<D>, state: S) => Promise<R>): Promise<Extract<R, { readonly type: "done" }>["value"]>;
 	/** Monitoring only: logged for `status`, `tree` and `show`, never returned, never matched on replay. */
 	observe(label: string, value: Json): void;
 }
@@ -831,32 +869,50 @@ export function subWorkflow<I extends TSchema, O extends TSchema>(spec: Omit<Wor
 	return { kind: "workflow", ...spec };
 }
 
-export interface WorkflowSpec<M extends ModelTable, J extends McpConfig, I extends TSchema, O extends TSchema> {
+export interface WorkflowSpec<
+	M extends ModelTable,
+	J extends McpConfig,
+	I extends TSchema,
+	O extends TSchema,
+	A extends AgentDef = AgentDef,
+	C extends CommandDef = CommandDef,
+	Q extends OrchestratorDef = OrchestratorDef,
+	T extends ToolsetRef = ToolsetRef,
+> {
 	readonly name: string;
 	readonly models: Models<M>;
 	/** The MCP servers its agents and body use (`defineMcp`). */
 	readonly mcp?: McpServers<J>;
 	/** The tool modules its agents and body use (`toolset`). */
-	readonly toolsets?: readonly { readonly [TOOLSET]: { readonly path: string } & ToolsetOptions }[];
+	readonly toolsets?: readonly T[];
 	/** Every agent the body may call, nested workflows included. */
-	readonly agents: readonly AgentDef[];
+	readonly agents: readonly A[];
 	/** Every command the body may call, nested workflows included. */
-	readonly commands?: readonly CommandDef[];
+	readonly commands?: readonly C[];
 	/** Every orchestrator node the body may call: the questions the run may ask, with their answer schemas. */
-	readonly orchestrators?: readonly OrchestratorDef[];
+	readonly orchestrators?: readonly Q[];
 	readonly budget?: Budget;
 	readonly pin?: PinSpec;
 	readonly input: I;
 	readonly output: O;
-	readonly run: (ctx: Ctx, input: Static<I>) => Promise<Static<O>>;
+	/** The body: its `ctx` takes only what the workflow declares (a compile error, and `Refused` at run time). */
+	readonly run: (ctx: Ctx<{ agents: A; commands: C; orchestrators: Q; toolsets: ModuleOf<T>; servers: keyof J["mcpServers"] & string }>, input: Static<I>) => Promise<Static<O>>;
 }
 
 export interface WorkflowDef<I extends TSchema = TSchema, O extends TSchema = TSchema> extends WorkflowNode<I, O> {
 	readonly spec: WorkflowSpec<ModelTable, McpConfig, I, O>;
 }
 
-export function workflow<const M extends ModelTable, const J extends McpConfig, I extends TSchema, O extends TSchema>(
-	spec: WorkflowSpec<M, J, I, O>,
-): WorkflowDef<I, O> {
-	return { kind: "workflow", name: spec.name, input: spec.input, output: spec.output, run: spec.run, spec: spec as unknown as WorkflowSpec<ModelTable, McpConfig, I, O> };
+export function workflow<
+	const M extends ModelTable,
+	const J extends McpConfig,
+	I extends TSchema,
+	O extends TSchema,
+	A extends AgentDef = never,
+	C extends CommandDef = never,
+	Q extends OrchestratorDef = never,
+	T extends ToolsetRef = never,
+>(spec: WorkflowSpec<M, J, I, O, A, C, Q, T>): WorkflowDef<I, O> {
+	const general = spec as unknown as WorkflowSpec<ModelTable, McpConfig, I, O>;
+	return { kind: "workflow", name: spec.name, input: spec.input, output: spec.output, run: general.run as WorkflowNode<I, O>["run"], spec: general };
 }

@@ -142,5 +142,8 @@ generics or wrappers that add no proof.
   `CommandFailed`, `ToolFailed`, `OrchestratorCancelled`, `WorkflowFailed`,
   `SchemaError`, each with
   a typed failure); never make it match on message text.
+- `ctx` is typed by the workflow's declarations (`Ctx<D>`); keep every new
+  ctx method's callbacks on `Ctx<D>`, and every new node kind declared
+  (name literal type) and refused at run time when undeclared.
 - Compile-time guarantees get `@ts-expect-error` tests in
   `host/test/sdk-types.ts`.

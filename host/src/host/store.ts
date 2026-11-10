@@ -88,6 +88,8 @@ const Facts = Type.Object({
 	volumes: Type.Optional(Type.Record(Type.String(), Type.String())),
 	/** Each toolset's bundle digest (its module and the runner, as run), by path. */
 	toolsets: Type.Optional(Type.Record(Type.String(), Type.String())),
+	/** Preflight: each tool given to agents that may write outside (unannotated counts), and the agents that hold it. */
+	writes: Type.Optional(Type.Record(Type.String(), Type.Array(Type.String()))),
 });
 
 /** Parameters for the first session of a run started by `wallis run`. */

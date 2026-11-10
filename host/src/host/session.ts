@@ -42,7 +42,7 @@ import { canonical } from "./render.ts";
 import { putDialogue, readDialogue } from "./dialogues.ts";
 import { commitLayer, layersAfter, type Work, xattrToolsMissing } from "./layers.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
-import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources } from "./toolsets.ts";
+import { type Confinement, resolveAgentTools, sourceKey, type ToolInfo, ToolSources, writesOutside } from "./toolsets.ts";
 import { bundleWorkflow } from "./bundle.ts";
 import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode, SubmittableNode } from "./capability.ts";
 import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type InFlightDecision, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
@@ -562,12 +562,16 @@ export class Session {
 		}
 		// What runs, for `describe`: a toolset is code from the project, bundled once per run.
 		if (Object.keys(bundles).length > 0) this.#note("toolsets", bundles);
+		const writes: Record<string, string[]> = {};
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
 			if (resolved.unknown !== null) throw new RunRefused({ type: "unknown_tool", name: resolved.unknown });
 			if (resolved.taken !== null) throw new RunRefused({ type: "tool_name_taken", agent, name: resolved.taken });
 			for (const w of resolved.warnings) this.#warn(w);
+			for (const t of resolved.tools) if (writesOutside(t.annotations)) (writes[t.id] ??= []).push(agent);
 		}
+		// Who holds a tool that may write outside, for `describe`.
+		this.#note("writes", writes);
 		return bundles;
 	}
 

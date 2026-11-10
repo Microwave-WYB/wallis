@@ -106,6 +106,14 @@ const LOOP_STATE_CHARS = 2000;
 /** The workflow's agents, by name: a session value names its agent. */
 const agents = new Map<string, AgentDef>();
 
+/**
+ * What the workflow declares: a node the body calls must be the declared
+ * value itself (a value of the same name defined elsewhere is not it), and
+ * a tool must come from a declared toolset or MCP server. Anything else is
+ * `Refused`, as the types say.
+ */
+const declared = { commands: new Map<string, CommandDef>(), orchestrators: new Map<string, unknown>(), toolsets: new Set<string>(), servers: new Set<string>() };
+
 /** What an agent call answers with: its output and the session value after it. */
 const ANSWER = { type: "object", required: ["output", "session", "layers"], properties: { session: { type: "string" }, layers: { type: "array", items: { type: "string" } } } };
 
@@ -173,6 +181,7 @@ function makeCtx(path: string, seed: number): Ctx {
 				const desc = toolDesc(node);
 				if (desc === null) return Promise.reject(new SchemaError("ctx.call", ["not a node or a tool"]));
 				if (desc.kind !== "custom" && desc.kind !== "mcp_tool") return Promise.reject(new SchemaError("ctx.call", ["only toolset tools and MCP tools can be called from the body"]));
+				if (desc.kind === "custom" ? !declared.toolsets.has(desc.toolset) : !declared.servers.has(desc.server)) return Promise.reject(new Refused({ type: "unknown_tool", name: toolId(desc) }));
 				return callTool(next(), toolId(desc), input, schema) as never;
 			}
 			// A session value: plain data, so its shape is checked like any input.
@@ -191,6 +200,8 @@ function makeCtx(path: string, seed: number): Ctx {
 			const subject = `input of ${node.kind} ${node.name}`;
 			const errors = schemaErrors(node.input, input);
 			if (errors.length > 0) return Promise.reject(new SchemaError(subject, errors));
+			if (node.kind === "command" && declared.commands.get(node.name) !== node) return Promise.reject(new Refused({ type: "unknown_command", name: node.name }));
+			if (node.kind === "orchestrator" && declared.orchestrators.get(node.name) !== node) return Promise.reject(new Refused({ type: "unknown_orchestrator", name: node.name }));
 			const id = next();
 			switch (node.kind) {
 				case "command":
@@ -203,6 +214,7 @@ function makeCtx(path: string, seed: number): Ctx {
 		}) as unknown as Ctx["call"],
 		// A new session is a value: no id is taken, and two are equal.
 		session(agent, options) {
+			if (agents.get(agent.name) !== agent) throw new Refused({ type: "unknown_agent", name: agent.name });
 			const session: Session = { kind: "session", agent: agent.name, id: null, layers: [...(options?.from?.layers ?? [])] };
 			return session as never;
 		},
@@ -373,6 +385,10 @@ export function install(def: WorkflowDef): void {
 	const g = globalThis as Record<string, unknown>;
 	const commands = commandsOf(def);
 	for (const a of def.spec.agents) agents.set(a.name, a);
+	for (const c of def.spec.commands ?? []) declared.commands.set(c.name, c);
+	for (const o of def.spec.orchestrators ?? []) declared.orchestrators.set(o.name, o);
+	for (const t of def.spec.toolsets ?? []) declared.toolsets.add(toolsetDecl(t)?.path ?? "");
+	for (const server of Object.keys(def.spec.mcp ? (mcpDecl(def.spec.mcp)?.config.mcpServers ?? {}) : {})) declared.servers.add(server);
 	g.__wallis_declare = () => JSON.stringify(declarations(def));
 	// False when no request of this body waits for `id` (a result for an
 	// earlier execution of the body; it is in the journal and hits later).

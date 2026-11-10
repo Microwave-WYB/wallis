@@ -121,3 +121,46 @@ test("a parallel key is escaped in request ids; a toolset declared twice with di
 	assert.throws(() => declarations(workflow({ ...base, toolsets: [a, b] })), /toolset .\/tools\/lib.ts is declared twice/);
 	assert.doesNotThrow(() => declarations(workflow({ ...base, toolsets: [a, a] })));
 });
+
+test("an undeclared node, agent or tool is refused at run time, even under a declared name", async () => {
+	const { fileURLToPath } = await import("node:url");
+	const workflow = fileURLToPath(new URL("fixtures/undeclared/workflow.ts", import.meta.url));
+	const commands = new FakeCommands({});
+	const done = await runWorkflow({ ...base, bins: { sh: "/bin/sh" }, workflow, dir: join(tmp(), "run"), input: null, executor: new FakeExecutor({}), commands });
+	assert.deepEqual(done.outcome, { type: "done", value: { command: "unknown_command", agent: "unknown_agent", orchestrator: "unknown_orchestrator", tool: "unknown_tool" } });
+	assert.equal(commands.calls.length, 0);
+});
+
+test("describe summarizes capabilities: write-capable tools and who holds them, questions, exec, network, binds", async () => {
+	const { describeWorkflow } = await import("../src/host/describe.ts");
+	const root = tmp("wallis-caps-");
+	const dir = join(root, "wf");
+	mkdirSync(join(dir, "tools"), { recursive: true });
+	mkdirSync(join(dir, "scripts"));
+	writeFileSync(
+		join(dir, "tools", "lib.ts"),
+		`import { Type, type WallisTool } from "wallis";
+export const post = { name: "post", label: "post", description: "Posts.", parameters: Type.Object({}), execute: async () => ({ content: [], details: undefined }) } satisfies WallisTool<ReturnType<typeof Type.Object>>;\n`,
+	);
+	writeFileSync(
+		join(dir, "workflow.ts"),
+		`import { defineAgent, defineModels, defineSandbox, orchestrator, toolset, Type, workflow } from "wallis";
+const models = defineModels({ default: "fake/default" });
+const shell = defineSandbox({}, { name: "shell", requires: ["bash"], volumes: ["./scripts:/scripts:ro", "cache:/var/cache/x"] });
+const node = defineSandbox({}, { name: "node", requires: ["node"] });
+const lib = toolset<typeof import("./tools/lib.ts")>("./tools/lib.ts", { sandbox: node });
+const poster = defineAgent({ models }, { name: "poster", model: "default", prompt: "p", input: Type.Null(), output: Type.Null(), tools: [lib.post] });
+const coder = defineAgent({ models }, { name: "coder", model: "default", prompt: "p", input: Type.Null(), output: Type.Null(), workspace: { access: "exec", sandbox: shell } });
+const ok = orchestrator({ name: "ok", description: "Publish it?", input: Type.Null(), output: Type.Boolean() });
+export default workflow({ name: "caps", models, agents: [poster, coder], orchestrators: [ok], toolsets: [lib], input: Type.Null(), output: Type.Any(), run: async () => null });\n`,
+	);
+	await runWorkflow({ ...base, bins: { bash: "/bin/bash", node: process.execPath }, workflow: join(dir, "workflow.ts"), dir: join(root, ".wallis", "runs", "r1"), root, input: null, executor: new FakeExecutor({}) });
+	const d = (await describeWorkflow(join(dir, "workflow.ts"), root)) as { capabilities: unknown };
+	assert.deepEqual(d.capabilities, {
+		writes: { from_run: "r1", tools: { "custom:./tools/lib.ts#post": ["poster"] } },
+		questions: [{ name: "ok", description: "Publish it?" }],
+		exec_agents: [{ agent: "coder", sandbox: "shell" }],
+		network: { toolsets: ["./tools/lib.ts"], mcp_servers: [], sandboxes: [] },
+		bind_volumes: [{ sandbox: "shell", host: "./scripts", target: "/scripts" }],
+	});
+});

@@ -116,6 +116,12 @@ command({
 });
 
 const inner = subWorkflow({ name: "inner", input: Type.Null(), output: Type.Number(), run: async () => 1 });
+// Nodes, toolsets and servers the workflow does not declare: the typed ctx refuses them.
+const stray = command({ name: "stray", sandbox: py, input: Type.Null(), output: Type.Null(), run: ["uv", "run"] });
+const strayAgent = defineAgent({ models }, { name: "stray_agent", model: "default", prompt: "", input: Type.Null(), output: Type.Null() });
+const strayQuestion = orchestrator({ name: "stray_question", input: Type.Null(), output: Type.Null() });
+const strayTools = toolset<typeof import("./fixtures/names/tools/other.ts")>("./tools/other.ts", { sandbox: nodeBox });
+const strayMcp = defineMcp({ mcpServers: { elsewhere: { command: "x" } } });
 const pick = orchestrator({ name: "pick", input: Type.Object({ question: Type.String() }), output: Type.Object({ choice: Type.Union([Type.Literal("a"), Type.Literal("b")]) }) });
 
 export default workflow({
@@ -136,6 +142,22 @@ export default workflow({
 		const answer: string = out.answer;
 		// @ts-expect-error: agents are called through sessions only
 		await ctx.call(ok, { q: "?", papers: [] });
+		// @ts-expect-error: a command the workflow does not declare
+		await ctx.call(stray, null);
+		// @ts-expect-error: an orchestrator node it does not declare
+		await ctx.call(strayQuestion, null);
+		// @ts-expect-error: a session of an agent it does not declare
+		ctx.session(strayAgent);
+		// @ts-expect-error: a tool of a toolset it does not declare
+		await ctx.call(strayTools.search, {});
+		// @ts-expect-error: a tool of an MCP server it does not declare
+		await ctx.call(strayMcp.elsewhere.find, {});
+		// Branches, iterations and map items get the same typed ctx.
+		await ctx.parallel({
+			// @ts-expect-error: inside a branch too
+			a: (c) => c.call(stray, null),
+			b: (c) => c.call(train, { model: { digest: "d", name: "m", media: "x" }, epochs: 1 }),
+		});
 		// An orchestrator node's answer is typed by its output schema.
 		const picked: "a" | "b" = (await ctx.call(pick, { question: "a or b?" })).choice;
 		// @ts-expect-error: and an answer of another type does not fit it

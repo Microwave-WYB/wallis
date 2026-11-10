@@ -227,10 +227,18 @@ Prototype choices:
 - `describe` shows the warnings of the latest preflight of that workflow in
   the project, and each toolset's bundle digest from it; it does not start
   tool processes itself.
-- A toolset's body-call digest is its tool id, not its code: like an MCP
-  server, a changed module is the outside world changing. What code ran is
-  recorded instead: each preflight writes the toolsets' bundle digests
-  (`sha256` of module and runner, as run) to run metadata (`toolsets`).
+- A toolset tool's identity is (its bundle digest, export): the bundle is
+  made once per run, at its start, and pinned (see "The journal is a
+  cache"), so within a run a toolset never changes; a new run of changed
+  code is new tools. An MCP server's tool stays (server, tool): a changed
+  server is the outside world changing. The bundle digests are also in run
+  metadata (`toolsets`).
+- `describe` summarizes capabilities (this round): the tools given to
+  agents that may write outside (unannotated counts as a write) and the
+  agents that hold them (from the latest preflight, `writes`), the
+  orchestrator questions, agents with `exec`, what reaches the network
+  (toolsets, MCP servers, sandboxes with `network: "host"`), and every
+  bind volume.
 
 ## Goal (decided)
 
@@ -1244,6 +1252,20 @@ typed errors `Refused`, `AgentFailed` (`agent`, `failure`), `CommandFailed`
 CommandDef | WorkflowNode | OrchestratorDef`, discriminated by `kind`;
 `ctx.call` takes every kind but an agent (`CallableNode`), and tool values
 (toolset tools, MCP tools).
+
+**`ctx` is typed by what the workflow declares** (this round): the body's
+`ctx` is `Ctx<{ agents, commands, orchestrators, toolsets, servers }>`,
+inferred from `workflow({ agents, commands, orchestrators, toolsets, mcp })`.
+`ctx.call` on an undeclared command or orchestrator, `ctx.session` of an
+undeclared agent, and a tool of an undeclared toolset or MCP server are
+compile errors. Definitions carry their name as a literal type
+(`CommandDef<I, O, "train">`), a toolset tool its module's type
+(invariant), an MCP tool its server. Branches, iterations and map items get
+the same typed ctx. A nested workflow's `ctx` is the permissive `Ctx`. At
+run time the same rule holds whatever the types say: a node must be the
+declared value itself (another value under a declared name is not it),
+else `Refused` (`unknown_command`, `unknown_orchestrator`, `unknown_agent`,
+`unknown_tool`).
 
 The body gets `ctx.call(node | tool, input, schema?)`, `ctx.session(agent)`,
 `ctx.parallel`, `ctx.map`, `ctx.observe` and `ctx.seed`; nothing else.
