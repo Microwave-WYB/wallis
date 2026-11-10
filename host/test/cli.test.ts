@@ -3,7 +3,7 @@
 // cancel and pending.
 
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fakeExecutor, lines, logOf, normalized, onlyRun, project, runDir, tmp, wallis } from "./util.ts";
@@ -207,4 +207,38 @@ test("ids inside nested workflows and escaped branch keys parse: CLI interventio
 	assert.match(forked.stdout, /forgetting #3>#0/);
 	const forkId = /into (\S+),/.exec(forked.stdout)![1]!;
 	assert.ok(logOf(root, forkId).some((e) => e.type === "call_forgotten" && e.node === "#3>#0"));
+});
+
+test("--json: run, submit, fork and resume print one JSON object with the run id and its fields", () => {
+	const root = project();
+	mkdirSync(join(root, ".agents", "workflows", "q"), { recursive: true });
+	writeFileSync(
+		join(root, ".agents", "workflows", "q", "workflow.ts"),
+		`import { defineModels, orchestrator, Type, workflow } from "wallis";
+const ok = orchestrator({ name: "ok", input: Type.Null(), output: Type.Boolean() });
+export default workflow({ name: "q", models: defineModels({ default: "fake/default" }), agents: [], orchestrators: [ok], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.call(ok, null) });\n`,
+	);
+	const json = (args: string[]) => {
+		const r = wallis(root, [...args, "--json", "--executor", fakeExecutor]);
+		assert.equal(r.status, 0, r.stderr);
+		const lines = r.stdout.trim().split("\n");
+		assert.equal(lines.length, 1, `one JSON object, got: ${r.stdout}`);
+		return JSON.parse(lines[0]!) as { run_id: string; status: { type: string } | null; [k: string]: unknown };
+	};
+	const started = json(["run", "q"]);
+	assert.equal(started.status?.type, "idle");
+	const forked = json(["fork", started.run_id]);
+	assert.equal(forked.forked_from, started.run_id);
+	assert.notEqual(forked.run_id, started.run_id);
+	const submitted = json(["submit", started.run_id, "#0", "true"]);
+	assert.equal(submitted.run_id, started.run_id);
+	assert.deepEqual((submitted.submitted as { node: string }).node, "#0");
+	const resumed = json(["resume", forked.run_id]);
+	assert.equal(resumed.run_id, forked.run_id);
+	const detached = json(["run", "q", "--detach"]);
+	assert.equal(detached.detached, true);
+	// A refusal is JSON too.
+	const refused = wallis(root, ["submit", started.run_id, "#9", "true", "--json"]);
+	assert.equal(refused.status, 1);
+	assert.equal(typeof (JSON.parse(refused.stdout) as { refused: { type: unknown } }).refused.type, "string");
 });

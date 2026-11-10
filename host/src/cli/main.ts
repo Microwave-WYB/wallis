@@ -2,12 +2,12 @@
 // The wallis CLI. Runs live under `.wallis/runs/` of the project (the
 // working directory, or --root).
 //
-//   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--volume target=dir]... [--executor module] [--detach]
-//   wallis resume <run> [--model a=m]... [--budget kind=limit]... [--executor module] [--detach]
+//   wallis run <workflow> [--input json] [--seed n] [--model a=m]... [--volume target=dir]... [--executor module] [--detach] [--json]
+//   wallis resume <run> [--model a=m]... [--budget kind=limit]... [--executor module] [--detach] [--json]
 //   wallis describe <workflow>               its input, agents and the questions it may ask (JSON)
 //   wallis doc                               how to write and orchestrate workflows
 //   wallis send <run> <node> <text> [--turns n]   idle: delivered; running: queued as a steer
-//   wallis submit <run> <node> '<json>'      complete an orchestrator node (checked against its schema)
+//   wallis submit <run> <node> '<json>' [--json]   complete an orchestrator node (checked against its schema)
 //   wallis restart <run> <node> [note]       discard the node's progress, reissue with the note
 //   wallis cancel <run>
 //   wallis status <run> [--json]
@@ -17,7 +17,7 @@
 //   wallis ls | tree <run> [--full] | log <run> [--follow] [--since n] | show <run> [<node>]
 //   wallis interrupt <run> <node> | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
-//   wallis fork <run> [--forget <node>]... [--model a=m]... [--detach]   (copies the journal; unchanged calls hit; forgotten calls execute again)
+//   wallis fork <run> [--forget <node>]... [--model a=m]... [--detach] [--json]   (copies the journal; unchanged calls hit; forgotten calls execute again)
 //   wallis export <run> <artifact> <dir>
 //   wallis export <run> --output <dir> [--merge]   the whole output value: its artifacts by JSON path, and output.json
 //   wallis serve [--executor module]
@@ -138,12 +138,16 @@ function out(text: string): void {
 	if (text) process.stdout.write(`${text}\n`);
 }
 
-function report(dir: string): void {
+/** A run as JSON (`--json`): its id, status, nodes, observations, spend, what needs attention, warnings; plus `extra`. */
+function runJson(dir: string, extra: Record<string, unknown> = {}): string {
+	const view = inspectRun(dir);
+	return JSON.stringify({ run_id: view.runId, ...extra, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed: latestObservations(view), spent: view.run.spent, attention: attention(view), warnings: view.warnings });
+}
+
+function report(dir: string, extra: Record<string, unknown> = {}): void {
 	const view = inspectRun(dir);
 	const observed = latestObservations(view);
-	if (values.json) {
-		return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed, spent: view.run.spent, attention: attention(view), warnings: view.warnings }));
-	}
+	if (values.json) return out(runJson(dir, extra));
 	const items = attention(view);
 	out(items.length > 0 ? describe(items) : `Run ${view.runId}: ${view.run.status?.type}${view.stopped ? ", stopped" : ""}.`);
 	const labels = Object.entries(observed);
@@ -262,7 +266,7 @@ async function main(): Promise<number> {
 			writeLaunch(runPaths(dir), { workflow, root, executor, created: new Date().toISOString(), start });
 			if (values.detach) {
 				detach(dir);
-				out(`Started run ${runPaths(dir).id}.\nTo be notified when it needs attention, run in the background: npx wallis wait ${runPaths(dir).id}`);
+				out(values.json ? JSON.stringify({ run_id: runPaths(dir).id, detached: true }) : `Started run ${runPaths(dir).id}.\nTo be notified when it needs attention, run in the background: npx wallis wait ${runPaths(dir).id}`);
 				return 0;
 			}
 			await drive(dir, {});
@@ -277,7 +281,7 @@ async function main(): Promise<number> {
 			const options = { models: pairs(values.model), budget: budgets(values.budget), unpause: command === "resume" || values.unpause === true };
 			if (values.detach) {
 				detach(dir, [...(values.model ?? []).flatMap((m) => ["--model", m]), ...(values.budget ?? []).flatMap((b) => ["--budget", b]), "--unpause"]);
-				out(`Resuming run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
+				out(values.json ? JSON.stringify({ run_id: runPaths(dir).id, detached: true }) : `Resuming run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 				return 0;
 			}
 			await drive(dir, options);
@@ -323,7 +327,7 @@ async function main(): Promise<number> {
 			// Checked against the node's answer schema by the driver; a mismatch leaves it pending.
 			const refusal = refusedEntry(runPaths(dir), entry.id);
 			if (refusal) throw new RunRefused(refusal);
-			out(`Submitted to ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
+			out(values.json ? runJson(dir, { submitted: { node, id: entry.id } }) : `Submitted to ${node} of run ${runPaths(dir).id}. To be notified: npx wallis wait ${runPaths(dir).id}`);
 			return 0;
 		}
 		case "interrupt": {
@@ -485,13 +489,15 @@ async function main(): Promise<number> {
 			const forget = (values.forget ?? []).map((n) => parseNodeId(n));
 			const target = forkRun(source, join(runsDir(root), newRunId(name)), { forget, by: caller });
 			applyControl(target.dir, { type: "claimed", owner: caller });
-			out(`Forked ${runPaths(source).id} into ${target.id}${forget.length > 0 ? `, forgetting ${forget.join(", ")}` : ""}.`);
+			const forked = { forked_from: runPaths(source).id, forgotten: forget };
+			if (!values.json) out(`Forked ${runPaths(source).id} into ${target.id}${forget.length > 0 ? `, forgetting ${forget.join(", ")}` : ""}.`);
 			if (values.detach) {
 				detach(target.dir, (values.model ?? []).flatMap((m) => ["--model", m]));
+				if (values.json) out(JSON.stringify({ run_id: target.id, ...forked, detached: true }));
 				return 0;
 			}
 			await drive(target.dir, { models: pairs(values.model) });
-			report(target.dir);
+			report(target.dir, forked);
 			return 0;
 		}
 		case "export": {
@@ -527,7 +533,8 @@ main().then(
 	(error: unknown) => {
 		// A host that finds its run already driven has nothing to do.
 		if (error instanceof RunLocked && command === "drive") process.exit(0);
-		if (error instanceof RunRefused) out(`Refused: ${JSON.stringify(error.refusal)}`);
+		if (error instanceof RunRefused) out(values.json ? JSON.stringify({ refused: error.refusal }) : `Refused: ${JSON.stringify(error.refusal)}`);
+		else if (values.json) out(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
 		else if (error instanceof NotOwner) process.stderr.write(`wallis: ${error.message}\n`);
 		else process.stderr.write(`wallis: ${error instanceof Error ? error.message : String(error)}\n`);
 		process.exit(1);
