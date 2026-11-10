@@ -317,3 +317,20 @@ test("darktable still runs in a sandbox that requires it", { skip: (!existsSync(
 	// Its check runs inside the sandbox (prepare throws requires_broken if it cannot start).
 	assert.match(boxes.prepare()["darktable-cli"]!, /darktable/i);
 });
+
+test("a required program called by its real path still sees the name it was asked for as argv[0]", { skip: (!existsSync("/usr/bin/cc") && "no C compiler") || skip }, async () => {
+	const { symlinkSync } = await import("node:fs");
+	// A program that dispatches on argv[0], as clang++ (-> clang-23), busybox and ld do.
+	const dir = tmp("wallis-argv0-");
+	mkdirSync(join(dir, "bin"));
+	writeFileSync(join(dir, "main.c"), '#include <stdio.h>\n#include <string.h>\n#include <libgen.h>\nint main(int c, char **v) { printf("%s\\n", basename(v[0])); return 0; }\n');
+	const cc = spawnSync("/usr/bin/cc", ["-o", join(dir, "bin", "multi-23"), join(dir, "main.c")], { encoding: "utf8" });
+	assert.equal(cc.status, 0, cc.stderr);
+	symlinkSync("multi-23", join(dir, "bin", "multi++"));
+	const decls = { box: { requires: [{ name: "multi++", check: ["multi++"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const };
+	const boxes = new Sandboxes({ decls, bins: { "multi++": realpathSync(join(dir, "bin", "multi++")) }, volumes: {}, bindDigests: {}, cacheDir: join(tmp(), "envs") });
+	const sp = boxes.spawn("box", ["multi++", "x.cc"], { scratch: tmp(), inputs: null });
+	assert.ok(sp.args.includes(realpathSync(join(dir, "bin", "multi-23"))), "called by its real path");
+	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
+	assert.equal(r.stdout.trim(), "multi++", r.stderr);
+});

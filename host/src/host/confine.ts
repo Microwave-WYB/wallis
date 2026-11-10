@@ -286,9 +286,13 @@ export class Sandboxes {
 		} else args.push("--bind", dirs.scratch, LAYOUT.work);
 		// Volumes at their targets: a bind read-only, a named volume (a cache) writable.
 		for (const v of this.#volumes[name] ?? []) args.push(v.kind === "bind" ? "--ro-bind" : "--bind", v.dir, v.target);
-		args.push("--chdir", LAYOUT.work, "--");
 		const program = argv[0] ?? "";
-		args.push(s.requires.some((r) => r.name === program) && this.#bins[program] ? this.#bins[program]! : program, ...argv.slice(1));
+		const required = s.requires.some((r) => r.name === program) && this.#bins[program] !== undefined;
+		// Called by its real path, but with the name it was asked for as argv[0]: programs that
+		// dispatch on it (clang++ -> clang, busybox, ld) behave as that name.
+		if (required) args.push("--argv0", program);
+		args.push("--chdir", LAYOUT.work, "--");
+		args.push(required ? this.#bins[program]! : program, ...argv.slice(1));
 		// The environment inside: set with --setenv, never through the host-side spawn's own.
 		for (const key of Object.keys(s.environment)) {
 			const reason = sandboxEnvProblem(key);
