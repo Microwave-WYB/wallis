@@ -214,6 +214,8 @@ export interface SpawnOptions {
 	readonly secrets?: Readonly<Record<string, string>>;
 	/** MCP servers only: their overlay's network. Agents and commands never get one. */
 	readonly network?: "none" | "host";
+	/** An agent's process: named volumes are read-only for it (writable only for commands and tool sources). */
+	readonly agent?: boolean;
 	/** Setup only: the network on and `$WALLIS_ENV` writable. */
 	readonly setup?: { readonly envDir: string };
 }
@@ -286,8 +288,9 @@ export class Sandboxes {
 			for (const l of dirs.overlay.lowers) args.push("--overlay-src", l);
 			args.push("--overlay", dirs.scratch, dirs.overlay.ovl, LAYOUT.work);
 		} else args.push("--bind", dirs.scratch, LAYOUT.work);
-		// Volumes at their targets: a bind read-only, a named volume (a cache) writable.
-		for (const v of this.#volumes[name] ?? []) args.push(v.kind === "bind" ? "--ro-bind" : "--bind", v.dir, v.target);
+		// Volumes at their targets: a bind read-only; a named volume (a cache) writable for commands and
+		// tool sources, read-only for an agent (its writes would reach later runs outside every key).
+		for (const v of this.#volumes[name] ?? []) args.push(v.kind === "bind" || options.agent ? "--ro-bind" : "--bind", v.dir, v.target);
 		const program = argv[0] ?? "";
 		const required = s.requires.some((r) => r.name === program) && this.#bins[program] !== undefined;
 		// Called by its real path, but with the name it was asked for as argv[0]: programs that

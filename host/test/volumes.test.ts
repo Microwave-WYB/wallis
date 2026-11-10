@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { sandboxDigest } from "../src/host/confine.ts";
 import { bwrapAvailable, Sandboxes } from "../src/host/index.ts";
 import { bindDigest, checkDevices, namedVolumesDir, resolveVolumes, VolumeError } from "../src/host/volumes.ts";
@@ -439,4 +439,44 @@ test("a sandbox digest is canonical: the same declaration in another key order i
 	const b = { image: null, environment: { B: "2", A: "1" }, network: "none", devices: [], volumes: [], setup: [], requires: [] } as const;
 	assert.equal(sandboxDigest(a, {}, { "/x": "d1", "/y": "d2" }), sandboxDigest(b, {}, { "/y": "d2", "/x": "d1" }));
 	assert.notEqual(sandboxDigest(a, {}, {}), sandboxDigest({ ...a, environment: { A: "1" } }, {}, {}));
+});
+
+test("an agent's sandbox has named volumes read-only; a command's has them writable", { skip }, () => {
+	const workflowDir = tmp();
+	const decl = { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [parseVolume("agentcache:/var/cache/agent")], devices: [], network: "none", environment: {}, image: null } as const;
+	const volumes = resolveVolumes("w", workflowDir, { box: decl }, { root: workflowDir });
+	const boxes = new Sandboxes({ decls: { box: decl }, bins: { sh: realpathSync("/bin/sh") }, volumes, bindDigests: {} });
+	const run = (agent: boolean) => {
+		const sp = boxes.spawn("box", ["sh", "-c", "echo x > /var/cache/agent/f && echo wrote || echo refused"], { scratch: tmp(), inputs: null }, { agent });
+		return spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" }).stdout.trim();
+	};
+	assert.equal(run(true), "refused", "an agent's write would reach later runs outside every key");
+	assert.equal(run(false), "wrote");
+});
+
+test("a volume target may not sit on what a required program needs bound", async () => {
+	const { FakeExecutor, RunRefused, runWorkflow } = await import("../src/host/index.ts");
+	const { chmodSync } = await import("node:fs");
+	const { mkdtempSync, rmSync } = await import("node:fs");
+	const root = tmp("wallis-clash-");
+	// Outside /tmp (a target there is refused for another reason): a throwaway dir next to the tests.
+	const outside = mkdtempSync(join(import.meta.dirname, ".clash-"));
+	after(() => rmSync(outside, { recursive: true, force: true }));
+	const prefix = join(outside, "apps", "tool");
+	mkdirSync(join(prefix, "bin"), { recursive: true });
+	mkdirSync(join(prefix, "share"));
+	writeFileSync(join(prefix, "bin", "tool"), "#!/bin/sh\n");
+	chmodSync(join(prefix, "bin", "tool"), 0o755);
+	mkdirSync(join(root, "wf"));
+	writeFileSync(
+		join(root, "wf", "workflow.ts"),
+		`import { command, defineModels, defineSandbox, Type, workflow } from "wallis";
+const box = defineSandbox({}, { name: "box", requires: ["tool"], volumes: ["cache:${join(prefix, "share")}"] });
+const c = command({ name: "c", sandbox: box, input: Type.Null(), output: Type.Any(), run: ["tool"] });
+export default workflow({ name: "clash", models: defineModels({ default: "fake/default" }), agents: [], commands: [c], input: Type.Null(), output: Type.Any(), run: async () => null });\n`,
+	);
+	await assert.rejects(
+		runWorkflow({ workflow: join(root, "wf", "workflow.ts"), dir: join(tmp(), "run"), root, input: null, executor: new FakeExecutor({}), confine: "off", bins: { tool: join(prefix, "bin", "tool") }, inboxPollMs: null }),
+		(e: unknown) => e instanceof RunRefused && e.refusal.type === "invalid_volume" && /a required program needs/.test(JSON.stringify(e.refusal)),
+	);
 });

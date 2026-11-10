@@ -1190,7 +1190,13 @@ reads as a subset of a compose service.
   `$XDG_CACHE_HOME/wallis/volumes/<name>`, shared across runs and
   sandboxes that name it, and left out of every cache key. The contract:
   results must not depend on its contents (a cache: downloaded models, a
-  compiler cache, darktable's cache). wallis cannot check it.
+  compiler cache, darktable's cache). wallis cannot check it. A named
+  volume is writable for commands and tool sources only; in an agent's
+  sandbox (its `bash` and its file tools) it is read-only, since an
+  agent's writes would reach later runs outside every key (review fixes).
+  Concurrent runs share a named volume with no lock: a program that
+  writes one must tolerate concurrent writers (caches built by atomic
+  renames do).
 - **Targets** are absolute, plain (no `.`, `..` or trailing `/`), and
   overlap neither each other nor a dir the bwrap backend owns: `/usr`,
   `/etc`, `/bin`, `/sbin`, `/lib*`, `/proc`, `/dev`, `/in`, `/w`, `/tmp`,
@@ -1199,8 +1205,10 @@ reads as a subset of a compose service.
   types refuse the reserved dirs too, and preflight refuses the rest as
   `invalid_volume`.
 - Agents can use sandboxes with read-only binds and named volumes, which is
-  all a volume can be; their file tools see each volume at its target (a
-  bind read-only, a named volume writable with `write`).
+  all a volume can be; their file tools see each volume at its target,
+  read-only (named volumes too, see above).
+- No volume target may sit on or over a path a required program needs
+  bound (`invalid_volume`).
 - `describe` lists each sandbox's volumes, devices and network.
 - The host parses the workflow VM's declarations (a TypeBox schema,
   `host/src/host/declarations.ts`) and checks every sandbox rule again:
@@ -1402,7 +1410,7 @@ external result. The tools:
 - the workspace's file tools by access (`read`, `ls`; `write`, `edit`,
   `export_artifact`; `bash`), on the sandbox's paths (`/w` the workspace,
   read through its layers and written to the call's upper dir; `/in`,
-  `/in/trees/<hex>` and bind volumes read-only, named volumes writable);
+  `/in/trees/<hex>` and volumes read-only);
   an agent with a
   workspace gets one short note on these dirs in its system prompt;
 - `ask`, if declared;

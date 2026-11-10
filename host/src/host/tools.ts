@@ -341,12 +341,13 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			{ at: LAYOUT.work, stack: ws.work === null ? [ws.scratch] : [ws.work.upper, ...[...ws.work.lowers].reverse()], upper: ws.scratch },
 			{ at: LAYOUT.inputs, stack: [ws.inputs], upper: null },
 			...ws.trees.map((t) => ({ at: t.at, stack: [...t.lowers].reverse(), upper: null })),
-			...ws.volumes.map((v) => ({ at: v.target, stack: [v.dir], upper: v.kind === "named" ? v.dir : null })),
+			// An agent reads named volumes but never writes them (see Sandboxes.spawn).
+			...ws.volumes.map((v) => ({ at: v.target, stack: [v.dir], upper: null })),
 		];
 		const view = (path: string, create = false) => locate(roots, path.startsWith("/") ? path : `${LAYOUT.work}/${path}`, true, create);
 		const binds = ws.volumes.flatMap((v) => (v.kind === "bind" ? [v.target] : []));
 		const caches = ws.volumes.flatMap((v) => (v.kind === "named" ? [v.target] : []));
-		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files)${binds.length > 0 ? ` and ${binds.join(", ")}` : ""} are read-only${caches.length > 0 ? `; ${caches.join(", ")} ${caches.length > 1 ? "are caches" : "is a cache"} (writable, shared across runs)` : ""}`;
+		const where = `${LAYOUT.work} is your workspace (writable, the working directory); ${LAYOUT.inputs} (your input files)${binds.length > 0 ? ` and ${binds.join(", ")}` : ""} are read-only${caches.length > 0 ? `; ${caches.join(", ")} ${caches.length > 1 ? "are caches" : "is a cache"} (read-only, shared across runs)` : ""}`;
 		const builtins: Record<string, WallisToolRun> = {
 			read: {
 				name: "read",

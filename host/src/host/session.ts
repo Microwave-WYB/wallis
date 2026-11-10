@@ -37,7 +37,7 @@ import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
 import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, putBlob, resolveDrafts, verifyRefs } from "./artifacts.ts";
 import type { CommandRunner } from "./commands.ts";
-import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
+import { baseIdentity, bwrapAvailable, LAYOUT, programBinds, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
 import { putDialogue, readDialogue } from "./dialogues.ts";
 import { commitLayer, layersAfter, type Work, xattrToolsMissing } from "./layers.ts";
@@ -545,6 +545,14 @@ export class Session {
 			const bins = fresh || !meta?.bins
 				? resolveBins(this.#decl.core.name, decls, { callTime: o.bins, profile: this.#local.bins, path: o.callerPath ?? process.env.PATH })
 				: Object.fromEntries(Object.entries(meta.bins).map(([n, b]) => [n, b.path]));
+			// No volume may sit on (or over) what a required program needs bound at the same path.
+			for (const [sandbox, s] of Object.entries(decls)) {
+				const needed = s.requires.flatMap((r) => (bins[r.name] ? programBinds(bins[r.name]!, { root: resolve(this.#root) }) : []));
+				for (const v of this.#volumes[sandbox] ?? []) {
+					const clash = needed.find((p) => p === v.target || p.startsWith(`${v.target}/`) || v.target.startsWith(`${p}/`));
+					if (clash) throw new SandboxError({ type: "invalid_volume", sandbox, volume: v.target, reason: `the target overlaps ${clash}, which a required program needs` });
+				}
+			}
 			const confine = o.confine ?? "auto";
 			const can = confine !== "off" && bwrapAvailable();
 			if (confine === "require" && !can) throw new Error("bubblewrap is required but cannot create a sandbox here");
@@ -649,7 +657,8 @@ export class Session {
 		const boxes = this.#boxes;
 		if (!boxes) return { type: "unavailable", name, reason: "confinement is off or bubblewrap cannot create a sandbox here" };
 		const overlay = dirs.work === null ? undefined : { lowers: dirs.work.lowers, ovl: dirs.work.ovl };
-		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs, ...(overlay ? { overlay } : {}), trees: dirs.trees }) };
+		// An agent reads named volumes (caches) but never writes them: a write would reach later runs outside every key.
+		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs, ...(overlay ? { overlay } : {}), trees: dirs.trees }, { agent: true }) };
 	}
 
 	/**
