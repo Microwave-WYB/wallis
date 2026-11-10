@@ -5,6 +5,32 @@ owner), **proposed** (drafted, not yet confirmed) or **open**. Details the
 first prototype had to fix are marked **prototype choice**: the simplest
 option consistent with the section they sit in, not yet confirmed.
 
+## What changed for workflow authors (this round)
+
+- **Volumes replace mounts.** `defineMounts`, the workflow's `mounts` and
+  sandbox `mounts` are gone. A sandbox declares
+  `volumes: ["./scripts:/scripts:ro", "dt-cache:/root/.cache/darktable"]`
+  (a bind must say `:ro`; a named volume is a writable cache), `devices`,
+  `network: "none" | "host"` (for tool sources only), `environment` and
+  `image`. Paths inside sandboxes are the volume targets, not
+  `/mnt/<name>`. The caller gives a bind's host dir by target:
+  `--volume /data=<dir>`, MCP `volumes`, profile `volumes`. A run
+  snapshots its binds when it starts; a fork takes new snapshots. See
+  "Volumes".
+- **Names are labels.** Renaming an agent, command, sandbox or nested
+  workflow with the same definition keeps its journal entries. Runs from
+  before this round (`wallis-core/7`) are refused on resume; start them
+  again or keep the old checkout for them.
+- **`ctx` is typed by your declarations.** Calling a node, agent, toolset
+  tool or MCP server the workflow does not list is a compile error, and
+  `Refused` at run time.
+- **`wallis fork <run> --forget <node>…`** (MCP `fork`): re-execute
+  chosen calls in a fork; everything else hits.
+- **Small things:** `ctx.map(items, f, { concurrency })`; `parse(r,
+  input)`; agents see `/in/...` paths of their input artifacts;
+  `wallis tree --full`; cache hits are noted (`hit <id>`); `describe` has
+  `sandboxes` and `capabilities`.
+
 ## Everything is a value (decided, foundation round)
 
 **The only mutation is appending an event to the run log.** Every side
