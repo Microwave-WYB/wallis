@@ -17,7 +17,7 @@
 //   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> [<node>]
 //   wallis interrupt <run> <node> | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
-//   wallis fork <run> [--model a=m]... [--detach]   (copies the journal; unchanged calls hit)
+//   wallis fork <run> [--forget <node>]... [--model a=m]... [--detach]   (copies the journal; unchanged calls hit; forgotten calls execute again)
 //   wallis export <run> <artifact> <dir>
 //   wallis serve [--executor module]
 
@@ -73,6 +73,7 @@ const { values, positionals } = parseArgs({
 		seed: { type: "string" },
 		model: { type: "string", multiple: true },
 		volume: { type: "string", multiple: true },
+		forget: { type: "string", multiple: true },
 		bin: { type: "string", multiple: true },
 		turns: { type: "string" },
 		budget: { type: "string", multiple: true },
@@ -476,9 +477,10 @@ async function main(): Promise<number> {
 			control(source);
 			const meta = readMeta(runPaths(source));
 			const name = meta ? (meta.workflow.split("/").at(-2) ?? "run") : "run";
-			const target = forkRun(source, join(runsDir(root), newRunId(name)));
+			const forget = (values.forget ?? []).map((n) => parseNodeId(n));
+			const target = forkRun(source, join(runsDir(root), newRunId(name)), { forget, by: caller });
 			applyControl(target.dir, { type: "claimed", owner: caller });
-			out(`Forked ${runPaths(source).id} into ${target.id}.`);
+			out(`Forked ${runPaths(source).id} into ${target.id}${forget.length > 0 ? `, forgetting ${forget.join(", ")}` : ""}.`);
 			if (values.detach) {
 				detach(target.dir, (values.model ?? []).flatMap((m) => ["--model", m]));
 				return 0;

@@ -12,8 +12,8 @@ import type { Executor } from "./executor.ts";
 import { IdleNode, LiveNode, must, type NodeId, OwnedRun, type RunId, SteerableNode, SubmittableNode } from "./capability.ts";
 import { NotOwner, type Owner, serverOwner } from "./owner.ts";
 import { loadProfile } from "./profile.ts";
-import { applyControl, deliveryOf, inspectRun, type RunView } from "./query.ts";
-import { type Session, type SessionOptions, startSession } from "./session.ts";
+import { applyControl, deliveryOf, forkRun, inspectRun, type RunView } from "./query.ts";
+import { RunRefused, type Session, type SessionOptions, startSession } from "./session.ts";
 import { MachineSlots } from "./slots.ts";
 import { appendInbox, type InboxEntry, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir } from "./store.ts";
 
@@ -134,6 +134,21 @@ export class Runs {
 				owner: this.owner,
 			}),
 		);
+	}
+
+	/**
+	 * A fork of a run (the caller must own it), owned by the caller, which
+	 * re-executes against the copied journal; `forget` names calls it
+	 * executes again.
+	 */
+	async fork(runId: RunId, forget: readonly NodeId[] = []): Promise<Session> {
+		this.control(runId);
+		const source = resolveRunDir(this.root, runId);
+		const name = readMeta(runPaths(source))?.workflow.split("/").at(-2) ?? "run";
+		const target = forkRun(source, join(runsDir(this.root), newRunId(name)), { forget, by: this.owner });
+		const refusal = applyControl(target.dir, { type: "claimed", owner: this.owner });
+		if (refusal) throw new RunRefused(refusal);
+		return this.#track(await startSession({ ...this.#options(target.dir) }));
 	}
 
 	/** The live session of a run, resuming it if no session drives it. */

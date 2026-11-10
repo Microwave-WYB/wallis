@@ -164,3 +164,35 @@ export default workflow({ name: "caps", models, agents: [poster, coder], orchest
 		bind_volumes: [{ sandbox: "shell", host: "./scripts", target: "/scripts" }],
 	});
 });
+
+test("fork --forget: forgotten calls execute again in the fork; the rest hit; a bad id leaves no fork", async () => {
+	const { existsSync } = await import("node:fs");
+	const { RunRefused } = await import("../src/host/index.ts");
+	const p = project();
+	const dir = join(p.root, "run");
+	await runWorkflow({ ...base, workflow: p.workflow, dir, root: p.root, input: null, executor: new FakeExecutor({ writer: { submit: { ok: true } } }), commands: new FakeCommands({ echo: { stdout: '{"n":1}' } }) });
+	answer(dir);
+	const done = await runWorkflow({ ...base, workflow: p.workflow, dir, root: p.root, executor: new FakeExecutor({}) });
+	// Forget the command (#1): it runs again; the agent before it and the question after it hit.
+	const fork = forkRun(dir, join(p.root, "fork"), { forget: ["#1"] });
+	const executor = new FakeExecutor({});
+	const commands = new FakeCommands({ echo: { stdout: '{"n":2}' } });
+	const again = await runWorkflow({ ...base, workflow: p.workflow, dir: fork.dir, root: p.root, executor, commands });
+	assert.equal(commands.calls.length, 1);
+	assert.equal(executor.calls.length, 0);
+	assert.deepEqual(again.outcome, { type: "done", value: { ...(done.outcome as unknown as { value: object }).value, c: { n: 2 } } });
+	// The journal keeps the earlier attempt: the fork's log has the mark.
+	assert.ok(new EventLog(join(fork.dir, "log.jsonl")).read().some((e) => e.type === "call_forgotten" && e.node === "#1"));
+	// Forget the agent (#0): it runs again.
+	const second = forkRun(dir, join(p.root, "fork2"), { forget: ["#0"] });
+	const writer = new FakeExecutor({ writer: { submit: { ok: false } } });
+	const redone = await runWorkflow({ ...base, workflow: p.workflow, dir: second.dir, root: p.root, executor: writer, commands: new FakeCommands({}) });
+	assert.equal(writer.calls.length, 1);
+	assert.deepEqual((redone.outcome as unknown as { value: { a: unknown } }).value.a, { ok: false });
+	// A call the run never made is refused, typed, and no fork is left behind.
+	assert.throws(
+		() => forkRun(dir, join(p.root, "fork3"), { forget: ["#9"] }),
+		(e: unknown) => e instanceof RunRefused && JSON.stringify(e.refusal) === JSON.stringify({ type: "not_live", node: "#9" }),
+	);
+	assert.ok(!existsSync(join(p.root, "fork3")));
+});

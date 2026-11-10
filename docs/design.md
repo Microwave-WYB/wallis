@@ -848,6 +848,14 @@ Prototype choices:
   which re-executes; unchanged calls hit. The journal is per run and its
   forks, never shared implicitly with other runs: runs are independent
   samples.
+- `wallis fork <run> --forget <node>…` (MCP `fork` with `forget`; this
+  round) also forgets those calls in the fork: each gets a `call_forgotten`
+  mark (an intervention with `by`, checked by the core: a call already
+  forgotten, refused, or unknown is `not_live`, and a refused forget leaves
+  no fork behind). A forgotten call executes again when the body reaches
+  it; calls downstream miss only if their inputs change; a later call of
+  a forgotten agent call's session misses (its session value is new). The
+  source run and the fork's earlier attempts are untouched.
 
 Prototype choices:
 

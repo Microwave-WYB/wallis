@@ -271,6 +271,10 @@ pub type Event {
   Restarted(node: String, note: Option(String), by: String, turns: Int)
   /// Fails one node as an agent failure, for the body to handle.
   NodeCancelled(node: String, by: String)
+  /// Forgets a settled or open call (`wallis fork --forget`): a `Forgotten`
+  /// mark on its slot, so its next request is a new attempt and executes
+  /// again; calls downstream miss when their inputs change.
+  CallForgotten(node: String, by: String)
   AliasRebound(alias: String, from: String, to: String)
   BudgetRaised(kind: BudgetKind, limit: Float)
   ExecutorChanged(name: String)
@@ -510,6 +514,12 @@ pub fn event_to_json(event: Event) -> json.Json {
     NodeCancelled(node:, by:) ->
       json.object([
         #("type", json.string("node_cancelled")),
+        #("node", json.string(node)),
+        #("by", json.string(by)),
+      ])
+    CallForgotten(node:, by:) ->
+      json.object([
+        #("type", json.string("call_forgotten")),
         #("node", json.string(node)),
         #("by", json.string(by)),
       ])
@@ -766,6 +776,11 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use node <- decode.field("node", decode.string)
       use by <- decode.field("by", decode.string)
       decode.success(NodeCancelled(node:, by:))
+    }
+    "call_forgotten" -> {
+      use node <- decode.field("node", decode.string)
+      use by <- decode.field("by", decode.string)
+      decode.success(CallForgotten(node:, by:))
     }
     "alias_rebound" -> {
       use alias <- decode.field("alias", decode.string)

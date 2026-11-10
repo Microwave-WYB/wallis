@@ -47,6 +47,7 @@ export type Event =
 	| { type: "interrupt_requested"; node: string; by: string }
 	| { type: "restarted"; node: string; note: string | null; by: string; turns: number }
 	| { type: "node_cancelled"; node: string; by: string }
+	| { type: "call_forgotten"; node: string; by: string }
 	| { type: "alias_rebound"; alias: string; from: string; to: string }
 	| { type: "budget_raised"; kind: BudgetKind; limit: number }
 	| { type: "executor_changed"; name: string }

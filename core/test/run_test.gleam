@@ -854,6 +854,31 @@ pub fn names_are_labels_a_renamed_agent_hits_and_new_names_follow_the_declaratio
     == [types.Refuse(None, types.InvalidDeclaration("duplicate agent name"))]
 }
 
+pub fn a_forgotten_call_executes_again_and_the_journal_keeps_its_attempts_test() {
+  let events = [
+    started(basic()),
+    cached("#0", "n", JInt(0), 0),
+    returned("#0", summary("s0")),
+    cached("#1", "m", JInt(1), 0),
+    returned("#1", summary("s1")),
+  ]
+  let #(s, _, _) = replay(events)
+  let #(s, effects) = step(s, types.CallForgotten("#0", human))
+  assert effects == [Checkpoint]
+  // Forgotten: the same request is a new attempt; the other call still hits.
+  let #(s, effects) = step(s, cached("#0", "n", JInt(0), 0))
+  let assert [Checkpoint, CallAgent(id: "#0", ..)] = effects
+  let #(s, effects) = step(s, cached("#1", "m", JInt(1), 0))
+  assert effects == [Deliver("#1", summary("s1"))]
+  // A call already forgotten, or an unknown id, has nothing to forget: refused, typed.
+  let #(s2, _, _) =
+    replay(list.append(events, [types.CallForgotten("#0", human)]))
+  let #(_, effects) = step(s2, types.CallForgotten("#0", human))
+  assert effects == [types.Refuse(None, types.NotLive("#0"))]
+  let #(_, effects) = step(s, types.CallForgotten("#9", human))
+  assert effects == [types.Refuse(None, types.NotLive("#9"))]
+}
+
 // --- An uncaught node failure holds the run ---
 
 fn held_events() {

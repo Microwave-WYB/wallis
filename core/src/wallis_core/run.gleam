@@ -282,6 +282,7 @@ fn phase(event: Event) -> Phase {
     | types.InterruptRequested(..)
     | types.Restarted(..)
     | types.NodeCancelled(..)
+    | types.CallForgotten(..)
     | types.AliasRebound(..)
     | types.BudgetRaised(..)
     | types.ExecutorChanged(..)
@@ -601,6 +602,8 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
         ))
         restart(run, node, note, turns)
       })
+    types.CallForgotten(node:, by:) ->
+      intervene(run, by, fn(_owned) { forget(run, rid(node)) })
     types.NodeCancelled(node:, by:) ->
       intervene(run, by, fn(owned) {
         use node <- result.map(capability.check_live(
@@ -2279,6 +2282,38 @@ fn restart_agent(
     CommandCall(..) | ToolCall(..) | OrchestratorCall(..) | RefusedCall(..) ->
       Error(types.NotAnAgent(ids.request_text(id)))
   }
+}
+
+/// Forgets a call: a `Forgotten` mark on its slot's attempts (the journal
+/// keeps every earlier attempt), so its next request is a new attempt. A
+/// call already forgotten, or refused before it started, has nothing to
+/// forget: refused.
+fn forget(run: Run, id: RequestId) -> Result(#(Run, List(Effect)), Refusal) {
+  let not_live = types.NotLive(ids.request_text(id))
+  use #(slot, call) <- result.try(
+    lookup(run, id) |> result.replace_error(not_live),
+  )
+  let forgotten = case call {
+    AgentCall(attempts: [Tried(_), ..] as attempts, ..) ->
+      Ok(AgentCall(..call, attempts: [Forgotten, ..attempts]))
+    CommandCall(attempts: [Tried(_), ..] as attempts, ..) ->
+      Ok(CommandCall(..call, attempts: [Forgotten, ..attempts]))
+    ToolCall(attempts: [Tried(_), ..] as attempts, ..) ->
+      Ok(ToolCall(..call, attempts: [Forgotten, ..attempts]))
+    OrchestratorCall(attempts: [Tried(_), ..] as attempts, ..) ->
+      Ok(OrchestratorCall(..call, attempts: [Forgotten, ..attempts]))
+    AgentCall(attempts: [Forgotten, ..], ..)
+    | AgentCall(attempts: [], ..)
+    | CommandCall(attempts: [Forgotten, ..], ..)
+    | CommandCall(attempts: [], ..)
+    | ToolCall(attempts: [Forgotten, ..], ..)
+    | ToolCall(attempts: [], ..)
+    | OrchestratorCall(attempts: [Forgotten, ..], ..)
+    | OrchestratorCall(attempts: [], ..)
+    | RefusedCall(..) -> Error(not_live)
+  }
+  use call <- result.map(forgotten)
+  #(put(run, slot, call), [types.Checkpoint])
 }
 
 /// Fails one node as a typed failure; the body handles it.

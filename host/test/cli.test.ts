@@ -160,6 +160,23 @@ test("fork copies the journal (a cache): the fork re-executes and every unchange
 	assert.equal(wallis(root, ["fork", id, "--at", "3"]).status, 1, "--at is gone: positions do not matter");
 });
 
+test("fork --forget: the forgotten call executes again; the rest hit; an unknown node is refused", () => {
+	const root = project();
+	const { id } = askAndReply(root);
+	const execLog = join(tmp(), "exec.jsonl");
+	writeFileSync(execLog, "");
+	const forked = wallis(root, ["fork", id, "--forget", "#0"], { WALLIS_FAKE_EXEC_LOG: execLog });
+	assert.equal(forked.status, 0, forked.stderr);
+	assert.match(forked.stdout, /forgetting #0/);
+	const forkId = /into (\S+),/.exec(forked.stdout)![1]!;
+	assert.deepEqual(lines(execLog).map((e) => e.agent), ["scout"], "only the forgotten call ran again");
+	// Executed again, the scout asks its question again: the fork waits for the answer.
+	assert.deepEqual(status(root, forkId).status, { type: "idle", reason: null });
+	const refused = wallis(root, ["fork", id, "--forget", "#99"]);
+	assert.equal(refused.status, 1);
+	assert.match(refused.stdout, /Refused: \{"type":"not_live","node":"#99"\}/);
+});
+
 test("cancel finishes an idle run as cancelled", () => {
 	const root = project();
 	assert.equal(wallis(root, ask).status, 0);

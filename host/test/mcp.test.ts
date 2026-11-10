@@ -3,6 +3,7 @@
 // test of `wallis serve`.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -34,7 +35,7 @@ test("MCP: run a two-node workflow with a question through run, send, get_run an
 	try {
 		assert.match(client.getInstructions() ?? "", /npx wallis wait <run_id>/);
 		const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-		assert.deepEqual(tools, ["cancel", "describe", "get_run", "interrupt", "list_runs", "node_transcript", "pause", "pending", "restart", "resume", "run", "run_log", "run_tree", "send", "submit_result", "wait"]);
+		assert.deepEqual(tools, ["cancel", "describe", "fork", "get_run", "interrupt", "list_runs", "node_transcript", "pause", "pending", "restart", "resume", "run", "run_log", "run_tree", "send", "submit_result", "wait"]);
 		// interrupt enumerates only steerable agents, from the declarations.
 		for (const name of ["interrupt"]) {
 			const schema = (await client.listTools()).tools.find((t) => t.name === name)!.inputSchema as unknown as { properties: { agent: { enum: string[] } } };
@@ -107,7 +108,7 @@ test("MCP over stdio: wallis serve lists tools and runs a workflow", async () =>
 	const client = new Client({ name: "test", version: "0.0.0" });
 	await client.connect(transport);
 	try {
-		assert.equal((await client.listTools()).tools.length, 16);
+		assert.equal((await client.listTools()).tools.length, 17);
 		const r = (await client.callTool({ name: "run", arguments: { workflow: "two-node", input: { topic: "x" } } })) as Result;
 		const runId = JSON.parse(r.content[1]!.text).run_id;
 		const w = (await client.callTool({ name: "wait", arguments: { run_id: runId, timeout_s: 10 } })) as Result;
@@ -130,6 +131,30 @@ test("MCP: without a command runner from the executor module, commands run as sa
 		assert.ok(meta.bins!.sh!.path.startsWith("/"));
 	} finally {
 		await close();
+	}
+});
+
+test("MCP fork: forget re-executes a call in a new run the caller owns; another harness may not fork", async () => {
+	const root = project();
+	const mine = await connect(root, "harness:mine");
+	const theirs = await connect(root, "harness:theirs");
+	try {
+		const started = await mine.call("run", { workflow: "two-node", input: { topic: "x" } });
+		const runId = started.data.run_id as string;
+		await mine.call("wait", { run_id: runId, timeout_s: 10 });
+		const forked = await mine.call("fork", { run_id: runId, forget: ["#0"] });
+		assert.equal(forked.isError, false, forked.text);
+		const forkId = forked.data.run_id as string;
+		assert.notEqual(forkId, runId);
+		await mine.call("wait", { run_id: forkId, timeout_s: 10 });
+		const log = readFileSync(join(root, ".wallis", "runs", forkId, "log.jsonl"), "utf8");
+		assert.match(log, /"type":"call_forgotten","node":"#0","by":"harness:mine"/);
+		const refused = await theirs.call("fork", { run_id: runId, forget: ["#0"] });
+		assert.equal(refused.isError, true);
+		assert.match(refused.text, /owned by harness:mine/);
+	} finally {
+		await mine.close();
+		await theirs.close();
 	}
 });
 

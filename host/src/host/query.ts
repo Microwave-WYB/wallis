@@ -9,6 +9,7 @@ import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
 import { Core, type Event, type FailReason, type IdleCause, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
+import { RunRefused } from "./session.ts";
 import { acquireLock, listRuns, lockHolder, readMeta, type RunPaths, runPaths } from "./store.ts";
 
 export interface RunView {
@@ -340,17 +341,34 @@ export async function waitForAttention(dir: string, options: { timeoutMs?: numbe
  * events that ended the source are left out. The cache is per run and its
  * forks; it is never shared implicitly with other runs.
  */
-export function forkRun(source: string, target: string): RunPaths {
+/**
+ * A new run with the source's whole journal (a cache), which re-executes.
+ * `forget` names calls (request ids) the fork forgets: each gets a
+ * `call_forgotten` mark, so it executes again and calls downstream of it
+ * miss when their inputs change. Each forget is checked by the core first
+ * (`by` must own the run); a refused one leaves no fork behind.
+ */
+export function forkRun(source: string, target: string, options: { readonly forget?: readonly string[]; readonly by?: string } = {}): RunPaths {
 	const from = runPaths(source);
 	const to = runPaths(target);
 	if (existsSync(to.log)) throw new Error(`run ${to.id} already exists`);
 	const events = new EventLog(from.log).read().filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested");
+	if ((options.forget ?? []).length > 0) {
+		const core = Core.refold(events);
+		const by = options.by ?? core.snapshot().owner ?? "human";
+		for (const node of options.forget ?? []) {
+			const event: Event = { type: "call_forgotten", node, by };
+			const refused = core.step(event).find((e) => e.type === "refuse");
+			if (refused && refused.type === "refuse") throw new RunRefused(refused.refusal);
+			events.push(event);
+		}
+	}
 	mkdirSync(to.dir, { recursive: true });
 	// Blobs and layers first: the log names them. Both are immutable, so hardlinks share them.
 	shareBlobs(from.dir, to.dir);
 	if (existsSync(join(from.dir, "layers"))) spawnSync("cp", ["-al", join(from.dir, "layers"), join(to.dir, "layers")]);
 	// Where the fork comes from is a fact of its own log; meta.json is derived from it.
-	const at = events.length;
+	const at = events.filter((e) => e.type !== "call_forgotten").length;
 	events.push({ type: "noted", key: "created", value: new Date().toISOString() }, { type: "noted", key: "forked_from", value: { run_id: from.id, at } });
 	writeFileSync(to.log, events.map((e) => `${JSON.stringify(e)}\n`).join(""));
 	return to;

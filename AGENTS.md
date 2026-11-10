@@ -135,7 +135,8 @@ generics or wrappers that add no proof.
 - Interventions carry `by` and go through the capability checks on both
   sides (host, then core). Verbs: send (idle: reply; running: steer),
   submit (orchestrator nodes), interrupt (no message), restart, cancel,
-  pause, resume.
+  pause, resume, and fork `--forget` (a `call_forgotten` mark per call in
+  the fork).
 - Every value crossing the sandbox or executor boundary is schema-checked on
   both sides (`src/sdk/validate.ts`); keep new boundaries that way.
 - The body sees typed errors only (`Refused`, `AgentFailed`,

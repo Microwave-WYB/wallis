@@ -112,6 +112,23 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 	);
 
 	server.registerTool(
+		"fork",
+		{
+			description: "Fork a run you own into a new run that re-executes against its journal (unchanged calls hit). `forget` names calls (node ids) the fork executes again; calls downstream miss when their inputs change.",
+			inputSchema: { run_id: z.string(), forget: z.array(z.string()).optional().describe("Node ids to execute again, e.g. #3") },
+		},
+		async ({ run_id, forget }) => {
+			try {
+				const session = await runs.fork(parseRunId(run_id), (forget ?? []).map((n) => parseNodeId(n)));
+				const view = runs.view(parseRunId(session.paths.id));
+				return reply(`Forked ${run_id} into ${view.runId}.\n${summary(view)}`, data(view));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
 		"describe",
 		{
 			description: "A workflow's input and output schemas, its agents (model alias, MCP tools by mode), its MCP tool nodes, and the questions it may ask you: its orchestrator nodes with their answer schemas.",
