@@ -6,7 +6,7 @@
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import Type, { type Static, type TSchema } from "typebox";
-import { type CheckVolumes, parseVolume, type Volume } from "./volumes.ts";
+import { type CheckDevices, type CheckVolumes, parseVolume, type Volume } from "./volumes.ts";
 
 export { Type };
 export type { Static, TSchema };
@@ -217,7 +217,7 @@ export interface Resources {
 /** A binary the base must provide, checked inside the sandbox (default `<name> --version`). */
 export type Requirement<R extends string> = R | { readonly name: R; readonly check: readonly string[] };
 
-export interface SandboxSpec<R extends string, V extends readonly string[]> {
+export interface SandboxSpec<R extends string, V extends readonly string[], Dv extends readonly string[] = readonly []> {
 	/** Names the sandbox in logs, run metadata and the setup cache. */
 	readonly name: string;
 	/** Programs the host base must provide: called by their real path, checked inside the sandbox. */
@@ -233,8 +233,8 @@ export interface SandboxSpec<R extends string, V extends readonly string[]> {
 	 * cache key of every call in the sandbox.
 	 */
 	readonly volumes?: V & CheckVolumes<V>;
-	/** Device nodes bound as declared (a GPU: `/dev/dri`). */
-	readonly devices?: readonly string[];
+	/** Device nodes bound as declared (a GPU: `/dev/dri`): character devices, or dirs of them, under /dev. */
+	readonly devices?: Dv & CheckDevices<Dv>;
 	/** `"none"` (default) or `"host"`: the host's network, for tool sources only (agents and commands never get network). */
 	readonly network?: "none" | "host";
 	/** Environment variables of every process in the sandbox. */
@@ -260,14 +260,17 @@ export interface SandboxDef<R extends string = string> {
 	readonly image: string | null;
 }
 
-export function defineSandbox<const R extends string = never, const V extends readonly string[] = readonly []>(_env: object, spec: SandboxSpec<R, V>): SandboxDef<R> {
+export function defineSandbox<const R extends string = never, const V extends readonly string[] = readonly [], const Dv extends readonly string[] = readonly []>(
+	_env: object,
+	spec: SandboxSpec<R, V, Dv>,
+): SandboxDef<R> {
 	return {
 		kind: "sandbox",
 		name: spec.name,
 		requires: (spec.requires ?? []).map((r) => (typeof r === "string" ? { name: r, check: [r, "--version"] } : r)),
 		setup: spec.setup ?? [],
 		volumes: (spec.volumes ?? []).map((v: string) => parseVolume(v)),
-		devices: [...(spec.devices ?? [])],
+		devices: [...((spec.devices ?? []) as readonly string[])],
 		network: spec.network ?? "none",
 		environment: { ...(spec.environment ?? {}) },
 		image: spec.image ?? null,
@@ -472,6 +475,7 @@ export type Refusal =
 	| { readonly type: "invalid_volume"; readonly sandbox: string; readonly volume: string; readonly reason: string }
 	| { readonly type: "volume_missing"; readonly sandbox: string; readonly target: string; readonly path: string }
 	| { readonly type: "device_missing"; readonly sandbox: string; readonly device: string }
+	| { readonly type: "invalid_device"; readonly sandbox: string; readonly device: string; readonly reason: string }
 	| { readonly type: "unknown_volume"; readonly target: string }
 	| { readonly type: "input_too_large"; readonly agent: string; readonly field: string | null; readonly chars: number; readonly limit: number }
 	| { readonly type: "not_owner"; readonly by: string; readonly owner: string | null }

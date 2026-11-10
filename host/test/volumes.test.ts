@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { sandboxDigest } from "../src/host/confine.ts";
@@ -84,6 +84,18 @@ test("a declared device this host lacks is a typed refusal", () => {
 		(e: unknown) => e instanceof VolumeError && JSON.stringify(e.refusal) === JSON.stringify({ type: "device_missing", sandbox: "box", device: "/dev/wallis-none" }),
 	);
 	assert.throws(() => checkDevices({ box: { devices: ["/etc/passwd"] } }), VolumeError);
+	// Only character devices (or dirs of them) under /dev: anything else would be a writable host bind.
+	const refused = (device: string) => {
+		try {
+			checkDevices({ box: { devices: [device] } });
+			return null;
+		} catch (e) {
+			return e instanceof VolumeError ? e.refusal.type : String(e);
+		}
+	};
+	for (const device of ["/dev/../tmp", "/dev/./null", "/dev//null", "/dev/shm", "/dev/pts", "/dev/mqueue", "/dev/fd", "/dev/stdin", "/dev/"]) assert.equal(refused(device), "invalid_device", device);
+	assert.equal(refused("/dev/null"), null);
+	if (existsSync("/dev/dri")) assert.equal(refused("/dev/dri"), null, "a dir of devices, its by-path links included");
 });
 
 test("a bind's digest follows its content; a named volume is not part of the sandbox digest", () => {

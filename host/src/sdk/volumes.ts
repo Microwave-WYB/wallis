@@ -70,5 +70,17 @@ export type CheckVolume<V extends string> = V extends `${infer H}:${infer T}:${i
 			: Target<T, V>
 		: "error: a volume is <host path>:<target>:ro or <name>:<target>";
 
+/** A device as the types check it: a plain path under /dev, not a shared-state dir (the host checks it is a device). */
+export type CheckDevice<D extends string> = D extends `/dev/${infer R}`
+	? D extends `${string}/./${string}` | `${string}/../${string}` | `${string}/.` | `${string}/..` | `${string}//${string}` | `${string}/`
+		? "error: a device is a plain path under /dev"
+		: R extends "shm" | "pts" | "mqueue" | "fd" | `${"shm" | "pts" | "mqueue" | "fd"}/${string}`
+			? "error: shared state, not a device"
+			: D
+	: "error: a device is a plain path under /dev";
+
+/** Each device of a list, checked. */
+export type CheckDevices<D extends readonly string[]> = { readonly [K in keyof D]: CheckDevice<D[K]> };
+
 /** Each volume of a list, checked. */
 export type CheckVolumes<V extends readonly string[]> = { readonly [K in keyof V]: CheckVolume<V[K]> };

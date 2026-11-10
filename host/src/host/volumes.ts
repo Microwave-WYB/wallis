@@ -26,9 +26,9 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, posix, relative, resolve } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
 import type { Volume } from "../sdk/volumes.ts";
 
@@ -102,9 +102,45 @@ export function resolveVolumes(
 	return out;
 }
 
-/** Every device a sandbox declares exists on this host (bwrap binds it as declared); a missing one is refused. */
+/** Device dirs that are shared state, not devices: never bound. */
+const SHARED_DEV = ["/dev/shm", "/dev/pts", "/dev/mqueue", "/dev/fd"];
+
+/**
+ * Why a declared device is not one wallis binds (dev-bound, so writable),
+ * or null: a plain path (`posix.normalize`) under /dev whose real path is a
+ * character device under /dev, or a dir of them (`/dev/dri`), and not a
+ * shared-state dir.
+ */
+export function deviceProblem(device: string): string | null {
+	const inside = (p: string) => p.startsWith("/dev/") && !SHARED_DEV.some((d) => p === d || p.startsWith(`${d}/`));
+	if (posix.normalize(device) !== device || !device.startsWith("/dev/")) return "a device is a plain path under /dev";
+	if (!inside(device)) return "shared state, not a device";
+	const real = realpathSync(device);
+	if (!inside(real)) return `its real path ${real} is not a device under /dev`;
+	const check = (path: string): string | null => {
+		const st = statSync(path);
+		if (st.isCharacterDevice()) return null;
+		if (!st.isDirectory()) return `${path} is not a character device`;
+		for (const entry of readdirSync(path)) {
+			const real = realpathSync(join(path, entry));
+			if (!inside(real)) return `${join(path, entry)} leads to ${real}, not a device under /dev`;
+			const problem = check(real);
+			if (problem) return problem;
+		}
+		return null;
+	};
+	return check(real);
+}
+
+/** Every device a sandbox declares exists on this host and is one wallis binds; anything else is refused, typed. */
 export function checkDevices(sandboxes: Readonly<Record<string, { readonly devices: readonly string[] }>>): void {
-	for (const [sandbox, s] of Object.entries(sandboxes)) for (const device of s.devices) if (!device.startsWith("/dev/") || !existsSync(device)) throw new VolumeError({ type: "device_missing", sandbox, device });
+	for (const [sandbox, s] of Object.entries(sandboxes)) {
+		for (const device of s.devices) {
+			if (posix.normalize(device) === device && device.startsWith("/dev/") && !existsSync(device)) throw new VolumeError({ type: "device_missing", sandbox, device });
+			const reason = deviceProblem(device);
+			if (reason !== null) throw new VolumeError({ type: "invalid_device", sandbox, device, reason });
+		}
+	}
 }
 
 type HashCache = Record<string, string>;

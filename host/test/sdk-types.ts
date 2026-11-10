@@ -91,6 +91,18 @@ defineSandbox({}, { name: "s", volumes: ["./x:/usr/local:ro"] });
 // @ts-expect-error: nor be above one
 defineSandbox({}, { name: "s", volumes: ["cache:/run"] });
 
+// Devices: plain paths under /dev, never shared-state dirs.
+defineSandbox({}, { name: "s", devices: ["/dev/dri", "/dev/null"] });
+
+// @ts-expect-error: a device path with .. (it would bind /tmp, writable)
+defineSandbox({}, { name: "s", devices: ["/dev/../tmp/x"] });
+
+// @ts-expect-error: /dev/shm is shared state with the host, not a device
+defineSandbox({}, { name: "s", devices: ["/dev/shm"] });
+
+// @ts-expect-error: nor anything outside /dev
+defineSandbox({}, { name: "s", devices: ["/tmp"] });
+
 // @ts-expect-error: the old mount names are gone
 defineSandbox({}, { name: "s", mounts: ["kb"] });
 
