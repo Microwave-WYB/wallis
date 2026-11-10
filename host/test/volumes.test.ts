@@ -421,3 +421,15 @@ test("bind snapshots are hashed first and shared by content; a bind that holds w
 	mkdirSync(join(root, "data"));
 	assert.equal(refusal("./data"), null);
 });
+
+test("a bind's digest covers file modes and empty dirs", async () => {
+	const { chmodSync } = await import("node:fs");
+	const dir = tmp();
+	writeFileSync(join(dir, "run.sh"), "echo hi");
+	const plain = bindDigest(dir);
+	chmodSync(join(dir, "run.sh"), 0o755);
+	const executable = bindDigest(dir);
+	assert.notEqual(executable, plain, "making a script executable changes what runs");
+	mkdirSync(join(dir, "out"));
+	assert.notEqual(bindDigest(dir), executable, "an empty dir a program expects is part of it");
+});

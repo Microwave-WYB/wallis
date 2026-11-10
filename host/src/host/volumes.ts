@@ -26,7 +26,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, posix, relative, resolve } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
@@ -245,8 +245,9 @@ export function snapshotBind(store: string, dir: string): string {
 }
 
 /**
- * sha256 over the sorted relative paths and content hashes of every file
- * in the dir, and the targets of its symlinks. File hashes are reused
+ * sha256 over the sorted relative paths of everything in the dir: each
+ * file's content hash and mode, each dir (empty ones too) and its mode,
+ * each symlink's target, and any other entry's type. File hashes are reused
  * while a file's path (under `cacheAs`, by default the dir itself), mtime
  * and size are unchanged.
  */
@@ -257,9 +258,14 @@ export function bindDigest(dir: string, cacheAs = dir): string {
 	const walk = (d: string) => {
 		for (const entry of readdirSync(d, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
 			const path = join(d, entry.name);
-			if (entry.isDirectory()) walk(path);
-			else if (entry.isSymbolicLink()) lines.push(`${relative(dir, path)}\t-> ${readlinkSync(path)}`);
-			else if (entry.isFile()) {
+			const mode = (lstatSync(path).mode & 0o7777).toString(8);
+			if (entry.isDirectory()) {
+				// Every dir, empty ones too, with its mode.
+				lines.push(`${relative(dir, path)}/\tdir ${mode}`);
+				walk(path);
+			} else if (entry.isSymbolicLink()) lines.push(`${relative(dir, path)}\t-> ${readlinkSync(path)}`);
+			else if (!entry.isFile()) lines.push(`${relative(dir, path)}\tspecial ${lstatSync(path).mode.toString(8)}`);
+			else {
 				const st = statSync(path, { bigint: true });
 				const key = `${join(cacheAs, relative(dir, path))}\0${st.mtimeNs}\0${st.size}`;
 				let hash = cache[key];
@@ -268,7 +274,7 @@ export function bindDigest(dir: string, cacheAs = dir): string {
 					cache[key] = hash;
 					dirty = true;
 				}
-				lines.push(`${relative(dir, path)}\t${hash}`);
+				lines.push(`${relative(dir, path)}\t${hash} ${mode}`);
 			}
 		}
 	};

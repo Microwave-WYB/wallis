@@ -1211,8 +1211,9 @@ reads as a subset of a compose service.
 
 Prototype choices:
 
-- The digest is `bind:sha256:` over the sorted relative paths, file
-  sha256s and symlink targets. File hashes are cached by path, mtime and size in
+- The digest is `bind:sha256:` over the sorted relative paths: file
+  sha256s and modes, dirs (empty ones too) and their modes, symlink
+  targets, and the type of anything else. File hashes are cached by path, mtime and size in
   `$XDG_CACHE_HOME/wallis/file-hashes.json`; a content change that keeps
   all three is not detected.
 
