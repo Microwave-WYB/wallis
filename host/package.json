@@ -6,7 +6,9 @@
   "type": "module",
   "exports": {
     ".": "./src/sdk/index.ts",
-    "./host": "./src/host/index.ts"
+    "./host": "./src/host/index.ts",
+    "./executors": "./src/executors/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p . && tsc --noEmit -p ../.agents/workflows",

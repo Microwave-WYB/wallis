@@ -1381,6 +1381,13 @@ Prototype choices:
 
 ## SDK (prototype choice)
 
+Package entry points (this round): `wallis` (the SDK), `wallis/host`,
+`wallis/executors` (`PiExecutor`, pi-ai's `builtinModels` and
+`createModels`, the executor module's types) and `wallis/testing` (pi-ai's
+faux provider, `FakeExecutor`, `FakeCommands`, `conversation`), so a
+workflow outside the repo imports by package name with the package
+installed as a link; `wallis doc` gives its minimal tsconfig.
+
 The `wallis` package in `host/` exports `defineModels`, `defineMcp(config,
 overlay)`, `toolset(path, options)`, `ask`,
 `defineSandbox(env, spec)`, `defineAgent(env, spec)`, `command(spec)`,

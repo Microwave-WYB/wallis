@@ -93,5 +93,53 @@ export default workflow({
   (tools, questions): that is not reproduction.
 
 The same verbs are MCP tools of `wallis serve`: run, describe, send,
-submit_result, interrupt, restart, cancel, pause, resume, get_run,
-pending, wait.
+submit_result, interrupt, restart, cancel, pause, resume, fork,
+export_output, get_run, pending, wait.
+- `run`, `fork`, `resume`, `submit` take `--json`: one JSON object with
+  `run_id` and the run's status, nodes and what needs attention.
+- `wallis fork <run> --forget <node>`: the fork executes that call again;
+  reads after a write it re-executed read the outside again.
+- `wallis export <run> --output <dir>`: the whole output, its artifacts at
+  their JSON paths, and `output.json`.
+
+## A workflow outside a wallis checkout
+
+Install the wallis package into the workflow's project as a link (npm
+links a local directory; Node then runs its TypeScript from the real
+path), and import by package name:
+
+    npm install --save-dev <path to wallis>/host
+    npm install --save-dev @types/node typescript
+
+Its `package.json` says `"type": "module"` (the workflow and executor
+modules are ES modules).
+
+- `wallis`: the SDK (`workflow`, `defineAgent`, ...), in `workflow.ts`.
+- `wallis/executors`: for an executor module (`--executor executor.ts`):
+  `PiExecutor`, `builtinModels`, `createModels`, `type ExecutorKit`.
+- `wallis/testing`: scripted runs without a model: `fauxProvider`,
+  `fauxAssistantMessage`, `fauxText`, `fauxToolCall`, `FakeExecutor`,
+  `FakeCommands`, `conversation`.
+
+A minimal `tsconfig.json` next to `workflow.ts`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["*.ts", "tools/*.ts", "node_modules/wallis/types/assets.d.ts"]
+}
+```
+
+`npx tsc -p .` checks it; `npx wallis run ./workflow.ts --executor
+./executor.ts` runs it.
