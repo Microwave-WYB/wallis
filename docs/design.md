@@ -759,6 +759,15 @@ Prototype choices:
 - **Observations** (`ctx.observe`) are logged events; `wallis status`
   prints the latest value per label, `wallis tree` shows each one at its
   position, `wallis show <run>` lists them.
+- **Nondeterministic outputs** are warnings (this round): when a command
+  or tool call executes again under the same key (a restart, a forget, a
+  re-run after a crash) and its output's digest differs from the previous
+  attempt's, the host notes `nondeterministic_output <id>` = `{ type:
+  "nondeterministic_output", node, previous, current }` and prints it.
+  `wallis status`, `tree` and the workflow's `describe` (per run) show it.
+  Nothing else changes: the new output still misses everything
+  downstream. (A command's output is its parse, so stderr alone never
+  counts.)
 - **Cache hits** are logged as one host fact per host session (review
   fixes): when the session ends it notes `hits` = `{ host, count, by_kind,
   ids, digest }` (`host`: when it started; `ids`: the first 200; `digest`:

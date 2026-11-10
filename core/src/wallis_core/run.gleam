@@ -2933,6 +2933,55 @@ fn describe_attempts(
   })
 }
 
+fn answered(
+  attempts: List(Attempt(state)),
+  settled: fn(state) -> Option(Entry),
+) -> Option(Value) {
+  list.find_map(attempts, fn(a) {
+    case a {
+      Tried(state) ->
+        case settled(state) {
+          Some(Answered(v)) -> Ok(v)
+          Some(Errored(_)) | Some(Refused(_)) | None -> Error(Nil)
+        }
+      Forgotten -> Error(Nil)
+    }
+  })
+  |> option.from_result
+}
+
+/// The newest answer an attempt at a command or tool call's slot settled
+/// with (the live attempt's, once it settled; before, the previous
+/// attempt's): the host compares a re-execution's output with it.
+pub fn previous_answer(run: RunState, id: String) -> Option(Value) {
+  case run {
+    NotYetStarted -> None
+    Active(r) ->
+      case lookup(r, ids.request_id(id)) {
+        Error(Nil) -> None
+        Ok(#(_, call)) ->
+          case call {
+            CommandCall(attempts:, ..) ->
+              answered(attempts, fn(s) {
+                case s {
+                  CommandSettled(e) -> Some(e)
+                  CommandHeld(..) | CommandRunning(..) -> None
+                }
+              })
+            ToolCall(attempts:, ..) ->
+              answered(attempts, fn(s) {
+                case s {
+                  ToolSettled(e) -> Some(e)
+                  ToolHeld(..) | ToolRunning(..) | ToolInDoubt -> None
+                }
+              })
+            // Agents and orchestrators are not compared: their answers are not outputs of a program.
+            AgentCall(..) | OrchestratorCall(..) | RefusedCall(..) -> None
+          }
+      }
+  }
+}
+
 /// The attempts at a request's slot, newest first, for tests and display:
 /// `open`, `forgotten`, or how it settled and by which model.
 pub fn attempts(run: RunState, id: String) -> List(String) {

@@ -221,6 +221,11 @@ export class Core {
 		return gleam.attempt_count(this.#state, id);
 	}
 
+	/** The newest answer of a command or tool call's attempts (null when none answered). */
+	previousAnswer(id: string): Json | null {
+		return JSON.parse(gleam.previous_answer_json(this.#state, id)) as Json | null;
+	}
+
 	/** The host facts the log noted (`noted` events), by key. */
 	facts(): Record<string, Json> {
 		return JSON.parse(gleam.facts_json(this.#state)) as Record<string, Json>;

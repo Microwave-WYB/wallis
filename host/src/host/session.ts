@@ -1034,6 +1034,26 @@ export class Session {
 	}
 
 	/**
+	 * A command or tool call that executed again under the same key (a
+	 * restart, a forget, a re-run after a crash) and whose output differs
+	 * from its previous attempt's: a typed warning, noted
+	 * (`nondeterministic_output <id>`), with both digests. Its new output
+	 * invalidates everything downstream of it; nothing else changes. A
+	 * command's output is its parse (`{ result, output }`'s `output`), so
+	 * a different stderr alone is not one.
+	 */
+	#noteNondeterminism(id: string, output: Json): void {
+		const previous = this.#core.previousAnswer(id);
+		if (previous === null) return;
+		const recorded = previous !== null && typeof previous === "object" && !Array.isArray(previous) && "result" in previous && "output" in previous ? previous.output! : previous;
+		const digest = (v: Json) => `sha256:${createHash("sha256").update(canonical(v)).digest("hex")}`;
+		if (digest(recorded) === digest(output)) return;
+		const warning = { type: "nondeterministic_output", node: id, previous: digest(recorded), current: digest(output) };
+		process.stderr.write(`wallis: warning: ${id} executed again and its output changed (${warning.previous.slice(0, 19)} -> ${warning.current.slice(0, 19)}): everything downstream of it misses\n`);
+		this.#note(`nondeterministic_output ${id}`, warning);
+	}
+
+	/**
 	 * A request answered from the journal (a hit: answered, nothing else) is
 	 * counted; when the host session ends, one host fact, `hits`, sums them
 	 * up (see #noteHits). A fact, not the run: it never changes the run's
@@ -1490,7 +1510,10 @@ export class Session {
 						if (r.isError === true) return failed({ type: "tool_error", message: text.slice(0, 2000) });
 						const output = info.outputSchema === null ? (r.structuredContent ?? text) : r.structuredContent;
 						const out = this.#parseOutput(output, info.outputSchema ?? {}, null);
-						if (out.ok) this.#feed({ type: "tool_returned", id, output: out.value });
+						if (out.ok) {
+							this.#noteNondeterminism(id, out.value);
+							this.#feed({ type: "tool_returned", id, output: out.value });
+						}
 						else failed({ type: "tool_output_mismatch", errors: [out.error] });
 					}),
 				(error: unknown) =>
@@ -1552,7 +1575,10 @@ export class Session {
 							const files = storeCommandOutputs(this.paths.dir, workspace.scratch);
 							const result = { exit: r.exit, stdout: r.stdout, stderr: r.stderr, files };
 							const parsed = this.#parseCommand(effect.command, result, input, files === null ? null : commandOutputsDir(this.paths.dir, files));
-							if (parsed.ok) this.#feed({ type: "command_returned", id, output: { result, output: parsed.value }, minutes: r.minutes });
+							if (parsed.ok) {
+								this.#noteNondeterminism(id, parsed.value);
+								this.#feed({ type: "command_returned", id, output: { result, output: parsed.value }, minutes: r.minutes });
+							}
 							else failed(parsed.failure, r.minutes);
 						}
 						done();

@@ -26,12 +26,34 @@ export interface RunView {
 	readonly owner: string | null;
 	/** The owner still exists (a harness process that is still running, or the human). */
 	readonly ownerAlive: boolean;
+	/** Typed warnings the run's hosts noted: calls that executed again and gave another output. */
+	readonly warnings: readonly NondeterministicOutput[];
+}
+
+/** A command or tool call that executed again under the same key and gave another output. */
+export interface NondeterministicOutput {
+	readonly type: "nondeterministic_output";
+	readonly node: string;
+	readonly previous: string;
+	readonly current: string;
+}
+
+/** The `nondeterministic_output` warnings in a run's host facts, by node id. */
+export function warningsOf(facts: Readonly<Record<string, Json>>): NondeterministicOutput[] {
+	return Object.entries(facts).flatMap(([key, value]) => {
+		if (!key.startsWith("nondeterministic_output ")) return [];
+		const v = value as { type?: unknown; node?: unknown; previous?: unknown; current?: unknown } | null;
+		return v && v.type === "nondeterministic_output" && typeof v.node === "string" && typeof v.previous === "string" && typeof v.current === "string"
+			? [{ type: "nondeterministic_output" as const, node: v.node, previous: v.previous, current: v.current }]
+			: [];
+	});
 }
 
 export function inspectRun(dir: string): RunView {
 	const paths = runPaths(dir);
 	const events = new EventLog(paths.log).read();
-	const run = Core.refold(events).snapshot();
+	const core = Core.refold(events);
+	const run = core.snapshot();
 	const driver = lockHolder(paths);
 	const meta = readMeta(paths);
 	return {
@@ -45,6 +67,7 @@ export function inspectRun(dir: string): RunView {
 		events: events.length,
 		owner: run.owner ?? null,
 		ownerAlive: ownerAlive(run.owner ?? null),
+		warnings: warningsOf(core.facts()),
 	};
 }
 
@@ -462,6 +485,11 @@ export function latestObservations(v: RunView): Record<string, Json> {
 }
 
 /** One line per run, for `wallis ls` and `list_runs`. */
+/** A run's warnings, one line each. */
+export function warningLines(v: RunView): string[] {
+	return v.warnings.map((w) => `  warning: ${w.node} executed again and its output changed (${w.previous.slice(0, 19)}… -> ${w.current.slice(0, 19)}…): nondeterministic output`);
+}
+
 export function runLine(v: RunView): string {
 	const status = v.run.status?.type ?? "unknown";
 	const reason = v.run.status?.type === "idle" && v.run.status.reason ? ` (${v.run.status.reason.type})` : "";
@@ -475,7 +503,7 @@ export function runLine(v: RunView): string {
  */
 /** The run as a tree. `full`: each loop iteration's whole state, else its first 120 characters. */
 export function renderTree(v: RunView, options: { readonly full?: boolean } = {}): string {
-	const lines = [runLine(v)];
+	const lines = [runLine(v), ...warningLines(v)];
 	const depthOf = (id: string) => (id.match(/[.>]/g) ?? []).length;
 	for (const node of v.run.nodes) {
 		const indent = "  ".repeat(depthOf(node.id) + 1);

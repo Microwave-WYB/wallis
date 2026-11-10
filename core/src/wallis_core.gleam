@@ -13,6 +13,7 @@ import gleam/option.{None}
 import gleam/string
 import wallis_core/run.{type RunState}
 import wallis_core/types.{type Effect, type Event, InvalidEvent, Refuse}
+import wallis_core/value
 
 pub fn init() -> RunState {
   run.new()
@@ -66,4 +67,13 @@ pub fn semantics() -> String {
 /// re-executed misses.
 pub fn attempt_count(state: RunState, id: String) -> Int {
   list.length(run.attempts(state, id))
+}
+
+/// The newest answer of a command or tool call's attempts, as JSON (`null`
+/// when none answered): a re-execution's output is compared with it.
+pub fn previous_answer_json(state: RunState, id: String) -> String {
+  case run.previous_answer(state, id) {
+    option.Some(v) -> json.to_string(value.to_json(v))
+    option.None -> "null"
+  }
 }

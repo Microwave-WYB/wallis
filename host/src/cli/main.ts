@@ -55,7 +55,7 @@ import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { loadProfile } from "../host/profile.ts";
 import { ProcessCommands } from "../host/commands.ts";
-import { CONTINUE } from "../host/query.ts";
+import { CONTINUE, warningLines } from "../host/query.ts";
 import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
 import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir, writeLaunch } from "../host/store.ts";
@@ -139,12 +139,13 @@ function report(dir: string): void {
 	const view = inspectRun(dir);
 	const observed = latestObservations(view);
 	if (values.json) {
-		return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed, spent: view.run.spent, attention: attention(view) }));
+		return out(JSON.stringify({ run_id: view.runId, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed, spent: view.run.spent, attention: attention(view), warnings: view.warnings }));
 	}
 	const items = attention(view);
 	out(items.length > 0 ? describe(items) : `Run ${view.runId}: ${view.run.status?.type}${view.stopped ? ", stopped" : ""}.`);
 	const labels = Object.entries(observed);
 	if (labels.length > 0) out(`Observed: ${labels.map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 200)}`).join("; ")}`);
+	for (const line of warningLines(view)) out(line.trim());
 }
 
 /** `WALLIS_HOST`: `systemd`, `plain`, or (default) systemd when `systemd-run --user` works. */

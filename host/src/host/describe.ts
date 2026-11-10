@@ -11,6 +11,7 @@
 import { resolve } from "node:path";
 import type { Json } from "../sdk/index.ts";
 import { declarationsOf } from "./sandbox.ts";
+import { warningsOf } from "./query.ts";
 import { listRuns, readMeta } from "./store.ts";
 
 const ACCESS = ["none", "read", "write", "exec"] as const;
@@ -23,6 +24,11 @@ export async function describeWorkflow(path: string, root: string): Promise<Json
 	const latest = runs.filter((r) => r.meta.warnings !== undefined).at(-1);
 	const bundled = runs.filter((r) => r.meta.toolsets !== undefined).at(-1);
 	const listed = runs.filter((r) => r.meta.writes !== undefined).at(-1);
+	// Nondeterministic outputs the workflow's runs in this project have shown, by run.
+	const nondeterministic = runs.flatMap((r) => {
+		const warnings = warningsOf(r.meta as unknown as Record<string, Json>);
+		return warnings.length > 0 ? [{ run: r.id, warnings }] : [];
+	});
 	const mcpConfig = ((d.mcp as { mcpServers?: Record<string, { url?: string }> } | null)?.mcpServers ?? {}) as Record<string, { url?: string }>;
 	return JSON.parse(
 		JSON.stringify({
@@ -61,6 +67,7 @@ export async function describeWorkflow(path: string, root: string): Promise<Json
 				bind_volumes: Object.entries(d.sandboxes).flatMap(([sandbox, s]) => s.volumes.flatMap((v) => (v.kind === "bind" ? [{ sandbox, host: v.host, target: v.target }] : []))),
 			},
 			tool_warnings: latest ? { from_run: latest.id, warnings: latest.meta.warnings } : null,
+			nondeterministic_outputs: nondeterministic,
 			toolset_bundles: bundled ? { from_run: bundled.id, digests: bundled.meta.toolsets } : null,
 		}),
 	) as Json;

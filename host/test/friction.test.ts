@@ -127,3 +127,38 @@ test("tree --full shows each loop iteration's whole state; the log keeps a long 
 	assert.match(full, /"notes": "x{3000}END"/);
 	assert.match(full, /"i": 0/);
 });
+
+test("a command that executed again and gave another output is a typed warning, in status, tree and describe; nothing else changes", async () => {
+	const { forkRun } = await import("../src/host/index.ts");
+	const { inspectRun, renderTree } = await import("../src/host/query.ts");
+	const { describeWorkflow } = await import("../src/host/describe.ts");
+	// A command whose output embeds the current time (like darktable's ICC header).
+	const wf = workflow(
+		`const stamp = command({ name: "stamp", sandbox: box, input: Type.Null(), output: Type.Object({ at: Type.String() }), run: ["sh", "-c", "date +%s%N"], parse: (r) => ({ at: r.stdout.trim() }) });`,
+		`agents: [], commands: [stamp], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.call(stamp, null)`,
+	);
+	let n = 0;
+	const clock = { run: async () => ({ exit: 0, stdout: `${Date.now()}${n++}\n`, stderr: "", minutes: 0, timedOut: false }) };
+	const root = join(tmp(), "proj");
+	const dir = join(root, ".wallis", "runs", "r1");
+	await runWorkflow({ ...base, workflow: wf, dir, root, executor: new FakeExecutor({}), commands: clock });
+	assert.deepEqual(inspectRun(dir).warnings, []);
+	const fork = forkRun(dir, join(root, ".wallis", "runs", "r2"), { forget: ["#0"] });
+	const r = await runWorkflow({ ...base, workflow: wf, dir: fork.dir, root, executor: new FakeExecutor({}), commands: clock });
+	assert.equal(r.outcome?.type, "done", "no behaviour change");
+	const [w] = inspectRun(fork.dir).warnings;
+	assert.equal(w?.type, "nondeterministic_output");
+	assert.equal(w?.node, "#0");
+	assert.match(w!.previous, /^sha256:[0-9a-f]{64}$/);
+	assert.notEqual(w!.previous, w!.current);
+	assert.match(renderTree(inspectRun(fork.dir)), /warning: #0 executed again and its output changed/);
+	const described = (await describeWorkflow(wf, root)) as { nondeterministic_outputs: { run: string }[] };
+	assert.deepEqual(described.nondeterministic_outputs.map((x) => x.run), ["r2"]);
+	// The same output again: no warning.
+	const steady = { run: async () => ({ exit: 0, stdout: "same\n", stderr: "", minutes: 0, timedOut: false }) };
+	const d2 = join(root, ".wallis", "runs", "r3");
+	await runWorkflow({ ...base, workflow: wf, dir: d2, root, input: null, executor: new FakeExecutor({}), commands: steady });
+	const f2 = forkRun(d2, join(root, ".wallis", "runs", "r4"), { forget: ["#0"] });
+	await runWorkflow({ ...base, workflow: wf, dir: f2.dir, root, executor: new FakeExecutor({}), commands: steady });
+	assert.deepEqual(inspectRun(f2.dir).warnings, []);
+});
