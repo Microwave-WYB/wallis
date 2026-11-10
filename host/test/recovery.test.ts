@@ -108,11 +108,14 @@ test("R2: SIGKILL at turn 3; the resumed node continues at turn 3 and turns 1-2 
 
 test("R2: SIGKILL between a checkpoint blob and the event that names it: the blob is unreferenced, the run resumes from the checkpoint before it", async () => {
 	const dir = join(tmp(), "run");
-	// The third checkpoint blob is written; the host dies before journaling it.
-	const killed = spawnSync(process.execPath, [resolve(here, "fixtures/crash/drive.ts"), dir, "99"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, WALLIS_CRASH_AT: "blob:3" } });
+	// The third checkpoint blob is written (the first blob is the workflow bundle); the host dies before journaling it.
+	const killed = spawnSync(process.execPath, [resolve(here, "fixtures/crash/drive.ts"), dir, "99"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, WALLIS_CRASH_AT: "blob:4" } });
 	assert.equal(killed.signal, "SIGKILL", killed.stderr);
-	const named = new Set(new EventLog(join(dir, "log.jsonl")).read().flatMap((e) => (e.type === "agent_progressed" ? [e.dialogue.slice("sha256:".length)] : [])));
-	assert.equal(named.size, 2);
+	const log = new EventLog(join(dir, "log.jsonl")).read();
+	const dialogues = log.flatMap((e) => (e.type === "agent_progressed" ? [e.dialogue.slice("sha256:".length)] : []));
+	assert.equal(dialogues.length, 2);
+	const bundle = (log[0] as { pin: { workflow_digest: string } }).pin.workflow_digest.slice("sha256:".length);
+	const named = new Set([...dialogues, bundle]);
 	const stored = (await import("node:fs")).readdirSync(join(dir, "blobs"));
 	// Every blob the log names is whole; the third is in the store, named by nothing.
 	for (const hex of named) assert.ok(stored.includes(hex));

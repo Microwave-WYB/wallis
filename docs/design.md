@@ -1120,9 +1120,16 @@ reads as a subset of a compose service.
   sandbox binds is `unknown_volume(target)`.
 - **A bind's content digest is part of the cache key** of every command
   and agent call whose sandbox binds it (through the sandbox digest in the
-  node digest). It is no longer pinned: changing a bound script re-runs
-  the calls that use it, and only those, on resume or in a fork. (A
-  snapshot of each bind at run start is foundation step 9.)
+  node digest). It is no longer pinned.
+- **A run snapshots its binds when it starts** (foundation 9): each host
+  dir is copied into the run, `<run>/binds/<hex>` (`cp -a
+  --reflink=auto`: a reflink on filesystems that have them, else a plain
+  copy), named by its digest and noted (`binds`: host dir -> digest).
+  Calls bind the snapshot, so an edit while the run goes on never reaches
+  it; every later host of the run reuses the snapshot (a noted one that is
+  gone is `volume_missing`, never retaken). A fork takes a new snapshot:
+  edit a bound script, then fork (or `fork --forget`), and the calls that
+  bind it, and only those, run again.
 - **Named volumes**, `"<name>:<target>"`: a wallis-managed writable dir,
   `$XDG_CACHE_HOME/wallis/volumes/<name>`, shared across runs and
   sandboxes that name it, and left out of every cache key. The contract:
@@ -1142,8 +1149,8 @@ reads as a subset of a compose service.
 
 Prototype choices:
 
-- The digest is `bind:sha256:` over the sorted relative paths and file
-  sha256s. File hashes are cached by path, mtime and size in
+- The digest is `bind:sha256:` over the sorted relative paths, file
+  sha256s and symlink targets. File hashes are cached by path, mtime and size in
   `$XDG_CACHE_HOME/wallis/file-hashes.json`; a content change that keeps
   all three is not detected.
 
@@ -1169,7 +1176,8 @@ Prototype choices:
     bundle is a blob in the run's store, pinned as `toolset:<path>`, and
     every later host (and a fork) runs the pinned bundle whatever the
     source is now. A new run bundles the source as it is.
-  - The workflow is its bundle digest (`workflow_digest`, recorded; a
+  - The workflow is its bundle digest (`workflow_digest`, recorded; the
+    bundle itself is a blob in the run's store under that digest; a
     code change is logged as `code_changed`, followed by
     `workflow_declared` with the new code's agents, commands and
     orchestrators, which the core looks nodes up in from then on).

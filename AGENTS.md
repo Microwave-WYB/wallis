@@ -118,8 +118,9 @@ generics or wrappers that add no proof.
   in compose vocabulary: `volumes` (`"./x:/x:ro"` binds, read-only only;
   `"name:/target"` named caches), `devices`, `network`, `environment`.
   Never mount the workflow dir implicitly, never add a writable bind. A
-  bind's content digest is part of the cache key of every call that binds
-  it; named volumes are outside every key (results must not depend on
+  bind is snapshotted into the run when it starts (a fork takes a new
+  snapshot) and its digest is part of the cache key of every call that
+  binds it; named volumes are outside every key (results must not depend on
   them). Volume rules are both a type (`CheckVolume`) and a preflight
   parse (`parseVolume`, `resolveVolumes`).
 - Identity is by digest or structure; names are labels only. Never put a

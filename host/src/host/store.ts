@@ -90,6 +90,8 @@ const Facts = Type.Object({
 	toolsets: Type.Optional(Type.Record(Type.String(), Type.String())),
 	/** Preflight: each tool given to agents that may write outside (unannotated counts), and the agents that hold it. */
 	writes: Type.Optional(Type.Record(Type.String(), Type.Array(Type.String()))),
+	/** Each bind's snapshot, taken when the run (or its fork) started: host dir -> digest. */
+	binds: Type.Optional(Type.Record(Type.String(), Type.String())),
 });
 
 /** Parameters for the first session of a run started by `wallis run`. */

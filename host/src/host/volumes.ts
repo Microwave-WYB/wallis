@@ -5,8 +5,13 @@
 //   target. Its host path resolves against the workflow dir (`~/` against
 //   the home dir); the caller can give another host dir for a target
 //   (`--volume <target>=<dir>`, or the local profile's `volumes`), which
-//   later hosts of the run reuse. Its content digest is part of the cache
-//   key of every call in a sandbox that binds it.
+//   later hosts of the run reuse. When a run starts, each bind is
+//   snapshotted into the run (`<run>/binds/<hex>`, a content-addressed copy,
+//   reflinked where the filesystem can): its calls see the snapshot, so an
+//   edit made while the run is going on never reaches it; a later host of
+//   the run reuses the snapshot, and a fork takes a new one. The snapshot's
+//   digest is part of the cache key of every call in a sandbox that binds
+//   it.
 // - A named volume (`<name>:<target>`) is a wallis-managed writable dir,
 //   `$XDG_CACHE_HOME/wallis/volumes/<name>`, shared across runs and left
 //   out of every cache key: results must not depend on its contents.
@@ -19,8 +24,9 @@
 // Per-file hashes are cached by path, mtime and size in
 // `$XDG_CACHE_HOME/wallis/file-hashes.json`.
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
@@ -34,7 +40,7 @@ export interface VolumeProfile {
 
 /** A volume as a sandbox sees it: a host dir at a target, read-only (a bind) or writable (a named volume). */
 export type ResolvedVolume =
-	| { readonly kind: "bind"; readonly target: string; readonly dir: string }
+	| { readonly kind: "bind"; readonly target: string; readonly dir: string; readonly digest?: string }
 	| { readonly kind: "named"; readonly target: string; readonly dir: string; readonly name: string };
 
 export class VolumeError extends Error {
@@ -115,12 +121,40 @@ function loadCache(): HashCache {
 	}
 }
 
+/** Where a run keeps the snapshot of a bind by its digest. */
+export function bindSnapshotDir(runDir: string, digest: string): string {
+	return join(runDir, "binds", digest.slice(digest.lastIndexOf(":") + 1));
+}
+
+/**
+ * Snapshots a bind's host dir into the run: a copy (`cp -a
+ * --reflink=auto`: a reflink where the filesystem has them, else a plain
+ * copy), named by its digest; an identical snapshot already there is
+ * reused. Returns the digest.
+ */
+export function snapshotBind(runDir: string, dir: string): string {
+	mkdirSync(join(runDir, "binds"), { recursive: true });
+	const temp = join(runDir, "binds", `.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`);
+	const copied = spawnSync("cp", ["-a", "--reflink=auto", "--no-target-directory", dir, temp], { encoding: "utf8" });
+	if (copied.status !== 0) {
+		rmSync(temp, { recursive: true, force: true });
+		throw new Error(`cannot snapshot bind ${dir}: ${copied.stderr.trim()}`);
+	}
+	// File hashes come from the cache of the host dir: `cp -a` keeps mtimes and sizes.
+	const digest = bindDigest(temp, dir);
+	const target = bindSnapshotDir(runDir, digest);
+	if (existsSync(target)) rmSync(temp, { recursive: true, force: true });
+	else renameSync(temp, target);
+	return digest;
+}
+
 /**
  * sha256 over the sorted relative paths and content hashes of every file
- * in the dir. File hashes are reused while a file's path, mtime and size
- * are unchanged.
+ * in the dir, and the targets of its symlinks. File hashes are reused
+ * while a file's path (under `cacheAs`, by default the dir itself), mtime
+ * and size are unchanged.
  */
-export function bindDigest(dir: string): string {
+export function bindDigest(dir: string, cacheAs = dir): string {
 	const cache = loadCache();
 	let dirty = false;
 	const lines: string[] = [];
@@ -128,9 +162,10 @@ export function bindDigest(dir: string): string {
 		for (const entry of readdirSync(d, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
 			const path = join(d, entry.name);
 			if (entry.isDirectory()) walk(path);
+			else if (entry.isSymbolicLink()) lines.push(`${relative(dir, path)}\t-> ${readlinkSync(path)}`);
 			else if (entry.isFile()) {
 				const st = statSync(path, { bigint: true });
-				const key = `${path}\0${st.mtimeNs}\0${st.size}`;
+				const key = `${join(cacheAs, relative(dir, path))}\0${st.mtimeNs}\0${st.size}`;
 				let hash = cache[key];
 				if (!hash) {
 					hash = createHash("sha256").update(readFileSync(path)).digest("hex");

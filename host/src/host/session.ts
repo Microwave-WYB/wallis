@@ -35,7 +35,7 @@ import { dirname, join, resolve } from "node:path";
 import { type ArtifactRef, type CommandFailure, type Json, type Refusal, type ToolDesc, type ToolFailure, Type } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
-import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
+import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, putBlob, resolveDrafts, verifyRefs } from "./artifacts.ts";
 import type { CommandRunner } from "./commands.ts";
 import { baseIdentity, bwrapAvailable, LAYOUT, resolveBins, SandboxError, sandboxDigest, Sandboxes } from "./confine.ts";
 import { canonical } from "./render.ts";
@@ -49,7 +49,7 @@ import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, t
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
-import { bindDigest, checkDevices, type ResolvedVolume, resolveVolumes, VolumeError } from "./volumes.ts";
+import { bindDigest, bindSnapshotDir, checkDevices, type ResolvedVolume, resolveVolumes, snapshotBind, VolumeError } from "./volumes.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
@@ -406,6 +406,8 @@ export class Session {
 		const prior = this.#log.read();
 		this.#resumed = prior.length > 0;
 		this.#code = code;
+		// The bundle as it runs, in the run's store under its digest (the pin's workflow_digest).
+		if (putBlob(this.paths.dir, code) !== this.#digest) throw new Error("the workflow bundle's digest does not match its code");
 		this.#sandbox = await this.#newSandbox();
 		const decl = this.#sandbox.declare();
 		this.#decl = decl;
@@ -419,6 +421,7 @@ export class Session {
 				const dirs = new Map(Object.values(this.#volumes).flat().map((v) => [v.target, v.dir]));
 				this.#note("volumes", Object.fromEntries(Object.keys(callTime).map((t) => [t, dirs.get(t)!])));
 			}
+			this.#volumes = this.#snapshotBinds(this.#volumes);
 		} catch (error) {
 			if (error instanceof VolumeError) throw new RunRefused(error.refusal);
 			throw error;
@@ -520,11 +523,8 @@ export class Session {
 			const confine = o.confine ?? "auto";
 			const can = confine !== "off" && bwrapAvailable();
 			if (confine === "require" && !can) throw new Error("bubblewrap is required but cannot create a sandbox here");
-			// Bind volumes are read in place: their content digest is part of the cache key of every call that binds them.
-			const digests = new Map<string, string>();
-			const bindDigests = Object.fromEntries(
-				Object.entries(this.#volumes).map(([n, vs]) => [n, Object.fromEntries(vs.flatMap((v) => (v.kind === "bind" ? [[v.target, digests.get(v.dir) ?? digests.set(v.dir, bindDigest(v.dir)).get(v.dir)!]] : [])))]),
-			);
+			// A bind's snapshot digest is part of the cache key of every call that binds it.
+			const bindDigests = Object.fromEntries(Object.entries(this.#volumes).map(([n, vs]) => [n, Object.fromEntries(vs.flatMap((v) => (v.kind === "bind" ? [[v.target, v.digest ?? bindDigest(v.dir)]] : [])))]));
 			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, bindDigests[n] ?? {})]));
 			this.#boxes = can ? new Sandboxes({ decls, bins, volumes: this.#volumes, bindDigests }) : null;
 			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
@@ -625,6 +625,30 @@ export class Session {
 		if (!boxes) return { type: "unavailable", name, reason: "confinement is off or bubblewrap cannot create a sandbox here" };
 		const overlay = dirs.work === null ? undefined : { lowers: dirs.work.lowers, ovl: dirs.work.ovl };
 		return { type: "bwrap", name, spawn: (argv) => boxes.spawn(name, argv, { scratch: dirs.scratch, inputs: dirs.inputs, ...(overlay ? { overlay } : {}), trees: dirs.trees }) };
+	}
+
+	/**
+	 * Each bind volume as its snapshot in the run: taken now for a new run
+	 * (or a fork), and reused by every later host of the run, so an edit to
+	 * a host dir while the run goes on never reaches it. A noted snapshot
+	 * the run no longer has is refused (`volume_missing`), never retaken.
+	 */
+	#snapshotBinds(volumes: Record<string, ResolvedVolume[]>): Record<string, ResolvedVolume[]> {
+		const taken: Record<string, string> = { ...(readMeta(this.paths)?.binds ?? {}) };
+		const out = Object.fromEntries(
+			Object.entries(volumes).map(([sandbox, vs]) => [
+				sandbox,
+				vs.map((v): ResolvedVolume => {
+					if (v.kind !== "bind") return v;
+					const digest = (taken[v.dir] ??= snapshotBind(this.paths.dir, v.dir));
+					const dir = bindSnapshotDir(this.paths.dir, digest);
+					if (!existsSync(dir)) throw new VolumeError({ type: "volume_missing", sandbox, target: v.target, path: dir });
+					return { kind: "bind", target: v.target, dir, digest };
+				}),
+			]),
+		);
+		if (Object.keys(taken).length > 0) this.#note("binds", taken);
+		return out;
 	}
 
 	#nodeVolumes(sandbox: string | null): readonly ResolvedVolume[] {

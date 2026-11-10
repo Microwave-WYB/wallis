@@ -152,3 +152,57 @@ test("describe lists each sandbox's volumes, devices and network", async () => {
 		network: "none",
 	});
 });
+
+test("a snapshot of a bind: a copy named by its digest, the same digest as its host dir; symlinks count", async () => {
+	const { snapshotBind, bindSnapshotDir } = await import("../src/host/volumes.ts");
+	const { symlinkSync } = await import("node:fs");
+	const dir = tmp();
+	writeFileSync(join(dir, "a.py"), "print(1)");
+	symlinkSync("a.py", join(dir, "link"));
+	const runDir = tmp();
+	const digest = snapshotBind(runDir, dir);
+	assert.equal(digest, bindDigest(dir));
+	assert.equal(readFileSync(join(bindSnapshotDir(runDir, digest), "a.py"), "utf8"), "print(1)");
+	// Taken again unchanged: the same snapshot.
+	assert.equal(snapshotBind(runDir, dir), digest);
+	const { unlinkSync } = await import("node:fs");
+	unlinkSync(join(dir, "link"));
+	symlinkSync("elsewhere", join(dir, "link"));
+	assert.notEqual(bindDigest(dir), digest, "a symlink's target is part of the digest");
+});
+
+test("binds are snapshotted when a run starts: an edit while it waits never reaches it; a fork takes a new snapshot", { skip }, async () => {
+	const { appendInbox, EventLog, FakeExecutor, forkRun, ProcessCommands, readMeta, runPaths, runWorkflow } = await import("../src/host/index.ts");
+	const { readBlob } = await import("../src/host/artifacts.ts");
+	const root = tmp("wallis-snap-");
+	const wf = join(root, "wf");
+	mkdirSync(join(wf, "data"), { recursive: true });
+	writeFileSync(join(wf, "data", "x"), "old");
+	writeFileSync(
+		join(wf, "workflow.ts"),
+		`import { command, defineModels, defineSandbox, orchestrator, Type, workflow } from "wallis";
+const box = defineSandbox({}, { name: "box", requires: ["sh"], volumes: ["./data:/data:ro"] });
+const read = command({ name: "read", sandbox: box, input: Type.Object({ n: Type.Number() }), output: Type.Object({ v: Type.String() }), run: ["sh", "-c", 'printf "{\\\\"v\\\\":\\\\"%s\\\\"}" "$(cat /data/x)"'] });
+const go = orchestrator({ name: "go", input: Type.Null(), output: Type.Boolean() });
+export default workflow({ name: "snap", models: defineModels({ default: "fake/default" }), agents: [], commands: [read], orchestrators: [go], input: Type.Null(), output: Type.Any(),
+	run: async (ctx) => { const a = await ctx.call(read, { n: 1 }); await ctx.call(go, null); const b = await ctx.call(read, { n: 2 }); return { a: a.v, b: b.v }; } });\n`,
+	);
+	const dir = join(root, ".wallis", "runs", "r1");
+	const opts = { workflow: join(wf, "workflow.ts"), root, executor: new FakeExecutor({}), commands: new ProcessCommands(), confine: "require" as const, bins: { sh: realpathSync("/bin/sh") }, local: {}, inboxPollMs: null };
+	const first = await runWorkflow({ ...opts, dir, input: null });
+	assert.equal(first.run.nodes.at(-1)?.type, "orchestrator_pending");
+	const meta = readMeta(runPaths(dir))!;
+	assert.deepEqual(Object.keys(meta.binds!), [join(wf, "data")]);
+	// The workflow bundle is in the run's store under the pinned digest.
+	const started = new EventLog(join(dir, "log.jsonl")).read()[0] as { pin: { workflow_digest: string } };
+	assert.ok(readBlob(dir, started.pin.workflow_digest)?.includes("snap"));
+	writeFileSync(join(wf, "data", "x"), "new");
+	appendInbox(runPaths(dir), { id: "a1", type: "submit", node: "#1", value: true, by: "human" });
+	const done = await runWorkflow({ ...opts, dir });
+	assert.deepEqual(done.outcome, { type: "done", value: { a: "old", b: "old" } }, "the run sees its snapshot");
+	// A fork snapshots anew: the calls that bind it miss and see the edit.
+	const fork = forkRun(dir, join(root, ".wallis", "runs", "r2"));
+	appendInbox(runPaths(fork.dir), { id: "a2", type: "submit", node: "#1", value: true, by: "human" });
+	const forked = await runWorkflow({ ...opts, dir: fork.dir });
+	assert.deepEqual(forked.outcome, { type: "done", value: { a: "new", b: "new" } });
+});

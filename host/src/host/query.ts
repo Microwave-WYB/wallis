@@ -352,7 +352,10 @@ export function forkRun(source: string, target: string, options: { readonly forg
 	const from = runPaths(source);
 	const to = runPaths(target);
 	if (existsSync(to.log)) throw new Error(`run ${to.id} already exists`);
-	const events = new EventLog(from.log).read().filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested");
+	// A fork snapshots its binds anew (the `binds` fact is not copied): edits since the source started reach it.
+	const events = new EventLog(from.log)
+		.read()
+		.filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested" && !(e.type === "noted" && e.key === "binds"));
 	if ((options.forget ?? []).length > 0) {
 		const core = Core.refold(events);
 		const by = options.by ?? core.snapshot().owner ?? "human";
