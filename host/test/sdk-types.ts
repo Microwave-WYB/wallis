@@ -64,6 +64,22 @@ defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.N
 // @ts-expect-error: the old agent `mcp` selection is gone
 defineAgent({ models }, { name: "x", model: "default", prompt: "", input: Type.Null(), output: Type.Null(), mcp: { arxiv: ["search"] } });
 
+// Limits in compose vocabulary: mem_limit is a size with a unit, pids_limit a number.
+defineSandbox({}, { name: "s", mem_limit: "2g", pids_limit: 64 });
+defineSandbox({}, { name: "s", mem_limit: "512m" });
+
+// @ts-expect-error: mem_limit needs a unit
+defineSandbox({}, { name: "s", mem_limit: "2" });
+
+// @ts-expect-error: no such unit
+defineSandbox({}, { name: "s", mem_limit: "2x" });
+
+// @ts-expect-error: not a whole number
+defineSandbox({}, { name: "s", mem_limit: "1.5g" });
+
+// @ts-expect-error: pids_limit is a number, not a string
+defineSandbox({}, { name: "s", pids_limit: "16" });
+
 // Volumes in compose vocabulary: a bind's mode must be written, and only :ro exists.
 defineSandbox({}, { name: "s", volumes: ["./a:/a:ro", "~/b:/b:ro", "../c:/c:ro", "cache:/cache"] });
 

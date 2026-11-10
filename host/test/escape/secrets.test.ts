@@ -29,7 +29,7 @@ after(() => {
 const SECRET = "SUPERSECRET-sk-abc123";
 
 function boxes(environment: Record<string, string> = {}) {
-	const decl = { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [], devices: [], network: "none" as const, environment, image: null };
+	const decl = { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [], devices: [], network: "none" as const, environment, mem_limit: null, pids_limit: null, image: null };
 	return new Sandboxes({ decls: { box: decl }, bins: { sh: realpathSync("/bin/sh") }, volumes: {}, bindDigests: {} });
 }
 

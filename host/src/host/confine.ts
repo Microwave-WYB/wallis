@@ -39,6 +39,7 @@ import type { Json, Refusal } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 import { canonical } from "./render.ts";
 import { hostEnv, hostProgram, sandboxEnvProblem, secretEnvProblem } from "./hostbin.ts";
+import { inScope, type LimitHit, LimitsUnavailable, type Scope, scopeFor, scopeResult, watchScope } from "./limits.ts";
 import type { ResolvedVolume } from "./volumes.ts";
 
 export type SandboxDecl = Declarations["sandboxes"][string];
@@ -153,7 +154,9 @@ export function baseIdentity(): { distro: string; kernel: string } {
  */
 export function sandboxDigest(s: SandboxDecl, bins: Readonly<Record<string, string>>, bindDigests: Readonly<Record<string, string>>): string {
 	// Canonical JSON (sorted keys): the same declaration is the same digest whatever order its keys were written in.
-	const parts = { s, bins: s.requires.map((r) => [r.name, bins[r.name] ?? null]), binds: bindDigests };
+	// Limits are left out too: a result must not depend on them (hitting one is a failure).
+	const { mem_limit: _mem, pids_limit: _pids, ...declared } = s;
+	const parts = { s: declared, bins: s.requires.map((r) => [r.name, bins[r.name] ?? null]), binds: bindDigests };
 	return createHash("sha256").update(canonical(JSON.parse(JSON.stringify(parts)) as Json)).digest("hex");
 }
 
@@ -184,12 +187,31 @@ function gpuDevices(): string[] {
 	return devices.flatMap((d) => ["--dev-bind", d, d]);
 }
 
-/** One process to start: `command args` with exactly `env` (secrets never on the command line). */
+/**
+ * One sandboxed process: bwrap `args` with exactly `env` (secrets never on
+ * the command line), started only in its `scope` (`launch`): its memory and
+ * process limits.
+ */
 export interface Spawn {
 	readonly command: string;
 	readonly args: readonly string[];
 	readonly env: Readonly<Record<string, string>>;
 	readonly cwd: string;
+	readonly scope: Scope;
+}
+
+/**
+ * How a sandboxed process is started: in its scope (`limits.ts`);
+ * `limits_unavailable` without a user manager. `observed`: its runner reads
+ * the scope's result afterwards (`runSpawn`).
+ */
+export function launch(sp: Spawn, options: { readonly observed?: boolean } = {}): { command: string; args: string[]; env: Record<string, string> } {
+	try {
+		return inScope(sp.scope, sp.command, sp.args, sp.env, options);
+	} catch (error) {
+		if (error instanceof LimitsUnavailable) throw new SandboxError({ type: "limits_unavailable", reason: error.reason });
+		throw error;
+	}
 }
 
 export interface CallDirs {
@@ -204,6 +226,8 @@ export interface CallDirs {
 
 export interface SpawnOptions {
 	readonly gpu?: boolean;
+	/** A command's `resources.memoryGb`: its memory limit in place of the default (capped by `mem_limit`). */
+	readonly memoryGb?: number;
 	/** Variables set inside (`WALLIS_COMPUTE_MINUTES`), with `--setenv`. */
 	readonly env?: Readonly<Record<string, string>>;
 	/**
@@ -322,7 +346,8 @@ export class Sandboxes {
 			const reason = secretEnvProblem(key);
 			if (reason !== null) throw new SandboxError({ type: "invalid_environment", sandbox: name, key, reason });
 		}
-		return { command: hostProgram("bwrap"), args, env: { ...(options.secrets ?? {}) }, cwd: dirs.scratch };
+		const scope = scopeFor(s, options.memoryGb ? { memoryGb: options.memoryGb } : {});
+		return { command: hostProgram("bwrap"), args, env: { ...(options.secrets ?? {}) }, cwd: dirs.scratch, scope };
 	}
 
 	/**
@@ -375,8 +400,8 @@ export class Sandboxes {
 	#runSync(name: string, argv: readonly string[], options: SpawnOptions = {}): { status: number; stdout: string; stderr: string } {
 		const scratch = mkdtempSync(join(tmpdir(), "wallis-check-"));
 		try {
-			const sp = this.spawn(name, argv, { scratch, inputs: null }, options);
-			const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8", timeout: 600_000 });
+			const sp = launch(this.spawn(name, argv, { scratch, inputs: null }, options));
+			const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: scratch, encoding: "utf8", timeout: 600_000 });
 			return { status: r.status ?? 128, stdout: r.stdout ?? "", stderr: r.stderr ?? (r.error ? String(r.error) : "") };
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
@@ -407,15 +432,20 @@ export class Sandboxes {
 	}
 }
 
-/** Starts a sandboxed (or any) process; resolves with its result. Aborting kills it. */
+/**
+ * Starts a sandboxed process in its scope; resolves with its result.
+ * Aborting kills it; a limit hit stops its whole scope and is `limit`.
+ */
 export function runSpawn(
 	sp: Spawn,
 	stdin: string,
 	options: { readonly timeoutMs?: number | null; readonly signal?: AbortSignal } = {},
-): Promise<{ exit: number; stdout: string; stderr: string; timedOut: boolean; aborted: boolean; minutes: number }> {
+): Promise<{ exit: number; stdout: string; stderr: string; timedOut: boolean; aborted: boolean; minutes: number; limit: LimitHit | null }> {
 	const started = Date.now();
+	const scoped = launch(sp, { observed: true });
 	return new Promise((done, fail) => {
-		const child = spawn(sp.command, sp.args, { env: sp.env, cwd: existsSync(sp.cwd) ? sp.cwd : undefined, stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(scoped.command, scoped.args, { env: scoped.env, cwd: existsSync(sp.cwd) ? sp.cwd : undefined, stdio: ["pipe", "pipe", "pipe"] });
+		const watch = child.pid === undefined ? null : watchScope(child.pid, sp.scope, () => child.kill("SIGKILL"));
 		let stdout = "";
 		let stderr = "";
 		let timedOut = false;
@@ -425,11 +455,20 @@ export function runSpawn(
 		const timer = options.timeoutMs ? setTimeout(() => ((timedOut = true), child.kill("SIGKILL")), options.timeoutMs) : null;
 		const onAbort = () => ((aborted = true), child.kill("SIGKILL"));
 		options.signal?.addEventListener("abort", onAbort, { once: true });
-		child.on("error", fail);
+		child.on("error", (error) => (watch?.stop(), fail(error)));
+		child.on("exit", () => watch?.stop());
 		child.on("close", (code, signal) => {
 			if (timer) clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
-			done({ exit: code ?? (signal ? 128 : 1), stdout, stderr, timedOut, aborted, minutes: (Date.now() - started) / 60_000 });
+			watch?.stop();
+			const exit = code ?? (signal ? 128 : 1);
+			const result = { exit, stdout, stderr, timedOut, aborted, minutes: (Date.now() - started) / 60_000 };
+			const seen = watch?.hit() ?? null;
+			if (exit < 128) return done({ ...result, limit: seen });
+			// Killed by a signal: the OOM killer may have ended the scope before the watch saw it (systemd
+			// recorded it), and a failed scope is cleared either way. Our own kills are not limits.
+			const recorded = (limit: LimitHit | null) => done({ ...result, limit: seen ?? (timedOut || aborted ? null : limit) });
+			void scopeResult(sp.scope).then(recorded, () => recorded(null));
 		});
 		child.stdin.on("error", () => {});
 		child.stdin.end(stdin);

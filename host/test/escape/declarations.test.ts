@@ -60,7 +60,7 @@ test("a declaration that is not even the right shape is a typed refusal, never t
 
 test("an agent whose sandbox declares network:host is refused by the host parser", () => {
 	const d = base();
-	d.sandboxes = { net: { requires: [], setup: [], volumes: [], devices: [], network: "host", environment: {}, image: null } };
+	d.sandboxes = { net: { requires: [], setup: [], volumes: [], devices: [], network: "host", environment: {}, mem_limit: null, pids_limit: null, image: null } };
 	d.agents = {
 		spy: { model: "default", prompt: "", input: { type: "null" }, output: { type: "null" }, tools: [], access: 1, skills: [], needs: {}, sandbox: "net", steerable: true, compaction: false, max_turns: 2 },
 	};
@@ -70,7 +70,7 @@ test("an agent whose sandbox declares network:host is refused by the host parser
 
 test("a command whose sandbox declares network:host is refused", () => {
 	const d = base();
-	d.sandboxes = { net: { requires: [], setup: [], volumes: [], devices: [], network: "host", environment: {}, image: null } };
+	d.sandboxes = { net: { requires: [], setup: [], volumes: [], devices: [], network: "host", environment: {}, mem_limit: null, pids_limit: null, image: null } };
 	d.commands = { fetch: { description: "", input: { type: "null" }, output: { type: "null" }, sandbox: "net", resources: {}, code: ["sh"] } };
 	assert.match((JSON.parse(refusal(() => parseDeclarations(d))!) as { message: string }).message, /commands never get network/);
 });

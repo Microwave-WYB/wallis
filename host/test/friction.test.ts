@@ -51,7 +51,7 @@ test("ctx.map with a concurrency limit runs at most that many branches at once; 
 				most = Math.max(most, ++now);
 				await new Promise((r) => setTimeout(r, 20));
 				now--;
-				return { exit: 0, stdout: JSON.stringify(call.input), stderr: "", minutes: 0, timedOut: false };
+				return { exit: 0, stdout: JSON.stringify(call.input), stderr: "", minutes: 0, timedOut: false, limit: null };
 			},
 		};
 		const dir = join(tmp(), "run");
@@ -76,7 +76,7 @@ test("an agent's rendered input shows the /in path of each input artifact", asyn
 const look = defineAgent({ models }, { name: "look", model: "default", prompt: "Look.", input: Type.Object({ sheet: Artifact("image/png") }), output: Type.Null(), workspace: { access: "read" } });`,
 		`agents: [look], commands: [make], input: Type.Null(), output: Type.Any(), run: async (ctx) => { const m = await ctx.call(make, null); return (await ctx.call(ctx.session(look), { sheet: m.sheet }))[0]; }`,
 	);
-	const commands = { run: async (call: { workspace: { scratch: string } }) => (writeFileSync(join(call.workspace.scratch, "sheet.png"), "png"), { exit: 0, stdout: "", stderr: "", minutes: 0, timedOut: false }) };
+	const commands = { run: async (call: { workspace: { scratch: string } }) => (writeFileSync(join(call.workspace.scratch, "sheet.png"), "png"), { exit: 0, stdout: "", stderr: "", minutes: 0, timedOut: false, limit: null }) };
 	const executor = new FakeExecutor({ look: { submit: null } });
 	const r = await runWorkflow({ ...base, workflow: wf, dir: join(tmp(), "run"), executor, commands });
 	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
@@ -138,7 +138,7 @@ test("a command that executed again and gave another output is a typed warning, 
 		`agents: [], commands: [stamp], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.call(stamp, null)`,
 	);
 	let n = 0;
-	const clock = { run: async () => ({ exit: 0, stdout: `${Date.now()}${n++}\n`, stderr: "", minutes: 0, timedOut: false }) };
+	const clock = { run: async () => ({ exit: 0, stdout: `${Date.now()}${n++}\n`, stderr: "", minutes: 0, timedOut: false, limit: null }) };
 	const root = join(tmp(), "proj");
 	const dir = join(root, ".wallis", "runs", "r1");
 	await runWorkflow({ ...base, workflow: wf, dir, root, executor: new FakeExecutor({}), commands: clock });
@@ -155,7 +155,7 @@ test("a command that executed again and gave another output is a typed warning, 
 	const described = (await describeWorkflow(wf, root)) as { nondeterministic_outputs: { run: string }[] };
 	assert.deepEqual(described.nondeterministic_outputs.map((x) => x.run), ["r2"]);
 	// The same output again: no warning.
-	const steady = { run: async () => ({ exit: 0, stdout: "same\n", stderr: "", minutes: 0, timedOut: false }) };
+	const steady = { run: async () => ({ exit: 0, stdout: "same\n", stderr: "", minutes: 0, timedOut: false, limit: null }) };
 	const d2 = join(root, ".wallis", "runs", "r3");
 	await runWorkflow({ ...base, workflow: wf, dir: d2, root, input: null, executor: new FakeExecutor({}), commands: steady });
 	const f2 = forkRun(d2, join(root, ".wallis", "runs", "r4"), { forget: ["#0"] });
@@ -176,7 +176,7 @@ const edit = defineAgent({ models }, { name: "edit", model: "default", prompt: "
 		return { finals, notes: "two", workspace: ctx.files(s) };
 	}`,
 	);
-	const commands = { run: async (call: { input: unknown; workspace: { scratch: string } }) => (writeFileSync(join(call.workspace.scratch, (call.input as { n: string }).n), `jpeg ${(call.input as { n: string }).n}`), { exit: 0, stdout: "", stderr: "", minutes: 0, timedOut: false }) };
+	const commands = { run: async (call: { input: unknown; workspace: { scratch: string } }) => (writeFileSync(join(call.workspace.scratch, (call.input as { n: string }).n), `jpeg ${(call.input as { n: string }).n}`), { exit: 0, stdout: "", stderr: "", minutes: 0, timedOut: false, limit: null }) };
 	const executor = new FakeExecutor({ edit: (call) => (mkdirSync(join(call.workspace.scratch, "sub"), { recursive: true }), writeFileSync(join(call.workspace.scratch, "sub", "edit.xmp"), "xmp"), { submit: null }) });
 	const root = newProject();
 	const dir = join(root, ".wallis", "runs", "r1");

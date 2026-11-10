@@ -441,7 +441,9 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 					const { command, timeout } = args as { command: string; timeout?: number };
 					const r = await runSpawn(box.spawn(["bash", "-c", command]), "", { timeoutMs: (timeout ?? 120) * 1000, signal });
 					const out = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
-					return { text: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}\n${out}`, value: { exit: r.exit, stdout: r.stdout, stderr: r.stderr }, isError: r.exit !== 0 };
+					// A limit hit stopped the whole command (its scope): say which, typed in the value too.
+					const limit = r.limit ? ` (stopped at its ${r.limit.limit === "mem_limit" ? `memory limit, mem_limit ${r.limit.max} bytes` : `process limit, pids_limit ${r.limit.max}`})` : "";
+					return { text: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}${limit}\n${out}`, value: { exit: r.exit, stdout: r.stdout, stderr: r.stderr, ...(r.limit ? { limit: { ...r.limit } } : {}) }, isError: r.exit !== 0 || r.limit !== null };
 				},
 			},
 		};

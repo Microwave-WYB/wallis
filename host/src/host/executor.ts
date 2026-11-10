@@ -39,6 +39,7 @@ import { schemaErrors } from "../sdk/validate.ts";
 import type { NodeDirs } from "./artifacts.ts";
 import type { CommandCall, CommandRun, CommandRunner } from "./commands.ts";
 import type { Spawn } from "./confine.ts";
+import type { LimitHit } from "./limits.ts";
 import type { McpClient } from "@earendil-works/pi-mcp";
 import type { Source } from "./toolsets.ts";
 import type { Message, Usage, InFlightCall, InFlightDecision } from "./core.ts";
@@ -316,7 +317,7 @@ export class FakeExecutor implements Executor {
 }
 
 /** A scripted command: what it prints, and the files it writes in its scratch dir. */
-export type FakeRun = { readonly stdout?: string; readonly stderr?: string; readonly exit?: number; readonly minutes?: number; readonly timedOut?: boolean };
+export type FakeRun = { readonly stdout?: string; readonly stderr?: string; readonly exit?: number; readonly minutes?: number; readonly timedOut?: boolean; readonly limit?: LimitHit };
 
 /** Plays scripted command results; a function may write files into `call.workspace.scratch` first. */
 export class FakeCommands implements CommandRunner {
@@ -330,6 +331,6 @@ export class FakeCommands implements CommandRunner {
 	async run(call: CommandCall): Promise<CommandRun> {
 		this.calls.push(call);
 		const r = await this.#scripts.pick(call.command, call, true);
-		return { exit: r.exit ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "", minutes: r.minutes ?? 0, timedOut: r.timedOut ?? false };
+		return { exit: r.exit ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "", minutes: r.minutes ?? 0, timedOut: r.timedOut ?? false, limit: r.limit ?? null };
 	}
 }

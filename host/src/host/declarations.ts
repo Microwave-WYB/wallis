@@ -8,6 +8,7 @@ import Type from "typebox";
 import Value from "typebox/value";
 import type { Refusal, TSchema } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
+import { parseMemLimit, pidsLimitProblem } from "./limits.ts";
 
 const Str = Type.String();
 const Strs = Type.Array(Str);
@@ -35,6 +36,8 @@ const Sandbox = Type.Object({
 	devices: Strs,
 	network: Network,
 	environment: Type.Record(Str, Str),
+	mem_limit: NullableStr,
+	pids_limit: Type.Union([Type.Integer(), Type.Null()]),
 	image: NullableStr,
 });
 
@@ -126,6 +129,13 @@ function checkRules(decl: Declarations): void {
 	}
 	for (const [name, c] of Object.entries(decl.commands)) {
 		if (sandbox(c.sandbox, `command ${name}`)?.network === "host") throw new DeclarationError(`command ${name}: commands never get network; sandbox ${c.sandbox} has network "host"`);
+	}
+	// Limits: parsed here, never trusted from the VM.
+	for (const [name, s] of Object.entries(decl.sandboxes)) {
+		const mem = s.mem_limit === null ? null : parseMemLimit(s.mem_limit);
+		if (mem && !mem.ok) throw new DeclarationError(`sandbox ${name}: ${mem.reason}`);
+		const pids = s.pids_limit === null ? null : pidsLimitProblem(s.pids_limit);
+		if (pids !== null) throw new DeclarationError(`sandbox ${name}: ${pids}`);
 	}
 	for (const [path, t] of Object.entries(decl.toolsets)) sandbox(t.sandbox, `toolset ${path}`);
 	for (const [server, m] of Object.entries(decl.mcpServers)) sandbox(m.sandbox, `MCP server ${server}`);

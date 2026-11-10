@@ -85,11 +85,6 @@ export class MachineSlots implements Slots {
 	}
 }
 
-/** `systemd-run --user --scope -p MemoryMax=...` around a command, when available. */
-export function scoped(command: string, argv: string[], memoryGb: number | undefined): [string, string[]] {
-	if (!memoryGb || !systemdAvailable()) return [command, argv];
-	return [hostProgram("systemd-run"), ["--user", "--scope", "--quiet", "--collect", "-p", `MemoryMax=${memoryGb}G`, "--", command, ...argv]];
-}
 
 // --- Per-provider LLM concurrency ---------------------------------------------------
 

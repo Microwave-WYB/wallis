@@ -166,7 +166,7 @@ test("setup runs once per digest with the network on, writes $WALLIS_ENV, and it
 			devices: [],
 			network: "none" as const,
 			environment: {},
-			image: null,
+			mem_limit: null, pids_limit: null, image: null,
 		},
 	};
 	const cacheDir = tmp("wallis-envs-");

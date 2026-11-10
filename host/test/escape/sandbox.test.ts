@@ -39,7 +39,7 @@ function boxes(volumes: string[] = [], workflowDir = tmp("wd-")) {
 		devices: [],
 		network: "none" as const,
 		environment: {},
-		image: null,
+		mem_limit: null, pids_limit: null, image: null,
 	};
 	const resolved = resolveVolumes("w", workflowDir, { box: decl }, { root: workflowDir });
 	return new Sandboxes({ decls: { box: decl }, bins: { sh: SH }, volumes: resolved, bindDigests: {} });

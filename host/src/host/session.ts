@@ -47,6 +47,7 @@ import { bundleWorkflow } from "./bundle.ts";
 import { HUMAN, IdleNode, LiveNode, must, OwnedRun, ResumableRun, SteerableNode, SubmittableNode } from "./capability.ts";
 import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, type InFlightDecision, type Outcome, type Pin, SEMANTICS, type Snapshot, type Usage } from "./core.ts";
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
+import { systemdAvailable } from "./slots.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
 import { DeclarationError } from "./declarations.ts";
@@ -575,6 +576,8 @@ export class Session {
 			const confine = o.confine ?? "auto";
 			const can = confine !== "off" && bwrapAvailable();
 			if (confine === "require" && !can) throw new Error("bubblewrap is required but cannot create a sandbox here");
+			// Sandboxes run only under their limits (a systemd user scope each): never without.
+			if (can && Object.keys(decls).length > 0 && !systemdAvailable()) throw new SandboxError({ type: "limits_unavailable", reason: "systemd-run --user --scope does not work here (no systemd user manager); sandboxes never run without memory and process limits" });
 			// A bind's snapshot digest is part of the cache key of every call that binds it.
 			const bindDigests = Object.fromEntries(Object.entries(this.#volumes).map(([n, vs]) => [n, Object.fromEntries(vs.flatMap((v) => (v.kind === "bind" ? [[v.target, v.digest ?? bindDigest(v.dir)]] : [])))]));
 			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, bindDigests[n] ?? {})]));
@@ -1554,7 +1557,7 @@ export class Session {
 		const abort = new AbortController();
 		this.#commandAborts.set(id, abort);
 		const env: Record<string, string> = effect.compute_minutes === null ? {} : { WALLIS_COMPUTE_MINUTES: String(effect.compute_minutes) };
-		const spawn = this.#boxes?.spawn(declaration.sandbox, argv.argv, { scratch: workspace.scratch, inputs: workspace.inputs, trees: workspace.trees }, { gpu: (declaration.resources.gpu ?? 0) > 0, env }) ?? null;
+		const spawn = this.#boxes?.spawn(declaration.sandbox, argv.argv, { scratch: workspace.scratch, inputs: workspace.inputs, trees: workspace.trees }, { gpu: (declaration.resources.gpu ?? 0) > 0, env, ...(declaration.resources.memoryGb ? { memoryGb: declaration.resources.memoryGb } : {}) }) ?? null;
 		const log = this.#transcriptLog(id);
 		log({ kind: "note", text: `argv: ${JSON.stringify(argv.argv)}` });
 		const done = () => {
@@ -1567,8 +1570,10 @@ export class Session {
 				(r) =>
 					this.#later(() => {
 						if (!current()) return log({ kind: "note", text: "discarded the result of a command that was restarted or cancelled" });
-						log({ kind: "turn", result: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}` });
-						if (r.timedOut) failed({ type: "timed_out", minutes: r.minutes }, r.minutes);
+						log({ kind: "turn", result: `exit ${r.exit}${r.timedOut ? " (timed out)" : ""}${r.limit ? ` (stopped at ${r.limit.limit} ${r.limit.max})` : ""}` });
+						// A limit hit is a failure whatever the exit code: the program did not run as written.
+						if (r.limit) failed({ type: "resource_limit", limit: r.limit.limit, max: r.limit.max }, r.minutes);
+						else if (r.timedOut) failed({ type: "timed_out", minutes: r.minutes }, r.minutes);
 						else if (r.exit !== 0) failed({ type: "exit_code", code: r.exit, stderr_head: r.stderr.trim().slice(-500) }, r.minutes);
 						else {
 							// The files it wrote are kept by digest, so a later `parse` can read them too.

@@ -105,7 +105,7 @@ test("a bind's digest follows its content; a named volume is not part of the san
 	assert.match(before, /^bind:sha256:[0-9a-f]{64}$/);
 	writeFileSync(join(dir, "a.py"), "print(2)");
 	assert.notEqual(bindDigest(dir), before);
-	const decl = { requires: [], setup: [], volumes: [parseVolume("./s:/s:ro"), parseVolume("cache:/cache")], devices: [], network: "none", environment: {}, image: null } as const;
+	const decl = { requires: [], setup: [], volumes: [parseVolume("./s:/s:ro"), parseVolume("cache:/cache")], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } as const;
 	assert.equal(sandboxDigest(decl, {}, { "/s": before }), sandboxDigest(decl, {}, { "/s": before }));
 	assert.notEqual(sandboxDigest(decl, {}, { "/s": before }), sandboxDigest(decl, {}, { "/s": bindDigest(dir) }));
 });
@@ -121,7 +121,7 @@ test("in the sandbox: a bind is read-only at its target, a named volume is writa
 		devices: ["/dev/null"],
 		network: "none",
 		environment: { THING: "yes" },
-		image: null,
+		mem_limit: null, pids_limit: null, image: null,
 	} as const;
 	const volumes = resolveVolumes("w", workflowDir, { box: decl }, { root: workflowDir });
 	const boxes = new Sandboxes({ decls: { box: decl }, bins: { sh: realpathSync("/bin/sh") }, volumes, bindDigests: {} });
@@ -245,7 +245,7 @@ test("environment never reaches the host side: bwrap by absolute path, only secr
 	const fake = tmp();
 	writeFileSync(join(fake, "bwrap"), "#!/bin/sh\ntouch /tmp/wallis-fake-bwrap-ran\n");
 	chmodSync(join(fake, "bwrap"), 0o755);
-	const decls = { box: { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: { THING: "yes" }, image: null } as const };
+	const decls = { box: { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: { THING: "yes" }, mem_limit: null, pids_limit: null, image: null } as const };
 	const boxes = new Sandboxes({ decls, bins: {}, volumes: {}, bindDigests: {} });
 	const sp = boxes.spawn("box", ["/bin/true"], { scratch: tmp(), inputs: null }, { secrets: { TOKEN: "s3cret" }, env: { WALLIS_COMPUTE_MINUTES: "5" } });
 	assert.ok(sp.command.startsWith("/") && sp.command.endsWith("bwrap") && !sp.command.startsWith(fake));
@@ -261,7 +261,7 @@ test("environment never reaches the host side: bwrap by absolute path, only secr
 });
 
 test("inside the sandbox the declared environment and the secrets are set; the host's are not", { skip }, () => {
-	const decls = { box: { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [], devices: [], network: "none", environment: { THING: "yes" }, image: null } as const };
+	const decls = { box: { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [], devices: [], network: "none", environment: { THING: "yes" }, mem_limit: null, pids_limit: null, image: null } as const };
 	const boxes = new Sandboxes({ decls, bins: { sh: realpathSync("/bin/sh") }, volumes: {}, bindDigests: {} });
 	const sp = boxes.spawn("box", ["sh", "-c", 'echo "$THING $TOKEN $HOME ${USER:-none}"'], { scratch: tmp(), inputs: null }, { secrets: { TOKEN: "s3cret" } });
 	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
@@ -301,7 +301,7 @@ test("in the sandbox a required program finds its share dir; its siblings and th
 	writeFileSync(join(prefix, "bin", "other"), "#!/bin/sh\necho other\n");
 	chmodSync(join(prefix, "bin", "tool"), 0o755);
 	chmodSync(join(prefix, "bin", "other"), 0o755);
-	const decls = { box: { requires: [{ name: "tool", check: ["tool"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const };
+	const decls = { box: { requires: [{ name: "tool", check: ["tool"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } as const };
 	const boxes = new Sandboxes({ decls, bins: { tool: join(prefix, "bin", "tool") }, volumes: {}, bindDigests: {}, cacheDir: join(tmp(), "envs") });
 	const sp = boxes.spawn("box", ["tool"], { scratch: tmp(), inputs: null });
 	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
@@ -312,7 +312,7 @@ test("in the sandbox a required program finds its share dir; its siblings and th
 });
 
 test("darktable still runs in a sandbox that requires it", { skip: (!existsSync("/usr/bin/darktable-cli") && "darktable is not installed") || skip }, () => {
-	const decls = { box: { requires: [{ name: "darktable-cli", check: ["darktable-cli", "--version"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const };
+	const decls = { box: { requires: [{ name: "darktable-cli", check: ["darktable-cli", "--version"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } as const };
 	const boxes = new Sandboxes({ decls, bins: { "darktable-cli": "/usr/bin/darktable-cli" }, volumes: {}, bindDigests: {}, cacheDir: join(tmp(), "envs") });
 	// Its check runs inside the sandbox (prepare throws requires_broken if it cannot start).
 	assert.match(boxes.prepare()["darktable-cli"]!, /darktable/i);
@@ -327,7 +327,7 @@ test("a required program called by its real path still sees the name it was aske
 	const cc = spawnSync("/usr/bin/cc", ["-o", join(dir, "bin", "multi-23"), join(dir, "main.c")], { encoding: "utf8" });
 	assert.equal(cc.status, 0, cc.stderr);
 	symlinkSync("multi-23", join(dir, "bin", "multi++"));
-	const decls = { box: { requires: [{ name: "multi++", check: ["multi++"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const };
+	const decls = { box: { requires: [{ name: "multi++", check: ["multi++"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } as const };
 	const boxes = new Sandboxes({ decls, bins: { "multi++": realpathSync(join(dir, "bin", "multi++")) }, volumes: {}, bindDigests: {}, cacheDir: join(tmp(), "envs") });
 	const sp = boxes.spawn("box", ["multi++", "x.cc"], { scratch: tmp(), inputs: null });
 	assert.ok(sp.args.includes(realpathSync(join(dir, "bin", "multi-23"))), "called by its real path");
@@ -374,7 +374,7 @@ export default workflow({ name: "d", models: defineModels({ default: "fake/defau
 		toolsets: {},
 		mcp: null,
 		mcpServers: {},
-		sandboxes: { box: { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } },
+		sandboxes: { box: { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } },
 		input: {},
 		output: {},
 	};
@@ -435,15 +435,15 @@ test("a bind's digest covers file modes and empty dirs", async () => {
 });
 
 test("a sandbox digest is canonical: the same declaration in another key order is the same digest", () => {
-	const a = { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: { A: "1", B: "2" }, image: null } as const;
-	const b = { image: null, environment: { B: "2", A: "1" }, network: "none", devices: [], volumes: [], setup: [], requires: [] } as const;
+	const a = { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: { A: "1", B: "2" }, mem_limit: null, pids_limit: null, image: null } as const;
+	const b = { mem_limit: null, pids_limit: null, image: null, environment: { B: "2", A: "1" }, network: "none", devices: [], volumes: [], setup: [], requires: [] } as const;
 	assert.equal(sandboxDigest(a, {}, { "/x": "d1", "/y": "d2" }), sandboxDigest(b, {}, { "/y": "d2", "/x": "d1" }));
 	assert.notEqual(sandboxDigest(a, {}, {}), sandboxDigest({ ...a, environment: { A: "1" } }, {}, {}));
 });
 
 test("an agent's sandbox has named volumes read-only; a command's has them writable", { skip }, () => {
 	const workflowDir = tmp();
-	const decl = { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [parseVolume("agentcache:/var/cache/agent")], devices: [], network: "none", environment: {}, image: null } as const;
+	const decl = { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [parseVolume("agentcache:/var/cache/agent")], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } as const;
 	const volumes = resolveVolumes("w", workflowDir, { box: decl }, { root: workflowDir });
 	const boxes = new Sandboxes({ decls: { box: decl }, bins: { sh: realpathSync("/bin/sh") }, volumes, bindDigests: {} });
 	const run = (agent: boolean) => {

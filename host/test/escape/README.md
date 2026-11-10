@@ -62,10 +62,11 @@ shut:
   is the sandboxed program itself and its cmdline is its own argv; no host
   path or `--setenv` value of the bwrap argv is visible
   (`sandbox.test.ts`, now a normal test).
-- **Resource exhaustion** inside a sandbox (fork bombs, huge `/w` files, deep
-  directories) is **not** bounded by wallis itself for agent/command sandboxes:
-  bwrap applies no memory/pids cgroup to them (only a command that declares
-  `resources.memoryGb` is wrapped in `systemd-run --scope -p MemoryMax=…`;
-  agents and unscoped commands get none). A fork bomb in an agent's `bash` is
-  contained to the sandbox's PID namespace but can still exhaust host memory/PIDs.
-  This is called out here rather than failing open silently.
+- **Resource exhaustion** (memory, fork bombs) — CLOSED for memory and
+  processes: every sandboxed process (agent shell, command, tool process,
+  setup) runs in its own `systemd-run --user --scope` with `MemoryMax`
+  (default 8G, `mem_limit`), `MemorySwapMax=0` and `TasksMax` (default 512,
+  `pids_limit`); the first limit hit stops the scope and is typed
+  (`resource_limit`); without a user manager sandboxes are refused
+  (`limits_unavailable`) (`../limits.test.ts`). Disk use in `/w` (huge
+  files, deep directories) is still not bounded by wallis.

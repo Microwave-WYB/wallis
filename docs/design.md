@@ -26,6 +26,11 @@ option consistent with the section they sit in, not yet confirmed.
   `Refused` at run time.
 - **`wallis fork <run> --forget <node>…`** (MCP `fork`): re-execute
   chosen calls in a fork; everything else hits.
+- **Sandbox limits:** every sandboxed process runs under `MemoryMax` 8G and
+  `TasksMax` 512 (a systemd user scope); override per sandbox with
+  `mem_limit: "2g"` and `pids_limit: 64`. Hitting one fails a command with
+  `resource_limit`. Without a systemd user manager, runs with sandboxes are
+  refused (`limits_unavailable`).
 - **`wallis fork <run> --input <json>`** (or `--input-file`; MCP `fork`
   with `input`): a fork with a new input; only calls whose inputs change
   run again.
@@ -811,8 +816,9 @@ Prototype choices:
 ## Many runs on one machine (decided, round 3)
 
 - **Resource slots.** Commands declare `resources: { gpu?, memoryGb? }`. They
-  take machine-wide flock slots, like `~/.local/bin/build-guard`, and run in
-  `systemd-run --user --scope -p MemoryMax=...`.
+  take machine-wide flock slots, like `~/.local/bin/build-guard`; a
+  command's `memoryGb` is also its scope's memory limit (see "Sandbox
+  limits").
 - **Concurrency limits.** The local profile sets per-provider limits on LLM
   calls (`providers`), also through flock.
 - **Run hosts** start detached via
@@ -837,9 +843,9 @@ Prototype choices:
 - A host that finds its run already driven exits 0 (nothing to do), so
   systemd does not restart it. `send`/`cancel` start at most one host per
   handoff.
-- Command memory scopes use `systemd-run --user --scope` only when the
-  command declares `memoryGb` and systemd works. The scope wraps bwrap, which keeps
-  its clean environment inside.
+- Every sandboxed process runs in its own `systemd-run --user --scope`
+  (see "Sandbox limits"); the scope wraps bwrap, which keeps its clean
+  environment inside.
 
 ## Recovery (decided; round 5: the most important property)
 
@@ -1173,10 +1179,50 @@ Prototype choices:
 - Setup envs live in `$XDG_CACHE_HOME/wallis/envs/<digest>/`, ready once
   `.wallis-ready` is written. A setup step's argv is the same as a run's
   (`argv[0]` a required binary).
-- A command's memory scope wraps bwrap in `systemd-run --user --scope -p
-  MemoryMax=…`; the session-bus variables it needs are unset inside.
+- The scope of every sandboxed process wraps bwrap in `systemd-run --user
+  --scope`; the session-bus variables it needs are unset inside.
 - Per-node dirs: `work/<node>/inputs/<hex>/<name>`, `work/<node>/scratch/`,
   and `work/<node>/spill/`, deleted when the node is done.
+
+## Sandbox limits (decided, this round)
+
+- Every sandboxed process (an agent's shell, a command, a toolset or MCP
+  server process, a sandbox's setup and requirement checks) runs in its own
+  systemd user scope, `systemd-run --user --scope -p MemoryMax=<m> -p
+  MemorySwapMax=0 -p TasksMax=<n> -- bwrap ...`, by absolute path. The
+  capability is the `Spawn` itself: `Sandboxes.spawn` gives every spawn its
+  `scope`, and the only way to start one is `launch` (`runSpawn` uses it).
+- Defaults: `MemoryMax` 8G, `TasksMax` 512. A sandbox overrides them
+  compose-style: `mem_limit` (`"512m"`, `"2g"`: a positive integer with a
+  unit b, k, m or g; typed in the SDK as `MemLimit`) and `pids_limit` (a
+  positive integer). The host parses both from the declarations
+  (`invalid_declaration`). Swap is off in the scope, so `mem_limit` is all
+  the memory the processes get.
+- A command's `resources.memoryGb` replaces the default memory limit for
+  that command; the sandbox's `mem_limit`, when declared, caps it. (This
+  folds in the old memory-only scope a command got for `memoryGb`.)
+- Hitting a limit stops the whole scope (`cgroup.kill`: every process in
+  it, background ones included). A command fails with `resource_limit`
+  (`limit`: `mem_limit` | `pids_limit`, `max`: bytes or processes), held
+  like any node failure, whatever its exit code; an agent's `bash` result
+  says which limit stopped it (and carries `limit` in its value). A tool
+  process that hits one is killed, and calls to it fail (not typed as a
+  limit yet).
+- Detection: while the process runs, the scope's cgroup counters are
+  polled (`pids.events` `max`, `memory.events` `oom_kill`). An OOM kill can
+  end the scope before the poll reads it, so `runSpawn`'s scopes run
+  without `--collect`: after a death by a signal wallis did not send, the
+  scope's systemd `Result` is read (`oom-kill` is `mem_limit`) and a failed
+  scope is reset. A host killed in between leaves that failed scope loaded;
+  `systemctl --user reset-failed 'wallis-sbx-*'` clears it.
+- No systemd user manager (`systemd-run --user --scope` fails): a run that
+  declares sandboxes is refused when it starts, typed `limits_unavailable`
+  (`reason`), and `launch` refuses the same way; sandboxed processes never
+  run without limits. `confine: "off"` (tests, development) has no
+  sandboxes and so no scopes.
+- Limits are outside every cache key, like named volumes (`sandboxDigest`
+  leaves them out): a result does not depend on them; hitting one is a
+  failure, not a result.
 
 ## Volumes (decided, this round; replaces the round-4 mounts)
 

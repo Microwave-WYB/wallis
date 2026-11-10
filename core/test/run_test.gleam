@@ -536,6 +536,21 @@ pub fn a_command_failure_is_typed_test() {
     == [types.CommandDone("#0", "train", [], types.FailedWith(failure))]
 }
 
+pub fn a_resource_limit_is_a_typed_command_failure_from_the_host_test() {
+  // The host reports which limit was hit; the event arrives as JSON.
+  let #(s, _, _) = replay([started(basic()), command("#0", JNull)])
+  let #(s, _) =
+    wallis_core.step_json(
+      s,
+      "{\"type\":\"command_failed\",\"id\":\"#0\",\"failure\":{\"type\":\"resource_limit\",\"limit\":\"pids_limit\",\"max\":16},\"minutes\":0.1}",
+    )
+  let failure = types.ResourceLimit(types.PidsLimit, 16)
+  assert run.nodes(s)
+    == [types.CommandDone("#0", "train", [], types.FailedWith(failure))]
+  assert json.to_string(types.command_failure_to_json(failure))
+    == "{\"type\":\"resource_limit\",\"limit\":\"pids_limit\",\"max\":16}"
+}
+
 pub fn a_command_takes_restart_and_cancel_but_no_dialogue_test() {
   let running = [started(basic()), command("#0", JInt(3))]
   assert last(list.append(running, [sent("#0", "hi")]))

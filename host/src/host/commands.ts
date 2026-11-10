@@ -7,7 +7,8 @@
 import type { Json } from "../sdk/index.ts";
 import type { NodeDirs } from "./artifacts.ts";
 import { runSpawn, type Spawn } from "./confine.ts";
-import { scoped, type Slots } from "./slots.ts";
+import type { LimitHit } from "./limits.ts";
+import type { Slots } from "./slots.ts";
 
 export interface CommandCall {
 	readonly id: string;
@@ -26,13 +27,14 @@ export interface CommandCall {
 	readonly signal: AbortSignal;
 }
 
-/** A process result; `timedOut` when the compute budget killed it. */
+/** A process result; `timedOut` when the compute budget killed it, `limit` when a sandbox limit stopped it. */
 export interface CommandRun {
 	readonly exit: number;
 	readonly stdout: string;
 	readonly stderr: string;
 	readonly minutes: number;
 	readonly timedOut: boolean;
+	readonly limit: LimitHit | null;
 }
 
 export interface CommandRunner {
@@ -58,15 +60,11 @@ export class ProcessCommands implements CommandRunner {
 
 	async #spawn(call: CommandCall): Promise<CommandRun> {
 		if (!call.spawn) throw new CommandError("no sandbox: bubblewrap cannot create one here");
-		// A memory scope's systemd-run needs the session bus; the sandbox does not get it.
-		const bus = Object.fromEntries(["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"].flatMap((k) => (process.env[k] ? [[k, process.env[k]!]] : [])));
-		const inner = call.resources.memoryGb ? [...Object.keys(bus).flatMap((k) => ["--unsetenv", k]), ...call.spawn.args] : [...call.spawn.args];
-		const [command, args] = scoped(call.spawn.command, inner, call.resources.memoryGb);
-		const env = command === call.spawn.command ? call.spawn.env : { ...call.spawn.env, ...bus };
-		const r = await runSpawn({ ...call.spawn, command, args, env }, JSON.stringify(call.input), {
+		// Its scope (memory, processes; `resources.memoryGb` included) is the spawn's: `limits.ts`.
+		const r = await runSpawn(call.spawn, JSON.stringify(call.input), {
 			timeoutMs: call.computeMinutes === null ? null : Math.max(1000, call.computeMinutes * 60_000),
 			signal: call.signal,
 		});
-		return { exit: r.exit, stdout: r.stdout, stderr: r.stderr, minutes: r.minutes, timedOut: r.timedOut };
+		return { exit: r.exit, stdout: r.stdout, stderr: r.stderr, minutes: r.minutes, timedOut: r.timedOut, limit: r.limit };
 	}
 }

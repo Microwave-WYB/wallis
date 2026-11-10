@@ -1254,6 +1254,9 @@ pub type CommandFailure {
   /// It could not be started (no sandbox, an unresolvable binary).
   Unrunnable(error: String)
   CommandCancelled
+  /// It hit one of its sandbox's limits (`limit`, at `max`: bytes for
+  /// `mem_limit`, processes for `pids_limit`) and its scope was stopped.
+  ResourceLimit(limit: Limit, max: Int)
 }
 
 pub fn command_failure_to_json(command_failure: CommandFailure) -> json.Json {
@@ -1288,6 +1291,12 @@ pub fn command_failure_to_json(command_failure: CommandFailure) -> json.Json {
       json.object([
         #("type", json.string("command_cancelled")),
       ])
+    ResourceLimit(limit:, max:) ->
+      json.object([
+        #("type", json.string("resource_limit")),
+        #("limit", limit_to_json(limit)),
+        #("max", json.int(max)),
+      ])
   }
 }
 
@@ -1316,7 +1325,34 @@ pub fn command_failure_decoder() -> decode.Decoder(CommandFailure) {
       decode.success(Unrunnable(error:))
     }
     "command_cancelled" -> decode.success(CommandCancelled)
+    "resource_limit" -> {
+      use limit <- decode.field("limit", limit_decoder())
+      use max <- decode.field("max", decode.int)
+      decode.success(ResourceLimit(limit:, max:))
+    }
     _ -> decode.failure(CommandCancelled, "CommandFailure")
+  }
+}
+
+/// A per-sandbox limit, as the sandbox declares it (compose names).
+pub type Limit {
+  MemLimit
+  PidsLimit
+}
+
+pub fn limit_to_json(limit: Limit) -> json.Json {
+  case limit {
+    MemLimit -> json.string("mem_limit")
+    PidsLimit -> json.string("pids_limit")
+  }
+}
+
+pub fn limit_decoder() -> decode.Decoder(Limit) {
+  use variant <- decode.then(decode.string)
+  case variant {
+    "mem_limit" -> decode.success(MemLimit)
+    "pids_limit" -> decode.success(PidsLimit)
+    _ -> decode.failure(MemLimit, "Limit")
   }
 }
 
@@ -1673,6 +1709,9 @@ pub type Refusal {
   /// Tool processes run only in sandboxes, and none can be built here
   /// (`confine: "off"` runs them unconfined).
   SandboxUnavailable(source: String)
+  /// Sandboxes run only under per-sandbox memory and process limits (a
+  /// systemd user scope), and none can be created here.
+  LimitsUnavailable(reason: String)
   InvalidDeclaration(message: String)
   InvalidEvent(message: String)
   NotStarted
@@ -1898,6 +1937,11 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
         #("type", json.string("sandbox_unavailable")),
         #("source", json.string(source)),
       ])
+    LimitsUnavailable(reason:) ->
+      json.object([
+        #("type", json.string("limits_unavailable")),
+        #("reason", json.string(reason)),
+      ])
     InvalidDeclaration(message:) ->
       json.object([
         #("type", json.string("invalid_declaration")),
@@ -2098,6 +2142,10 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
     "sandbox_unavailable" -> {
       use source <- decode.field("source", decode.string)
       decode.success(SandboxUnavailable(source:))
+    }
+    "limits_unavailable" -> {
+      use reason <- decode.field("reason", decode.string)
+      decode.success(LimitsUnavailable(reason:))
     }
     "invalid_declaration" -> {
       use message <- decode.field("message", decode.string)

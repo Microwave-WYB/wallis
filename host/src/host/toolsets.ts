@@ -36,7 +36,7 @@ import { build } from "esbuild";
 import type { Json, ToolAnnotations, ToolDesc } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
 import { putBlob, readBlob } from "./artifacts.ts";
-import { LAYOUT, SandboxError, type Sandboxes } from "./confine.ts";
+import { launch, LAYOUT, SandboxError, type Sandboxes } from "./confine.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const nodeModules = resolve(here, "../../node_modules");
@@ -231,7 +231,8 @@ export class ToolSources {
 		let sp: { command: string; args: readonly string[]; env: Readonly<Record<string, string>>; cwd?: string };
 		if (c.type === "bwrap") {
 			if (!overlay?.sandbox) throw new Error(`MCP server ${server} has no sandbox in the workflow's mcp overlay`);
-			sp = c.boxes.spawn(overlay.sandbox, argv, { scratch, inputs: null }, { secrets: env, network: overlay.network });
+			// Started in its scope (memory and process limits), like every sandboxed process.
+			sp = { ...launch(c.boxes.spawn(overlay.sandbox, argv, { scratch, inputs: null }, { secrets: env, network: overlay.network })), cwd: scratch };
 		} else sp = { command: argv[0]!, args: argv.slice(1), env: { PATH: process.env.PATH ?? "", ...env }, cwd: scratch };
 		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe", ...(sp.cwd ? { cwd: sp.cwd } : {}) });
 	}
@@ -245,7 +246,7 @@ export class ToolSources {
 		const secrets = Object.fromEntries(decl.secrets.flatMap((name) => (this.#env[name] === undefined ? [] : [[name, this.#env[name]!]])));
 		const scratch = this.#scratch(`toolset-${digest(path).slice(0, 12)}`);
 		let sp: { command: string; args: readonly string[]; env: Readonly<Record<string, string>>; cwd?: string };
-		if (c.type === "bwrap") sp = c.boxes.spawn(decl.sandbox, ["node", `${LAYOUT.inputs}/runner.mjs`], { scratch, inputs: dir }, { secrets, network: decl.network });
+		if (c.type === "bwrap") sp = { ...launch(c.boxes.spawn(decl.sandbox, ["node", `${LAYOUT.inputs}/runner.mjs`], { scratch, inputs: dir }, { secrets, network: decl.network })), cwd: scratch };
 		else sp = { command: process.execPath, args: [join(dir, "runner.mjs")], env: { PATH: process.env.PATH ?? "", ...secrets }, cwd: scratch };
 		return new StdioTransport({ command: sp.command, args: [...sp.args], env: { ...sp.env }, inheritEnv: false, stderr: "pipe", ...(sp.cwd ? { cwd: sp.cwd } : {}) });
 	}

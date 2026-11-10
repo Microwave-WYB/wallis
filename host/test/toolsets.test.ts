@@ -40,7 +40,7 @@ test("each MCP connection gets its own scratch dir; a toolset runs bundled under
 	execute: async () => ({ content: [{ type: "text", text: process.cwd() }], details: undefined, structuredContent: { cwd: process.cwd(), secret: process.env.TOKEN ?? null, home: process.env.HOME } }) };\n`,
 	);
 	const node = { name: "node", check: ["node", "--version"] };
-	const plain = { setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const;
+	const plain = { setup: [], volumes: [], devices: [], network: "none", environment: {}, mem_limit: null, pids_limit: null, image: null } as const;
 	const boxes = new Sandboxes({
 		decls: { srv: { ...plain, requires: [node], volumes: [{ kind: "bind", host: "./srv", target: "/srv" }] }, tools: { ...plain, requires: [node] } },
 		bins: { node: realpathSync(process.execPath) },

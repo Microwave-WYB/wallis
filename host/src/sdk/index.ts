@@ -239,6 +239,14 @@ export interface SandboxSpec<R extends string, V extends readonly string[], Dv e
 	readonly network?: "none" | "host";
 	/** Environment variables of every process in the sandbox. */
 	readonly environment?: Readonly<Record<string, string>>;
+	/**
+	 * Memory limit of each process tree in the sandbox (its systemd scope's
+	 * MemoryMax; swap is off), compose-style: `"512m"`, `"2g"`. Default 8g.
+	 * Hitting it stops the process: a command fails with `resource_limit`.
+	 */
+	readonly mem_limit?: MemLimit;
+	/** Process (task) limit of each process tree in the sandbox (TasksMax), a positive integer. Default 512. */
+	readonly pids_limit?: number;
 	/** Reserved for a Docker backend; bwrap ignores it and uses the host rootfs. */
 	readonly image?: string;
 }
@@ -257,8 +265,14 @@ export interface SandboxDef<R extends string = string> {
 	readonly devices: readonly string[];
 	readonly network: "none" | "host";
 	readonly environment: Readonly<Record<string, string>>;
+	/** As declared; the host parses it (`invalid_declaration`). */
+	readonly mem_limit: string | null;
+	readonly pids_limit: number | null;
 	readonly image: string | null;
 }
+
+/** A compose memory size: a positive integer with a unit (bytes, KiB, MiB, GiB). */
+export type MemLimit = `${bigint}${"b" | "k" | "m" | "g"}`;
 
 export function defineSandbox<const R extends string = never, const V extends readonly string[] = readonly [], const Dv extends readonly string[] = readonly []>(
 	_env: object,
@@ -273,6 +287,8 @@ export function defineSandbox<const R extends string = never, const V extends re
 		devices: [...((spec.devices ?? []) as readonly string[])],
 		network: spec.network ?? "none",
 		environment: { ...(spec.environment ?? {}) },
+		mem_limit: spec.mem_limit ?? null,
+		pids_limit: spec.pids_limit ?? null,
 		image: spec.image ?? null,
 	};
 }
@@ -499,6 +515,7 @@ export type Refusal =
 	| { readonly type: "retry_takes_no_note"; readonly node: string }
 	| { readonly type: "tool_name_taken"; readonly agent: string; readonly name: string }
 	| { readonly type: "sandbox_unavailable"; readonly source: string }
+	| { readonly type: "limits_unavailable"; readonly reason: string }
 	| { readonly type: "session_required"; readonly agent: string }
 	| { readonly type: "unknown_orchestrator"; readonly name: string }
 	| { readonly type: "unknown_tool"; readonly name: string }
@@ -526,7 +543,9 @@ export type CommandFailure =
 	| { readonly type: "timed_out"; readonly minutes: number }
 	| { readonly type: "missing_file"; readonly name: string }
 	| { readonly type: "unrunnable"; readonly error: string }
-	| { readonly type: "command_cancelled" };
+	| { readonly type: "command_cancelled" }
+	/** It hit its sandbox's `mem_limit` (bytes) or `pids_limit` (processes) and was stopped. */
+	| { readonly type: "resource_limit"; readonly limit: "mem_limit" | "pids_limit"; readonly max: number };
 
 /** Why a body MCP tool call failed. Mirrors `ToolFailure` in the core. */
 export type ToolFailure =
@@ -577,6 +596,8 @@ export function failureText(failure: AgentFailure | CommandFailure | ToolFailure
 			return `it wrote no file ${failure.name}`;
 		case "unrunnable":
 			return failure.error;
+		case "resource_limit":
+			return failure.limit === "mem_limit" ? `stopped at its memory limit (mem_limit, ${failure.max} bytes)` : `stopped at its process limit (pids_limit, ${failure.max})`;
 	}
 }
 

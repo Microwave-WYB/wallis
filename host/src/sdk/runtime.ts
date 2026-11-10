@@ -284,7 +284,7 @@ function seededRandom(seed: number): () => number {
 }
 
 function sandboxDeclaration(s: SandboxDef) {
-	return { requires: s.requires, setup: s.setup, volumes: s.volumes, devices: s.devices, network: s.network, environment: s.environment, image: s.image };
+	return { requires: s.requires, setup: s.setup, volumes: s.volumes, devices: s.devices, network: s.network, environment: s.environment, mem_limit: s.mem_limit, pids_limit: s.pids_limit, image: s.image };
 }
 
 /** Declarations: the core's workflow plus what the host and executors need. */
