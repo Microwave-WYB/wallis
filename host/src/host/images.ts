@@ -60,20 +60,26 @@ export function imageTokens(base64: string): number {
 	return Math.min(MAX_IMAGE_TOKENS, Math.ceil((width * height) / 750));
 }
 
-/** A message's images, counted, and the message without their data (to count the rest as text). */
+/**
+ * A message's images, counted, and the message without them (to count the
+ * rest as text): an image block is removed, not emptied, so a text
+ * estimate that prices every image block at a fixed size never counts it
+ * a second time.
+ */
 export function splitImages(value: unknown): { tokens: number; rest: unknown } {
 	let tokens = 0;
+	const isImage = (v: unknown): v is { type: "image"; data: string } => v !== null && typeof v === "object" && (v as { type?: unknown }).type === "image" && typeof (v as { data?: unknown }).data === "string";
 	const walk = (v: unknown): unknown => {
-		if (Array.isArray(v)) return v.map(walk);
-		if (v !== null && typeof v === "object") {
-			const o = v as Record<string, unknown>;
-			if (o.type === "image" && typeof o.data === "string") {
-				tokens += imageTokens(o.data);
-				return { ...o, data: "" };
-			}
-			return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, walk(x)]));
-		}
+		if (Array.isArray(v))
+			return v.flatMap((x) => {
+				if (!isImage(x)) return [walk(x)];
+				tokens += imageTokens(x.data);
+				return [];
+			});
+		if (v !== null && typeof v === "object") return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, walk(x)]));
 		return v;
 	};
-	return { tokens, rest: walk(value) };
+	// The walk counts as it goes: the tokens are read after it.
+	const rest = walk(value);
+	return { tokens, rest };
 }
