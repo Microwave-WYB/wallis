@@ -244,3 +244,34 @@ test("a toolset's runner is written whole and checked: a half-written one is rep
 	assert.equal(done.outcome?.type, "done");
 	assert.equal(read(runner, "utf8"), whole);
 });
+
+test("a toolset a mid-run code change adds is pinned when first bundled: later hosts run that bundle", async () => {
+	const { writeFileSync: write } = await import("node:fs");
+	const p = project();
+	// v1 has the sandbox (through a command it never calls), not the toolset.
+	const v1 = `import { command, defineModels, defineSandbox, orchestrator, Type, workflow } from "wallis";
+const box = defineSandbox({}, { name: "box", requires: ["node"] });
+const idle = command({ name: "idle", sandbox: box, input: Type.Null(), output: Type.Any(), run: ["node", "-e", "0"] });
+const go = orchestrator({ name: "go", input: Type.Null(), output: Type.Boolean() });
+export default workflow({ name: "ident", models: defineModels({ default: "fake/default" }), agents: [], commands: [idle], orchestrators: [go], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.call(go, null) });\n`;
+	const v2 = `import { defineModels, defineSandbox, orchestrator, toolset, Type, workflow } from "wallis";
+const box = defineSandbox({}, { name: "box", requires: ["node"] });
+const lib = toolset<typeof import("./tools/lib.ts")>("./tools/lib.ts", { sandbox: box });
+const go = orchestrator({ name: "go", input: Type.Null(), output: Type.Boolean() });
+const again = orchestrator({ name: "again", input: Type.Null(), output: Type.Boolean() });
+export default workflow({ name: "ident", models: defineModels({ default: "fake/default" }), agents: [], orchestrators: [go, again], toolsets: [lib], input: Type.Null(), output: Type.Any(),
+	run: async (ctx) => { await ctx.call(go, null); await ctx.call(again, null); return ctx.call(lib.say, {}); } });\n`;
+	const dir = join(p.root, "run");
+	const opts = { ...base, bins: { node: process.execPath }, workflow: p.workflow, dir, root: p.root, executor: new FakeExecutor({}) };
+	write(p.workflow, v1);
+	await runWorkflow({ ...opts, input: null });
+	// The code adds a toolset mid-run; this host bundles it first.
+	write(p.workflow, v2);
+	appendInbox(runPaths(dir), { id: "a1", type: "submit", node: "#0", value: true, by: "human" });
+	await runWorkflow(opts);
+	// Its source changes before the tool is ever called; the next host runs the bundle first made.
+	write(p.tool, toolText("second"));
+	appendInbox(runPaths(dir), { id: "a2", type: "submit", node: "#1", value: true, by: "human" });
+	const done = await runWorkflow(opts);
+	assert.deepEqual(done.outcome, { type: "done", value: { word: "first" } });
+});

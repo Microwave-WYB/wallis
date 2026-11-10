@@ -489,8 +489,11 @@ export class Session {
 			seed = o.seed ?? first.pin.seed;
 			input = first.input;
 			// The run's toolset bundles are its pinned ones, used as they are whatever the source is now.
-			const pinned = Object.fromEntries(Object.entries(first.pin.inputs).flatMap(([k, v]) => (k.startsWith(TOOLSET_PIN) ? [[k.slice(TOOLSET_PIN.length), v]] : [])));
-			for (const [path, digest] of Object.entries(pinned)) inputs[`${TOOLSET_PIN}${path}`] = digest;
+			const pinnedAtStart = Object.fromEntries(Object.entries(first.pin.inputs).flatMap(([k, v]) => (k.startsWith(TOOLSET_PIN) ? [[k.slice(TOOLSET_PIN.length), v]] : [])));
+			for (const [path, digest] of Object.entries(pinnedAtStart)) inputs[`${TOOLSET_PIN}${path}`] = digest;
+			// A toolset a code change added since is pinned by the host that first bundled it (the
+			// `toolsets` fact): later hosts use that bundle, never the source as it is now.
+			const pinned = { ...(readMeta(this.paths)?.toolsets ?? {}), ...pinnedAtStart };
 			must(ResumableRun.check(this.#core, { workflow_digest: this.#digest, prior_digests: [], models: first.pin.models, seed, inputs, semantics: SEMANTICS }), refused);
 			// Changed code is allowed: logged, and the body re-executes against the journal.
 			const recorded = this.#core.snapshot().code[0];
