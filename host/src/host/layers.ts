@@ -20,7 +20,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import Type from "typebox";
 import Value from "typebox/value";
@@ -367,7 +367,13 @@ export function locate(roots: readonly ViewRoot[], path: string, follow: boolean
 				throw new ViewError(`${path}: no such file or directory`);
 			}
 			if (entry.kind === "symlink" && (!last || follow)) {
-				const link = readlinkSync(entry.host);
+				let link: string;
+				try {
+					link = readlinkSync(entry.host);
+				} catch {
+					// It was a link when checked and is not now: changed under us, refused (typed).
+					throw new ViewError(`${path}: changed while it was resolved (refused)`);
+				}
 				const here = posix.join(root.at, ...parts.slice(0, i));
 				target = posix.normalize(posix.join(link.startsWith("/") ? link : posix.join(here, link), ...parts.slice(i + 1)));
 				relinked = true;
@@ -380,12 +386,63 @@ export function locate(roots: readonly ViewRoot[], path: string, follow: boolean
 	throw new ViewError(`${path}: too many levels of symbolic links`);
 }
 
-/** A file's content through the view: opened without following a symlink. */
-export function readViewFile(located: Located, path: string): Buffer {
+/** A path relative to an open dir: `openat` for Node, through the kernel's /proc/self/fd magic link. */
+const at = (dirfd: number, name: string) => `/proc/self/fd/${dirfd}/${name}`;
+
+/**
+ * Opens `parts` under the host dir `base` as `openat` would, one component
+ * at a time from `base`'s fd, never following a symlink: every dir is
+ * opened `O_DIRECTORY | O_NOFOLLOW` relative to its parent's fd, and the
+ * last component with `flags | O_NOFOLLOW`. A component swapped for a
+ * symlink after `locate` checked it (an agent's bash shares the upper dir)
+ * fails the open (a `ViewError`) instead of leading out of `base`. Returns
+ * the fd (the caller closes it).
+ */
+export function openBeneath(base: string, parts: readonly string[], flags: number, mode?: number, path = parts.join("/")): number {
+	if (parts.some((p) => p === "" || p === "." || p === ".." || p.includes("/"))) throw new ViewError(`${path}: not a plain path`);
+	let dirfd = openSync(base, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+	try {
+		for (const part of parts.slice(0, -1)) {
+			const next = openSync(at(dirfd, part), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+			closeSync(dirfd);
+			dirfd = next;
+		}
+		const last = parts.at(-1);
+		return last === undefined ? openSync(at(dirfd, "."), flags | constants.O_NOFOLLOW) : openSync(at(dirfd, last), flags | constants.O_NOFOLLOW, mode);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ELOOP" || code === "ENOTDIR" || code === "ENOENT") throw new ViewError(`${path}: changed while it was opened, or a link (refused)`);
+		throw error;
+	} finally {
+		closeSync(dirfd);
+	}
+}
+
+/** Which of a root's host dirs a located host path is in, and its components under it. */
+function beneath(root: ViewRoot, host: string): { base: string; parts: string[] } {
+	const base = root.stack.find((d) => host === d || host.startsWith(`${d}/`));
+	if (base === undefined) throw new ViewError(`${host} is not in this root`);
+	return { base, parts: host === base ? [] : host.slice(base.length + 1).split("/") };
+}
+
+/** A regular file of the view, opened for reading beneath its layer dir, never through a symlink (see `openBeneath`); the caller closes it. */
+export function openViewFile(located: Located, path: string): number {
 	const entry = located.entry;
 	if (entry === null) throw new ViewError(`${path}: no such file`);
 	if (entry.kind !== "file") throw new ViewError(`${path} is not a file`);
-	const fd = openSync(entry.host, constants.O_RDONLY | constants.O_NOFOLLOW);
+	const { base, parts } = beneath(located.root, entry.host);
+	// Non-blocking: a FIFO swapped in for the file never blocks the host (and is refused below).
+	const fd = openBeneath(base, parts, constants.O_RDONLY | constants.O_NONBLOCK, undefined, path);
+	if (!fstatSync(fd).isFile()) {
+		closeSync(fd);
+		throw new ViewError(`${path} is not a file`);
+	}
+	return fd;
+}
+
+/** A file's content through the view (see `openViewFile`). */
+export function readViewFile(located: Located, path: string): Buffer {
+	const fd = openViewFile(located, path);
 	try {
 		return readFileSync(fd);
 	} finally {
@@ -393,12 +450,20 @@ export function readViewFile(located: Located, path: string): Buffer {
 	}
 }
 
-/** The names in a directory of the view, merged through its layers (whiteouts and opaque dirs honoured). */
+/** The names in a directory of the view, merged through its layers (whiteouts and opaque dirs honoured); each dir read through an fd opened beneath its layer. */
 export function listView(located: Located, path: string): string[] {
 	const entry = located.entry;
 	if (entry === null || entry.kind !== "dir") throw new ViewError(`${path} is not a directory`);
 	const names = new Set<string>();
-	for (const dir of entry.dirs) for (const name of readdirSync(dir)) names.add(name);
+	for (const dir of entry.dirs) {
+		const { base, parts } = beneath(located.root, dir);
+		const fd = openBeneath(base, parts, constants.O_RDONLY | constants.O_DIRECTORY, undefined, path);
+		try {
+			for (const name of readdirSync(`/proc/self/fd/${fd}`)) names.add(name);
+		} finally {
+			closeSync(fd);
+		}
+	}
 	return [...names].filter((n) => childOf(entry.dirs, n) !== null).sort();
 }
 
@@ -415,34 +480,62 @@ export function writeViewFile(located: Located, path: string, content: string | 
 	if (located.entry !== null && located.entry.kind !== "file") throw new ViewError(`${path} is not a file`);
 	const rel = located.rel;
 	if (rel.length === 0) throw new ViewError(`${path} is not a file`);
-	let dir = upper;
-	for (const part of rel.slice(0, -1)) {
-		dir = join(dir, part);
-		let st;
-		try {
-			st = lstatSync(dir);
-		} catch {
-			mkdirSync(dir);
-			continue;
-		}
-		if (st.isCharacterDevice() && st.rdev === 0) {
-			// Deleted in this call: a new dir, opaque, so the layers' old one stays hidden.
-			unlinkSync(dir);
-			mkdirSync(dir);
-			markOpaque(dir);
-		} else if (!st.isDirectory()) throw new ViewError(`${path}: not a directory`);
-	}
-	const file = join(dir, rel.at(-1)!);
-	if (isWhiteout(file)) unlinkSync(file);
-	const fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+	if (rel.some((p) => p === "" || p === "." || p === ".." || p.includes("/"))) throw new ViewError(`${path}: not a plain path`);
+	// Every dir is made and opened through its verified parent's fd (no symlink followed on the way),
+	// so a component the agent's bash swaps for a link fails the write instead of leading out.
+	let dirfd = openSync(upper, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+	let dirPath = upper;
 	try {
-		writeSync(fd, typeof content === "string" ? Buffer.from(content) : content);
+		for (const part of rel.slice(0, -1)) {
+			dirPath = join(dirPath, part);
+			let st;
+			try {
+				st = lstatSync(at(dirfd, part));
+			} catch {
+				st = null;
+			}
+			if (st === null) mkdirSync(at(dirfd, part));
+			else if (st.isCharacterDevice() && st.rdev === 0) {
+				// Deleted in this call: a new dir, opaque, so the layers' old one stays hidden.
+				unlinkSync(at(dirfd, part));
+				mkdirSync(at(dirfd, part));
+				// setfattr is another process (its /proc/self is not ours): the host path, never followed (-h).
+				markOpaque(dirPath);
+			} else if (!st.isDirectory()) throw new ViewError(`${path}: not a directory`);
+			let next: number;
+			try {
+				next = openSync(at(dirfd, part), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+			} catch {
+				throw new ViewError(`${path}: changed while it was opened, or a link (refused)`);
+			}
+			closeSync(dirfd);
+			dirfd = next;
+		}
+		const name = rel.at(-1)!;
+		if (isWhiteout(at(dirfd, name))) unlinkSync(at(dirfd, name));
+		let fd: number;
+		try {
+			// Non-blocking: a FIFO there fails (ENXIO) instead of blocking the host.
+			fd = openSync(at(dirfd, name), constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new ViewError(`${path} is a link (refused)`);
+			throw error;
+		}
+		try {
+			if (!fstatSync(fd).isFile()) throw new ViewError(`${path} is not a file`);
+			// Truncated only once it is known to be a regular file in the upper dir.
+			ftruncateSync(fd, 0);
+			writeSync(fd, typeof content === "string" ? Buffer.from(content) : content);
+		} finally {
+			closeSync(fd);
+		}
 	} finally {
-		closeSync(fd);
+		closeSync(dirfd);
 	}
 }
 
 function markOpaque(dir: string): void {
-	const r = spawnSync("setfattr", ["-n", "user.overlay.opaque", "-v", "y", dir], { encoding: "utf8" });
+	// -h: never through a link, should the dir be swapped for one.
+	const r = spawnSync("setfattr", ["-h", "-n", "user.overlay.opaque", "-v", "y", dir], { encoding: "utf8" });
 	if (r.status !== 0) throw new ViewError(`cannot mark ${dir} opaque: ${r.stderr.trim()}`);
 }

@@ -7,8 +7,9 @@
 // only guards the FINAL component, so the open follows the swapped intermediate
 // symlink out of the sandbox.
 //
-// This file hosts the escape as node:test `todo`s so the gate stays green while
-// the hole is open. See README.md (ESCAPE-02).
+// ESCAPE-02 is closed: the tools now open every component relative to its
+// parent's fd with O_NOFOLLOW (`openBeneath`, layers.ts), so a swap fails
+// the open. These were todos while the hole was open; they are the gate now.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -55,7 +56,6 @@ function raceRead(up: string, outside: string, decoy: string, budgetMs: number):
 
 test(
 	"host `read` tool cannot be raced into reading a file outside /w (TOCTOU on an intermediate dir)",
-	{ todo: "ESCAPE-02: locate()+openSync has a TOCTOU; O_NOFOLLOW guards only the final component, so an intermediate-dir symlink swap reads arbitrary host files" },
 	() => {
 		const up = tmp("toctou-up-");
 		const outside = tmp("toctou-outside-");
@@ -68,7 +68,6 @@ test(
 
 test(
 	"host `read` tool cannot be raced into reading a host system file (/etc) via an intermediate symlink swap",
-	{ todo: "ESCAPE-02: same TOCTOU, demonstrated against /etc (arbitrary host read)" },
 	() => {
 		const up = tmp("toctou-up-");
 		// The decoy name matches a real file under /etc, so when `a` becomes a symlink to /etc the open succeeds.
@@ -76,3 +75,58 @@ test(
 		assert.equal(stolen, null, `the read tool was raced into reading /etc/hostname: ${JSON.stringify(stolen)}`);
 	},
 );
+
+/** The racer against a write (`write`/`edit`) or an artifact draft (`export_artifact`), for `budgetMs`. */
+function raceUse(up: string, outside: string, decoy: string, budgetMs: number, use: (root: ViewRoot) => void): void {
+	const child = spawn(process.execPath, [racer, up, outside, decoy], { stdio: "ignore" });
+	try {
+		const root: ViewRoot = { at: "/w", stack: [up], upper: up };
+		const start = Date.now();
+		while (Date.now() - start < budgetMs) {
+			try {
+				use(root);
+			} catch (error) {
+				if (!(error instanceof ViewError) && !(error instanceof Error && /artifact|ENOENT|EEXIST/.test(error.message))) throw error;
+			}
+		}
+	} finally {
+		child.kill("SIGKILL");
+	}
+}
+
+test("host `write` tool cannot be raced into writing a file outside /w (TOCTOU on an intermediate dir)", async () => {
+	const { writeViewFile } = await import("../../src/host/layers.ts");
+	const { existsSync } = await import("node:fs");
+	const up = tmp("toctou-up-");
+	const outside = tmp("toctou-outside-");
+	writeFileSync(join(outside, "victim"), "ORIGINAL\n");
+	raceUse(up, outside, "victim", 4_000, (root) => writeViewFile(locate([root], "/w/a/victim", true, true), "/w/a/victim", "PWNED\n"));
+	assert.equal(readFileSync(join(outside, "victim"), "utf8"), "ORIGINAL\n", "a host file outside /w was overwritten");
+	raceUse(up, outside, "victim", 2_000, (root) => writeViewFile(locate([root], "/w/a/new-file", true, true), "/w/a/new-file", "PWNED\n"));
+	assert.ok(!existsSync(join(outside, "new-file")), "a file was created outside /w");
+});
+
+test("export_artifact cannot be raced into storing a host file outside /w", async () => {
+	const { resolveDrafts } = await import("../../src/host/artifacts.ts");
+	const up = tmp("toctou-up-");
+	const outside = tmp("toctou-outside-");
+	writeFileSync(join(outside, "loot"), "HOST-FILE-CONTENTS-STOLEN\n");
+	const run = tmp("toctou-run-");
+	mkdirSync(join(run, "blobs"), { recursive: true });
+	raceUse(up, outside, "loot", 4_000, () => {
+		const ref = resolveDrafts({ artifact: "a/loot", media: "text/plain" }, run, up) as { digest: string };
+		const content = readFileSync(join(run, "blobs", ref.digest.slice("sha256:".length)), "utf8");
+		assert.ok(content.includes("INSIDE-THE-SANDBOX"), `stored a file from outside /w: ${JSON.stringify(content)}`);
+	});
+});
+
+test("host `ls` tool cannot be raced into listing a dir outside /w", async () => {
+	const { listView } = await import("../../src/host/layers.ts");
+	const up = tmp("toctou-up-");
+	const outside = tmp("toctou-outside-");
+	writeFileSync(join(outside, "secret-name"), "x");
+	raceUse(up, outside, "decoy", 4_000, (root) => {
+		const names = listView(locate([root], "/w/a", true), "/w/a");
+		assert.ok(!names.includes("secret-name"), `listed a dir outside /w: ${names.join(", ")}`);
+	});
+});

@@ -10,11 +10,11 @@
 // as artifacts are discarded. No directory is shared between nodes.
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ArtifactDraft, ArtifactRef, Json } from "../sdk/index.ts";
 import type { ResolvedVolume } from "./volumes.ts";
-import { layerDir, locate, prepareWork, removeWork, syncPath, ViewError, type ViewEntry, type Work, workRoot } from "./layers.ts";
+import { layerDir, type Located, locate, openViewFile, prepareWork, removeWork, syncPath, ViewError, type Work, workRoot } from "./layers.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
@@ -58,6 +58,36 @@ export function storeFile(runDir: string, path: string, media: string, name = ba
 		mkdirSync(blobsDir(runDir), { recursive: true });
 		copyFileSync(path, target);
 		chmodSync(target, 0o444);
+	}
+	return { digest, name, media };
+}
+
+/**
+ * Stores an open file's content (read once, through the fd: never by a
+ * path an agent could swap) and returns its ref. The caller closes the fd.
+ */
+export function storeFd(runDir: string, fd: number, media: string, name: string): ArtifactRef {
+	mkdirSync(blobsDir(runDir), { recursive: true });
+	const temp = join(blobsDir(runDir), `.in-${process.pid}-${Math.random().toString(36).slice(2)}`);
+	const out = openSync(temp, "wx", 0o600);
+	const hash = createHash("sha256");
+	try {
+		const chunk = Buffer.alloc(1 << 20);
+		for (;;) {
+			const n = readSync(fd, chunk, 0, chunk.length, null);
+			if (n === 0) break;
+			hash.update(chunk.subarray(0, n));
+			writeSync(out, chunk, 0, n);
+		}
+	} finally {
+		closeSync(out);
+	}
+	const digest = `sha256:${hash.digest("hex")}`;
+	const target = blobPath(runDir, digest);
+	if (existsSync(target)) rmSync(temp, { force: true });
+	else {
+		chmodSync(temp, 0o444);
+		renameSync(temp, target);
 	}
 	return { digest, name, media };
 }
@@ -130,16 +160,28 @@ export function resolveDrafts(value: Json, runDir: string, scratch: string | Wor
 		// Resolved in the sandbox view (an agent's file may be in any of its session's layers), never
 		// through a host symlink: a link out of /w is refused.
 		const root = typeof scratch === "string" ? { at: "/w", stack: [scratch], upper: scratch } : workRoot(scratch);
-		let entry: ViewEntry | null;
+		let located: Located;
 		try {
-			entry = locate([root], `/w/${rel}`, true).entry;
+			located = locate([root], `/w/${rel}`, true);
 		} catch (error) {
 			if (!(error instanceof ViewError)) throw error;
 			throw new ArtifactError(`artifact ${value.artifact}: ${error.message}`);
 		}
+		const entry = located.entry;
 		if (entry === null || entry.kind !== "file") throw new ArtifactError(`artifact ${value.artifact} is not a file in the node's scratch dir`, value.artifact);
-		const path = entry.host;
-		return storeFile(runDir, path, value.media, value.name ?? basename(path)) as unknown as Json;
+		// Read through an fd opened beneath its layer dir, never following a link (see openBeneath).
+		let fd: number;
+		try {
+			fd = openViewFile(located, `/w/${rel}`);
+		} catch (error) {
+			if (!(error instanceof ViewError)) throw error;
+			throw new ArtifactError(`artifact ${value.artifact}: ${error.message}`);
+		}
+		try {
+			return storeFd(runDir, fd, value.media, value.name ?? basename(entry.host)) as unknown as Json;
+		} finally {
+			closeSync(fd);
+		}
 	}
 	if (Array.isArray(value)) return value.map((v) => resolveDrafts(v, runDir, scratch));
 	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, resolveDrafts(v, runDir, scratch)]));
