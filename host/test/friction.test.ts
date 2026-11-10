@@ -84,20 +84,28 @@ const look = defineAgent({ models }, { name: "look", model: "default", prompt: "
 	assert.match(prompt, /"path": "\/in\/[0-9a-f]{64}\/sheet\.png"/);
 });
 
-test("a call answered from the journal is logged as a host fact, with the host that reused it", async () => {
+test("a host session's cache hits are one host fact; a fork does not inherit it", async () => {
 	const wf = workflow(
-		`const step = command({ name: "step", sandbox: box, input: Type.Null(), output: Type.Any(), run: ["sh", "-c", "cat"] });`,
-		`agents: [], commands: [step], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.call(step, null)`,
+		`const step = command({ name: "step", sandbox: box, input: Type.Object({ i: Type.Number() }), output: Type.Any(), run: ["sh", "-c", "cat"] });`,
+		`agents: [], commands: [step], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.map([0, 1, 2], async (c, i) => c.call(step, { i }))`,
 	);
 	const { forkRun } = await import("../src/host/index.ts");
+	const facts = (dir: string) => new EventLog(join(dir, "log.jsonl")).read().flatMap((e) => (e.type === "noted" && (e.key === "hits" || e.key.startsWith("hit ")) ? [e] : []));
 	const dir = join(tmp(), "run");
 	await runWorkflow({ ...base, workflow: wf, dir, executor: new FakeExecutor({}), commands: new FakeCommands({ step: { stdout: "1" } }) });
-	assert.ok(!new EventLog(join(dir, "log.jsonl")).read().some((e) => e.type === "noted" && e.key.startsWith("hit ")), "nothing was reused the first time");
+	assert.deepEqual(facts(dir), [], "nothing was reused the first time");
 	const fork = forkRun(dir, join(tmp(), "fork"));
 	await runWorkflow({ ...base, workflow: wf, dir: fork.dir, executor: new FakeExecutor({}), commands: new FakeCommands({}) });
-	const hit = new EventLog(join(fork.dir, "log.jsonl")).read().find((e) => e.type === "noted" && e.key === "hit #0");
-	assert.ok(hit && hit.type === "noted");
-	assert.deepEqual({ ...(hit.value as object), host: "" }, { kind: "command", node: "step", host: "" });
+	const once = facts(fork.dir);
+	assert.equal(once.length, 1, "one event for the host session, not one per hit");
+	const value = (once[0] as unknown as { value: { count: number; by_kind: object; ids: string[]; digest: string } }).value;
+	assert.equal(value.count, 3);
+	assert.deepEqual(value.by_kind, { command: 3 });
+	assert.deepEqual(value.ids, ["#0.0#0", "#0.1#0", "#0.2#0"]);
+	assert.match(value.digest, /^sha256:[0-9a-f]{64}$/);
+	// A fork of the fork starts with no hits of its own.
+	const again = forkRun(fork.dir, join(tmp(), "fork2"));
+	assert.deepEqual(facts(again.dir), []);
 });
 
 test("tree --full shows each loop iteration's whole state; the log keeps a long one truncated, whole in the store", async () => {

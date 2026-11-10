@@ -759,11 +759,12 @@ Prototype choices:
 - **Observations** (`ctx.observe`) are logged events; `wallis status`
   prints the latest value per label, `wallis tree` shows each one at its
   position, `wallis show <run>` lists them.
-- **Cache hits** are logged as host facts (this round): a request answered
-  from the journal notes `hit <id>` = `{ kind, node, host }` (`host`: when
-  the reusing host started), so a resume or fork says what it reused. A
-  fact, not the run's state: a resumed run still equals an uninterrupted
-  one.
+- **Cache hits** are logged as one host fact per host session (review
+  fixes): when the session ends it notes `hits` = `{ host, count, by_kind,
+  ids, digest }` (`host`: when it started; `ids`: the first 200; `digest`:
+  over all of them), so a resume or fork says what it reused, in one
+  event. A fact, not the run's state: a resumed run still equals an
+  uninterrupted one. A fork does not inherit its source's `hits`.
 - **CLI:** `wallis ls`, `wallis tree <run> [--full]`, `wallis log <run> [--follow]`,
   `wallis show <run> [<node>]`, `wallis describe <workflow>`, `wallis doc`;
   interventions `send`, `submit`, `interrupt`, `restart`, `cancel --node`,

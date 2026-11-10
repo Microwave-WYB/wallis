@@ -128,6 +128,9 @@ export class RunRefused extends Error {
 	}
 }
 
+/** How many hit ids the `hits` fact lists (all of them are in its digest). */
+const HIT_IDS = 200;
+
 /** A loop iteration's state, as logged: at most this many characters of its JSON (the whole one is a blob). */
 const LOOP_STATE_CHARS = 2000;
 
@@ -204,8 +207,10 @@ export class Session {
 	#seed = 0;
 	/** Set when the code changed since the last session: hits so far, until the first new call. */
 	#codeChange: { hits: number; reported: boolean } | null = null;
-	/** When this host started: which host reused a journaled call (`hit` facts). */
+	/** When this host started: which host reused journaled calls (the `hits` fact). */
 	readonly #hostStarted = new Date().toISOString();
+	/** The calls this host session answered from the journal. */
+	#hits: { byKind: Record<string, number>; ids: string[] } = { byKind: {}, ids: [] };
 	/** A restarted held node: the body runs again, in a fresh VM, against the journal. */
 	#restarting = false;
 	/** Tool sources (toolsets, MCP servers), and every tool they listed at preflight, by source key. */
@@ -918,15 +923,27 @@ export class Session {
 
 	/**
 	 * A request answered from the journal (a hit: answered, nothing else) is
-	 * logged as a host fact, `hit <id>`: what was reused, and by which host
-	 * (its start time). A fact, not the run: it never changes the run's
+	 * counted; when the host session ends, one host fact, `hits`, sums them
+	 * up (see #noteHits). A fact, not the run: it never changes the run's
 	 * state, so a resumed run still equals an uninterrupted one.
 	 */
 	#noteHit(event: Event, effects: readonly Effect[]): void {
 		if (event.type !== "requested" || effects.length !== 1 || effects[0]!.type !== "deliver") return;
-		const r = event.request as { type: string; agent?: string; command?: string; tool?: string; name?: string };
-		const node = r.agent ?? r.command ?? r.tool ?? r.name ?? null;
-		this.#note(`hit ${event.id}`, { kind: r.type, node, host: this.#hostStarted });
+		const kind = (event.request as { type: string }).type;
+		this.#hits.byKind[kind] = (this.#hits.byKind[kind] ?? 0) + 1;
+		this.#hits.ids.push(event.id);
+	}
+
+	/**
+	 * This host session's hits, as one fact (one event per host session):
+	 * when the host started, how many calls of each kind it reused, the
+	 * first HIT_IDS of their ids and a digest of all of them.
+	 */
+	#noteHits(): void {
+		const ids = this.#hits.ids;
+		if (ids.length === 0) return;
+		this.#note("hits", { host: this.#hostStarted, count: ids.length, by_kind: this.#hits.byKind, ids: ids.slice(0, HIT_IDS), digest: `sha256:${createHash("sha256").update(ids.join("\n")).digest("hex")}` });
+		this.#hits = { byKind: {}, ids: [] };
 	}
 
 	/** After a code change: count hits, and say where the first new call is. */
@@ -1453,6 +1470,7 @@ export class Session {
 
 	#complete(): void {
 		if (this.#settled) return;
+		this.#noteHits();
 		this.#settled = true;
 		this.#cleanup();
 		const run = this.#core.snapshot();

@@ -355,7 +355,8 @@ export function forkRun(source: string, target: string, options: { readonly forg
 	// A fork snapshots its binds anew (the `binds` fact is not copied): edits since the source started reach it.
 	const events = new EventLog(from.log)
 		.read()
-		.filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested" && !(e.type === "noted" && e.key === "binds"));
+		// Nor this run's hits: they are what its hosts reused, not the fork's.
+		.filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested" && !(e.type === "noted" && (e.key === "binds" || e.key === "hits" || e.key.startsWith("hit "))));
 	if ((options.forget ?? []).length > 0) {
 		const core = Core.refold(events);
 		const by = options.by ?? core.snapshot().owner ?? "human";
