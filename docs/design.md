@@ -1194,7 +1194,9 @@ reads as a subset of a compose service.
   volume is writable for commands and tool sources only; in an agent's
   sandbox (its `bash` and its file tools) it is read-only, since an
   agent's writes would reach later runs outside every key (review fixes).
-  Concurrent runs share a named volume with no lock: a program that
+  Named volumes are shared across a run's forks too (not copied), as an
+  outside service is; there is no run-scoped place for a fake service's
+  state yet (not now). Concurrent runs share a named volume with no lock: a program that
   writes one must tolerate concurrent writers (caches built by atomic
   renames do).
 - **Targets** are absolute, plain (no `.`, `..` or trailing `/`), and
@@ -1273,6 +1275,27 @@ Prototype choices:
     error; the same tool given to an agent twice is one tool.
   - Occurrences follow call issue order, which is synchronous and
     deterministic.
+- **Write epochs: a read after a write is keyed by that write** (this
+  round). Each tool source (a toolset: its bundle and sandbox; an MCP
+  server) has a write epoch, a hash chain over the write-capable calls to
+  it (annotated as writes; unannotated counts as a write) in the body's
+  program order. Every call that touches a source (a body tool call to it,
+  or an agent call holding any of its tools) has the source's current
+  epoch in its key (appended to its occurrence; a call with no write
+  upstream keeps the key it had). A write-capable call (a write tool; an
+  agent holding one) then advances the epoch: `sha256(epoch, its key, its
+  attempt count)`. So a read after a write misses whenever that write
+  executed again (a restart, a forget) or changed, and still hits when
+  nothing upstream changed. Program order: within a branch, calls with a
+  smaller counter in their id (ids are taken in program order); a branch
+  (`ctx.parallel`, `ctx.map`, a loop iteration, a nested workflow) starts
+  from its parent's epoch at the place it was made, and carries its own
+  chain: sibling branches never see each other's writes, and the parent
+  does not see its branches'. Inside one agent call the same rule holds
+  for its tool calls: each write-capable call advances its source's epoch
+  in call order, and a journaled result is reused only at the epoch it was
+  made at (a call resumed from a checkpoint starts its epochs afresh, so
+  such a read misses: never stale).
 - **Resume re-executes the body against the cache.** Unchanged calls hit;
   anything changed misses and executes; downstream calls miss
   automatically when their inputs change. There is no path divergence.

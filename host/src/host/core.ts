@@ -216,6 +216,11 @@ export class Core {
 		return gleam.full_state(this.#state);
 	}
 
+	/** How many attempts (tried or forgotten) the call at this request id has had; 0 if unknown. */
+	attemptCount(id: string): number {
+		return gleam.attempt_count(this.#state, id);
+	}
+
 	/** The host facts the log noted (`noted` events), by key. */
 	facts(): Record<string, Json> {
 		return JSON.parse(gleam.facts_json(this.#state)) as Record<string, Json>;

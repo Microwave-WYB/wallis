@@ -59,3 +59,11 @@ pub fn facts_json(state: RunState) -> String {
 pub fn semantics() -> String {
   run.semantics
 }
+
+/// How many attempts (tried or forgotten) the call at this request id has
+/// had: 0 for an id the run does not know. The host chains a write's count
+/// into the write epoch of its tool source, so a read after a write that
+/// re-executed misses.
+pub fn attempt_count(state: RunState, id: String) -> Int {
+  list.length(run.attempts(state, id))
+}

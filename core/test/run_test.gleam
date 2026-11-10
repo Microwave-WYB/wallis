@@ -7,6 +7,7 @@ import support.{
   basic, cached, call, command, human, idle, last, nodes_after, pin, replay,
   replay_from, returned, snapshot_get, started, status_after,
 }
+import wallis_core
 import wallis_core/run
 import wallis_core/types.{
   AgentGaveUp, AliasRebound, Answer, Assistant, Budget, BudgetRaised,
@@ -1564,4 +1565,18 @@ pub fn an_interrupt_names_the_attempt_it_is_for_test() {
   let assert [Checkpoint, CallAgent(attempt: 2, ..)] = effects
   let assert [Checkpoint, types.InterruptTurn("#0", 2)] =
     run.step(state, types.InterruptRequested("#0", human)).1
+}
+
+pub fn attempt_count_counts_tried_and_forgotten_attempts_test() {
+  let #(s, _, _) =
+    replay([
+      started(basic()),
+      cached("#0", "n", JInt(0), 0),
+      returned("#0", summary("s0")),
+    ])
+  assert wallis_core.attempt_count(s, "#0") == 1
+  assert wallis_core.attempt_count(s, "#9") == 0
+  let #(s, _) = step(s, types.CallForgotten("#0", human))
+  let #(s, _) = step(s, cached("#0", "n", JInt(0), 0))
+  assert wallis_core.attempt_count(s, "#0") == 3
 }

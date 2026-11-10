@@ -198,6 +198,16 @@ export class Session {
 	readonly #commandCalls = new Map<string, { command: string; input: Json; request: Extract<Event, { type: "requested" }> }>();
 	/** Occurrences of each (node, input) in this execution of the body. */
 	#occurrences = new Map<string, number>();
+	/**
+	 * Write epochs (see #epochAt): per branch of this execution of the body,
+	 * per tool source, the epoch after each write-capable call, by the
+	 * call's place (counter) in its branch.
+	 */
+	#writeEpochs = new Map<string, Map<string, { counter: number; epoch: string }[]>>();
+	/** Requests just keyed that may write: their epochs advance once the core has taken them (their attempt is known). */
+	readonly #pendingWrites = new Map<string, { branch: string; counter: number; sources: readonly string[]; key: string }>();
+	/** Per agent: the tool sources its tools come from, and whether any of its tools from each may write. */
+	#agentSources = new Map<string, Map<string, boolean>>();
 	/** Facts noted before the core started: logged right after `started`. */
 	readonly #pendingFacts = new Map<string, Json>();
 	#code = "";
@@ -833,6 +843,7 @@ export class Session {
 			const refusals = this.#feed(event);
 			// A request the core refuses as an event is a path divergence: the body took another path.
 			if (refusals.length > 0) throw new RunRefused(refusals[0]!);
+			if (event.type === "requested") this.#advanceEpochs(event.id);
 		}
 	}
 
@@ -920,13 +931,88 @@ export class Session {
 		const key = `${branch}\n${digest}\n${canonical(session)}\n${canonical(r.input ?? null)}`;
 		const n = this.#occurrences.get(key) ?? 0;
 		this.#occurrences.set(key, n + 1);
-		const occurrence = `${branch}/${n}`;
+		const counter = Number(event.id.slice(event.id.lastIndexOf("#") + 1));
+		// The write epochs of the tool sources this call touches are part of its key: a read after a
+		// write misses when that write re-executed or changed, and still hits when nothing upstream did.
+		const touched = this.#touched(r);
+		const epochs = [...touched.keys()].sort().flatMap((s) => {
+			const epoch = this.#epochAt(branch, counter, s);
+			return epoch === "" ? [] : [[s, epoch]];
+		});
+		const occurrence = epochs.length === 0 ? `${branch}/${n}` : `${branch}/${n}@${createHash("sha256").update(canonical(epochs as Json)).digest("hex").slice(0, 32)}`;
+		const writes = [...touched].flatMap(([s, w]) => (w ? [s] : []));
+		if (writes.length > 0) this.#pendingWrites.set(event.id, { branch, counter, sources: writes, key: `${digest}\n${occurrence}\n${canonical(r.input ?? null)}` });
 		// A body tool call carries whether it may be made again after a crash.
 		const request = r.type === "tool" ? { ...(event.request as object), replay: this.#bodyTool(r.tool!)?.replay === "safe" ? "replay_safe" : "replay_never" } : event.request;
 		const keyed: Extract<Event, { type: "requested" }> = { ...event, request: request as Json, node_digest: digest, occurrence };
 		// A command's answer is its process result, parsed by the current `parse` when it is delivered.
 		if (r.type === "command") this.#commandCalls.set(event.id, { command: r.command!, input: r.input ?? null, request: keyed });
 		return keyed;
+	}
+
+	/**
+	 * The tool sources a request touches, and whether it may write each: a
+	 * body tool call its source (a write when the tool may write outside;
+	 * unannotated counts as a write); an agent call every source its tools
+	 * come from (a write when any of them may write). Commands and
+	 * orchestrator nodes touch none.
+	 */
+	#touched(r: { type: string; agent?: string; tool?: string }): Map<string, boolean> {
+		if (r.type === "tool") {
+			const info = this.#bodyTool(r.tool!);
+			return info ? new Map([[sourceKey(info.source), writesOutside(info.annotations)]]) : new Map();
+		}
+		if (r.type !== "call") return new Map();
+		let sources = this.#agentSources.get(r.agent!);
+		if (sources === undefined) {
+			sources = new Map();
+			const a = this.#decl.agents[r.agent!];
+			for (const t of a ? resolveAgentTools(r.agent!, a.tools, this.#listing).tools : []) {
+				const s = sourceKey(t.source);
+				sources.set(s, (sources.get(s) ?? false) || writesOutside(t.annotations));
+			}
+			this.#agentSources.set(r.agent!, sources);
+		}
+		return sources;
+	}
+
+	/**
+	 * A tool source's write epoch at a place in the body: a hash chain over
+	 * the write-capable calls to it before that place, in program order. In
+	 * a branch, that is its calls with a smaller counter; a branch (a
+	 * parallel branch, a map item, a loop iteration, a nested workflow)
+	 * starts from its parent's epoch at the place it was made. "" before
+	 * any write.
+	 */
+	#epochAt(branch: string, counter: number, source: string): string {
+		const history = this.#writeEpochs.get(branch)?.get(source) ?? [];
+		for (let i = history.length - 1; i >= 0; i--) if (history[i]!.counter < counter) return history[i]!.epoch;
+		if (branch === "") return "";
+		const at = branch.lastIndexOf("#");
+		return this.#epochAt(branch.slice(0, at), Number.parseInt(branch.slice(at + 1), 10), source);
+	}
+
+	/**
+	 * After the core took a write-capable request: each source it may write
+	 * gets a new epoch, chained over the request's key and its attempt count
+	 * (so a write that executed again, after a restart or a forget, makes a
+	 * new epoch; a hit keeps the one it had).
+	 */
+	#advanceEpochs(id: string): void {
+		const w = this.#pendingWrites.get(id);
+		if (!w) return;
+		this.#pendingWrites.delete(id);
+		const attempts = this.#core.attemptCount(id);
+		const branch = this.#writeEpochs.get(w.branch) ?? new Map<string, { counter: number; epoch: string }[]>();
+		this.#writeEpochs.set(w.branch, branch);
+		for (const source of w.sources) {
+			const before = this.#epochAt(w.branch, w.counter, source);
+			const epoch = createHash("sha256").update(`${before}\n${w.key}\n${attempts}`).digest("hex");
+			const history = branch.get(source) ?? [];
+			history.push({ counter: w.counter, epoch });
+			history.sort((a, b) => a.counter - b.counter);
+			branch.set(source, history);
+		}
 	}
 
 	/**
@@ -999,6 +1085,7 @@ export class Session {
 				this.#requests.length = 0;
 				this.#deliveries.length = 0;
 				this.#occurrences = new Map();
+				this.#writeEpochs = new Map();
 				this.#restarting = false;
 				this.#sandbox.start(this.#input, this.#seed);
 			});

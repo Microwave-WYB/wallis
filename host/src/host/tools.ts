@@ -27,6 +27,7 @@
 // text is spilled to the node's spill dir with an explicit marker; the next
 // script pages it with `read_spill`. Nothing is dropped silently.
 
+import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, posix, relative, resolve, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -39,7 +40,7 @@ import type { InFlightCall } from "./core.ts";
 import { listView, locate, readViewFile, ViewError, type ViewRoot, writeViewFile } from "./layers.ts";
 import { type NodeSpec, validateSubmission } from "./executor.ts";
 import { canonical } from "./render.ts";
-import { resolveAgentTools, type Source, sourceKey, type ToolInfo, toolInfos } from "./toolsets.ts";
+import { resolveAgentTools, type Source, sourceKey, type ToolInfo, toolInfos, writesOutside } from "./toolsets.ts";
 
 /** A tool as wallis runs it, before it is adapted to an executor. */
 export interface WallisToolRun {
@@ -65,7 +66,8 @@ export interface ToolOutcome {
 
 const Outcome = Type.Object({ text: Type.String(), value: Type.Optional(Type.Unknown()), isError: Type.Optional(Type.Boolean()) });
 /** A journaled external result, parsed when it is read back. */
-const Recorded = Type.Object({ tool: Type.String(), args: Type.Unknown(), outcome: Outcome });
+/** A journaled tool result; `epoch`: its source's write epoch within the call when it was made (none: before epochs). */
+const Recorded = Type.Object({ tool: Type.String(), args: Type.Unknown(), outcome: Outcome, epoch: Type.Optional(Type.String()) });
 
 /** What a tool call in flight at a crash does when the call is reissued. */
 
@@ -135,13 +137,30 @@ export class NodeTools {
 		return `${this.turn}/${callId}`;
 	}
 
-	/** The journaled result of this external call, if one matches its tool and arguments. A mismatch is a miss, logged. */
-	recorded(key: string, info: ToolInfo, args: Json): ToolOutcome | null {
+	/**
+	 * Each tool source's write epoch within this call: a hash chain over
+	 * the write-capable calls made to it (unannotated tools count as
+	 * writes), in call order (advanced when a call starts, so a replay gets
+	 * the same chain). The call itself is keyed by the body's epochs.
+	 */
+	readonly #epochs = new Map<string, string>();
+
+	/** The epoch a call to this tool's source is made at; a write-capable call advances it (after it is taken). */
+	epochFor(info: ToolInfo, key: string, args: Json): string {
+		const source = sourceKey(info.source);
+		const epoch = this.#epochs.get(source) ?? "";
+		if (writesOutside(info.annotations)) this.#epochs.set(source, createHash("sha256").update(`${epoch}\n${key}\n${info.id}\n${canonical(args)}`).digest("hex"));
+		return epoch;
+	}
+
+	/** The journaled result of this external call, if one matches its tool, arguments and epoch. A mismatch is a miss, logged. */
+	recorded(key: string, info: ToolInfo, args: Json, epoch = ""): ToolOutcome | null {
 		const raw = this.spec.recorded.get(key);
 		if (raw === undefined) return null;
 		// Parsed, not cast: a record that does not match its schema is a miss.
 		const rec = Value.Check(Recorded, raw) ? raw : null;
-		if (rec !== null && rec.tool === info.id && canonical(rec.args as Json) === canonical(args)) return { text: rec.outcome.text, value: rec.outcome.value as Json, isError: rec.outcome.isError === true };
+		if (rec !== null && rec.tool === info.id && canonical(rec.args as Json) === canonical(args) && (rec.epoch ?? "") === epoch)
+			return { text: rec.outcome.text, value: rec.outcome.value as Json, isError: rec.outcome.isError === true };
 		this.spec.log({ kind: "note", text: `journaled result ${key} is for another call (${rec ? `${rec.tool} ${canonical(rec.args as Json)}` : "unreadable"}): calling ${info.id}` });
 		return null;
 	}
@@ -469,14 +488,16 @@ export async function buildNodeTools(spec: NodeSpec, options: ToolLayerOptions =
 			description: info.description,
 			parameters: { ...(info.inputSchema as object), type: "object", properties: (info.inputSchema as { properties?: Json }).properties ?? {} } as unknown as Json,
 			run: async (args, signal, call) => {
-				const recorded = tools.recorded(call, info, args);
+				// A read after a write to the same source, in this call, is keyed by that write.
+				const epoch = tools.epochFor(info, call, args);
+				const recorded = tools.recorded(call, info, args, epoch);
 				if (recorded !== null) return recorded;
 				const r = await client.callTool(info.remote, args as Record<string, unknown>, { signal });
 				const text = toLlmContent(r)
 					.map((c) => (c.type === "text" ? c.text : "[image]"))
 					.join("\n");
 				const outcome: ToolOutcome = { text, value: (r.structuredContent ?? text) as Json, isError: r.isError === true };
-				spec.record(call, { tool: info.id, args, outcome } as unknown as Json);
+				spec.record(call, { tool: info.id, args, outcome, ...(epoch === "" ? {} : { epoch }) } as unknown as Json);
 				return outcome;
 			},
 		});
