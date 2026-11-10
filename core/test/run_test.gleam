@@ -1089,6 +1089,33 @@ pub fn only_its_own_agent_continues_a_session_value_test() {
   assert session == s1
 }
 
+pub fn a_renamed_agent_continues_its_sessions_test() {
+  let #(state, s1) = first_call("dialogue-a")
+  // The same definition (digest) under a new name, declared by the new code.
+  let #(state, _) = run.step(state, types.CodeChanged("wf1", "wf2"))
+  let #(state, _) =
+    run.step(
+      state,
+      types.WorkflowDeclared(
+        support.workflow([support.agent("author"), support.agent("judge")]),
+      ),
+    )
+  let continued =
+    types.Requested(
+      id: "#1",
+      request: types.Call(
+        agent: "author",
+        input: input(2),
+        session: Some(s1),
+        from: [],
+      ),
+      node_digest: "worker",
+      occurrence: "0",
+    )
+  let assert [Checkpoint, CallAgent(id: "#1", history: Some("dialogue-a"), ..)] =
+    run.step(state, continued).1
+}
+
 pub fn a_reissued_call_resumes_from_its_newest_checkpoint_test() {
   let events = [
     started(basic()),

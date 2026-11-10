@@ -94,11 +94,18 @@ type Run {
   )
 }
 
-/// Where a session value comes from: the agent and the call (slot) and
-/// attempt that answered with it, and its workspace: layers, bottom first.
-/// Only that agent continues it.
+/// Where a session value comes from: the agent (its definition digest, and
+/// its name for messages) and the call (slot) and attempt that answered
+/// with it, and its workspace: layers, bottom first. Only that agent, by
+/// identity, continues it: a renamed agent still does.
 type Origin {
-  Origin(agent: String, after: Slot, attempt: Int, layers: List(Digest))
+  Origin(
+    agent: String,
+    node: Digest,
+    after: Slot,
+    attempt: Int,
+    layers: List(Digest),
+  )
 }
 
 type Spent {
@@ -113,6 +120,8 @@ type Call {
   AgentCall(
     id: RequestId,
     agent: String,
+    /// The agent's definition digest: its identity (the name is a label).
+    node: Digest,
     input: Value,
     session: Option(SessionId),
     from: List(Digest),
@@ -944,7 +953,7 @@ fn requested(
 ) -> #(Run, List(Effect)) {
   let slot = slot_of(node, request, occurrence)
   case dict.get(run.calls, slot) {
-    Error(Nil) -> new_attempt(run, id, slot, request, [])
+    Error(Nil) -> new_attempt(run, id, slot, request, node, [])
     Ok(call) ->
       case live(call) {
         LiveSettled(entry) -> #(run, [deliver(run, id, slot, call, entry)])
@@ -957,7 +966,7 @@ fn requested(
             False -> #(run, effects)
           }
         }
-        LiveForgotten -> new_attempt(run, id, slot, request, [call])
+        LiveForgotten -> new_attempt(run, id, slot, request, node, [call])
       }
   }
 }
@@ -967,9 +976,10 @@ fn new_attempt(
   id: RequestId,
   slot: Slot,
   request: Request,
+  node: Digest,
   prior: List(Call),
 ) -> #(Run, List(Effect)) {
-  let #(run, effects) = begin(run, id, slot, request, prior)
+  let #(run, effects) = begin(run, id, slot, request, node, prior)
   #(run, [types.Checkpoint, ..effects])
 }
 
@@ -1181,6 +1191,7 @@ fn begin(
   id: RequestId,
   slot: Slot,
   request: Request,
+  node: Digest,
   prior: List(Call),
 ) -> #(Run, List(Effect)) {
   case request {
@@ -1190,7 +1201,7 @@ fn begin(
       let known = case session {
         Some(s) ->
           case dict.get(run.sessions, ids.session_id(s)) {
-            Ok(origin) if origin.agent == name -> SessionOf
+            Ok(origin) if origin.node == node -> SessionOf
             Ok(origin) -> SessionOfAgent(origin.agent)
             Error(Nil) -> SessionUnknown
           }
@@ -1221,6 +1232,7 @@ fn begin(
             AgentCall(
               id:,
               agent: name,
+              node:,
               input:,
               session: option.map(session, ids.session_id),
               from: list.map(from, ids.digest),
@@ -1534,14 +1546,14 @@ fn settle_agent_with(
     })
   // An answer is a new session value: what a call of it continues.
   let run = case call, entry {
-    AgentCall(agent:, attempts:, ..), Answered(_) -> {
+    AgentCall(agent:, node:, attempts:, ..), Answered(_) -> {
       let n = list.length(attempts)
       Run(
         ..run,
         sessions: dict.insert(
           run.sessions,
           ids.next_session(slot, n),
-          Origin(agent, slot, n, layers),
+          Origin(agent, node, slot, n, layers),
         ),
       )
     }
