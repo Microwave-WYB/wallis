@@ -17,7 +17,7 @@
 //   wallis ls | tree <run> [--full] | log <run> [--follow] [--since n] | show <run> [<node>]
 //   wallis interrupt <run> <node> | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
-//   wallis fork <run> [--forget <node>]... [--model a=m]... [--detach] [--json]   (copies the journal; unchanged calls hit; forgotten calls execute again)
+//   wallis fork <run> [--input json | --input-file path] [--forget <node>]... [--model a=m]... [--detach] [--json]   (copies the journal; unchanged calls hit; forgotten calls execute again)
 //   wallis export <run> <artifact> <dir>
 //   wallis export <run> --output <dir> [--merge]   the whole output value: its artifacts by JSON path, and output.json
 //   wallis serve [--executor module]
@@ -56,7 +56,7 @@ import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { loadProfile } from "../host/profile.ts";
 import { ProcessCommands } from "../host/commands.ts";
-import { CONTINUE, exportOutput, warningLines } from "../host/query.ts";
+import { CONTINUE, checkWorkflowInput, exportOutput, warningLines } from "../host/query.ts";
 import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
 import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir, writeLaunch } from "../host/store.ts";
@@ -75,6 +75,7 @@ const { values, positionals } = parseArgs({
 		model: { type: "string", multiple: true },
 		volume: { type: "string", multiple: true },
 		forget: { type: "string", multiple: true },
+		"input-file": { type: "string" },
 		output: { type: "string" },
 		merge: { type: "boolean" },
 		full: { type: "boolean" },
@@ -141,7 +142,9 @@ function out(text: string): void {
 /** A run as JSON (`--json`): its id, status, nodes, observations, spend, what needs attention, warnings; plus `extra`. */
 function runJson(dir: string, extra: Record<string, unknown> = {}): string {
 	const view = inspectRun(dir);
-	return JSON.stringify({ run_id: view.runId, ...extra, status: view.run.status, stopped: view.stopped, nodes: view.run.nodes, observed: latestObservations(view), spent: view.run.spent, attention: attention(view), warnings: view.warnings });
+	const status = view.run.status;
+	const output = status?.type === "finished" && status.outcome.type === "done" ? status.outcome.value : null;
+	return JSON.stringify({ run_id: view.runId, ...extra, status, output, stopped: view.stopped, nodes: view.run.nodes, observed: latestObservations(view), spent: view.run.spent, attention: attention(view), warnings: view.warnings });
 }
 
 function report(dir: string, extra: Record<string, unknown> = {}): void {
@@ -487,9 +490,24 @@ async function main(): Promise<number> {
 			const meta = readMeta(runPaths(source));
 			const name = meta ? (meta.workflow.split("/").at(-2) ?? "run") : "run";
 			const forget = (values.forget ?? []).map((n) => parseNodeId(n));
-			const target = forkRun(source, join(runsDir(root), newRunId(name)), { forget, by: caller });
-			applyControl(target.dir, { type: "claimed", owner: caller });
-			const forked = { forked_from: runPaths(source).id, forgotten: forget };
+			// A new input, parsed against the workflow's input schema before anything is written.
+			if (values.input !== undefined && values["input-file"] !== undefined) throw new Error("wallis fork: give --input or --input-file, not both");
+			const raw = values["input-file"] !== undefined ? readFileSync(resolve(values["input-file"]), "utf8") : values.input;
+			let input: Json | undefined;
+			if (raw !== undefined) {
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(raw);
+				} catch {
+					throw new RunRefused({ type: "invalid_input", errors: ["the input is not JSON"] });
+				}
+				if (!meta) throw new Error(`run ${runPaths(source).id} has no meta.json`);
+				input = await checkWorkflowInput(meta.workflow, parsed);
+			}
+			const target = forkRun(source, join(runsDir(root), newRunId(name)), { forget, by: caller, ...(input !== undefined ? { input } : {}) });
+			const claim = applyControl(target.dir, { type: "claimed", owner: caller });
+			if (claim) throw new RunRefused(claim);
+			const forked = { forked_from: runPaths(source).id, forgotten: forget, input_changed: input !== undefined };
 			if (!values.json) out(`Forked ${runPaths(source).id} into ${target.id}${forget.length > 0 ? `, forgetting ${forget.join(", ")}` : ""}.`);
 			if (values.detach) {
 				detach(target.dir, (values.model ?? []).flatMap((m) => ["--model", m]));

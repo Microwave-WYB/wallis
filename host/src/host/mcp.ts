@@ -91,7 +91,7 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 			description: `Start a workflow run. Workflows: ${workflows.join(", ") || "(none)"}. Returns the run id; then run \`npx wallis wait <run_id>\` in the background to be notified.`,
 			inputSchema: {
 				workflow: z.string().describe(`Workflow name: ${workflows.join(", ")}`),
-				input: z.any().optional().describe("Workflow input (JSON)"),
+				input: z.unknown().optional().describe("Workflow input (JSON)"),
 				seed: z.number().int().optional(),
 				models: z.record(z.string(), z.string()).optional().describe("Model alias remaps, alias -> provider/model:thinking"),
 				volumes: z.record(z.string(), z.string()).optional().describe("Host dirs for bind volumes, container target -> host dir (read-only)"),
@@ -131,12 +131,16 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 	server.registerTool(
 		"fork",
 		{
-			description: "Fork a run you own into a new run that re-executes against its journal (unchanged calls hit). `forget` names calls (node ids) the fork executes again; calls downstream miss when their inputs change.",
-			inputSchema: { run_id: z.string(), forget: z.array(z.string()).optional().describe("Node ids to execute again, e.g. #3") },
+			description: "Fork a run you own into a new run that re-executes against its journal (unchanged calls hit). `input` replaces the run's input (checked against the workflow's input schema): only calls whose inputs change run again. `forget` names calls (node ids) the fork executes again; calls downstream miss when their inputs change.",
+			inputSchema: {
+				run_id: z.string(),
+				input: z.unknown().optional().describe("A new workflow input (JSON)"),
+				forget: z.array(z.string()).optional().describe("Node ids to execute again, e.g. #3"),
+			},
 		},
-		async ({ run_id, forget }) => {
+		async ({ run_id, input, forget }) => {
 			try {
-				const session = await runs.fork(parseRunId(run_id), (forget ?? []).map((n) => parseNodeId(n)));
+				const session = await runs.fork(parseRunId(run_id), (forget ?? []).map((n) => parseNodeId(n)), input);
 				const view = runs.view(parseRunId(session.paths.id));
 				return reply(`Forked ${run_id} into ${view.runId}.\n${summary(view)}`, data(view));
 			} catch (error) {

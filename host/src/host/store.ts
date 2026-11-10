@@ -73,7 +73,8 @@ const Facts = Type.Object({
 	/** Module whose default export creates the executor and script runner. */
 	executor: Type.Union([Type.String(), Type.Null()]),
 	created: Type.String(),
-	forked_from: Type.Optional(Type.Object({ run_id: Type.String(), at: Type.Integer() })),
+	/** The run this one was forked from, after how many of its events, and whether the fork has a new input. */
+	forked_from: Type.Optional(Type.Object({ run_id: Type.String(), at: Type.Integer(), input_changed: Type.Optional(Type.Boolean()) })),
 	/** Every required binary: the absolute path resolved at run creation (reused on resume), and its version. */
 	bins: Type.Optional(Type.Record(Type.String(), Type.Object({ path: Type.String(), version: Type.Optional(Type.String()) }))),
 	/** The host base the sandboxes run on. */

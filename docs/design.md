@@ -26,6 +26,9 @@ option consistent with the section they sit in, not yet confirmed.
   `Refused` at run time.
 - **`wallis fork <run> --forget <node>…`** (MCP `fork`): re-execute
   chosen calls in a fork; everything else hits.
+- **`wallis fork <run> --input <json>`** (or `--input-file`; MCP `fork`
+  with `input`): a fork with a new input; only calls whose inputs change
+  run again.
 - **Small things:** `ctx.map(items, f, { concurrency })`; `parse(r,
   input)`; agents see `/in/...` paths of their input artifacts;
   `wallis tree --full`; cache hits are noted (one `hits` fact per host session); `describe` has
@@ -903,6 +906,16 @@ Prototype choices:
   it; calls downstream miss only if their inputs change; a later call of
   a forgotten agent call's session misses (its session value is new). The
   source run and the fork's earlier attempts are untouched.
+- `wallis fork <run> --input <json> | --input-file <path>` (MCP `fork`
+  with `input`) gives the fork a new run input: its `started` event
+  carries it, and the body re-executes against the copied journal, so a
+  call whose own input does not depend on what changed hits. The input is
+  parsed against the workflow's input schema (the code as it is now)
+  before anything is written: a mismatch, or text that is not JSON, is the
+  typed refusal `invalid_input` (`errors`), and no fork is created. It
+  combines with `--forget`. The `forked_from` fact records
+  `input_changed`; `--json` prints one object (`run_id`, `forked_from`,
+  `forgotten`, `input_changed`, `status`, `output`, ...).
 
 Prototype choices:
 

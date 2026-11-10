@@ -1628,6 +1628,9 @@ pub type Refusal {
   /// in the environment of the host-side spawn) may not be a variable that
   /// steers the host programs either.
   InvalidEnvironment(sandbox: String, key: String, reason: String)
+  /// A run input (a fork's new input) that does not match the workflow's
+  /// input schema.
+  InvalidInput(errors: List(String))
   InputTooLarge(agent: String, field: Option(String), chars: Int, limit: Int)
   NotOwner(by: String, owner: Option(String))
   NotIdle(node: String)
@@ -1740,6 +1743,11 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
         #("sandbox", json.string(sandbox)),
         #("key", json.string(key)),
         #("reason", json.string(reason)),
+      ])
+    InvalidInput(errors:) ->
+      json.object([
+        #("type", json.string("invalid_input")),
+        #("errors", json.array(errors, json.string)),
       ])
     InputTooLarge(agent:, field:, chars:, limit:) ->
       json.object([
@@ -1969,6 +1977,10 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use key <- decode.field("key", decode.string)
       use reason <- decode.field("reason", decode.string)
       decode.success(InvalidEnvironment(sandbox:, key:, reason:))
+    }
+    "invalid_input" -> {
+      use errors <- decode.field("errors", decode.list(decode.string))
+      decode.success(InvalidInput(errors:))
     }
     "input_too_large" -> {
       use agent <- decode.field("agent", decode.string)

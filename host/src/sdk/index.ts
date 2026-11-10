@@ -503,6 +503,7 @@ export type Refusal =
 	| { readonly type: "unknown_orchestrator"; readonly name: string }
 	| { readonly type: "unknown_tool"; readonly name: string }
 	| { readonly type: "invalid_answer"; readonly node: string; readonly errors: readonly string[] }
+	| { readonly type: "invalid_input"; readonly errors: readonly string[] }
 	| { readonly type: "not_pending"; readonly node: string }
 	| { readonly type: "invalid_declaration"; readonly message: string }
 	| { readonly type: "invalid_event"; readonly message: string }

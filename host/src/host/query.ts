@@ -10,6 +10,7 @@ import { layerDir, listView, locate, readViewFile, type ViewRoot } from "./layer
 import { Core, type Event, type FailReason, type IdleCause, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
+import { schemaErrors, toJson } from "../sdk/validate.ts";
 import { RunRefused } from "./session.ts";
 import { acquireLock, listRuns, lockHolder, readMeta, type RunPaths, runPaths } from "./store.ts";
 
@@ -372,7 +373,7 @@ export async function waitForAttention(dir: string, options: { timeoutMs?: numbe
  * miss when their inputs change. Each forget is checked by the core first
  * (`by` must own the run); a refused one leaves no fork behind.
  */
-export function forkRun(source: string, target: string, options: { readonly forget?: readonly string[]; readonly by?: string } = {}): RunPaths {
+export function forkRun(source: string, target: string, options: { readonly forget?: readonly string[]; readonly by?: string; readonly input?: Json } = {}): RunPaths {
 	const from = runPaths(source);
 	const to = runPaths(target);
 	if (existsSync(to.log)) throw new Error(`run ${to.id} already exists`);
@@ -381,6 +382,13 @@ export function forkRun(source: string, target: string, options: { readonly forg
 		.read()
 		// Nor this run's hits: they are what its hosts reused, not the fork's.
 		.filter((e: Event) => e.type !== "body_finished" && e.type !== "body_failed" && e.type !== "cancel_requested" && !(e.type === "noted" && (e.key === "binds" || e.key === "hits" || e.key.startsWith("hit "))));
+	// A new input: the fork is a new run, started with it; its body re-executes against the copied
+	// journal, so calls whose own inputs are unchanged hit. (Check it first: `checkWorkflowInput`.)
+	if (options.input !== undefined) {
+		const started = events[0];
+		if (started?.type !== "started") throw new Error(`run ${from.id}: its log does not begin with a started event`);
+		events[0] = { ...started, input: options.input };
+	}
 	if ((options.forget ?? []).length > 0) {
 		const core = Core.refold(events);
 		const by = options.by ?? core.snapshot().owner ?? "human";
@@ -399,7 +407,10 @@ export function forkRun(source: string, target: string, options: { readonly forg
 	if (existsSync(join(from.dir, "outputs"))) spawnSync("cp", ["-al", join(from.dir, "outputs"), join(to.dir, "outputs")]);
 	// Where the fork comes from is a fact of its own log; meta.json is derived from it.
 	const at = events.filter((e) => e.type !== "call_forgotten").length;
-	events.push({ type: "noted", key: "created", value: new Date().toISOString() }, { type: "noted", key: "forked_from", value: { run_id: from.id, at } });
+	events.push(
+		{ type: "noted", key: "created", value: new Date().toISOString() },
+		{ type: "noted", key: "forked_from", value: { run_id: from.id, at, ...(options.input !== undefined ? { input_changed: true } : {}) } },
+	);
 	writeFileSync(to.log, events.map((e) => `${JSON.stringify(e)}\n`).join(""));
 	return to;
 }
@@ -426,6 +437,20 @@ export function exportArtifact(dir: string, selector: string, target: string): s
 	const path = join(target, ref.name);
 	copyFileSync(blobPath(runPaths(dir).dir, ref.digest), path);
 	return path;
+}
+
+/**
+ * A run input for `workflow` (a fork's new input): parsed against the
+ * workflow's input schema (the code as it is now); a mismatch is
+ * `invalid_input`, typed.
+ */
+export async function checkWorkflowInput(workflow: string, input: unknown): Promise<Json> {
+	const { declarationsOf } = await import("./sandbox.ts");
+	const json = toJson(input);
+	if (!json.ok) throw new RunRefused({ type: "invalid_input", errors: json.errors });
+	const errors = schemaErrors((await declarationsOf(workflow)).input, json.value);
+	if (errors.length > 0) throw new RunRefused({ type: "invalid_input", errors });
+	return json.value;
 }
 
 /**
