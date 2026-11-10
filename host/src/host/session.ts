@@ -49,7 +49,7 @@ import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, t
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
-import { bindDigest, bindSnapshotDir, checkDevices, type ResolvedVolume, resolveVolumes, snapshotBind, VolumeError } from "./volumes.ts";
+import { bindDigest, bindSnapshotDir, checkDevices, checkEnvironments, type ResolvedVolume, resolveVolumes, snapshotBind, VolumeError } from "./volumes.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
@@ -422,6 +422,7 @@ export class Session {
 			const callTime = o.volumes ?? readMeta(this.paths)?.volumes;
 			this.#volumes = resolveVolumes(decl.core.name, dirname(this.#workflow), decl.sandboxes, { root: this.#root, callTime, profile: this.#local.volumes });
 			checkDevices(decl.sandboxes);
+			checkEnvironments(decl);
 			if (callTime !== undefined && Object.keys(callTime).length > 0) {
 				const dirs = new Map(Object.values(this.#volumes).flat().map((v) => [v.target, v.dir]));
 				this.#note("volumes", Object.fromEntries(Object.keys(callTime).map((t) => [t, dirs.get(t)!])));

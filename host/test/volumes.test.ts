@@ -218,3 +218,52 @@ export default workflow({ name: "snap", models: defineModels({ default: "fake/de
 	const forked = await runWorkflow({ ...opts, dir: fork.dir });
 	assert.deepEqual(forked.outcome, { type: "done", value: { a: "new", b: "new" } });
 });
+
+test("environment never reaches the host side: bwrap by absolute path, only secrets in its environment, the rest set inside", async () => {
+	const { checkEnvironments } = await import("../src/host/volumes.ts");
+	const { chmodSync } = await import("node:fs");
+	const decl = (environment: Record<string, string>, secrets: string[] = []) => ({
+		sandboxes: { box: { environment } },
+		toolsets: { "./t.ts": { sandbox: "box", secrets } },
+		mcp: { mcpServers: { srv: { command: "x", env: { TOKEN: "${TOKEN}" } } } },
+		mcpServers: { srv: { sandbox: "box" } },
+	});
+	const refusal = (d: ReturnType<typeof decl>) => {
+		try {
+			checkEnvironments(d);
+			return null;
+		} catch (e) {
+			return e instanceof VolumeError ? e.refusal : String(e);
+		}
+	};
+	// The reviewer's repro: a PATH that put a fake bwrap first on the host.
+	assert.deepEqual(refusal(decl({ PATH: "/tmp/fake:/usr/bin" })), { type: "invalid_environment", sandbox: "box", key: "PATH", reason: "set by wallis" });
+	for (const key of ["HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "WALLIS_ENV", "A-B"]) assert.equal((refusal(decl({ [key]: "x" })) as { type: string }).type, "invalid_environment", key);
+	for (const key of ["LD_PRELOAD", "GCONV_PATH", "SYSTEMD_LOG_LEVEL", "PATH"]) assert.equal((refusal(decl({}, [key])) as { type: string }).type, "invalid_environment", key);
+	assert.equal(refusal(decl({ DARKTABLE_FLAGS: "x" }, ["S2_API_KEY"])), null);
+	// The spawn itself: bwrap by its absolute path; its environment is the secrets alone; the rest is --setenv.
+	const fake = tmp();
+	writeFileSync(join(fake, "bwrap"), "#!/bin/sh\ntouch /tmp/wallis-fake-bwrap-ran\n");
+	chmodSync(join(fake, "bwrap"), 0o755);
+	const decls = { box: { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: { THING: "yes" }, image: null } as const };
+	const boxes = new Sandboxes({ decls, bins: {}, volumes: {}, bindDigests: {} });
+	const sp = boxes.spawn("box", ["/bin/true"], { scratch: tmp(), inputs: null }, { secrets: { TOKEN: "s3cret" }, env: { WALLIS_COMPUTE_MINUTES: "5" } });
+	assert.ok(sp.command.startsWith("/") && sp.command.endsWith("bwrap") && !sp.command.startsWith(fake));
+	assert.deepEqual(sp.env, { TOKEN: "s3cret" });
+	assert.ok(!sp.args.includes("s3cret"), "a secret never appears on the command line");
+	const setenv = (k: string) => sp.args[sp.args.indexOf(k) + 1];
+	assert.equal(sp.args[sp.args.indexOf("THING") - 1], "--setenv");
+	assert.equal(setenv("THING"), "yes");
+	assert.equal(setenv("WALLIS_COMPUTE_MINUTES"), "5");
+	// And a key that slips past preflight is refused by the spawn itself.
+	const bad = new Sandboxes({ decls: { box: { ...decls.box, environment: { LD_PRELOAD: "/tmp/x.so" } } }, bins: {}, volumes: {}, bindDigests: {} });
+	assert.throws(() => bad.spawn("box", ["/bin/true"], { scratch: tmp(), inputs: null }), /invalid_environment/);
+});
+
+test("inside the sandbox the declared environment and the secrets are set; the host's are not", { skip }, () => {
+	const decls = { box: { requires: [{ name: "sh", check: ["sh", "-c", "true"] }], setup: [], volumes: [], devices: [], network: "none", environment: { THING: "yes" }, image: null } as const };
+	const boxes = new Sandboxes({ decls, bins: { sh: realpathSync("/bin/sh") }, volumes: {}, bindDigests: {} });
+	const sp = boxes.spawn("box", ["sh", "-c", 'echo "$THING $TOKEN $HOME ${USER:-none}"'], { scratch: tmp(), inputs: null }, { secrets: { TOKEN: "s3cret" } });
+	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
+	assert.equal(r.stdout.trim(), "yes s3cret /w none");
+});

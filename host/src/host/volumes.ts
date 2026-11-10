@@ -31,6 +31,7 @@ import { homedir } from "node:os";
 import { dirname, join, posix, relative, resolve } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
 import type { Volume } from "../sdk/volumes.ts";
+import { sandboxEnvProblem, secretEnvProblem } from "./hostbin.ts";
 
 /** Per workflow (or for all), the caller's host dir for a bind volume's target. */
 export interface VolumeProfile {
@@ -141,6 +142,26 @@ export function checkDevices(sandboxes: Readonly<Record<string, { readonly devic
 			if (reason !== null) throw new VolumeError({ type: "invalid_device", sandbox, device, reason });
 		}
 	}
+}
+
+/**
+ * Every environment variable a sandbox declares, and every secret a tool
+ * source carries (toolset `secrets`, an MCP server's `env`), is one it may
+ * set; anything else is refused, typed (`invalid_environment`).
+ */
+export function checkEnvironments(decl: {
+	readonly sandboxes: Readonly<Record<string, { readonly environment: Readonly<Record<string, string>> }>>;
+	readonly toolsets: Readonly<Record<string, { readonly sandbox: string; readonly secrets: readonly string[] }>>;
+	readonly mcp: unknown;
+	readonly mcpServers: Readonly<Record<string, { readonly sandbox: string | null }>>;
+}): void {
+	const refuse = (sandbox: string, key: string, reason: string | null) => {
+		if (reason !== null) throw new VolumeError({ type: "invalid_environment", sandbox, key, reason });
+	};
+	for (const [sandbox, s] of Object.entries(decl.sandboxes)) for (const key of Object.keys(s.environment)) refuse(sandbox, key, sandboxEnvProblem(key));
+	for (const t of Object.values(decl.toolsets)) for (const key of t.secrets) refuse(t.sandbox, key, secretEnvProblem(key));
+	const servers = ((decl.mcp as { mcpServers?: Record<string, { env?: Record<string, unknown> }> } | null)?.mcpServers ?? {}) as Record<string, { env?: Record<string, unknown> }>;
+	for (const [server, config] of Object.entries(servers)) for (const key of Object.keys(config.env ?? {})) refuse(decl.mcpServers[server]?.sandbox ?? server, key, secretEnvProblem(key));
 }
 
 type HashCache = Record<string, string>;

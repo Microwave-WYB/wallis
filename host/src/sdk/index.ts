@@ -476,6 +476,7 @@ export type Refusal =
 	| { readonly type: "volume_missing"; readonly sandbox: string; readonly target: string; readonly path: string }
 	| { readonly type: "device_missing"; readonly sandbox: string; readonly device: string }
 	| { readonly type: "invalid_device"; readonly sandbox: string; readonly device: string; readonly reason: string }
+	| { readonly type: "invalid_environment"; readonly sandbox: string; readonly key: string; readonly reason: string }
 	| { readonly type: "unknown_volume"; readonly target: string }
 	| { readonly type: "input_too_large"; readonly agent: string; readonly field: string | null; readonly chars: number; readonly limit: number }
 	| { readonly type: "not_owner"; readonly by: string; readonly owner: string | null }

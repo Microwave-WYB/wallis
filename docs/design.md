@@ -1115,7 +1115,13 @@ Prototype choices:
   dies with the host. The environment is exactly `PATH`, `HOME=/w`,
   `LANG`, `WALLIS_SCRATCH`, `WALLIS_INPUTS`, `WALLIS_ENV`,
   `WALLIS_COMPUTE_MINUTES`, the sandbox's declared `environment` (and, for
-  MCP servers, their secrets); secrets
+  MCP servers, their secrets). Everything but the secrets is set inside
+  with `--setenv`; the host-side bwrap (and systemd-run) is spawned by its
+  absolute path, resolved once from wallis's own PATH, and its environment
+  holds the secrets alone, so nothing a workflow declares chooses or steers
+  a host program. `environment` may not set `PATH`, `HOME`, `LD_*` or
+  `WALLIS_*`, and a secret's name may not be one of those or a variable
+  that steers libc, systemd or D-Bus (`invalid_environment`). Secrets
   never appear on a command line.
 - No sandbox an agent or a command runs in has network (round 6: the
   domain allowlist is gone; filtering it per domain was premature): an

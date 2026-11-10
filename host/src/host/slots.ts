@@ -4,6 +4,7 @@
 // in its own systemd scope with a memory cap. Per-provider LLM concurrency
 // uses the same locks.
 
+import { hostEnv, hostProgram } from "./hostbin.ts";
 import { spawn, spawnSync } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
@@ -57,7 +58,7 @@ let systemdChecked: boolean | null = null;
 /** Whether `systemd-run --user --scope` works here. */
 export function systemdAvailable(): boolean {
 	if (systemdChecked === null) {
-		const r = spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--collect", "--", "/bin/true"], { stdio: "ignore" });
+		const r = spawnSync(hostProgram("systemd-run"), ["--user", "--scope", "--quiet", "--collect", "--", "/bin/true"], { stdio: "ignore", env: hostEnv() });
 		systemdChecked = r.status === 0;
 	}
 	return systemdChecked;
@@ -87,7 +88,7 @@ export class MachineSlots implements Slots {
 /** `systemd-run --user --scope -p MemoryMax=...` around a command, when available. */
 export function scoped(command: string, argv: string[], memoryGb: number | undefined): [string, string[]] {
 	if (!memoryGb || !systemdAvailable()) return [command, argv];
-	return ["systemd-run", ["--user", "--scope", "--quiet", "--collect", "-p", `MemoryMax=${memoryGb}G`, "--", command, ...argv]];
+	return [hostProgram("systemd-run"), ["--user", "--scope", "--quiet", "--collect", "-p", `MemoryMax=${memoryGb}G`, "--", command, ...argv]];
 }
 
 // --- Per-provider LLM concurrency ---------------------------------------------------

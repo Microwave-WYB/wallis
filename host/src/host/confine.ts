@@ -37,6 +37,7 @@ import { homedir, release, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
+import { hostEnv, hostProgram, sandboxEnvProblem, secretEnvProblem } from "./hostbin.ts";
 import type { ResolvedVolume } from "./volumes.ts";
 
 export type SandboxDecl = Declarations["sandboxes"][string];
@@ -138,7 +139,7 @@ let bwrapChecked: boolean | null = null;
 /** Whether bubblewrap can create a sandbox here (user namespaces may be off). */
 export function bwrapAvailable(): boolean {
 	if (bwrapChecked === null) {
-		const r = spawnSync("bwrap", ["--ro-bind", "/", "/", "--unshare-all", "--", "/bin/true"], { stdio: "ignore" });
+		const r = spawnSync(hostProgram("bwrap"), ["--ro-bind", "/", "/", "--unshare-all", "--", "/bin/true"], { stdio: "ignore", env: hostEnv() });
 		bwrapChecked = r.status === 0;
 	}
 	return bwrapChecked;
@@ -180,8 +181,14 @@ export interface CallDirs {
 
 export interface SpawnOptions {
 	readonly gpu?: boolean;
-	/** Extra environment (secrets for MCP servers, WALLIS_COMPUTE_MINUTES). */
+	/** Variables set inside (`WALLIS_COMPUTE_MINUTES`), with `--setenv`. */
 	readonly env?: Readonly<Record<string, string>>;
+	/**
+	 * Secrets (a toolset's, an MCP server's): carried in the environment of
+	 * the host-side bwrap, so they never appear on a command line; nothing
+	 * else is in that environment.
+	 */
+	readonly secrets?: Readonly<Record<string, string>>;
 	/** MCP servers only: their overlay's network. Agents and commands never get one. */
 	readonly network?: "none" | "host";
 	/** Setup only: the network on and `$WALLIS_ENV` writable. */
@@ -254,17 +261,29 @@ export class Sandboxes {
 		args.push("--chdir", LAYOUT.work, "--");
 		const program = argv[0] ?? "";
 		args.push(s.requires.some((r) => r.name === program) && this.#bins[program] ? this.#bins[program]! : program, ...argv.slice(1));
-		const env: Record<string, string> = {
+		// The environment inside: set with --setenv, never through the host-side spawn's own.
+		for (const key of Object.keys(s.environment)) {
+			const reason = sandboxEnvProblem(key);
+			if (reason !== null) throw new SandboxError({ type: "invalid_environment", sandbox: name, key, reason });
+		}
+		const inside: Record<string, string> = {
+			...s.environment,
 			PATH: [...new Set(s.requires.map((r) => dirname(this.#bins[r.name]!))), ...(envDir ? [`${LAYOUT.env}/bin`] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
 			HOME: LAYOUT.work,
 			LANG: "C.UTF-8",
 			WALLIS_SCRATCH: LAYOUT.work,
 			WALLIS_INPUTS: LAYOUT.inputs,
 			...(envDir ? { WALLIS_ENV: LAYOUT.env } : {}),
-			...s.environment,
 			...(options.env ?? {}),
 		};
-		return { command: "bwrap", args, env, cwd: dirs.scratch };
+		const setenv = Object.entries(inside).flatMap(([k, v]) => ["--setenv", k, v]);
+		const at = args.indexOf("--chdir");
+		args.splice(at, 0, ...setenv);
+		for (const key of Object.keys(options.secrets ?? {})) {
+			const reason = secretEnvProblem(key);
+			if (reason !== null) throw new SandboxError({ type: "invalid_environment", sandbox: name, key, reason });
+		}
+		return { command: hostProgram("bwrap"), args, env: { ...(options.secrets ?? {}) }, cwd: dirs.scratch };
 	}
 
 	/** The setup digest: the declaration, its binaries and the content of its bind volumes. */

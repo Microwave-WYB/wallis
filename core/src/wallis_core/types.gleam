@@ -1623,6 +1623,11 @@ pub type Refusal {
   /// path is a character device (or a dir of them) under /dev, or one that
   /// is shared state (/dev/shm, /dev/pts, /dev/mqueue, /dev/fd).
   InvalidDevice(sandbox: String, device: String, reason: String)
+  /// An environment variable a sandbox may not set: wallis sets `PATH`,
+  /// `HOME` and `WALLIS_*`; `LD_*` would steer the loader. A secret (carried
+  /// in the environment of the host-side spawn) may not be a variable that
+  /// steers the host programs either.
+  InvalidEnvironment(sandbox: String, key: String, reason: String)
   InputTooLarge(agent: String, field: Option(String), chars: Int, limit: Int)
   NotOwner(by: String, owner: Option(String))
   NotIdle(node: String)
@@ -1718,6 +1723,12 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
       #("type", json.string("invalid_device")),
       #("sandbox", json.string(sandbox)),
       #("device", json.string(device)),
+      #("reason", json.string(reason)),
+    ])
+    InvalidEnvironment(sandbox:, key:, reason:) -> json.object([
+      #("type", json.string("invalid_environment")),
+      #("sandbox", json.string(sandbox)),
+      #("key", json.string(key)),
       #("reason", json.string(reason)),
     ])
     InputTooLarge(agent:, field:, chars:, limit:) -> json.object([
@@ -1912,6 +1923,12 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use reason <- decode.field("reason", decode.string)
       decode.success(InvalidDevice(sandbox:, device:, reason:))
     }
+    "invalid_environment" -> {
+      use sandbox <- decode.field("sandbox", decode.string)
+      use key <- decode.field("key", decode.string)
+      use reason <- decode.field("reason", decode.string)
+      decode.success(InvalidEnvironment(sandbox:, key:, reason:))
+    }
     "input_too_large" -> {
       use agent <- decode.field("agent", decode.string)
       use field <- decode.field("field", decode.optional(decode.string))
@@ -2043,6 +2060,8 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
     _ -> decode.failure(NotStarted, "Refusal")
   }
 }
+
+
 
 
 
