@@ -189,3 +189,22 @@ test("cancel finishes an idle run as cancelled", () => {
 	assert.equal(logOf(root, id).at(-1)!.type, "cancel_requested");
 	assert.equal(wallis(root, ["pending"]).stdout, "");
 });
+
+test("ids inside nested workflows and escaped branch keys parse: CLI interventions and fork --forget reach them", async () => {
+	const { parseNodeId } = await import("../src/host/capability.ts");
+	for (const id of ["#0", "#2.a#0", "#3>#0", "#3>#0.a#1", "#0.a%2eb#0", "#1.0#2", "#0.a#0.b#1>#0"]) assert.equal(parseNodeId(id), id);
+	for (const id of ["", "0", "#", "#0.", "#0>", "#0.a", "#a", "#0.a#0\n", "x#0"]) assert.throws(() => parseNodeId(id), /not a node id/, JSON.stringify(id));
+	// A fanout run (a nested workflow at #3) made by the library in a throwaway project, then the CLI.
+	const { FakeCommands, FakeExecutor, runWorkflow } = await import("../src/host/index.ts");
+	const { responses } = await import("./fixtures/fake-executor.ts");
+	const root = project();
+	const id = "fanout-1";
+	await runWorkflow({ workflow: join(root, ".agents", "workflows", "fanout", "workflow.ts"), dir: runDir(root, id), root, input: null, executor: new FakeExecutor(responses), commands: new FakeCommands({ train: { stdout: '{"budget":null}', minutes: 5 } }), confine: "off", inboxPollMs: null });
+	const shown = wallis(root, ["show", id, "#3>#0"]);
+	assert.equal(shown.status, 0, shown.stderr);
+	const forked = wallis(root, ["fork", id, "--forget", "#3>#0", "--detach"]);
+	assert.equal(forked.status, 0, forked.stderr);
+	assert.match(forked.stdout, /forgetting #3>#0/);
+	const forkId = /into (\S+),/.exec(forked.stdout)![1]!;
+	assert.ok(logOf(root, forkId).some((e) => e.type === "call_forgotten" && e.node === "#3>#0"));
+});

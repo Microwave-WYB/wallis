@@ -28,9 +28,16 @@ export function parseRunId(raw: unknown): RunId {
 	return raw as RunId;
 }
 
-/** Request ids: `#0`, `#2.a#0`, `#3>retry#1`; a session's calls are `#1:0`, `#1:1`. */
+/**
+ * Request ids, as the runtime makes them: `#<n>`, then any number of a
+ * branch (`.<key>`: a parallel key, `%`-escaped for `% # . > ~`, or a map
+ * or loop index) or a nested workflow's call (`>`), each followed by
+ * `#<n>`: `#0`, `#2.a#0`, `#3>#0`, `#3>#0.a#1`, `#0.a%2eb#0`.
+ */
+const NODE_ID = /^#\d+((\.[^#.>~\x00-\x1f]+|>)#\d+)*$/;
+
 export function parseNodeId(raw: unknown): NodeId {
-	if (typeof raw !== "string" || !/^(#\d+|:\d+|\.[A-Za-z0-9_-]+|>[A-Za-z0-9_-]+)+$/.test(raw) || !raw.startsWith("#")) {
+	if (typeof raw !== "string" || !NODE_ID.test(raw)) {
 		throw new BadId(`not a node id: ${JSON.stringify(raw)}`);
 	}
 	return raw as NodeId;
