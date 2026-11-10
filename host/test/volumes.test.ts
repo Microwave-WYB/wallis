@@ -433,3 +433,10 @@ test("a bind's digest covers file modes and empty dirs", async () => {
 	mkdirSync(join(dir, "out"));
 	assert.notEqual(bindDigest(dir), executable, "an empty dir a program expects is part of it");
 });
+
+test("a sandbox digest is canonical: the same declaration in another key order is the same digest", () => {
+	const a = { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: { A: "1", B: "2" }, image: null } as const;
+	const b = { image: null, environment: { B: "2", A: "1" }, network: "none", devices: [], volumes: [], setup: [], requires: [] } as const;
+	assert.equal(sandboxDigest(a, {}, { "/x": "d1", "/y": "d2" }), sandboxDigest(b, {}, { "/y": "d2", "/x": "d1" }));
+	assert.notEqual(sandboxDigest(a, {}, {}), sandboxDigest({ ...a, environment: { A: "1" } }, {}, {}));
+});

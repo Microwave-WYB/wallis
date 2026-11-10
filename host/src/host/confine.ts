@@ -35,8 +35,9 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, release, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
-import type { Refusal } from "../sdk/index.ts";
+import type { Json, Refusal } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
+import { canonical } from "./render.ts";
 import { hostEnv, hostProgram, sandboxEnvProblem, secretEnvProblem } from "./hostbin.ts";
 import type { ResolvedVolume } from "./volumes.ts";
 
@@ -151,8 +152,9 @@ export function baseIdentity(): { distro: string; kernel: string } {
  * are caches, and results must not depend on them.
  */
 export function sandboxDigest(s: SandboxDecl, bins: Readonly<Record<string, string>>, bindDigests: Readonly<Record<string, string>>): string {
-	const parts = { s, bins: s.requires.map((r) => [r.name, bins[r.name]]), binds: Object.entries(bindDigests).sort(([a], [b]) => (a < b ? -1 : 1)) };
-	return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+	// Canonical JSON (sorted keys): the same declaration is the same digest whatever order its keys were written in.
+	const parts = { s, bins: s.requires.map((r) => [r.name, bins[r.name] ?? null]), binds: bindDigests };
+	return createHash("sha256").update(canonical(JSON.parse(JSON.stringify(parts)) as Json)).digest("hex");
 }
 
 let bwrapChecked: boolean | null = null;
