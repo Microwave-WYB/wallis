@@ -128,6 +128,11 @@ generics or wrappers that add no proof.
   digest or a request id: a node is its definition digest, a custom tool
   is (bundle digest, export), an MCP tool is (server, tool). A change to
   what a digest covers bumps the core's semantics version.
+- The workflow VM runs untrusted workflow code: the host parses its
+  declarations (`host/src/host/declarations.ts`) and re-checks every
+  sandbox rule itself; VM-side checks are early errors only. Host programs
+  (bwrap, systemd-run) run by absolute path with an environment holding
+  secrets only; everything else reaches the sandbox via `--setenv`.
 - Recovery is the most important property: keep transient-error retries
   in the executor, per-turn checkpoints, held node failures, and the
   journal as a cache (node digest, input, occurrence) working, with tests.

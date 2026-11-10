@@ -28,7 +28,7 @@ option consistent with the section they sit in, not yet confirmed.
   chosen calls in a fork; everything else hits.
 - **Small things:** `ctx.map(items, f, { concurrency })`; `parse(r,
   input)`; agents see `/in/...` paths of their input artifacts;
-  `wallis tree --full`; cache hits are noted (`hit <id>`); `describe` has
+  `wallis tree --full`; cache hits are noted (one `hits` fact per host session); `describe` has
   `sandboxes` and `capabilities`.
 
 ## Everything is a value (decided, foundation round)
@@ -1294,20 +1294,25 @@ Prototype choices:
 
 Prototype choices:
 
-- The host computes the node digest (sha256 of the canonical declaration)
-  and counts occurrences per (digest, canonical input), resetting them
-  whenever the body starts; `Requested` carries both, so a refold rebuilds
-  the same cache. The core's slot is a digest of the node digest, kind,
-  name and canonical input, plus `#n`.
+- The host computes the node digest (sha256 of the canonical definition;
+  for a command, of the argv its `run` computes and its sandbox digest) and
+  counts occurrences per (branch, digest, session, canonical input),
+  resetting them whenever the body starts; `Requested` carries both, so a
+  refold rebuilds the same cache. The core's slot is a digest of the node
+  digest, kind, canonical input and the session it continues, plus the
+  occurrence; never the node's name.
 - The model alias is part of an agent's digest, not the model it resolves
   to: a rebind does not invalidate completed calls (as before, completed
   calls are never re-executed; later calls use the new binding).
-- A hit is answered without being logged. A slot whose call is in flight
+- A hit is answered without being logged as a request; each host session
+  sums its hits up in one `hits` fact. A slot whose call is in flight
   or waiting is the same call: if it is requested under another id, its
   record moves to that id and the move is logged; a call in flight is
   reissued only if it was not issued in this session.
 - A fork copies every event except those that ended the source
-  (`body_finished`, `body_failed`, `cancel_requested`), then re-executes.
+  (`body_finished`, `body_failed`, `cancel_requested`) and the source's
+  `binds` and `hits` facts (a fork takes its own snapshots and counts its
+  own hits), then re-executes.
 - The log is JSONL, fsynced per line; a partial last line is ignored.
 - The workflow body runs in QuickJS (`quickjs-wasi` 3.6.2, the `encoding`
   extension only) with a virtual clock from 2025-01-01T00:00:00Z advancing
