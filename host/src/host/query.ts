@@ -370,6 +370,8 @@ export function forkRun(source: string, target: string, options: { readonly forg
 	// Blobs and layers first: the log names them. Both are immutable, so hardlinks share them.
 	shareBlobs(from.dir, to.dir);
 	if (existsSync(join(from.dir, "layers"))) spawnSync("cp", ["-al", join(from.dir, "layers"), join(to.dir, "layers")]);
+	// Commands' files, which their journaled results name.
+	if (existsSync(join(from.dir, "outputs"))) spawnSync("cp", ["-al", join(from.dir, "outputs"), join(to.dir, "outputs")]);
 	// Where the fork comes from is a fact of its own log; meta.json is derived from it.
 	const at = events.filter((e) => e.type !== "call_forgotten").length;
 	events.push({ type: "noted", key: "created", value: new Date().toISOString() }, { type: "noted", key: "forked_from", value: { run_id: from.id, at } });

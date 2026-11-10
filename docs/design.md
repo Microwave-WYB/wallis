@@ -1218,8 +1218,18 @@ Prototype choices:
     tools (each by identity), access, skills, needs, the sandbox digest
     (declaration, binaries, bind volume content), steerable, compaction,
     maxTurns.
-  - Command digest: its `run` and `parse` code, schemas, resources, the
-    sandbox digest. Its description is a label.
+  - Command digest: what it runs, not its code's text (which misses the
+    constants the code reads): the argv its `run` computes for the input
+    (or why it cannot), and the sandbox digest. The compute budget left
+    (`WALLIS_COMPUTE_MINUTES`) is not in it (review fixes).
+  - A command's journal entry is its process result, `{ result, output }`:
+    exit, stdout, stderr and the files it wrote (kept by digest in
+    `<run>/outputs/`), and its parse as recorded (for views and exports).
+    The current `parse` (and output check) is applied to `result` on every
+    delivery, so a changed `parse` needs no rerun and is never stale; when
+    it no longer accepts the journaled result, the call is forgotten and
+    runs again, where a failure is held as usual. Entries from before this
+    fix (an output alone) are delivered as they are.
   - Orchestrator digest: its description (the question), input and answer
     schemas.
   - A custom tool is (its toolset's bundle digest, export); an MCP tool is

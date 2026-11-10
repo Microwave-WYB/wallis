@@ -49,7 +49,7 @@ import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, t
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
-import { bindDigest, bindSnapshotDir, checkDevices, checkEnvironments, type ResolvedVolume, resolveVolumes, snapshotBind, VolumeError } from "./volumes.ts";
+import { bindDigest, bindSnapshotDir, checkDevices, checkEnvironments, commandOutputsDir, storeCommandOutputs, type ResolvedVolume, resolveVolumes, snapshotBind, VolumeError } from "./volumes.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
@@ -192,6 +192,8 @@ export class Session {
 	#sandboxDigests: Record<string, string> = {};
 	/** Per node name: the digest of its definition, the first part of its journal key. */
 	readonly #nodeDigests = new Map<string, string>();
+	/** Command requests of this execution of the body, by id: their answers are parsed on delivery. */
+	readonly #commandCalls = new Map<string, { command: string; input: Json; request: Extract<Event, { type: "requested" }> }>();
 	/** Occurrences of each (node, input) in this execution of the body. */
 	#occurrences = new Map<string, number>();
 	/** Facts noted before the core started: logged right after `started`. */
@@ -859,7 +861,7 @@ export class Session {
 	#keyed(event: Extract<Event, { type: "requested" }>): Event {
 		const r = event.request as { type: string; agent?: string; command?: string; tool?: string; name?: string; input?: Json };
 		const name = r.type === "call" ? `agent:${r.agent}` : r.type === "command" ? `command:${r.command}` : r.type === "tool" ? `tool:${r.tool}` : `orchestrator:${r.name}`;
-		let digest = this.#nodeDigests.get(name);
+		let digest = r.type === "command" ? this.#commandDigest(r.command!, r.input ?? null) : this.#nodeDigests.get(name);
 		if (digest === undefined) {
 			digest = createHash("sha256").update(canonical(JSON.parse(JSON.stringify(this.#definition(r))) as Json)).digest("hex");
 			this.#nodeDigests.set(name, digest);
@@ -874,7 +876,28 @@ export class Session {
 		const occurrence = `${branch}/${n}`;
 		// A body tool call carries whether it may be made again after a crash.
 		const request = r.type === "tool" ? { ...(event.request as object), replay: this.#bodyTool(r.tool!)?.replay === "safe" ? "replay_safe" : "replay_never" } : event.request;
-		return { ...event, request: request as Json, node_digest: digest, occurrence };
+		const keyed: Extract<Event, { type: "requested" }> = { ...event, request: request as Json, node_digest: digest, occurrence };
+		// A command's answer is its process result, parsed by the current `parse` when it is delivered.
+		if (r.type === "command") this.#commandCalls.set(event.id, { command: r.command!, input: r.input ?? null, request: keyed });
+		return keyed;
+	}
+
+	/**
+	 * A command call's node digest: what it runs, not its code's text (which
+	 * misses the constants the code reads): the argv its `run` computes for
+	 * this input (or why it cannot), and its sandbox's digest (declaration,
+	 * binaries, bind volume content). `parse` is not in it: the journal keeps
+	 * the process result, and the current `parse` is applied on every
+	 * delivery. The compute budget left (`WALLIS_COMPUTE_MINUTES`) is not
+	 * either.
+	 */
+	#commandDigest(command: string, input: Json): string {
+		const declaration = this.#decl.commands[command];
+		const argv: { ok: true; argv: readonly string[] } | { ok: false; error: string } = declaration
+			? this.#sandbox!.argv(command, mountedInput(input, LAYOUT.inputs, declaration.input))
+			: { ok: false, error: `no command ${command}` };
+		const definition = { kind: "command", argv: argv.ok ? argv.argv : { error: argv.error }, env: declaration ? (this.#sandboxDigests[declaration.sandbox] ?? null) : null };
+		return createHash("sha256").update(canonical(definition as Json)).digest("hex");
 	}
 
 	/**
@@ -1000,9 +1023,12 @@ export class Session {
 				this.#transcriptLog(effect.id)({ kind: "note", text: "in flight at a crash and not safe to make again: its outcome is unknown" });
 				this.#requests.push({ type: "tool_call_unknown", id: effect.id });
 				return;
-			case "deliver":
+			case "deliver": {
+				const command = this.#commandCalls.get(effect.id);
+				if (command) return this.#deliverCommand(effect.id, command, effect.value);
 				this.#deliveries.push([effect.id, { type: "deliver", value: effect.value }]);
 				return;
+			}
 			case "fail":
 				this.#deliveries.push([effect.id, { type: "fail", reason: effect.reason }]);
 				return;
@@ -1019,6 +1045,45 @@ export class Session {
 	 * A producer's output, parsed: JSON, drafts stored as artifacts, every ref
 	 * verified against the store, then the schema. Errors are a string.
 	 */
+	/**
+	 * A command's answer, as the journal keeps it: `{ result, output }`,
+	 * the process result (exit, stdout, stderr, and the files it wrote, by
+	 * digest in `<run>/outputs/`) and its parse as recorded (for views and
+	 * exports). The current `parse` is applied to the result, so a changed
+	 * `parse` never needs a rerun and is never stale. When it no longer
+	 * accepts the result, the call is forgotten and runs again (where a
+	 * failure is held as usual).
+	 */
+	#deliverCommand(id: string, call: { command: string; input: Json; request: Extract<Event, { type: "requested" }> }, value: Json): void {
+		const recorded = value as { result?: { exit: number; stdout: string; stderr: string; files: string | null } } | null;
+		const result = recorded !== null && typeof recorded === "object" && !Array.isArray(recorded) ? recorded.result : undefined;
+		// An answer journaled before process results were kept: as it was.
+		if (result === undefined) return void this.#deliveries.push([id, { type: "deliver", value }]);
+		const declaration = this.#decl.commands[call.command]!;
+		const input = mountedInput(call.input, LAYOUT.inputs, declaration.input);
+		const parsed = this.#parseCommand(call.command, result, input, result.files === null ? null : commandOutputsDir(this.paths.dir, result.files));
+		if (parsed.ok) return void this.#deliveries.push([id, { type: "deliver", value: parsed.value }]);
+		this.#transcriptLog(id)({ kind: "note", text: `the current parse does not accept the journaled result (${parsed.failure.type}); running the command again` });
+		this.#commandCalls.delete(id);
+		queueMicrotask(() =>
+			this.#later(() => {
+				this.#refuseOn(this.#feed({ type: "call_forgotten", node: id, by: this.#core.snapshot().owner ?? HUMAN }));
+				this.#requests.push(call.request);
+				this.#pump();
+			}),
+		);
+	}
+
+	/** A process result through the command's current `parse` and output check; files come from `files`. */
+	#parseCommand(command: string, result: { exit: number; stdout: string; stderr: string }, input: Json, files: string | null): { ok: true; value: Json } | { ok: false; failure: CommandFailure } {
+		const declaration = this.#decl.commands[command]!;
+		const parsed = this.#sandbox!.parse(command, { exit: result.exit, stdout: result.stdout, stderr: result.stderr }, input);
+		if (!parsed.ok) return { ok: false, failure: { type: "output_mismatch", errors: [`parse: ${parsed.error}`] } };
+		const out = this.#parseOutput(parsed.output, declaration.output, files);
+		if (out.ok) return out;
+		return { ok: false, failure: out.missing === undefined ? { type: "output_mismatch", errors: [out.error] } : { type: "missing_file", name: out.missing } };
+	}
+
 	#parseOutput(output: unknown, schema: unknown, scratch: string | Work | null): { ok: true; value: Json } | { ok: false; error: string; missing?: string } {
 		const json = toJson(output);
 		if (!json.ok) return { ok: false, error: `output is not JSON: ${json.errors.join("; ")}` };
@@ -1337,13 +1402,12 @@ export class Session {
 						if (r.timedOut) failed({ type: "timed_out", minutes: r.minutes }, r.minutes);
 						else if (r.exit !== 0) failed({ type: "exit_code", code: r.exit, stderr_head: r.stderr.trim().slice(-500) }, r.minutes);
 						else {
-							const parsed = this.#sandbox!.parse(effect.command, { exit: r.exit, stdout: r.stdout, stderr: r.stderr }, input);
-							if (!parsed.ok) failed({ type: "output_mismatch", errors: [`parse: ${parsed.error}`] }, r.minutes);
-							else {
-								const out = this.#parseOutput(parsed.output, declaration.output, workspace.scratch);
-								if (out.ok) this.#feed({ type: "command_returned", id, output: out.value, minutes: r.minutes });
-								else failed(out.missing === undefined ? { type: "output_mismatch", errors: [out.error] } : { type: "missing_file", name: out.missing }, r.minutes);
-							}
+							// The files it wrote are kept by digest, so a later `parse` can read them too.
+							const files = storeCommandOutputs(this.paths.dir, workspace.scratch);
+							const result = { exit: r.exit, stdout: r.stdout, stderr: r.stderr, files };
+							const parsed = this.#parseCommand(effect.command, result, input, files === null ? null : commandOutputsDir(this.paths.dir, files));
+							if (parsed.ok) this.#feed({ type: "command_returned", id, output: { result, output: parsed.value }, minutes: r.minutes });
+							else failed(parsed.failure, r.minutes);
 						}
 						done();
 					}),

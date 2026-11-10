@@ -178,6 +178,27 @@ function loadCache(): HashCache {
 	}
 }
 
+/** Where a run keeps the files a command call wrote, by their digest. */
+export function commandOutputsDir(runDir: string, digest: string): string {
+	return join(runDir, "outputs", digest.slice(digest.lastIndexOf(":") + 1));
+}
+
+/**
+ * Keeps the files a command call wrote (its scratch dir, moved: no copy)
+ * in the run, named by their digest. A journaled
+ * process result names them, so the current `parse` can read them on
+ * every delivery. A call that wrote nothing keeps an empty dir.
+ */
+export function storeCommandOutputs(runDir: string, scratch: string): string {
+	mkdirSync(scratch, { recursive: true });
+	const digest = bindDigest(scratch);
+	const target = commandOutputsDir(runDir, digest);
+	mkdirSync(dirname(target), { recursive: true });
+	if (existsSync(target)) rmSync(scratch, { recursive: true, force: true });
+	else renameSync(scratch, target);
+	return digest;
+}
+
 /** Where a run keeps the snapshot of a bind by its digest. */
 export function bindSnapshotDir(runDir: string, digest: string): string {
 	return join(runDir, "binds", digest.slice(digest.lastIndexOf(":") + 1));
