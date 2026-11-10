@@ -532,7 +532,7 @@ export class Session {
 			// A bind's snapshot digest is part of the cache key of every call that binds it.
 			const bindDigests = Object.fromEntries(Object.entries(this.#volumes).map(([n, vs]) => [n, Object.fromEntries(vs.flatMap((v) => (v.kind === "bind" ? [[v.target, v.digest ?? bindDigest(v.dir)]] : [])))]));
 			this.#sandboxDigests = Object.fromEntries(Object.entries(decls).map(([n, d]) => [n, sandboxDigest(d, bins, bindDigests[n] ?? {})]));
-			this.#boxes = can ? new Sandboxes({ decls, bins, volumes: this.#volumes, bindDigests }) : null;
+			this.#boxes = can ? new Sandboxes({ decls, bins, volumes: this.#volumes, bindDigests, root: resolve(this.#root) }) : null;
 			const versions = this.#boxes ? this.#boxes.prepare((text) => process.stderr.write(`wallis: ${text}\n`)) : {};
 			this.#note("bins", Object.fromEntries(Object.entries(bins).map(([n, path]): [string, Json] => [n, versions[n] === undefined ? { path } : { path, version: versions[n] }])));
 			this.#note("base", meta?.base ?? baseIdentity());

@@ -1066,10 +1066,14 @@ Prototype choices:
   local profile (per workflow > global) > the caller's PATH at run
   creation (not the host process's: systemd hosts have a minimal PATH).
   The resolved absolute paths are stored in run metadata and reused on
-  resume. A required program is called by its real path; its install
-  prefix (the dir above its `bin/`) is visible read-only at the same path,
-  so files it finds relative to itself are there, and its dir is on PATH
-  (this round). Preflight runs a check inside
+  resume. A required program is called by its real path. Bound read-only
+  at the same paths are the program itself and those of its install
+  prefix's (the dir above its `bin/`) `lib`, `lib64`, `libexec` and `share`
+  that exist, so files it finds relative to itself are there; never the
+  prefix itself, and nothing of a prefix that is `/`, the home dir or a dir
+  directly in it (`~/.local`, `~/.cargo`), `/opt`, or that holds the
+  project. On PATH is `/run/wallis/bin`, a dir of links to the required
+  programs alone, never the dirs they are in (review fixes). Preflight runs a check inside
   the sandbox (`<name> --version`, or `{ name, check }`). Typed refusals:
   `requires_missing(name)`, `requires_broken(name, exit, stderr_head)`,
   `unknown_bin(name)`. Versions go in metadata only, not the pin.

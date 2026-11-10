@@ -32,7 +32,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, release, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
@@ -99,12 +99,33 @@ function underBase(path: string): boolean {
 
 /**
  * Where a program is installed: the dir above its `bin/` (so `../share`,
- * `../lib` are found), else its own dir. Never `/` or the home dir itself.
+ * `../lib` are found), else its own dir.
  */
 export function installPrefix(program: string): string {
 	const dir = dirname(program);
-	const above = dirname(dir);
-	return basename(dir) === "bin" && above !== "/" && above !== homedir() ? above : dir;
+	return basename(dir) === "bin" ? dirname(dir) : dir;
+}
+
+/** The dirs of an install prefix a program may find relative to itself. */
+const PREFIX_DIRS = ["lib", "lib64", "libexec", "share"];
+
+/**
+ * What a required program (its real path) needs bound, read-only at the
+ * same paths: the program itself, and those of its install prefix's `lib`,
+ * `lib64`, `libexec` and `share` that exist. Never the prefix itself (its
+ * other programs, its data), and nothing of a prefix that is `/`, the home
+ * dir or a dir directly in it (`~/.local`, `~/.cargo`), `/opt`, or that
+ * holds the project (its prompts, its runs): then the program alone.
+ * Nothing under the host base, which every sandbox has.
+ */
+export function programBinds(program: string, context: { readonly home?: string; readonly root?: string } = {}): string[] {
+	if (underBase(program)) return [];
+	const home = context.home ?? homedir();
+	const prefix = installPrefix(program);
+	const unsafe =
+		prefix === "/" || prefix === home || dirname(prefix) === home || prefix === "/opt" || (context.root !== undefined && (context.root === prefix || context.root.startsWith(`${prefix}/`)));
+	const dirs = unsafe ? [] : PREFIX_DIRS.map((d) => join(prefix, d)).filter((d) => existsSync(d) && !underBase(d) && !(context.root !== undefined && (context.root === d || context.root.startsWith(`${d}/`))));
+	return [program, ...dirs];
 }
 
 /** The host base, recorded in run metadata. */
@@ -202,6 +223,7 @@ export class Sandboxes {
 	readonly #decls: Readonly<Record<string, SandboxDecl>>;
 	readonly #bins: Readonly<Record<string, string>>;
 	readonly #volumes: Readonly<Record<string, readonly ResolvedVolume[]>>;
+	readonly #root: string | undefined;
 	readonly #bindDigests: Readonly<Record<string, Readonly<Record<string, string>>>>;
 	readonly #cache: string;
 	readonly #envs = new Map<string, string>();
@@ -214,7 +236,10 @@ export class Sandboxes {
 		/** Each sandbox's bind volumes' content digests, by target. */
 		readonly bindDigests: Readonly<Record<string, Readonly<Record<string, string>>>>;
 		readonly cacheDir?: string;
+		/** The project root: no required program's binds may hold it. */
+		readonly root?: string;
 	}) {
+		this.#root = options.root;
 		this.#decls = options.decls;
 		this.#bins = options.bins;
 		this.#volumes = options.volumes;
@@ -237,9 +262,12 @@ export class Sandboxes {
 		args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 		if (options.gpu) args.push(...gpuDevices());
 		for (const d of s.devices) args.push("--dev-bind", d, d);
-		// Each required program stays where it is, called by its real path: its install prefix is
-		// visible read-only at the same path, so files it finds relative to itself are there.
-		for (const prefix of new Set(s.requires.map((r) => installPrefix(this.#bins[r.name]!)))) if (!underBase(prefix)) args.push("--ro-bind", prefix, prefix);
+		// Each required program stays where it is, called by its real path, with only the parts of
+		// its install prefix it may find relative to itself (programBinds). On PATH is a dir of links
+		// to the required programs alone, never the dirs they are in.
+		for (const path of new Set(s.requires.flatMap((r) => programBinds(this.#bins[r.name]!, { root: this.#root })))) args.push("--ro-bind", path, path);
+		const binDir = this.#binDir(name);
+		if (binDir) args.push("--ro-bind", binDir, LAYOUT.bin);
 		if (envDir) args.push(options.setup ? "--bind" : "--ro-bind", envDir, LAYOUT.env);
 		if (dirs.inputs) args.push("--ro-bind", dirs.inputs, LAYOUT.inputs);
 		for (const t of dirs.trees ?? []) {
@@ -268,7 +296,7 @@ export class Sandboxes {
 		}
 		const inside: Record<string, string> = {
 			...s.environment,
-			PATH: [...new Set(s.requires.map((r) => dirname(this.#bins[r.name]!))), ...(envDir ? [`${LAYOUT.env}/bin`] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
+			PATH: [...(binDir ? [LAYOUT.bin] : []), ...(envDir ? [`${LAYOUT.env}/bin`] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
 			HOME: LAYOUT.work,
 			LANG: "C.UTF-8",
 			WALLIS_SCRATCH: LAYOUT.work,
@@ -284,6 +312,30 @@ export class Sandboxes {
 			if (reason !== null) throw new SandboxError({ type: "invalid_environment", sandbox: name, key, reason });
 		}
 		return { command: hostProgram("bwrap"), args, env: { ...(options.secrets ?? {}) }, cwd: dirs.scratch };
+	}
+
+	/**
+	 * A sandbox's dir of links to its required programs that are not in the
+	 * host base, by name (`<cache>/../bins/<hash>`), for PATH; null when
+	 * there are none.
+	 */
+	#binDir(name: string): string | null {
+		const s = this.#decl(name);
+		const links = s.requires.flatMap((r) => (this.#bins[r.name] && !underBase(this.#bins[r.name]!) ? [[r.name, this.#bins[r.name]!] as const] : []));
+		if (links.length === 0) return null;
+		const dir = join(dirname(this.#cache), "bins", createHash("sha256").update(JSON.stringify(links)).digest("hex").slice(0, 16));
+		if (!existsSync(dir)) {
+			const temp = `${dir}.${process.pid}.tmp`;
+			rmSync(temp, { recursive: true, force: true });
+			mkdirSync(temp, { recursive: true });
+			for (const [link, target] of links) symlinkSync(target, join(temp, link));
+			try {
+				renameSync(temp, dir);
+			} catch {
+				rmSync(temp, { recursive: true, force: true });
+			}
+		}
+		return dir;
 	}
 
 	/** The setup digest: the declaration, its binaries and the content of its bind volumes. */

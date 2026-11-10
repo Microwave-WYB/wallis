@@ -267,3 +267,53 @@ test("inside the sandbox the declared environment and the secrets are set; the h
 	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
 	assert.equal(r.stdout.trim(), "yes s3cret /w none");
 });
+
+test("a required program's binds: itself and its prefix's lib/share/libexec, never the prefix, the home dir, /opt or the project", async () => {
+	const { programBinds } = await import("../src/host/confine.ts");
+	const home = tmp("wallis-home-");
+	const make = (path: string) => (mkdirSync(path, { recursive: true }), path);
+	// The reviewer's table: each was a bind of a whole dir.
+	assert.deepEqual(programBinds(join(home, "mytool"), { home }), [join(home, "mytool")], "~/mytool: not all of ~");
+	make(join(home, ".local", "share"));
+	assert.deepEqual(programBinds(join(home, ".local", "bin", "x"), { home }), [join(home, ".local", "bin", "x")], "~/.local/bin/x: not ~/.local/share");
+	make(join(home, ".cargo", "lib"));
+	assert.deepEqual(programBinds(join(home, ".cargo", "bin", "x"), { home }), [join(home, ".cargo", "bin", "x")]);
+	assert.deepEqual(programBinds("/opt/bin/x", { home }), ["/opt/bin/x"], "/opt/bin/x: not all of /opt");
+	const project = make(join(home, "proj"));
+	make(join(project, "share"));
+	assert.deepEqual(programBinds(join(project, "bin", "tool"), { home, root: project }), [join(project, "bin", "tool")], "<project>/bin/tool: not the project");
+	assert.deepEqual(programBinds("/usr/bin/darktable", { home }), [], "the base is there already");
+	// A normal prefix: the program, and the parts of the prefix that exist.
+	const prefix = join(home, "apps", "dt");
+	make(join(prefix, "share", "darktable"));
+	make(join(prefix, "lib"));
+	assert.deepEqual(programBinds(join(prefix, "bin", "darktable"), { home }), [join(prefix, "bin", "darktable"), join(prefix, "lib"), join(prefix, "share")]);
+});
+
+test("in the sandbox a required program finds its share dir; its siblings and the rest of its prefix are not there", { skip }, async () => {
+	const { chmodSync } = await import("node:fs");
+	const prefix = tmp("wallis-prefix-");
+	mkdirSync(join(prefix, "bin"));
+	mkdirSync(join(prefix, "share", "tool"), { recursive: true });
+	writeFileSync(join(prefix, "share", "tool", "data"), "found");
+	writeFileSync(join(prefix, "secret"), "secret");
+	writeFileSync(join(prefix, "bin", "tool"), `#!/bin/sh\ncat "$(dirname "$(readlink -f "$0")")/../share/tool/data"; echo; cat ${prefix}/secret 2>/dev/null || echo no-secret; command -v other || echo no-other; echo "$PATH"\n`);
+	writeFileSync(join(prefix, "bin", "other"), "#!/bin/sh\necho other\n");
+	chmodSync(join(prefix, "bin", "tool"), 0o755);
+	chmodSync(join(prefix, "bin", "other"), 0o755);
+	const decls = { box: { requires: [{ name: "tool", check: ["tool"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const };
+	const boxes = new Sandboxes({ decls, bins: { tool: join(prefix, "bin", "tool") }, volumes: {}, bindDigests: {}, cacheDir: join(tmp(), "envs") });
+	const sp = boxes.spawn("box", ["tool"], { scratch: tmp(), inputs: null });
+	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
+	assert.deepEqual(r.stdout.trim().split("\n"), ["found", "no-secret", "no-other", "/run/wallis/bin:/usr/local/bin:/usr/bin:/bin"], r.stderr);
+	// The tool is on PATH by its name.
+	const byName = boxes.spawn("box", ["/bin/sh", "-c", "command -v tool"], { scratch: tmp(), inputs: null });
+	assert.equal(spawnSync(byName.command, byName.args, { env: byName.env, cwd: byName.cwd, encoding: "utf8" }).stdout.trim(), "/run/wallis/bin/tool");
+});
+
+test("darktable still runs in a sandbox that requires it", { skip: (!existsSync("/usr/bin/darktable-cli") && "darktable is not installed") || skip }, () => {
+	const decls = { box: { requires: [{ name: "darktable-cli", check: ["darktable-cli", "--version"] }], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } as const };
+	const boxes = new Sandboxes({ decls, bins: { "darktable-cli": "/usr/bin/darktable-cli" }, volumes: {}, bindDigests: {}, cacheDir: join(tmp(), "envs") });
+	// Its check runs inside the sandbox (prepare throws requires_broken if it cannot start).
+	assert.match(boxes.prepare()["darktable-cli"]!, /darktable/i);
+});
