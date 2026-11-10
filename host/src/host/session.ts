@@ -127,6 +127,9 @@ export class RunRefused extends Error {
 	}
 }
 
+/** A loop iteration's state, as logged: at most this many characters of its JSON (the whole one is a blob). */
+const LOOP_STATE_CHARS = 2000;
+
 /** The pin input of a toolset's bundle digest: `toolset:<path>`. */
 const TOOLSET_PIN = "toolset:";
 const NO_USAGE: Usage = { usd: 0, tokens: 0, turns: 0 };
@@ -198,6 +201,8 @@ export class Session {
 	#seed = 0;
 	/** Set when the code changed since the last session: hits so far, until the first new call. */
 	#codeChange: { hits: number; reported: boolean } | null = null;
+	/** When this host started: which host reused a journaled call (`hit` facts). */
+	readonly #hostStarted = new Date().toISOString();
 	/** A restarted held node: the body runs again, in a fresh VM, against the journal. */
 	#restarting = false;
 	/** Tool sources (toolsets, MCP servers), and every tool they listed at preflight, by source key. */
@@ -737,6 +742,7 @@ export class Session {
 		try {
 			const effects = this.#core.step(event);
 			this.#noteCodeChange(event, effects);
+			this.#noteHit(event, effects);
 			for (const effect of effects) {
 				if (effect.type === "refuse" && effect.id === null) refusals.push(effect.refusal);
 				else this.#handle(effect, event);
@@ -773,6 +779,7 @@ export class Session {
 				continue;
 			}
 			let event = this.#requests.shift()!;
+			if (event.type === "observed") event = this.#loopState(event);
 			if (event.type === "requested") {
 				const invalid = this.#invalidRequest(event.request);
 				if (invalid) {
@@ -786,6 +793,19 @@ export class Session {
 			// A request the core refuses as an event is a path divergence: the body took another path.
 			if (refusals.length > 0) throw new RunRefused(refusals[0]!);
 		}
+	}
+
+	/**
+	 * A loop iteration's state, as logged: whole up to LOOP_STATE_CHARS of
+	 * JSON; a longer one truncated, with the whole state a blob in the run's
+	 * store (`full`), for `wallis tree --full`.
+	 */
+	#loopState(event: Extract<Event, { type: "observed" }>): Event {
+		const value = event.value as { state?: Json } | null;
+		if (!event.label.startsWith("loop ") || value === null || typeof value !== "object" || !("state" in value)) return event;
+		const text = JSON.stringify(value.state ?? null);
+		if (text.length <= LOOP_STATE_CHARS) return event;
+		return { ...event, value: { ...(value as Record<string, Json>), state: { truncated: text.slice(0, LOOP_STATE_CHARS) }, full: putBlob(this.paths.dir, text) } };
 	}
 
 	/**
@@ -854,6 +874,19 @@ export class Session {
 		// A body tool call carries whether it may be made again after a crash.
 		const request = r.type === "tool" ? { ...(event.request as object), replay: this.#bodyTool(r.tool!)?.replay === "safe" ? "replay_safe" : "replay_never" } : event.request;
 		return { ...event, request: request as Json, node_digest: digest, occurrence };
+	}
+
+	/**
+	 * A request answered from the journal (a hit: answered, nothing else) is
+	 * logged as a host fact, `hit <id>`: what was reused, and by which host
+	 * (its start time). A fact, not the run: it never changes the run's
+	 * state, so a resumed run still equals an uninterrupted one.
+	 */
+	#noteHit(event: Event, effects: readonly Effect[]): void {
+		if (event.type !== "requested" || effects.length !== 1 || effects[0]!.type !== "deliver") return;
+		const r = event.request as { type: string; agent?: string; command?: string; tool?: string; name?: string };
+		const node = r.agent ?? r.command ?? r.tool ?? r.name ?? null;
+		this.#note(`hit ${event.id}`, { kind: r.type, node, host: this.#hostStarted });
 	}
 
 	/** After a code change: count hits, and say where the first new call is. */
@@ -1047,7 +1080,8 @@ export class Session {
 			if (!(error instanceof ArtifactError)) throw error;
 			return failed(error.message);
 		}
-		const rendered = renderInput(declaration.input, effect.input);
+		// The input as the agent reads it: each artifact with its path in the sandbox (`/in/<hex>/<name>`), each Tree with its mount.
+		const rendered = renderInput(declaration.input, mountedInput(effect.input, LAYOUT.inputs, declaration.input));
 		const contextTokens = this.#options.executor.contextWindow?.(effect.model);
 		if (effect.transcript.length === 0) {
 			// The window check, before the first request of the call.
@@ -1302,7 +1336,7 @@ export class Session {
 						if (r.timedOut) failed({ type: "timed_out", minutes: r.minutes }, r.minutes);
 						else if (r.exit !== 0) failed({ type: "exit_code", code: r.exit, stderr_head: r.stderr.trim().slice(-500) }, r.minutes);
 						else {
-							const parsed = this.#sandbox!.parse(effect.command, { exit: r.exit, stdout: r.stdout, stderr: r.stderr });
+							const parsed = this.#sandbox!.parse(effect.command, { exit: r.exit, stdout: r.stdout, stderr: r.stderr }, input);
 							if (!parsed.ok) failed({ type: "output_mismatch", errors: [`parse: ${parsed.error}`] }, r.minutes);
 							else {
 								const out = this.#parseOutput(parsed.output, declaration.output, workspace.scratch);

@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
-import { blobPath, nodeDirName, refsIn, shareBlobs } from "./artifacts.ts";
+import { blobPath, nodeDirName, readBlob, refsIn, shareBlobs } from "./artifacts.ts";
 import { Core, type Event, type FailReason, type IdleCause, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
@@ -470,7 +470,8 @@ export function runLine(v: RunView): string {
  * The run's nodes as a tree: request ids encode branches (`#2.a#0`) and
  * sub-workflows (`#3>retry#0`), so depth is the number of nested segments.
  */
-export function renderTree(v: RunView): string {
+/** The run as a tree. `full`: each loop iteration's whole state, else its first 120 characters. */
+export function renderTree(v: RunView, options: { readonly full?: boolean } = {}): string {
 	const lines = [runLine(v)];
 	const depthOf = (id: string) => (id.match(/[.>]/g) ?? []).length;
 	for (const node of v.run.nodes) {
@@ -522,7 +523,7 @@ export function renderTree(v: RunView): string {
 		}
 	}
 	// Loops (`ctx.loop`): the loop, then each iteration with its state; the rest are plain observations.
-	const loops = new Map<string, { at: string; iteration: number; state: Json }[]>();
+	const loops = new Map<string, { at: string; iteration: number; state: Json; full: string | null }[]>();
 	const finished = new Map<string, number>();
 	for (const o of v.run.observations) {
 		if (!o.label.startsWith("loop ")) {
@@ -530,14 +531,23 @@ export function renderTree(v: RunView): string {
 			continue;
 		}
 		const at = o.label.slice("loop ".length);
-		const value = o.value as { iteration?: number; state?: Json; done?: boolean };
+		const value = o.value as { iteration?: number; state?: Json; done?: boolean; full?: string };
 		if (value.done) finished.set(at, (value.iteration ?? 0) + 1);
-		else loops.set(at, [...(loops.get(at) ?? []), { at: o.at, iteration: value.iteration ?? 0, state: value.state ?? null }]);
+		else loops.set(at, [...(loops.get(at) ?? []), { at: o.at, iteration: value.iteration ?? 0, state: value.state ?? null, full: value.full ?? null }]);
 	}
 	for (const [at, iterations] of loops) {
 		const total = finished.get(at);
 		lines.push(`${"  ".repeat(depthOf(at) + 1)}${at}  loop  ${total === undefined ? `iteration ${iterations.length - 1} (current)` : `done after ${total} iteration${total === 1 ? "" : "s"}`}`);
-		for (const it of iterations) lines.push(`${"  ".repeat(depthOf(it.at) + 1)}${it.at}  iteration ${it.iteration}  state = ${truncate(JSON.stringify(it.state), 120)}`);
+		for (const it of iterations) {
+			const indent = "  ".repeat(depthOf(it.at) + 1);
+			if (!options.full) {
+				lines.push(`${indent}${it.at}  iteration ${it.iteration}  state = ${truncate(JSON.stringify(it.state), 120)}`);
+				continue;
+			}
+			// The whole state: from the run's store when the log keeps it truncated.
+			const whole = it.full === null ? it.state : (JSON.parse(readBlob(v.dir, it.full) ?? JSON.stringify({ missing: it.full })) as Json);
+			lines.push(`${indent}${it.at}  iteration ${it.iteration}  state =`, ...JSON.stringify(whole, null, 2).split("\n").map((l) => `${indent}    ${l}`));
+		}
 	}
 	// Session values, as a tree of branches: each is the session after a call of its parent.
 	const sessions = v.run.sessions ?? [];

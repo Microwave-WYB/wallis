@@ -321,8 +321,12 @@ export interface CommandSpec<R extends string, I extends TSchema, O extends TSch
 	readonly output: O;
 	/** Pure, run in the workflow sandbox. The input JSON is also on stdin. A plain argv is the default protocol. */
 	readonly run: Argv<NoInfer<R>> | ((input: Mounted<Static<I>>) => Argv<NoInfer<R>>);
-	/** Pure, run in the workflow sandbox. Default: the output JSON on stdout. Checked against `output` either way. */
-	readonly parse?: (result: CommandResult) => Static<O>;
+	/**
+	 * Pure, run in the workflow sandbox, with the process result and the
+	 * call's input (mounted, as `run` sees it). Default: the output JSON on
+	 * stdout. Checked against `output` either way.
+	 */
+	readonly parse?: (result: CommandResult, input: Mounted<Static<I>>) => Static<O>;
 	/** Machine resources; calls wait for free slots. GPU devices are bound only when `gpu` is set. */
 	readonly resources?: Resources;
 }
@@ -335,7 +339,7 @@ export interface CommandDef<I extends TSchema = TSchema, O extends TSchema = TSc
 	readonly input: I;
 	readonly output: O;
 	readonly run: Argv<string> | ((input: never) => Argv<string>);
-	readonly parse: ((result: CommandResult) => unknown) | null;
+	readonly parse: ((result: CommandResult, input: never) => unknown) | null;
 	readonly resources: Resources;
 }
 
@@ -831,8 +835,12 @@ export interface Ctx<D extends Declared = AnyDeclared> {
 	parallel<const B extends { readonly [key: string]: (ctx: Ctx<D>) => Promise<unknown> }>(
 		branches: B,
 	): Promise<{ -readonly [K in keyof B]: Awaited<ReturnType<B[K]>> }>;
-	/** One branch per item, concurrently, each with its own request ids; results in item order. */
-	map<T, U>(items: readonly T[], each: (ctx: Ctx<D>, item: T, index: number) => Promise<U>): Promise<U[]>;
+	/**
+	 * One branch per item, concurrently (at most `concurrency` at a time, if
+	 * given: a positive integer), each with its own request ids; results in
+	 * item order. Ids do not depend on the limit or on arrival order.
+	 */
+	map<T, U>(items: readonly T[], each: (ctx: Ctx<D>, item: T, index: number) => Promise<U>, options?: { readonly concurrency?: number }): Promise<U[]>;
 	/**
 	 * A typed fold: runs `body` on the state until it returns `done(value)`;
 	 * `next(state)` goes round again. The state (`S`, from `init`) and the

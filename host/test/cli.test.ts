@@ -136,7 +136,8 @@ test("an executor error pauses the run; a rebind and resume reissue the call", (
 	assert.equal(fixed.status, 0, fixed.stderr);
 	assert.equal(status(root, id).status.type, "finished");
 	assert.deepEqual(lines(execLog).map((e) => [e.agent, e.model]), [["planner", "fake/default"], ["writer", "bad/model"], ["writer", "bad/model"], ["writer", "good/model"]]);
-	const types = logOf(root, id).map((e) => e.type);
+	// Host facts (`noted`, such as cache hits) are not the run's events.
+	const types = logOf(root, id).flatMap((e) => (e.type === "noted" ? [] : [e.type]));
 	assert.deepEqual(types.slice(types.indexOf("executor_failed")), ["executor_failed", "retry_unavailable", "executor_failed", "alias_rebound", "retry_unavailable", "agent_returned", "observed", "body_finished"]);
 });
 

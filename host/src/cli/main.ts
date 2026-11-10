@@ -14,7 +14,7 @@
 //   wallis wait <run> [--timeout seconds] [--json]
 //   wallis pending [--json]
 //   wallis claim <run>
-//   wallis ls | tree <run> | log <run> [--follow] [--since n] | show <run> [<node>]
+//   wallis ls | tree <run> [--full] | log <run> [--follow] [--since n] | show <run> [<node>]
 //   wallis interrupt <run> <node> | pause <run> | cancel <run> [--node <node>]
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
 //   wallis fork <run> [--forget <node>]... [--model a=m]... [--detach]   (copies the journal; unchanged calls hit; forgotten calls execute again)
@@ -74,6 +74,7 @@ const { values, positionals } = parseArgs({
 		model: { type: "string", multiple: true },
 		volume: { type: "string", multiple: true },
 		forget: { type: "string", multiple: true },
+		full: { type: "boolean" },
 		bin: { type: "string", multiple: true },
 		turns: { type: "string" },
 		budget: { type: "string", multiple: true },
@@ -420,7 +421,7 @@ async function main(): Promise<number> {
 			return 0;
 		}
 		case "tree":
-			out(renderTree(inspectRun(resolveRun(root, args[0] ?? ""))));
+			out(renderTree(inspectRun(resolveRun(root, args[0] ?? "")), { full: values.full === true }));
 			return 0;
 		case "log": {
 			const dir = resolveRun(root, args[0] ?? "");

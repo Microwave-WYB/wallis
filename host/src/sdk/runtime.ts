@@ -100,8 +100,6 @@ export function branchKey(key: string): string {
 	return key.replace(/[%#.>~]/g, (c) => `%${c.charCodeAt(0).toString(16)}`);
 }
 
-/** An iteration's state, as observed for monitoring: at most this many characters of its JSON. */
-const LOOP_STATE_CHARS = 2000;
 
 /** The workflow's agents, by name: a session value names its agent. */
 const agents = new Map<string, AgentDef>();
@@ -229,20 +227,31 @@ function makeCtx(path: string, seed: number): Ctx {
 				(results) => Object.fromEntries(keys.map((key, i) => [key, results[i]])) as never,
 			);
 		},
-		map(items, each) {
+		map(items, each, options) {
 			const at = next();
-			return Promise.all(items.map((item, i) => each(makeCtx(`${at}.${i}`, seed), item, i)));
+			const limit = options?.concurrency;
+			if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1)) return Promise.reject(new SchemaError("ctx.map", [`concurrency must be a positive integer, not ${String(limit)}`]));
+			// Every branch's ctx (its ids) is made now, in item order; the limit only delays starts.
+			const branches = items.map((item, i) => () => each(makeCtx(`${at}.${i}`, seed), item, i));
+			if (limit === undefined || limit >= branches.length) return Promise.all(branches.map((b) => b()));
+			const results: unknown[] = new Array(branches.length);
+			let started = 0;
+			const worker = async (): Promise<void> => {
+				while (started < branches.length) {
+					const i = started++;
+					results[i] = await branches[i]!();
+				}
+			};
+			return Promise.all(Array.from({ length: limit }, worker)).then(() => results as never);
 		},
 		loop: ((init: unknown, body: (ctx: Ctx, state: unknown) => Promise<unknown>) => {
 			// The loop's position, taken now like a request id; iteration i is branch `<at>.<i>`.
 			const at = next();
 			const label = `loop ${at}`;
-			const show = (value: unknown): Json => {
-				const text = JSON.stringify(value) ?? "null";
-				return text.length <= LOOP_STATE_CHARS ? (JSON.parse(text) as Json) : { truncated: text.slice(0, LOOP_STATE_CHARS) };
-			};
+			// The whole state as JSON; the host logs a long one truncated, keeping it whole in the run's store.
+			const show = (value: unknown): Json => JSON.parse(JSON.stringify(value) ?? "null") as Json;
 			const iterate = async (state: unknown, i: number): Promise<unknown> => {
-				// Monitoring only: the iteration and its state (truncated), never returned or matched.
+				// Monitoring only: the iteration and its state, never returned or matched.
 				host().__wallis_send(JSON.stringify({ type: "observed", at: `${at}.${i}`, label, value: { iteration: i, state: show(state) } }));
 				const step: unknown = await body(makeCtx(`${at}.${i}`, seed), state);
 				const s = step as { type?: unknown; state?: unknown; value?: unknown } | null;
@@ -411,7 +420,7 @@ export function install(def: WorkflowDef): void {
 		}
 	};
 	// The command's output from its process result; files it names become artifact drafts.
-	g.__wallis_parse = (name: string, resultJson: string) => {
+	g.__wallis_parse = (name: string, resultJson: string, inputJson: string) => {
 		try {
 			const c = commands.get(name);
 			if (!c) throw new Error(`no command ${name}`);
@@ -420,7 +429,7 @@ export function install(def: WorkflowDef): void {
 				...raw,
 				file: (file, media) => ({ artifact: file, media: media ?? "application/octet-stream" }) as never,
 			};
-			const output = c.parse ? c.parse(result) : JSON.parse(raw.stdout);
+			const output = c.parse ? c.parse(result, JSON.parse(inputJson) as never) : JSON.parse(raw.stdout);
 			return JSON.stringify({ ok: true, output: output ?? null });
 		} catch (error) {
 			return JSON.stringify({ ok: false, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });

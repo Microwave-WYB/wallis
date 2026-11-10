@@ -404,9 +404,12 @@ const ending = await ctx.loop({ s: ctx.session(colorist), round: 0 }, async (c, 
   ids, like a `ctx.map` item), so replay, fork and resume are stable. State
   is plain data; sessions in it are values.
 - The runtime shows the loop: each iteration's state is observed (label
-  `loop <position>`, truncated to 2000 characters; monitoring only, never
-  returned or matched), so `wallis tree` lists the loop, its iterations and
-  the current one, and `status` the current iteration.
+  `loop <position>`; monitoring only, never returned or matched), so
+  `wallis tree` lists the loop, its iterations and the current one, and
+  `status` the current iteration. The log keeps a state of more than 2000
+  characters of JSON truncated, with the whole state a blob in the run's
+  store (`full`); `wallis tree --full` prints every iteration's whole
+  state (this round).
 - No iteration cap: the budget governs long loops. A body exception fails
   the run like any body error; a node failure inside an iteration is held
   as usual (its restart recomputes from that iteration; earlier ones hit).
@@ -421,7 +424,10 @@ const ending = await ctx.loop({ s: ctx.session(colorist), round: 0 }, async (c, 
   order results arrive in, and so is a replay after a kill.
 - A branch with several sequential steps must run in `ctx.parallel` or
   `ctx.map(items, async (c, item, i) => ...)`, which give each branch its
-  own counter. QuickJS has no async context tracking: ids taken after an
+  own counter. `ctx.map(items, f, { concurrency: n })` runs at most `n`
+  branches at once (a positive integer, else `SchemaError`); every
+  branch's ids are taken up front, so they do not depend on the limit
+  (this round). QuickJS has no async context tracking: ids taken after an
   `await` in plain concurrent code would depend on arrival order.
 - The cache key's occurrence counter follows issue order, which is
   synchronous and deterministic, so identical parallel calls stay apart.
@@ -727,7 +733,12 @@ Prototype choices:
 - **Observations** (`ctx.observe`) are logged events; `wallis status`
   prints the latest value per label, `wallis tree` shows each one at its
   position, `wallis show <run>` lists them.
-- **CLI:** `wallis ls`, `wallis tree <run>`, `wallis log <run> [--follow]`,
+- **Cache hits** are logged as host facts (this round): a request answered
+  from the journal notes `hit <id>` = `{ kind, node, host }` (`host`: when
+  the reusing host started), so a resume or fork says what it reused. A
+  fact, not the run's state: a resumed run still equals an uninterrupted
+  one.
+- **CLI:** `wallis ls`, `wallis tree <run> [--full]`, `wallis log <run> [--follow]`,
   `wallis show <run> [<node>]`, `wallis describe <workflow>`, `wallis doc`;
   interventions `send`, `submit`, `interrupt`, `restart`, `cancel --node`,
   `pause`, `resume`.
@@ -944,6 +955,9 @@ Prototype choices:
   prompt lists the folded paths.
 - The full input is always the JS `input` variable inside codemode. There
   are no separate input query tools.
+- The rendered input shows each input artifact with its path in the
+  sandbox (`"path": "/in/<hex>/<name>"`) and each mounted Tree with its
+  mount, so an agent opens a file without guessing (this round).
 - **Window check:** before a call's first request, the host checks the
   rendered prompt and input against the resolved model's context window at
   a conservative 3 characters per token. If it does not fit, the call is
@@ -1054,8 +1068,9 @@ Prototype choices:
   `run` and `parse` are pure functions run in the workflow's QuickJS VM.
   Inside `run` an input artifact appears as its mounted form `{ ...ref,
   path }`. `r.file(name)` must name a file the command wrote in its scratch
-  dir (else `missing_file`); it becomes an artifact. `parse`'s result is
-  still checked against `output`. Without `parse`, the default protocol: the
+  dir (else `missing_file`); it becomes an artifact. `parse(r, input)` also
+  gets the call's input, mounted as `run` sees it (this round). `parse`'s
+  result is still checked against `output`. Without `parse`, the default protocol: the
   input JSON on stdin, the output JSON (with artifact drafts) on stdout, and
   `run` may be a plain argv. `argv[0]` is typed as one of the sandbox's
   required binaries. Agents cannot be handed commands.

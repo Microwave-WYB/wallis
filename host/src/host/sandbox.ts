@@ -76,8 +76,9 @@ export class Sandbox {
 	}
 
 	/** A command's `parse`, evaluated in the workflow VM: pure, synchronous. */
-	parse(command: string, result: { exit: number; stdout: string; stderr: string }): { ok: true; output: unknown } | { ok: false; error: string } {
-		return JSON.parse(this.#invoke("__wallis_parse", [command, JSON.stringify(result)])) as never;
+	/** A command's `parse` of a process result, with the call's (mounted) input. */
+	parse(command: string, result: { exit: number; stdout: string; stderr: string }, input: unknown): { ok: true; output: unknown } | { ok: false; error: string } {
+		return JSON.parse(this.#invoke("__wallis_parse", [command, JSON.stringify(result), JSON.stringify(input)])) as never;
 	}
 
 	/** A body MCP tool's `parse` (or its default), evaluated in the workflow VM: pure, synchronous. */
