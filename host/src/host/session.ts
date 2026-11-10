@@ -54,7 +54,7 @@ import { bindDigest, bindSnapshotDir, checkDevices, checkEnvironments, commandOu
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
 import { Sandbox } from "./sandbox.ts";
-import { acquireLock, type InboxEntry, newMessageId, readInbox, readMeta, refusePending, type RunPaths, runPaths } from "./store.ts";
+import { acquireLock, type InboxEntry, lockHolder, newMessageId, readInbox, readMeta, refusePending, type RunPaths, runPaths } from "./store.ts";
 
 export interface SessionOptions {
 	/** The run directory. A directory without a log starts a new run. */
@@ -160,8 +160,6 @@ export async function startSession(options: SessionOptions): Promise<Session> {
 		return session;
 	} catch (error) {
 		release();
-		// A refused boot answers the inbox entries waiting for this host.
-		if (error instanceof RunRefused) refusePending(paths, error.refusal);
 		throw error;
 	}
 }
@@ -407,7 +405,15 @@ export class Session {
 		try {
 			await this.#boot(code);
 		} catch (error) {
-			this.#abort(error);
+			// A refused boot answers the inbox entries waiting for this host while it still holds the
+			// run's lock: once it lets go, another host may take them. (A session that already let go
+			// leaves them for the next host.)
+			const pid = this.#options.lockPid ?? process.pid;
+			try {
+				if (error instanceof RunRefused && lockHolder(this.paths) === pid) refusePending(this.paths, error.refusal, pid);
+			} finally {
+				this.#abort(error);
+			}
 			throw error;
 		}
 	}

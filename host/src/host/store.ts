@@ -256,9 +256,11 @@ export function readInbox(paths: RunPaths): InboxEntry[] {
 /**
  * A host that cannot boot (its run is refused) refuses every inbox entry it
  * has not taken, with that refusal: whoever handed it in learns why,
- * instead of entries piling up unanswered.
+ * instead of entries piling up unanswered. Only the run's lock holder
+ * (`pid`) may: an entry another host took must never be refused too.
  */
-export function refusePending(paths: RunPaths, refusal: Refusal): void {
+export function refusePending(paths: RunPaths, refusal: Refusal, pid: number): void {
+	if (lockHolder(paths) !== pid) throw new Error(`run ${paths.id}: only the lock holder refuses inbox entries`);
 	const done = new Set(existsSync(`${paths.inbox}.done`) ? readFileSync(`${paths.inbox}.done`, "utf8").split("\n") : []);
 	for (const entry of readInbox(paths)) {
 		if (done.has(entry.id) || refusedEntry(paths, entry.id) !== null) continue;

@@ -169,3 +169,16 @@ test("call-time bind volume dirs are noted and reused by every later host; a hos
 	await assert.rejects(runWorkflow({ ...quiet, workflow, dir: second, executor: new FakeExecutor({}), seed: 2 }), (e: unknown) => e instanceof RunRefused);
 	assert.equal(refusedEntry(runPaths(second), "s2")?.type, "pin_mismatch");
 });
+
+test("only the run's lock holder refuses waiting inbox entries (a refused boot does so before it releases the lock)", async () => {
+	const { acquireLock, appendInbox, refusePending, refusedEntry, runPaths } = await import("../src/host/store.ts");
+	const paths = runPaths(join(tmp(), "run"));
+	appendInbox(paths, { id: "e1", type: "submit", node: "#0", value: true, by: "human" });
+	// Without the lock (another host may hold it, or take the entry): refused to refuse.
+	assert.throws(() => refusePending(paths, { type: "not_running" }, process.pid), /only the lock holder/);
+	assert.equal(refusedEntry(paths, "e1"), null);
+	const release = acquireLock(paths);
+	refusePending(paths, { type: "not_running" }, process.pid);
+	release();
+	assert.deepEqual(refusedEntry(paths, "e1"), { type: "not_running" });
+});
