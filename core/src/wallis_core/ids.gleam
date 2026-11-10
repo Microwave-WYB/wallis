@@ -68,13 +68,12 @@ pub opaque type Slot {
 }
 
 /// The journal slot of a call: the node's definition digest, the request's
-/// kind, name and canonical input, the session it continues (`None` for a
+/// kind and canonical input (not its name: names are labels), the session it continues (`None` for a
 /// new session, and for calls that are not session calls), and its
 /// occurrence in its branch of the body.
 pub fn slot(
   node: Digest,
   kind: String,
-  name: String,
   input: Value,
   within: Option(SessionId),
   occurrence: String,
@@ -85,7 +84,7 @@ pub fn slot(
   }
   Slot(
     sha.hex(string.join(
-      [digest_text(node), kind, name, value.canonical(input), within],
+      [digest_text(node), kind, value.canonical(input), within],
       "\n",
     ))
     <> "#"

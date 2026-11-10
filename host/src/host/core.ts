@@ -18,6 +18,7 @@ export type Event =
 	/** `occurrence`: `<branch path>/<n>`, the nth call of the same node, session and input in that branch. */
 	| { type: "requested"; id: string; request: Json; node_digest: string; occurrence: string }
 	| { type: "code_changed"; from: string; to: string }
+	| { type: "workflow_declared"; workflow: Json }
 	/** `dialogue`: the session's dialogue after the call, a blob written before this event. */
 	| { type: "agent_returned"; id: string; output: Json; usage: Usage; model: string; dialogue: string | null; layers: string[] | null }
 	| { type: "agent_idle"; id: string; message: string; usage: Usage; model: string }

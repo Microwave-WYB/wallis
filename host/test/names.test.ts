@@ -55,6 +55,9 @@ test("the name check is on the listing too, and a second tool by one name is nev
 	assert.equal(resolved([["./a.ts", "submit"]]), "submit_result");
 	assert.equal(resolved([["./a.ts", "x"], ["./b.ts", "x"]]), "x");
 	assert.equal(resolved([["./a.ts", "x"]]), null);
+	// The same tool given twice is one tool (an agent's tools are built from this list without a clash).
+	assert.equal(resolved([["./a.ts", "x"], ["./a.ts", "x"]]), null);
+	assert.equal(resolveAgentTools("a", [{ kind: "custom", toolset: "./a.ts", export: "x" }, { kind: "custom", toolset: "./a.ts", export: "x" }], listing).tools.length, 1);
 	const tools = new NodeTools({ agent: "a" } as never, 1, 1);
 	tools.add({ name: "x", description: "", parameters: {}, run: async () => ({ text: "" }) });
 	assert.throws(() => tools.add({ name: "x", description: "", parameters: {}, run: async () => ({ text: "" }) }), /tool_name_taken/);

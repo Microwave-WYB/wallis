@@ -630,8 +630,7 @@ pub fn executor_error_pauses_and_retry_reissues_test() {
   let #(s, effects) = step(s, call("#0", "worker", JNull))
   assert effects == []
   // After a rebind, the retry reissues it with the new model.
-  let #(s, _) =
-    step(s, AliasRebound("default", "fake/model", "other/model"))
+  let #(s, _) = step(s, AliasRebound("default", "fake/model", "other/model"))
   let #(s, effects) = step(s, RetryUnavailable)
   let assert [Checkpoint, CallAgent(id: "#0", model: "other/model", ..)] =
     effects
@@ -819,6 +818,42 @@ pub fn a_code_change_is_logged_and_never_refused_test() {
   assert snapshot_get(s, "status.type") == JString("running")
 }
 
+pub fn names_are_labels_a_renamed_agent_hits_and_new_names_follow_the_declarations_test() {
+  let #(s, _, _) =
+    replay([
+      started(basic()),
+      cached("#0", "n", JInt(0), 0),
+      returned("#0", summary("s0")),
+    ])
+  let renamed = fn(id, input) {
+    types.Requested(
+      id:,
+      request: types.Call(agent: "author", input:, session: None, from: []),
+      node_digest: "n",
+      occurrence: "0",
+    )
+  }
+  // The same definition under another name is the same node: it hits.
+  let #(s, effects) = step(s, renamed("#0", JInt(0)))
+  assert effects == [Deliver("#0", summary("s0"))]
+  // A new call needs the agent declared: before the new code's declarations it is unknown.
+  let #(_, effects) = step(s, renamed("#1", JInt(1)))
+  assert effects
+    == [Checkpoint, types.Refuse(Some("#1"), types.UnknownAgent("author"))]
+  let #(s, _) = step(s, types.CodeChanged("wf1", "wf2"))
+  let declared =
+    support.workflow([support.agent("author"), support.agent("judge")])
+  let #(s, effects) = step(s, types.WorkflowDeclared(declared))
+  assert effects == [Checkpoint]
+  let #(s, effects) = step(s, renamed("#1", JInt(1)))
+  let assert [Checkpoint, CallAgent(id: "#1", ..)] = effects
+  // Declarations that do not hold are refused, typed, and change nothing.
+  let dup = support.workflow([support.agent("a"), support.agent("a")])
+  let #(_, effects) = step(s, types.WorkflowDeclared(dup))
+  assert effects
+    == [types.Refuse(None, types.InvalidDeclaration("duplicate agent name"))]
+}
+
 // --- An uncaught node failure holds the run ---
 
 fn held_events() {
@@ -925,8 +960,15 @@ fn first_call(dialogue: String) -> #(run.RunState, String) {
 pub fn a_call_of_a_session_value_continues_its_dialogue_test() {
   let #(state, s1) = first_call("dialogue-a")
   // A call of the session value continues where the call that made it ended.
-  let assert [Checkpoint, CallAgent(history: Some("dialogue-a"), checkpoint: None, session: Some(from), ..)] =
-    run.step(state, support.session_call("#1", Some(s1), input(2))).1
+  let assert [
+    Checkpoint,
+    CallAgent(
+      history: Some("dialogue-a"),
+      checkpoint: None,
+      session: Some(from),
+      ..,
+    ),
+  ] = run.step(state, support.session_call("#1", Some(s1), input(2))).1
   assert from == s1
   // A new session starts from nothing.
   let assert [CallAgent(history: None, checkpoint: None, session: None, ..)] =
@@ -936,10 +978,14 @@ pub fn a_call_of_a_session_value_continues_its_dialogue_test() {
 pub fn calling_a_session_value_again_is_a_branch_test() {
   let #(state, s1) = first_call("dialogue-a")
   // Two calls of the same value: two calls, each from the same dialogue.
-  let #(state, a) = run.step(state, support.session_call("#1", Some(s1), input(2)))
-  let #(state, b) = run.step(state, support.session_call("#2", Some(s1), input(3)))
-  let assert [Checkpoint, CallAgent(id: "#1", history: Some("dialogue-a"), ..)] = a
-  let assert [Checkpoint, CallAgent(id: "#2", history: Some("dialogue-a"), ..)] = b
+  let #(state, a) =
+    run.step(state, support.session_call("#1", Some(s1), input(2)))
+  let #(state, b) =
+    run.step(state, support.session_call("#2", Some(s1), input(3)))
+  let assert [Checkpoint, CallAgent(id: "#1", history: Some("dialogue-a"), ..)] =
+    a
+  let assert [Checkpoint, CallAgent(id: "#2", history: Some("dialogue-a"), ..)] =
+    b
   // Their answers are different session values, both from s1.
   let #(state, a) = run.step(state, returned("#1", summary("x")))
   let #(state, b) = run.step(state, returned("#2", summary("y")))
@@ -993,6 +1039,31 @@ pub fn a_session_value_the_run_never_answered_with_is_refused_test() {
     ])
 }
 
+pub fn only_its_own_agent_continues_a_session_value_test() {
+  let #(state, s1) = first_call("dialogue-a")
+  // The worker's session value, relabelled as the judge's: refused, typed.
+  let forged =
+    types.Requested(
+      id: "#1",
+      request: types.Call(
+        agent: "judge",
+        input: input(2),
+        session: Some(s1),
+        from: [],
+      ),
+      node_digest: "judge",
+      occurrence: "0",
+    )
+  let assert [
+    Checkpoint,
+    Refuse(
+      Some("#1"),
+      types.SessionOfAnotherAgent(session:, agent: "judge", owner: "worker"),
+    ),
+  ] = run.step(state, forged).1
+  assert session == s1
+}
+
 pub fn a_reissued_call_resumes_from_its_newest_checkpoint_test() {
   let events = [
     started(basic()),
@@ -1044,7 +1115,8 @@ pub fn host_facts_are_noted_even_after_the_end_test() {
 pub fn a_later_session_call_is_keyed_by_the_session_before_it_test() {
   // Calls 0 (input 1) and 1 (input 9, of call 0's session) are journaled.
   let #(state, s1) = first_call("dialogue-a")
-  let #(state, _) = run.step(state, support.session_call("#1", Some(s1), input(9)))
+  let #(state, _) =
+    run.step(state, support.session_call("#1", Some(s1), input(9)))
   let #(state, _) = run.step(state, returned("#1", summary("b")))
   // Another execution of the body with the same first call: both hit, and
   // the first answers with the same session value.
@@ -1058,8 +1130,7 @@ pub fn a_later_session_call_is_keyed_by_the_session_before_it_test() {
     == [Deliver("#1", summary("b"))]
   // With a different first call, the same second input misses: it is keyed
   // by the session value before it.
-  let #(other, _) =
-    run.step(state, support.session_call("#2", None, input(2)))
+  let #(other, _) = run.step(state, support.session_call("#2", None, input(2)))
   let #(other, effects) = run.step(other, returned("#2", summary("c")))
   let assert Some(s2) = support.session_of(effects)
   let assert [Checkpoint, CallAgent(id: "#3", ..)] =
@@ -1087,8 +1158,7 @@ pub fn restarting_a_held_session_call_reissues_it_from_its_session_test() {
       failed("#1", "boom"),
       types.BodyFailed(AgentGaveUp("worker", GaveUp("boom"))),
     ])
-  let #(state, effects) =
-    run.step(state, types.Restarted("#1", None, human, 0))
+  let #(state, effects) = run.step(state, types.Restarted("#1", None, human, 0))
   let assert [Checkpoint, CallAgent(id: "#1", history: Some("dialogue-a"), ..)] =
     effects
   let #(_, effects) = run.step(state, returned("#1", summary("b2")))
@@ -1157,8 +1227,7 @@ pub fn an_unknown_outcome_takes_a_restart_or_a_cancel_not_a_message_test() {
   let #(state, _, _) = replay(events)
   let assert [NodeIdle(cause: types.OutcomeUnknown("upload", _), ..)] =
     run.nodes(state)
-  assert step(state, sent("#0", "it worked")).1
-    == [Refuse(None, NotIdle("#0"))]
+  assert step(state, sent("#0", "it worked")).1 == [Refuse(None, NotIdle("#0"))]
   let assert [Checkpoint, CallAgent(..)] =
     step(state, types.Restarted("#0", None, human, 0)).1
 }
@@ -1422,22 +1491,24 @@ pub fn a_retry_of_an_unknown_outcome_survives_a_crash_before_it_resumes_test() {
   // The host dies before the retried call resumes: a new host reissues it.
   let #(state, _) = run.step(state, Resumed(pin()))
   let #(state, _) = run.step(state, call("#0", "worker", JNull))
-  let unsafe = [in_flight("1/c0", "upload", types.ExternalCall(types.ReplayNever))]
-  let #(state, effects) =
-    run.step(state, types.ToolCallsInFlight("#0", unsafe))
+  let unsafe = [
+    in_flight("1/c0", "upload", types.ExternalCall(types.ReplayNever)),
+  ]
+  let #(state, effects) = run.step(state, types.ToolCallsInFlight("#0", unsafe))
   assert effects
     == [Checkpoint, types.InFlightDecided("#0", [types.RunAgain("1/c0")])]
   // The retry is spent on that decision.
-  let assert [Checkpoint, types.InFlightDecided("#0", [types.OutcomeIsUnknown(_)])] =
-    run.step(state, types.ToolCallsInFlight("#0", unsafe)).1
+  let assert [
+    Checkpoint,
+    types.InFlightDecided("#0", [types.OutcomeIsUnknown(_)]),
+  ] = run.step(state, types.ToolCallsInFlight("#0", unsafe)).1
 }
 
 pub fn an_interrupt_names_the_attempt_it_is_for_test() {
   let #(state, _, _) = replay([started(basic()), call("#0", "worker", JNull)])
   let assert [Checkpoint, types.InterruptTurn("#0", 1)] =
     run.step(state, types.InterruptRequested("#0", human)).1
-  let #(state, effects) =
-    run.step(state, types.Restarted("#0", None, human, 0))
+  let #(state, effects) = run.step(state, types.Restarted("#0", None, human, 0))
   let assert [Checkpoint, CallAgent(attempt: 2, ..)] = effects
   let assert [Checkpoint, types.InterruptTurn("#0", 2)] =
     run.step(state, types.InterruptRequested("#0", human)).1

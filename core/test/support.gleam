@@ -77,7 +77,11 @@ pub fn cached(
 
 /// A call of a session value (`None`: a new session), keyed like the host
 /// keys it.
-pub fn session_call(id: String, session: Option(String), input: Value) -> Event {
+pub fn session_call(
+  id: String,
+  session: Option(String),
+  input: Value,
+) -> Event {
   Requested(
     id:,
     request: Call(agent: "worker", input:, session:, from: []),
@@ -107,7 +111,10 @@ pub fn outputs(effects: List(Effect)) -> List(Effect) {
   list.map(effects, fn(e) {
     case e {
       types.Deliver(id:, value: value.JObject(entries)) ->
-        case list.key_find(entries, "output"), list.key_find(entries, "session") {
+        case
+          list.key_find(entries, "output"),
+          list.key_find(entries, "session")
+        {
           Ok(output), Ok(_) -> types.Deliver(id, output)
           _, _ -> e
         }

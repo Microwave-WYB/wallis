@@ -95,6 +95,11 @@ export function toolId(desc: { kind: "custom"; toolset: string; export: string }
 	return desc.kind === "custom" ? `custom:${desc.toolset}#${desc.export}` : `mcp:${desc.server}/${desc.tool}`;
 }
 
+/** A parallel branch's key in request ids, escaped so no key reads as another id's path (`#`, `.`, `>`, `~`). */
+export function branchKey(key: string): string {
+	return key.replace(/[%#.>~]/g, (c) => `%${c.charCodeAt(0).toString(16)}`);
+}
+
 /** An iteration's state, as observed for monitoring: at most this many characters of its JSON. */
 const LOOP_STATE_CHARS = 2000;
 
@@ -151,7 +156,8 @@ function makeCtx(path: string, seed: number): Ctx {
 	const callWorkflow = async (id: string, sub: WorkflowNode, input: unknown) => {
 		let output: unknown;
 		try {
-			output = await sub.run(makeCtx(`${id}>${sub.name}`, seed), input as never);
+			// Its calls' ids are under the call's own id: the workflow's name is a label.
+			output = await sub.run(makeCtx(`${id}>`, seed), input as never);
 			check(sub.output, output, `output of workflow ${sub.name}`);
 		} catch (error) {
 			// A nested workflow's failure propagates, typed, with its cause.
@@ -207,7 +213,7 @@ function makeCtx(path: string, seed: number): Ctx {
 		parallel(branches) {
 			const at = next();
 			const keys = Object.keys(branches);
-			return Promise.all(keys.map((key) => branches[key]!(makeCtx(`${at}.${key}`, seed)))).then(
+			return Promise.all(keys.map((key) => branches[key]!(makeCtx(`${at}.${branchKey(key)}`, seed)))).then(
 				(results) => Object.fromEntries(keys.map((key, i) => [key, results[i]])) as never,
 			);
 		},
@@ -276,6 +282,11 @@ export function declarations(def: WorkflowDef) {
 		if (!d) throw new Error("toolsets takes only toolset(...) values");
 		return d;
 	});
+	// A toolset is its module: two declarations of one path must agree, never one silently winning.
+	for (const t of toolsets) {
+		const other = toolsets.find((u) => u.path === t.path && JSON.stringify(u) !== JSON.stringify(t));
+		if (other) throw new Error(`toolset ${t.path} is declared twice with different options`);
+	}
 	const overlay = mcp?.overlay ?? {};
 	const servers = Object.keys(mcp?.config.mcpServers ?? {});
 	for (const a of spec.agents) {

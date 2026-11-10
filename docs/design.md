@@ -854,11 +854,14 @@ Prototype choices:
   every assistant message and every turn) and restores from the newest
   (`NodeSpec.resume`). A reply that failed or was aborted is never progress
   and is dropped on restore.
-- The semantics version is `wallis-core/7` (foundation round: an
-  append-only journal of attempts, checkpoints and host facts as events,
-  and the session, workspace and identity changes below; round 7 was
-  opt-in ask, ended without result, unknown outcomes, body tool replay,
-  orchestrator restart and cancel). Logs of earlier versions are not read.
+- The semantics version is `wallis-core/8` (this round: journal keys
+  without names, structural node and tool identity, volumes in sandbox
+  digests; `wallis-core/7` was the foundation round: an append-only journal
+  of attempts, checkpoints and host facts as events, and the session,
+  workspace and identity changes below; round 7 was opt-in ask, ended
+  without result, unknown outcomes, body tool replay, orchestrator restart
+  and cancel). Runs of earlier versions are refused on resume
+  (`pin_mismatch` on `semantics`): their journal keys mean something else.
 - The core keeps each call by its slot, as a per-kind state union
   (`AgentCall` with `AgentHeld | AgentRunning | AgentWaiting |
   AgentUnavailable | AgentSettled`, and likewise for commands, tools and
@@ -1130,13 +1133,39 @@ Prototype choices:
 
 ## The journal is a cache (decided, round 5)
 
-- **Key:** (node definition digest, canonical input digest, occurrence n).
-  The nth call with the same node and input gets the nth recorded result.
-  - Agent digest: prompt, model alias, input and output schemas, MCP
-    selection, skills, needs, the sandbox digest (declaration, binaries,
-    bind volume content), steerable, compaction, maxTurns.
+- **Key:** (node definition digest, kind, canonical input digest, the
+  session it continues, occurrence n). The nth call with the same node and
+  input gets the nth recorded result.
+- **Identity is by digest or structure; names are labels only** (this
+  round). No key, digest or id contains a node's, a sandbox's or a nested
+  workflow's name, so renaming one with the same definition keeps every
+  journal entry, and two names for one definition are one node.
+  - Agent digest: prompt, model alias, input and output schemas, its
+    tools (each by identity), access, skills, needs, the sandbox digest
+    (declaration, binaries, bind volume content), steerable, compaction,
+    maxTurns.
   - Command digest: its `run` and `parse` code, schemas, resources, the
-    sandbox digest (declaration, binaries, bind volume content).
+    sandbox digest. Its description is a label.
+  - Orchestrator digest: its description (the question), input and answer
+    schemas.
+  - A custom tool is (its toolset's bundle digest, export); an MCP tool is
+    (server, tool). A run's toolsets are bundled once, when it starts: each
+    bundle is a blob in the run's store, pinned as `toolset:<path>`, and
+    every later host (and a fork) runs the pinned bundle whatever the
+    source is now. A new run bundles the source as it is.
+  - The workflow is its bundle digest (`workflow_digest`, recorded; a
+    code change is logged as `code_changed`, followed by
+    `workflow_declared` with the new code's agents, commands and
+    orchestrators, which the core looks nodes up in from then on).
+  - A session value is continued only by the agent whose dialogue it is
+    (`session_of_another_agent`), so a relabelled value cannot hand one
+    agent's dialogue to another.
+  - A nested workflow's calls are under its call's id (`#3>#0`), not its
+    name; a parallel key is escaped in ids (`#`, `.`, `>`, `~`, `%`), so no
+    key reads as another id's path; node dirs map ids one to one
+    (`#0.a#1` → `_0.a_1`; `-` escapes the rest).
+  - A toolset declared twice with different options is a declaration
+    error; the same tool given to an agent twice is one tool.
   - Occurrences follow call issue order, which is synchronous and
     deterministic.
 - **Resume re-executes the body against the cache.** Unchanged calls hit;

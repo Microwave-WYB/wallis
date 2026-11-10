@@ -181,8 +181,15 @@ export interface NodeDirs {
 	readonly spill: string;
 }
 
+/**
+ * A node's dir name: its id, one-to-one, in file-name characters. `#`
+ * becomes `_` (so `#0.a#1` reads `_0.a_1`); `-` escapes the rest (`--`,
+ * `-u` for `_`, `-<hex>-` for any other character), so two ids never share
+ * a dir.
+ */
 export function nodeDirName(id: string): string {
-	return id.replace(/[^A-Za-z0-9._-]/g, "_") || "_";
+	const name = id.replace(/[^A-Za-z0-9.]/g, (c) => (c === "#" ? "_" : c === "-" ? "--" : c === "_" ? "-u" : `-${c.codePointAt(0)!.toString(16)}-`));
+	return name === "" || name === "." || name === ".." ? `-${name}` : name;
 }
 
 /** Where a node's input artifact is mounted. */

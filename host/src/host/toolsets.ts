@@ -4,7 +4,10 @@
 // - A toolset is bundled with esbuild together with the runner
 //   (toolset-runner.ts) and run under node in the toolset's sandbox, with
 //   the network it declares (default host) and only its named secrets in
-//   its environment.
+//   its environment. It is bundled once, when the run starts: the bundle is
+//   a blob in the run's store and its digest is pinned, so every later host
+//   of the run (and a fork) runs the same code whatever the source is now.
+//   A tool's identity is (bundle digest, export), never the module's path.
 // - An MCP server from mcp.json runs in its overlay sandbox, with the
 //   overlay's network; `${VAR}` secrets reach its environment only. It
 //   never sees an agent's input artifacts or scratch dir, and wallis offers
@@ -25,13 +28,14 @@
 // Unannotated tools count as writes, per MCP's defaults.
 
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpClient, StdioTransport, StreamableHttpTransport } from "@earendil-works/pi-mcp";
 import { build } from "esbuild";
 import type { Json, ToolAnnotations, ToolDesc } from "../sdk/index.ts";
 import type { Declarations } from "../sdk/runtime.ts";
+import { putBlob, readBlob } from "./artifacts.ts";
 import { LAYOUT, SandboxError, type Sandboxes } from "./confine.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -116,12 +120,15 @@ export function resolveAgentTools(
 		if (d.kind === "mcp_server") {
 			const excluded = listed.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.remote);
 			if (excluded.length > 0) warnings.push(`agent ${agent}: from MCP server ${d.server} only tools annotated readOnlyHint are given; excluded: ${excluded.join(", ")}`);
-			tools.push(...listed.filter((t) => t.annotations.readOnlyHint === true));
+			tools.push(...listed.filter((t) => t.annotations.readOnlyHint === true && !tools.some((u) => u.id === t.id)));
 			continue;
 		}
 		const id = d.kind === "custom" ? `custom:${d.toolset}#${d.export}` : `mcp:${d.server}/${d.tool}`;
 		const found = listed.find((t) => t.id === id);
-		if (found) tools.push(found);
+		// The same tool given twice is one tool.
+		if (found) {
+			if (!tools.some((t) => t.id === found.id)) tools.push(found);
+		}
 		else unknown ??= id;
 	}
 	const seen = new Map<string, string>();
@@ -156,15 +163,31 @@ export class ToolSources {
 	readonly #confinement: Confinement;
 	readonly #env: Readonly<Record<string, string | undefined>>;
 	readonly #bundles = new Map<string, Promise<string>>();
-	/** Each bundled toolset's digest (its module and the runner, as run). */
+	/** Each bundled toolset's digest (its module and the runner, as run), by path. */
 	readonly #digests = new Map<string, string>();
+	/** The run's pinned bundles, by path: used as they are, never bundled again. */
+	readonly #pinned: Readonly<Record<string, string>>;
 
-	constructor(options: { decl: Declarations; workflowDir: string; runDir: string; confinement: Confinement; env?: Readonly<Record<string, string | undefined>> }) {
+	constructor(options: {
+		decl: Declarations;
+		workflowDir: string;
+		runDir: string;
+		confinement: Confinement;
+		env?: Readonly<Record<string, string | undefined>>;
+		pinned?: Readonly<Record<string, string>>;
+	}) {
 		this.#decl = options.decl;
 		this.#workflowDir = options.workflowDir;
 		this.#runDir = options.runDir;
 		this.#confinement = options.confinement;
 		this.#env = options.env ?? process.env;
+		this.#pinned = options.pinned ?? {};
+	}
+
+	/** Bundles every declared toolset (a pinned one is taken from the store): its digest, by path. */
+	async bundleAll(): Promise<Record<string, string>> {
+		for (const path of Object.keys(this.#decl.toolsets)) await this.#bundle(path);
+		return this.bundleDigests();
 	}
 
 	/** Every source the workflow declares. */
@@ -238,36 +261,47 @@ export class ToolSources {
 		return mkdtempSync(join(this.#runDir, "work", `${prefix}-`));
 	}
 
-	/** The module and the runner in one file, once per session: `<run>/toolsets/<digest>/runner.mjs`. */
+	/**
+	 * The module and the runner in one file, a blob in the run's store,
+	 * materialized at `<run>/toolsets/<hex>/runner.mjs`. A pinned bundle is
+	 * read from the store; a missing one is an error, never a silent rebuild.
+	 */
 	#bundle(path: string): Promise<string> {
 		let bundled = this.#bundles.get(path);
 		if (!bundled) {
 			bundled = (async () => {
-				const file = resolve(this.#workflowDir, path);
-				const runner = resolve(here, "toolset-runner.ts");
-				const result = await build({
-					stdin: { contents: `import * as m from ${JSON.stringify(file)};\nimport { serve } from ${JSON.stringify(runner)};\nawait serve(m);\n`, resolveDir: dirname(file), loader: "ts", sourcefile: "wallis-toolset.ts" },
-					bundle: true,
-					write: false,
-					format: "esm",
-					platform: "node",
-					target: "node22",
-					alias: { wallis: resolve(here, "../sdk/index.ts") },
-					nodePaths: [nodeModules],
-					banner: { js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);' },
-					legalComments: "none",
-					logLevel: "silent",
-				});
-				const code = result.outputFiles[0]!.text;
-				this.#digests.set(path, `sha256:${digest(code)}`);
-				const dir = join(this.#runDir, "toolsets", digest(code).slice(0, 16));
+				const pinned = this.#pinned[path];
+				const code = pinned === undefined ? await this.#build(path) : readBlob(this.#runDir, pinned);
+				if (code === null) throw new Error(`the pinned bundle ${pinned} of toolset ${path} is not in the run's store`);
+				const blob = pinned ?? putBlob(this.#runDir, code);
+				this.#digests.set(path, blob);
+				const dir = join(this.#runDir, "toolsets", blob.slice("sha256:".length, "sha256:".length + 16));
 				mkdirSync(dir, { recursive: true });
-				writeFileSync(join(dir, "runner.mjs"), code);
+				if (!existsSync(join(dir, "runner.mjs"))) writeFileSync(join(dir, "runner.mjs"), code);
 				return dir;
 			})();
 			this.#bundles.set(path, bundled);
 		}
 		return bundled;
+	}
+
+	async #build(path: string): Promise<string> {
+		const file = resolve(this.#workflowDir, path);
+		const runner = resolve(here, "toolset-runner.ts");
+		const result = await build({
+			stdin: { contents: `import * as m from ${JSON.stringify(file)};\nimport { serve } from ${JSON.stringify(runner)};\nawait serve(m);\n`, resolveDir: dirname(file), loader: "ts", sourcefile: "wallis-toolset.ts" },
+			bundle: true,
+			write: false,
+			format: "esm",
+			platform: "node",
+			target: "node22",
+			alias: { wallis: resolve(here, "../sdk/index.ts") },
+			nodePaths: [nodeModules],
+			banner: { js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);' },
+			legalComments: "none",
+			logLevel: "silent",
+		});
+		return result.outputFiles[0]!.text;
 	}
 }
 

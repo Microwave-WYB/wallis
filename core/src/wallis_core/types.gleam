@@ -178,6 +178,11 @@ pub type Event {
   /// The workflow code changed since the last session; calls whose node
   /// and input are unchanged still hit the journal.
   CodeChanged(from: String, to: String)
+  /// The declarations of the changed code: agents, commands and
+  /// orchestrators are looked up in these from now on (names are labels; a
+  /// call's identity is its node's definition digest). The budget is not
+  /// part of it: limits change by `BudgetRaised` only.
+  WorkflowDeclared(workflow: Workflow)
   /// A call of the body. `node_digest` is the digest of the node's
   /// definition; with the canonical input and `occurrence` (the nth such
   /// call in this execution of the body) it keys the journal, a cache.
@@ -303,6 +308,11 @@ pub fn event_to_json(event: Event) -> json.Json {
         #("type", json.string("code_changed")),
         #("from", json.string(from)),
         #("to", json.string(to)),
+      ])
+    WorkflowDeclared(workflow:) ->
+      json.object([
+        #("type", json.string("workflow_declared")),
+        #("workflow", workflow_to_json(workflow)),
       ])
     Requested(id:, request:, node_digest:, occurrence:) ->
       json.object([
@@ -581,6 +591,10 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use from <- decode.field("from", decode.string)
       use to <- decode.field("to", decode.string)
       decode.success(CodeChanged(from:, to:))
+    }
+    "workflow_declared" -> {
+      use workflow <- decode.field("workflow", workflow_decoder())
+      decode.success(WorkflowDeclared(workflow:))
     }
     "requested" -> {
       use id <- decode.field("id", decode.string)
@@ -1612,6 +1626,9 @@ pub type Refusal {
   SessionRequired(agent: String)
   /// A session value this run never answered with.
   UnknownSession(session: String)
+  /// A session value continued by another agent than the one whose
+  /// dialogue it is (`owner`).
+  SessionOfAnotherAgent(session: String, agent: String, owner: String)
   UnknownOrchestrator(name: String)
   UnknownTool(name: String)
   /// A submitted result does not match the node's answer schema.
@@ -1638,180 +1655,225 @@ pub type Refusal {
 
 pub fn refusal_to_json(refusal: Refusal) -> json.Json {
   case refusal {
-    PinMismatch(field:, recorded:, current:) -> json.object([
-      #("type", json.string("pin_mismatch")),
-      #("field", json.string(field)),
-      #("recorded", json.string(recorded)),
-      #("current", json.string(current)),
-    ])
-    UnknownAgent(name:) -> json.object([
-      #("type", json.string("unknown_agent")),
-      #("name", json.string(name)),
-    ])
-    UnknownCommand(name:) -> json.object([
-      #("type", json.string("unknown_command")),
-      #("name", json.string(name)),
-    ])
-    NeedsUnmet(agent:, need:) -> json.object([
-      #("type", json.string("needs_unmet")),
-      #("agent", json.string(agent)),
-      #("need", json.string(need)),
-    ])
-    InvalidVolume(sandbox:, volume:, reason:) -> json.object([
-      #("type", json.string("invalid_volume")),
-      #("sandbox", json.string(sandbox)),
-      #("volume", json.string(volume)),
-      #("reason", json.string(reason)),
-    ])
-    VolumeMissing(sandbox:, target:, path:) -> json.object([
-      #("type", json.string("volume_missing")),
-      #("sandbox", json.string(sandbox)),
-      #("target", json.string(target)),
-      #("path", json.string(path)),
-    ])
-    UnknownVolume(target:) -> json.object([
-      #("type", json.string("unknown_volume")),
-      #("target", json.string(target)),
-    ])
-    DeviceMissing(sandbox:, device:) -> json.object([
-      #("type", json.string("device_missing")),
-      #("sandbox", json.string(sandbox)),
-      #("device", json.string(device)),
-    ])
-    InputTooLarge(agent:, field:, chars:, limit:) -> json.object([
-      #("type", json.string("input_too_large")),
-      #("agent", json.string(agent)),
-      #("field", case field {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-      #("chars", json.int(chars)),
-      #("limit", json.int(limit)),
-    ])
-    NotOwner(by:, owner:) -> json.object([
-      #("type", json.string("not_owner")),
-      #("by", json.string(by)),
-      #("owner", case owner {
-        option.None -> json.null()
-        option.Some(value) -> json.string(value)
-      }),
-    ])
-    NotIdle(node:) -> json.object([
-      #("type", json.string("not_idle")),
-      #("node", json.string(node)),
-    ])
-    NodeNotRunning(node:) -> json.object([
-      #("type", json.string("node_not_running")),
-      #("node", json.string(node)),
-    ])
-    NotSteerable(node:) -> json.object([
-      #("type", json.string("not_steerable")),
-      #("node", json.string(node)),
-    ])
-    NotLive(node:) -> json.object([
-      #("type", json.string("not_live")),
-      #("node", json.string(node)),
-    ])
-    NotAnAgent(node:) -> json.object([
-      #("type", json.string("not_an_agent")),
-      #("node", json.string(node)),
-    ])
-    NoTurnsLeft(node:) -> json.object([
-      #("type", json.string("no_turns_left")),
-      #("node", json.string(node)),
-    ])
-    RequiresMissing(name:) -> json.object([
-      #("type", json.string("requires_missing")),
-      #("name", json.string(name)),
-    ])
-    RequiresBroken(name:, exit:, stderr_head:) -> json.object([
-      #("type", json.string("requires_broken")),
-      #("name", json.string(name)),
-      #("exit", json.int(exit)),
-      #("stderr_head", json.string(stderr_head)),
-    ])
-    SetupFailed(sandbox:, exit:, stderr_head:) -> json.object([
-      #("type", json.string("setup_failed")),
-      #("sandbox", json.string(sandbox)),
-      #("exit", json.int(exit)),
-      #("stderr_head", json.string(stderr_head)),
-    ])
-    ToolWritesOutside(server:, tool:) -> json.object([
-      #("type", json.string("tool_writes_outside")),
-      #("server", json.string(server)),
-      #("tool", json.string(tool)),
-    ])
-    UnknownBin(name:) -> json.object([
-      #("type", json.string("unknown_bin")),
-      #("name", json.string(name)),
-    ])
-    UnknownAlias(alias:) -> json.object([
-      #("type", json.string("unknown_alias")),
-      #("alias", json.string(alias)),
-    ])
-    JournalMissing(request:) -> json.object([
-      #("type", json.string("journal_missing")),
-      #("request", json.string(request)),
-    ])
-    SessionRequired(agent:) -> json.object([
-      #("type", json.string("session_required")),
-      #("agent", json.string(agent)),
-    ])
-    UnknownSession(session:) -> json.object([
-      #("type", json.string("unknown_session")),
-      #("session", json.string(session)),
-    ])
-    UnknownOrchestrator(name:) -> json.object([
-      #("type", json.string("unknown_orchestrator")),
-      #("name", json.string(name)),
-    ])
-    UnknownTool(name:) -> json.object([
-      #("type", json.string("unknown_tool")),
-      #("name", json.string(name)),
-    ])
-    InvalidAnswer(node:, errors:) -> json.object([
-      #("type", json.string("invalid_answer")),
-      #("node", json.string(node)),
-      #("errors", json.array(errors, json.string)),
-    ])
-    NotPending(node:) -> json.object([
-      #("type", json.string("not_pending")),
-      #("node", json.string(node)),
-    ])
-    DialogueMissing(node:) -> json.object([
-      #("type", json.string("dialogue_missing")),
-      #("node", json.string(node)),
-    ])
-    RetryTakesNoNote(node:) -> json.object([
-      #("type", json.string("retry_takes_no_note")),
-      #("node", json.string(node)),
-    ])
-    ToolNameTaken(agent:, name:) -> json.object([
-      #("type", json.string("tool_name_taken")),
-      #("agent", json.string(agent)),
-      #("name", json.string(name)),
-    ])
-    SandboxUnavailable(source:) -> json.object([
-      #("type", json.string("sandbox_unavailable")),
-      #("source", json.string(source)),
-    ])
-    InvalidDeclaration(message:) -> json.object([
-      #("type", json.string("invalid_declaration")),
-      #("message", json.string(message)),
-    ])
-    InvalidEvent(message:) -> json.object([
-      #("type", json.string("invalid_event")),
-      #("message", json.string(message)),
-    ])
-    NotStarted -> json.object([
-      #("type", json.string("not_started")),
-    ])
-    AlreadyStarted -> json.object([
-      #("type", json.string("already_started")),
-    ])
-    NotRunning -> json.object([
-      #("type", json.string("not_running")),
-    ])
+    PinMismatch(field:, recorded:, current:) ->
+      json.object([
+        #("type", json.string("pin_mismatch")),
+        #("field", json.string(field)),
+        #("recorded", json.string(recorded)),
+        #("current", json.string(current)),
+      ])
+    UnknownAgent(name:) ->
+      json.object([
+        #("type", json.string("unknown_agent")),
+        #("name", json.string(name)),
+      ])
+    UnknownCommand(name:) ->
+      json.object([
+        #("type", json.string("unknown_command")),
+        #("name", json.string(name)),
+      ])
+    NeedsUnmet(agent:, need:) ->
+      json.object([
+        #("type", json.string("needs_unmet")),
+        #("agent", json.string(agent)),
+        #("need", json.string(need)),
+      ])
+    InvalidVolume(sandbox:, volume:, reason:) ->
+      json.object([
+        #("type", json.string("invalid_volume")),
+        #("sandbox", json.string(sandbox)),
+        #("volume", json.string(volume)),
+        #("reason", json.string(reason)),
+      ])
+    VolumeMissing(sandbox:, target:, path:) ->
+      json.object([
+        #("type", json.string("volume_missing")),
+        #("sandbox", json.string(sandbox)),
+        #("target", json.string(target)),
+        #("path", json.string(path)),
+      ])
+    UnknownVolume(target:) ->
+      json.object([
+        #("type", json.string("unknown_volume")),
+        #("target", json.string(target)),
+      ])
+    DeviceMissing(sandbox:, device:) ->
+      json.object([
+        #("type", json.string("device_missing")),
+        #("sandbox", json.string(sandbox)),
+        #("device", json.string(device)),
+      ])
+    InputTooLarge(agent:, field:, chars:, limit:) ->
+      json.object([
+        #("type", json.string("input_too_large")),
+        #("agent", json.string(agent)),
+        #("field", case field {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+        #("chars", json.int(chars)),
+        #("limit", json.int(limit)),
+      ])
+    NotOwner(by:, owner:) ->
+      json.object([
+        #("type", json.string("not_owner")),
+        #("by", json.string(by)),
+        #("owner", case owner {
+          option.None -> json.null()
+          option.Some(value) -> json.string(value)
+        }),
+      ])
+    NotIdle(node:) ->
+      json.object([
+        #("type", json.string("not_idle")),
+        #("node", json.string(node)),
+      ])
+    NodeNotRunning(node:) ->
+      json.object([
+        #("type", json.string("node_not_running")),
+        #("node", json.string(node)),
+      ])
+    NotSteerable(node:) ->
+      json.object([
+        #("type", json.string("not_steerable")),
+        #("node", json.string(node)),
+      ])
+    NotLive(node:) ->
+      json.object([
+        #("type", json.string("not_live")),
+        #("node", json.string(node)),
+      ])
+    NotAnAgent(node:) ->
+      json.object([
+        #("type", json.string("not_an_agent")),
+        #("node", json.string(node)),
+      ])
+    NoTurnsLeft(node:) ->
+      json.object([
+        #("type", json.string("no_turns_left")),
+        #("node", json.string(node)),
+      ])
+    RequiresMissing(name:) ->
+      json.object([
+        #("type", json.string("requires_missing")),
+        #("name", json.string(name)),
+      ])
+    RequiresBroken(name:, exit:, stderr_head:) ->
+      json.object([
+        #("type", json.string("requires_broken")),
+        #("name", json.string(name)),
+        #("exit", json.int(exit)),
+        #("stderr_head", json.string(stderr_head)),
+      ])
+    SetupFailed(sandbox:, exit:, stderr_head:) ->
+      json.object([
+        #("type", json.string("setup_failed")),
+        #("sandbox", json.string(sandbox)),
+        #("exit", json.int(exit)),
+        #("stderr_head", json.string(stderr_head)),
+      ])
+    ToolWritesOutside(server:, tool:) ->
+      json.object([
+        #("type", json.string("tool_writes_outside")),
+        #("server", json.string(server)),
+        #("tool", json.string(tool)),
+      ])
+    UnknownBin(name:) ->
+      json.object([
+        #("type", json.string("unknown_bin")),
+        #("name", json.string(name)),
+      ])
+    UnknownAlias(alias:) ->
+      json.object([
+        #("type", json.string("unknown_alias")),
+        #("alias", json.string(alias)),
+      ])
+    JournalMissing(request:) ->
+      json.object([
+        #("type", json.string("journal_missing")),
+        #("request", json.string(request)),
+      ])
+    SessionRequired(agent:) ->
+      json.object([
+        #("type", json.string("session_required")),
+        #("agent", json.string(agent)),
+      ])
+    UnknownSession(session:) ->
+      json.object([
+        #("type", json.string("unknown_session")),
+        #("session", json.string(session)),
+      ])
+    SessionOfAnotherAgent(session:, agent:, owner:) ->
+      json.object([
+        #("type", json.string("session_of_another_agent")),
+        #("session", json.string(session)),
+        #("agent", json.string(agent)),
+        #("owner", json.string(owner)),
+      ])
+    UnknownOrchestrator(name:) ->
+      json.object([
+        #("type", json.string("unknown_orchestrator")),
+        #("name", json.string(name)),
+      ])
+    UnknownTool(name:) ->
+      json.object([
+        #("type", json.string("unknown_tool")),
+        #("name", json.string(name)),
+      ])
+    InvalidAnswer(node:, errors:) ->
+      json.object([
+        #("type", json.string("invalid_answer")),
+        #("node", json.string(node)),
+        #("errors", json.array(errors, json.string)),
+      ])
+    NotPending(node:) ->
+      json.object([
+        #("type", json.string("not_pending")),
+        #("node", json.string(node)),
+      ])
+    DialogueMissing(node:) ->
+      json.object([
+        #("type", json.string("dialogue_missing")),
+        #("node", json.string(node)),
+      ])
+    RetryTakesNoNote(node:) ->
+      json.object([
+        #("type", json.string("retry_takes_no_note")),
+        #("node", json.string(node)),
+      ])
+    ToolNameTaken(agent:, name:) ->
+      json.object([
+        #("type", json.string("tool_name_taken")),
+        #("agent", json.string(agent)),
+        #("name", json.string(name)),
+      ])
+    SandboxUnavailable(source:) ->
+      json.object([
+        #("type", json.string("sandbox_unavailable")),
+        #("source", json.string(source)),
+      ])
+    InvalidDeclaration(message:) ->
+      json.object([
+        #("type", json.string("invalid_declaration")),
+        #("message", json.string(message)),
+      ])
+    InvalidEvent(message:) ->
+      json.object([
+        #("type", json.string("invalid_event")),
+        #("message", json.string(message)),
+      ])
+    NotStarted ->
+      json.object([
+        #("type", json.string("not_started")),
+      ])
+    AlreadyStarted ->
+      json.object([
+        #("type", json.string("already_started")),
+      ])
+    NotRunning ->
+      json.object([
+        #("type", json.string("not_running")),
+      ])
   }
 }
 
@@ -1935,6 +1997,12 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use session <- decode.field("session", decode.string)
       decode.success(UnknownSession(session:))
     }
+    "session_of_another_agent" -> {
+      use session <- decode.field("session", decode.string)
+      use agent <- decode.field("agent", decode.string)
+      use owner <- decode.field("owner", decode.string)
+      decode.success(SessionOfAnotherAgent(session:, agent:, owner:))
+    }
     "unknown_orchestrator" -> {
       use name <- decode.field("name", decode.string)
       decode.success(UnknownOrchestrator(name:))
@@ -1983,10 +2051,6 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
     _ -> decode.failure(NotStarted, "Refusal")
   }
 }
-
-
-
-
 
 pub type FailReason {
   BodyError(message: String)

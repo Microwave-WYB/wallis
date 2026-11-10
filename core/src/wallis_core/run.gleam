@@ -47,7 +47,7 @@ import wallis_core/types.{
 import wallis_core/value.{type Value}
 
 /// Bumped when a change to the core changes what a log means.
-pub const semantics = "wallis-core/7"
+pub const semantics = "wallis-core/8"
 
 pub opaque type RunState {
   NotYetStarted
@@ -94,10 +94,11 @@ type Run {
   )
 }
 
-/// Where a session value comes from: the call (slot) and attempt that
-/// answered with it, and its workspace: layers, bottom first.
+/// Where a session value comes from: the agent and the call (slot) and
+/// attempt that answered with it, and its workspace: layers, bottom first.
+/// Only that agent continues it.
 type Origin {
-  Origin(after: Slot, attempt: Int, layers: List(Digest))
+  Origin(agent: String, after: Slot, attempt: Int, layers: List(Digest))
 }
 
 type Spent {
@@ -254,6 +255,7 @@ fn phase(event: Event) -> Phase {
     types.Claimed(owner:) -> Claiming(owner)
     types.Noted(key:, value:) -> Noting(key, value)
     types.CodeChanged(..)
+    | types.WorkflowDeclared(..)
     | types.Requested(..)
     | types.AgentReturned(..)
     | types.AgentIdle(..)
@@ -335,19 +337,7 @@ fn start(
   pin: Pin,
   input: Value,
 ) -> #(RunState, List(Effect)) {
-  let names = list.map(workflow.agents, fn(a) { a.name })
-  let checked = {
-    use _ <- result.try(
-      case list.length(list.unique(names)) == list.length(names) {
-        True -> Ok(Nil)
-        False -> Error("duplicate agent name")
-      },
-    )
-    list.try_each(workflow.agents, fn(a) {
-      resolve_model(pin.models, a.model) |> result.replace(Nil)
-    })
-  }
-  case checked {
+  case check_declarations(workflow, pin.models) {
     Error(reason) -> #(NotYetStarted, [
       types.Refuse(None, types.InvalidDeclaration(reason)),
     ])
@@ -376,6 +366,23 @@ fn start(
 }
 
 /// Resolution: the current alias table, then `default`.
+/// Agent names are unique and every agent's model alias resolves.
+fn check_declarations(
+  workflow: Workflow,
+  models: Dict(String, String),
+) -> Result(Nil, String) {
+  let names = list.map(workflow.agents, fn(a) { a.name })
+  use _ <- result.try(
+    case list.length(list.unique(names)) == list.length(names) {
+      True -> Ok(Nil)
+      False -> Error("duplicate agent name")
+    },
+  )
+  list.try_each(workflow.agents, fn(a) {
+    resolve_model(models, a.model) |> result.replace(Nil)
+  })
+}
+
 fn resolve_model(
   models: Dict(String, String),
   alias: String,
@@ -453,6 +460,13 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       ),
       [types.Checkpoint],
     )
+    types.WorkflowDeclared(workflow:) ->
+      case check_declarations(workflow, run.models) {
+        Ok(Nil) -> #(Run(..run, workflow:), [types.Checkpoint])
+        Error(reason) -> #(run, [
+          types.Refuse(None, types.InvalidDeclaration(reason)),
+        ])
+      }
     types.AgentReturned(id:, output:, usage:, model:, dialogue:, layers:) ->
       agent_returned(
         run,
@@ -892,31 +906,26 @@ fn replace_head(attempts: List(Attempt(s)), state: s) -> List(Attempt(s)) {
 /// includes its session's id, a hash chain over every call before it, so
 /// it depends on the whole dialogue before it.
 fn slot_of(node: Digest, request: Request, occurrence: String) -> Slot {
-  let #(kind, name, body, within) = case request {
+  // The node's name is not part of it: names are labels, and two names for
+  // one definition are one node.
+  let #(kind, body, within) = case request {
     // A new session is keyed by the layers it starts from.
-    types.Call(agent:, input:, session: Some(s), ..) -> #(
+    types.Call(input:, session: Some(s), ..) -> #(
       "call",
-      agent,
       input,
       Some(ids.session_id(s)),
     )
-    types.Call(agent:, input:, session: None, from: []) -> #(
+    types.Call(input:, session: None, from: [], ..) -> #("call", input, None)
+    types.Call(input:, session: None, from:, ..) -> #(
       "call",
-      agent,
-      input,
-      None,
-    )
-    types.Call(agent:, input:, session: None, from:) -> #(
-      "call",
-      agent,
       input,
       Some(ids.session_id("new:" <> string.join(from, ","))),
     )
-    types.Command(command:, input:) -> #("command", command, input, None)
-    types.Tool(tool:, input:, ..) -> #("tool", tool, input, None)
-    types.Orchestrator(name:, input:) -> #("orchestrator", name, input, None)
+    types.Command(input:, ..) -> #("command", input, None)
+    types.Tool(input:, ..) -> #("tool", input, None)
+    types.Orchestrator(input:, ..) -> #("orchestrator", input, None)
   }
-  ids.slot(node, kind, name, body, within, occurrence)
+  ids.slot(node, kind, body, within, occurrence)
 }
 
 /// The journal is a cache. A slot whose live attempt settled is a hit:
@@ -1153,6 +1162,16 @@ fn prior_orchestrator(prior: List(Call)) -> List(Attempt(OrchestratorState)) {
   }
 }
 
+/// What a call's session value is to its agent.
+type SessionCheck {
+  /// A new session, or one this agent answered with.
+  SessionOf
+  /// Another agent's dialogue.
+  SessionOfAgent(owner: String)
+  /// Not a session value of this run.
+  SessionUnknown
+}
+
 /// A new attempt at a slot (`prior`: the call there, if it was forgotten).
 fn begin(
   run: Run,
@@ -1163,21 +1182,38 @@ fn begin(
 ) -> #(Run, List(Effect)) {
   case request {
     types.Call(agent: name, input:, session:, from:) -> {
-      // A session value is one this run answered with (or a new one).
+      // A session value is one this run answered with (or a new one), and
+      // only the agent whose dialogue it is continues it.
       let known = case session {
-        Some(s) -> dict.has_key(run.sessions, ids.session_id(s))
-        None -> True
+        Some(s) ->
+          case dict.get(run.sessions, ids.session_id(s)) {
+            Ok(origin) if origin.agent == name -> SessionOf
+            Ok(origin) -> SessionOfAgent(origin.agent)
+            Error(Nil) -> SessionUnknown
+          }
+        None -> SessionOf
       }
       case find_agent(run.workflow, name), known {
         Error(Nil), _ -> refuse_call(run, id, slot, types.UnknownAgent(name))
-        Ok(_), False ->
+        Ok(_), SessionUnknown ->
           refuse_call(
             run,
             id,
             slot,
             types.UnknownSession(option.unwrap(session, "")),
           )
-        Ok(agent), True -> {
+        Ok(_), SessionOfAgent(other) ->
+          refuse_call(
+            run,
+            id,
+            slot,
+            types.SessionOfAnotherAgent(
+              option.unwrap(session, ""),
+              agent: name,
+              owner: other,
+            ),
+          )
+        Ok(agent), SessionOf -> {
           let call = fn(state) {
             AgentCall(
               id:,
@@ -1495,14 +1531,14 @@ fn settle_agent_with(
     })
   // An answer is a new session value: what a call of it continues.
   let run = case call, entry {
-    AgentCall(attempts:, ..), Answered(_) -> {
+    AgentCall(agent:, attempts:, ..), Answered(_) -> {
       let n = list.length(attempts)
       Run(
         ..run,
         sessions: dict.insert(
           run.sessions,
           ids.next_session(slot, n),
-          Origin(slot, n, layers),
+          Origin(agent, slot, n, layers),
         ),
       )
     }

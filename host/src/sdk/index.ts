@@ -472,6 +472,7 @@ export type Refusal =
 	| { readonly type: "unknown_alias"; readonly alias: string }
 	| { readonly type: "journal_missing"; readonly request: string }
 	| { readonly type: "unknown_session"; readonly session: string }
+	| { readonly type: "session_of_another_agent"; readonly session: string; readonly agent: string; readonly owner: string }
 	| { readonly type: "dialogue_missing"; readonly node: string }
 	| { readonly type: "retry_takes_no_note"; readonly node: string }
 	| { readonly type: "tool_name_taken"; readonly agent: string; readonly name: string }

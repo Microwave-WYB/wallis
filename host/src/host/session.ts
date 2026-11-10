@@ -32,7 +32,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
-import { type ArtifactRef, type CommandFailure, type Json, type Refusal, type ToolFailure, Type } from "../sdk/index.ts";
+import { type ArtifactRef, type CommandFailure, type Json, type Refusal, type ToolDesc, type ToolFailure, Type } from "../sdk/index.ts";
 import type { Declarations, Reply } from "../sdk/runtime.ts";
 import { schemaErrors, toJson } from "../sdk/validate.ts";
 import { ArtifactError, discardNode, mountedInput, type NodeDirs, nodeDirName, prepareNode, resolveDrafts, verifyRefs } from "./artifacts.ts";
@@ -127,6 +127,8 @@ export class RunRefused extends Error {
 	}
 }
 
+/** The pin input of a toolset's bundle digest: `toolset:<path>`. */
+const TOOLSET_PIN = "toolset:";
 const NO_USAGE: Usage = { usd: 0, tokens: 0, turns: 0 };
 
 function digestFile(path: string): string {
@@ -200,6 +202,8 @@ export class Session {
 	#restarting = false;
 	/** Tool sources (toolsets, MCP servers), and every tool they listed at preflight, by source key. */
 	#sources: ToolSources | null = null;
+	/** Each toolset's bundle digest (pinned), by path: a custom tool's identity is (bundle digest, export). */
+	#bundles: Readonly<Record<string, string>> = {};
 	#listing = new Map<string, ToolInfo[]>();
 	/** The body's connections: one per source for the run (this session). */
 	readonly #bodyClients = new Map<string, Promise<McpClient>>();
@@ -426,7 +430,8 @@ export class Session {
 		let seed: number;
 		if (prior.length === 0) {
 			this.#preflight();
-			await this.#preflightTools();
+			// Toolsets are bundled once, now: the bundles are blobs and their digests are pinned.
+			for (const [path, digest] of Object.entries(await this.#preflightTools({}))) inputs[`${TOOLSET_PIN}${path}`] = digest;
 			seed = o.seed ?? 0;
 			const pin: Pin = {
 				workflow_digest: this.#digest,
@@ -449,15 +454,20 @@ export class Session {
 			for (const e of prior) if (e.type === "sent" || e.type === "steered") this.#seen.add(e.message_id);
 			seed = o.seed ?? first.pin.seed;
 			input = first.input;
+			// The run's toolset bundles are its pinned ones, used as they are whatever the source is now.
+			const pinned = Object.fromEntries(Object.entries(first.pin.inputs).flatMap(([k, v]) => (k.startsWith(TOOLSET_PIN) ? [[k.slice(TOOLSET_PIN.length), v]] : [])));
+			for (const [path, digest] of Object.entries(pinned)) inputs[`${TOOLSET_PIN}${path}`] = digest;
 			must(ResumableRun.check(this.#core, { workflow_digest: this.#digest, prior_digests: [], models: first.pin.models, seed, inputs, semantics: SEMANTICS }), refused);
 			// Changed code is allowed: logged, and the body re-executes against the journal.
 			const recorded = this.#core.snapshot().code[0];
 			if (recorded !== undefined && recorded !== this.#digest && this.#core.snapshot().status.type !== "finished") {
 				this.#feed({ type: "code_changed", from: recorded, to: this.#digest });
+				// Names are labels: the new code's nodes are looked up in its own declarations.
+				this.#refuseOn(this.#feed({ type: "workflow_declared", workflow: decl.core as unknown as Json }));
 				this.#codeChange = { hits: 0, reported: false };
 			}
 			if (this.#core.snapshot().status.type === "finished") return this.#complete();
-			await this.#preflightTools();
+			await this.#preflightTools(pinned);
 			const snap = this.#core.snapshot();
 			if (snap.executor !== o.executor.id) this.#feed({ type: "executor_changed", name: o.executor.id });
 			for (const [alias, to] of Object.entries(o.models ?? {})) {
@@ -537,19 +547,20 @@ export class Session {
 	 * outside, and tools a whole MCP server leaves out, are warnings, printed
 	 * and recorded in run metadata.
 	 */
-	async #preflightTools(): Promise<void> {
+	async #preflightTools(pinned: Readonly<Record<string, string>>): Promise<Record<string, string>> {
 		// Unconfined only when confinement is explicitly off; without bubblewrap a local source is refused.
 		const confinement: Confinement = this.#boxes ? { type: "bwrap", boxes: this.#boxes } : this.#options.confine === "off" ? { type: "off" } : { type: "unavailable" };
-		this.#sources = new ToolSources({ decl: this.#decl, workflowDir: dirname(this.#workflow), runDir: this.paths.dir, confinement });
-		if (this.#sources.sources().length === 0) return;
+		this.#sources = new ToolSources({ decl: this.#decl, workflowDir: dirname(this.#workflow), runDir: this.paths.dir, confinement, pinned });
+		if (this.#sources.sources().length === 0) return {};
+		const bundles = await this.#sources.bundleAll();
+		this.#bundles = bundles;
 		try {
 			this.#listing = await this.#sources.listAll();
 		} catch (error) {
 			if (error instanceof SandboxError) throw new RunRefused(error.refusal);
 			throw error;
 		}
-		// What ran, for `describe`: a toolset is code from the project, bundled per session.
-		const bundles = this.#sources.bundleDigests();
+		// What runs, for `describe`: a toolset is code from the project, bundled once per run.
 		if (Object.keys(bundles).length > 0) this.#note("toolsets", bundles);
 		for (const [agent, a] of Object.entries(this.#decl.agents)) {
 			const resolved = resolveAgentTools(agent, a.tools, this.#listing);
@@ -557,6 +568,7 @@ export class Session {
 			if (resolved.taken !== null) throw new RunRefused({ type: "tool_name_taken", agent, name: resolved.taken });
 			for (const w of resolved.warnings) this.#warn(w);
 		}
+		return bundles;
 	}
 
 	/** A warning about tools: printed, and noted once (run metadata). */
@@ -749,6 +761,48 @@ export class Session {
 	}
 
 	/**
+	 * What a node is, for its digest: its definition, never its name or its
+	 * sandbox's name (labels only). A sandbox is its digest (declaration,
+	 * binaries, bind volume content); a custom tool is (bundle digest,
+	 * export); an MCP tool is (server, tool). An undeclared node has no
+	 * definition (null): the core refuses it.
+	 */
+	#definition(r: { type: string; agent?: string; command?: string; tool?: string; name?: string }): Json {
+		const env = (sandbox: string | null | undefined) => (sandbox ? (this.#sandboxDigests[sandbox] ?? null) : null);
+		switch (r.type) {
+			case "call": {
+				const a = this.#decl.agents[r.agent!];
+				if (!a) return null;
+				const { sandbox, tools, ...rest } = a;
+				return { kind: "agent", ...(rest as unknown as Record<string, Json>), tools: tools.map((t) => this.#toolIdentity(t)), env: env(sandbox) };
+			}
+			case "command": {
+				const c = this.#decl.commands[r.command!];
+				if (!c) return null;
+				const { sandbox, description: _label, ...rest } = c;
+				return { kind: "command", ...(rest as unknown as Record<string, Json>), env: env(sandbox) };
+			}
+			case "tool":
+				return { kind: "tool", tool: this.#toolIdentity(r.tool!) };
+			default: {
+				const o = this.#decl.orchestrators[r.name!];
+				return o ? { kind: "orchestrator", ...(o as unknown as Record<string, Json>) } : null;
+			}
+		}
+	}
+
+	/** A tool's identity: a custom tool by its toolset's bundle digest and export, an MCP tool by server and tool. */
+	#toolIdentity(tool: ToolDesc | string): Json {
+		if (typeof tool === "string") {
+			// A body tool: its listed source, not its id's text.
+			const info = this.#bodyTool(tool);
+			if (!info) return { kind: "unlisted", id: tool };
+			return info.source.kind === "toolset" ? { kind: "custom", bundle: this.#bundles[info.source.path] ?? null, export: info.remote } : { kind: "mcp_tool", server: info.source.server, tool: info.remote };
+		}
+		return tool.kind === "custom" ? { kind: "custom", bundle: this.#bundles[tool.toolset] ?? null, export: tool.export } : (tool as unknown as Json);
+	}
+
+	/**
 	 * The journal key of a request: its node's definition digest, and its
 	 * occurrence among calls with the same node, session and input in its
 	 * branch of this execution of the body.
@@ -758,15 +812,7 @@ export class Session {
 		const name = r.type === "call" ? `agent:${r.agent}` : r.type === "command" ? `command:${r.command}` : r.type === "tool" ? `tool:${r.tool}` : `orchestrator:${r.name}`;
 		let digest = this.#nodeDigests.get(name);
 		if (digest === undefined) {
-			const definition =
-				r.type === "call"
-					? { kind: "agent", ...this.#decl.agents[r.agent!], env: this.#sandboxDigests[this.#decl.agents[r.agent!]?.sandbox ?? ""] ?? null }
-					: r.type === "command"
-						? { kind: "command", ...this.#decl.commands[r.command!], env: this.#sandboxDigests[this.#decl.commands[r.command!]?.sandbox ?? ""] ?? null }
-						: r.type === "tool"
-							? { kind: "tool", id: r.tool }
-							: { kind: "orchestrator", ...this.#decl.orchestrators[r.name!] };
-			digest = createHash("sha256").update(canonical(JSON.parse(JSON.stringify(definition)) as Json)).digest("hex");
+			digest = createHash("sha256").update(canonical(JSON.parse(JSON.stringify(this.#definition(r))) as Json)).digest("hex");
 			this.#nodeDigests.set(name, digest);
 		}
 		// Counted per branch (the id's path): within one branch calls are made in program order, so

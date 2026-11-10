@@ -40,7 +40,7 @@ pub fn step_json_roundtrip_test() {
       "{\"type\":\"agent_returned\",\"id\":\"#0\",\"output\":{\"summary\":\"s1\"},\"usage\":{\"usd\":0.1,\"tokens\":5,\"turns\":1},\"model\":\"fake/m\",\"dialogue\":null,\"layers\":null}",
     )
   assert effects
-    == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"#0\",\"value\":{\"layers\":[],\"output\":{\"summary\":\"s1\"},\"session\":\"sa43deac0d9c6dfcc\"}}]"
+    == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"#0\",\"value\":{\"layers\":[],\"output\":{\"summary\":\"s1\"},\"session\":\"s42ac7d45c969c501\"}}]"
   let snapshot = wallis_core.snapshot_json(s)
   assert string.contains(
     snapshot,

@@ -122,6 +122,11 @@ generics or wrappers that add no proof.
   it; named volumes are outside every key (results must not depend on
   them). Volume rules are both a type (`CheckVolume`) and a preflight
   parse (`parseVolume`, `resolveVolumes`).
+- Identity is by digest or structure; names are labels only. Never put a
+  node's, sandbox's or nested workflow's name in a journal key, a node
+  digest or a request id: a node is its definition digest, a custom tool
+  is (bundle digest, export), an MCP tool is (server, tool). A change to
+  what a digest covers bumps the core's semantics version.
 - Recovery is the most important property: keep transient-error retries
   in the executor, per-turn checkpoints, held node failures, and the
   journal as a cache (node digest, input, occurrence) working, with tests.
