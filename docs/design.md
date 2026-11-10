@@ -1116,6 +1116,13 @@ Prototype choices:
   required binaries. Agents cannot be handed commands.
 - `wallis export <run> <artifact> <dir>` copies an artifact out; promoting
   artifacts across runs is the main agent's job.
+- `wallis export <run> --output <dir> [--merge]` (MCP `export_output`)
+  exports a finished run's whole output value: every artifact it refers to
+  at its JSON path (`finals/0/DSC_2818.jpg`; a key that is not a plain file
+  name is `%`-escaped), every Tree as a directory at its path, and
+  `output.json`, the value with each ref and Tree given its relative
+  `path`. The directory must be missing or empty unless `--merge`; even
+  then a file is never overwritten with other content (this round).
 
 Prototype choices:
 

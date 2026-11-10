@@ -19,6 +19,7 @@
 //   wallis wait [<run>] waits on one run, or on all of the caller's own runs
 //   wallis fork <run> [--forget <node>]... [--model a=m]... [--detach]   (copies the journal; unchanged calls hit; forgotten calls execute again)
 //   wallis export <run> <artifact> <dir>
+//   wallis export <run> --output <dir> [--merge]   the whole output value: its artifacts by JSON path, and output.json
 //   wallis serve [--executor module]
 
 import { spawn, spawnSync } from "node:child_process";
@@ -55,7 +56,7 @@ import { callerIdentity, mayControl, NotOwner } from "../host/owner.ts";
 import { loadExecutor, resolveRun, resolveWorkflow, Runs } from "../host/runs.ts";
 import { loadProfile } from "../host/profile.ts";
 import { ProcessCommands } from "../host/commands.ts";
-import { CONTINUE, warningLines } from "../host/query.ts";
+import { CONTINUE, exportOutput, warningLines } from "../host/query.ts";
 import { limitProviders, MachineSlots, systemdAvailable } from "../host/slots.ts";
 import { RunRefused, startSession, type SessionOptions } from "../host/session.ts";
 import { acquireLock, appendInbox, RunLocked, lockHolder, newMessageId, newRunId, readMeta, refusedEntry, runPaths, runsDir, writeLaunch } from "../host/store.ts";
@@ -74,6 +75,8 @@ const { values, positionals } = parseArgs({
 		model: { type: "string", multiple: true },
 		volume: { type: "string", multiple: true },
 		forget: { type: "string", multiple: true },
+		output: { type: "string" },
+		merge: { type: "boolean" },
 		full: { type: "boolean" },
 		bin: { type: "string", multiple: true },
 		turns: { type: "string" },
@@ -493,7 +496,13 @@ async function main(): Promise<number> {
 		}
 		case "export": {
 			const [run, artifact, target] = args;
-			if (!artifact || !target) throw new Error("usage: wallis export <run> <artifact digest or name> <dir>");
+			if (values.output !== undefined) {
+				const dir = resolve(values.output);
+				const written = exportOutput(resolveRun(root, run ?? ""), dir, { merge: values.merge === true });
+				out(values.json ? JSON.stringify({ dir, files: written }) : `Exported ${written.length} file${written.length === 1 ? "" : "s"} into ${dir} (output.json has their paths).`);
+				return 0;
+			}
+			if (!artifact || !target) throw new Error("usage: wallis export <run> <artifact digest or name> <dir>, or wallis export <run> --output <dir> [--merge]");
 			out(`Exported ${exportArtifact(resolveRun(root, run ?? ""), artifact, resolve(target))}`);
 			return 0;
 		}

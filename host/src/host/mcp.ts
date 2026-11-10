@@ -13,11 +13,11 @@ import { BadId, type NodeId, parseNodeId, parseRunId, type RunId } from "./capab
 import { describeWorkflow } from "./describe.ts";
 import { mayControl, NotOwner } from "./owner.ts";
 import { declarationsOf } from "./sandbox.ts";
-import { attention, CONTINUE, claimable, describe, listRunViews, nodeTranscript, pending, renderTree, runLine, runLog, type RunView, waitForAttention } from "./query.ts";
-import { resolveWorkflow, type Runs, SendRefused, workflowsIn } from "./runs.ts";
+import { attention, CONTINUE, claimable, describe, exportOutput, listRunViews, nodeTranscript, pending, renderTree, runLine, runLog, type RunView, waitForAttention } from "./query.ts";
+import { resolveRunDir, resolveWorkflow, type Runs, SendRefused, workflowsIn } from "./runs.ts";
 import { RunRefused } from "./session.ts";
 import { runPaths, runsDir } from "./store.ts";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 /** Server-side cap on one `wait` call. */
 export const WAIT_CAP_SECONDS = 30;
@@ -105,6 +105,23 @@ export async function createMcpServer(runs: Runs): Promise<McpServer> {
 				const session = await runs.start({ workflow, input: parsed.value, seed, models, volumes, bins });
 				const view = runs.view(parseRunId(session.paths.id));
 				return reply(`${summary(view)}\n\nTo be notified when it needs attention, run in the background: npx wallis wait ${view.runId}`, data(view));
+			} catch (error) {
+				return failure(error);
+			}
+		},
+	);
+
+	server.registerTool(
+		"export_output",
+		{
+			description: "Export a finished run's whole output value into a directory: each artifact it refers to at its JSON path (e.g. finals/0/DSC_2818.jpg), each Tree as a directory, and output.json with every ref's relative path. The directory must be missing or empty unless merge is true; an existing file is never overwritten with other content.",
+			inputSchema: { run_id: z.string(), dir: z.string().describe("Absolute directory to export into"), merge: z.boolean().optional() },
+		},
+		async ({ run_id, dir, merge }) => {
+			try {
+				const runDir = resolveRunDir(runs.root, parseRunId(run_id));
+				const files = exportOutput(runDir, resolve(dir), { merge: merge === true });
+				return reply(`Exported ${files.length} files into ${resolve(dir)}.`, { dir: resolve(dir), files });
 			} catch (error) {
 				return failure(error);
 			}

@@ -279,7 +279,7 @@ export class Runs {
 
 const refused = (refusal: Refusal) => new SendRefused(refusal);
 
-function resolveRunDir(root: string, runId: RunId): string {
+export function resolveRunDir(root: string, runId: RunId): string {
 	return runPaths(join(runsDir(root), runId)).dir;
 }
 

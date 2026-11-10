@@ -2,10 +2,11 @@
 // derived `stopped`, what needs attention, and agent-readable summaries.
 
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, posix } from "node:path";
 import type { ArtifactRef, Json } from "../sdk/index.ts";
-import { blobPath, nodeDirName, readBlob, refsIn, shareBlobs } from "./artifacts.ts";
+import { blobPath, isRef, isTree, nodeDirName, readBlob, refsIn, shareBlobs, type TreeRef } from "./artifacts.ts";
+import { layerDir, listView, locate, readViewFile, type ViewRoot } from "./layers.ts";
 import { Core, type Event, type FailReason, type IdleCause, type IdleReason, type Outcome, type Refusal, type Snapshot } from "./core.ts";
 import { EventLog } from "./log.ts";
 import { mayControl, type Owner, ownerAlive } from "./owner.ts";
@@ -425,6 +426,76 @@ export function exportArtifact(dir: string, selector: string, target: string): s
 	const path = join(target, ref.name);
 	copyFileSync(blobPath(runPaths(dir).dir, ref.digest), path);
 	return path;
+}
+
+/**
+ * Exports a finished run's whole output value into `target`: every
+ * artifact it refers to at its JSON path (`finals/0/DSC_2818.jpg`), every
+ * Tree as a directory at its path, and `output.json`, the value with each
+ * ref and Tree given its `path` (relative to `target`). A path segment is
+ * the object key or the array index, `%`-escaped to a plain file name.
+ * `target` must be missing or empty unless `merge`; even then an existing
+ * file is never overwritten with other content. Returns the files written.
+ */
+export function exportOutput(dir: string, target: string, options: { readonly merge?: boolean } = {}): string[] {
+	const paths = runPaths(dir);
+	const status = Core.refold(new EventLog(paths.log).read()).snapshot().status;
+	if (status?.type !== "finished" || status.outcome.type !== "done") throw new Error(`run ${paths.id} has no output: it is ${status?.type ?? "not started"}${status?.type === "finished" ? ` (${status.outcome.type})` : ""}`);
+	if (existsSync(target) && readdirSync(target).length > 0 && !options.merge) throw new Error(`${target} is not empty (pass --merge to export into it)`);
+	mkdirSync(target, { recursive: true });
+	const written: string[] = [];
+	const put = (rel: string, write: (path: string) => void, same: (path: string) => boolean) => {
+		const path = join(target, rel);
+		if (existsSync(path)) {
+			if (!same(path)) throw new Error(`${path} exists with other content`);
+			return;
+		}
+		mkdirSync(dirname(path), { recursive: true });
+		write(path);
+		written.push(rel);
+	};
+	const segment = (key: string) => (key === "." || key === ".." || key === "" ? encodeURIComponent(key).replace(/\./g, "%2E") || "%" : key.replace(/[^A-Za-z0-9._-]/g, (c) => encodeURIComponent(c)));
+	const exportTree = (tree: TreeRef, rel: string) => {
+		const root: ViewRoot = { at: "/t", stack: [...tree.layers].reverse().map((l) => layerDir(paths.dir, l)), upper: null };
+		const walk = (at: string, relDir: string) => {
+			const located = locate([root], at, false);
+			mkdirSync(join(target, relDir), { recursive: true });
+			for (const name of listView(located, at)) {
+				const child = locate([root], `${at}/${name}`, false);
+				const out = posix.join(relDir, name);
+				if (child.entry?.kind === "dir") walk(`${at}/${name}`, out);
+				else if (child.entry?.kind === "file") {
+					const content = readViewFile(child, `${at}/${name}`);
+					put(out, (p) => writeFileSync(p, content), (p) => readFileSync(p).equals(content));
+				} else if (child.entry?.kind === "symlink") {
+					const link = readlinkSync(child.entry.host);
+					put(out, (p) => symlinkSync(link, p), (p) => lstatSync(p).isSymbolicLink() && readlinkSync(p) === link);
+				}
+			}
+		};
+		walk("/t", rel);
+	};
+	const rewrite = (value: Json, at: string[]): Json => {
+		if (isRef(value)) {
+			const rel = posix.join(...at, segment(basename(value.name)));
+			const blob = blobPath(paths.dir, value.digest);
+			// The store's blobs are read-only; the export is the user's to change.
+			put(rel, (p) => (copyFileSync(blob, p), chmodSync(p, 0o644)), (p) => readFileSync(p).equals(readFileSync(blob)));
+			return { ...value, path: rel };
+		}
+		if (isTree(value) && value.layers.every((l) => existsSync(layerDir(paths.dir, l)))) {
+			const rel = at.length > 0 ? posix.join(...at) : "tree";
+			exportTree(value, rel);
+			return { kind: "tree", layers: [...value.layers], path: rel };
+		}
+		if (Array.isArray(value)) return value.map((v, i) => rewrite(v, [...at, String(i)]));
+		if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rewrite(v, [...at, segment(k)])]));
+		return value;
+	};
+	const value = rewrite(status.outcome.value, []);
+	const json = `${JSON.stringify(value, null, 2)}\n`;
+	put("output.json", (p) => writeFileSync(p, json), (p) => readFileSync(p, "utf8") === json);
+	return written;
 }
 
 /**

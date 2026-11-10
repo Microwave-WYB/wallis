@@ -162,3 +162,45 @@ test("a command that executed again and gave another output is a typed warning, 
 	await runWorkflow({ ...base, workflow: wf, dir: f2.dir, root, executor: new FakeExecutor({}), commands: steady });
 	assert.deepEqual(inspectRun(f2.dir).warnings, []);
 });
+
+test("wallis export --output: every artifact of the output at its JSON path, Trees as dirs, output.json with paths", async () => {
+	const { exportOutput } = await import("../src/host/index.ts");
+	const { readdirSync } = await import("node:fs");
+	const { wallis, project: newProject } = await import("./util.ts");
+	const wf = workflow(
+		`const develop = command({ name: "develop", sandbox: box, input: Type.Object({ n: Type.String() }), output: Type.Object({ jpg: Artifact("image/jpeg") }), run: ["sh", "-c", "true"], parse: (r, i) => ({ jpg: r.file(i.n, "image/jpeg") }) });
+const edit = defineAgent({ models }, { name: "edit", model: "default", prompt: "Edit.", input: Type.Null(), output: Type.Null(), workspace: { access: "write" } });`,
+		`agents: [edit], commands: [develop], input: Type.Null(), output: Type.Any(), run: async (ctx) => {
+		const finals = await ctx.map(["DSC_2818.jpg", "DSC_2819.jpg"], async (c, n) => (await c.call(develop, { n })).jpg);
+		const [, s] = await ctx.call(ctx.session(edit), null);
+		return { finals, notes: "two", workspace: ctx.files(s) };
+	}`,
+	);
+	const commands = { run: async (call: { input: unknown; workspace: { scratch: string } }) => (writeFileSync(join(call.workspace.scratch, (call.input as { n: string }).n), `jpeg ${(call.input as { n: string }).n}`), { exit: 0, stdout: "", stderr: "", minutes: 0, timedOut: false }) };
+	const executor = new FakeExecutor({ edit: (call) => (mkdirSync(join(call.workspace.scratch, "sub"), { recursive: true }), writeFileSync(join(call.workspace.scratch, "sub", "edit.xmp"), "xmp"), { submit: null }) });
+	const root = newProject();
+	const dir = join(root, ".wallis", "runs", "r1");
+	const r = await runWorkflow({ ...base, workflow: wf, dir, root, executor, commands });
+	assert.equal(r.outcome?.type, "done", JSON.stringify(r.status));
+	const target = join(tmp(), "out");
+	const files = exportOutput(dir, target);
+	assert.deepEqual(files.sort(), ["finals/0/DSC_2818.jpg", "finals/1/DSC_2819.jpg", "output.json", "workspace/sub/edit.xmp"]);
+	assert.equal(readFileSync(join(target, "finals", "1", "DSC_2819.jpg"), "utf8"), "jpeg DSC_2819.jpg");
+	assert.equal(readFileSync(join(target, "workspace", "sub", "edit.xmp"), "utf8"), "xmp");
+	const output = JSON.parse(readFileSync(join(target, "output.json"), "utf8")) as { finals: { path: string; digest: string }[]; notes: string; workspace: { path: string } };
+	assert.deepEqual(output.finals.map((f) => f.path), ["finals/0/DSC_2818.jpg", "finals/1/DSC_2819.jpg"]);
+	assert.match(output.finals[0]!.digest, /^sha256:/);
+	assert.equal(output.notes, "two");
+	assert.equal(output.workspace.path, "workspace");
+	// A non-empty dir is refused; --merge exports into it, but never over other content.
+	assert.throws(() => exportOutput(dir, target), /is not empty/);
+	assert.deepEqual(exportOutput(dir, target, { merge: true }), [], "the same files are already there");
+	writeFileSync(join(target, "finals", "0", "DSC_2818.jpg"), "changed");
+	assert.throws(() => exportOutput(dir, target, { merge: true }), /exists with other content/);
+	// The CLI.
+	const viaCli = join(tmp(), "cli-out");
+	const res = wallis(root, ["export", "r1", "--output", viaCli, "--json"]);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual((JSON.parse(res.stdout) as { files: string[] }).files.sort(), files.sort());
+	assert.ok(readdirSync(viaCli).includes("output.json"));
+});
