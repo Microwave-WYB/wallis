@@ -842,15 +842,24 @@ export class Session {
 		}
 	}
 
-	/** A tool's identity: a custom tool by its toolset's bundle digest and export, an MCP tool by server and tool. */
+	/**
+	 * A tool's identity: a custom tool by its toolset's bundle digest and
+	 * export, and where it runs (its sandbox's digest: declaration, binaries,
+	 * bind volume content; and its network), so editing data bound into its
+	 * sandbox misses; an MCP tool by server and tool.
+	 */
 	#toolIdentity(tool: ToolDesc | string): Json {
+		const custom = (path: string, name: string): Json => {
+			const t = this.#decl.toolsets[path];
+			return { kind: "custom", bundle: this.#bundles[path] ?? null, export: name, env: t ? (this.#sandboxDigests[t.sandbox] ?? null) : null, network: t?.network ?? null };
+		};
 		if (typeof tool === "string") {
 			// A body tool: its listed source, not its id's text.
 			const info = this.#bodyTool(tool);
 			if (!info) return { kind: "unlisted", id: tool };
-			return info.source.kind === "toolset" ? { kind: "custom", bundle: this.#bundles[info.source.path] ?? null, export: info.remote } : { kind: "mcp_tool", server: info.source.server, tool: info.remote };
+			return info.source.kind === "toolset" ? custom(info.source.path, info.remote) : { kind: "mcp_tool", server: info.source.server, tool: info.remote };
 		}
-		return tool.kind === "custom" ? { kind: "custom", bundle: this.#bundles[tool.toolset] ?? null, export: tool.export } : (tool as unknown as Json);
+		return tool.kind === "custom" ? custom(tool.toolset, tool.export) : (tool as unknown as Json);
 	}
 
 	/**

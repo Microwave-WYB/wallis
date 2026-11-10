@@ -196,3 +196,34 @@ test("fork --forget: forgotten calls execute again in the fork; the rest hit; a 
 	);
 	assert.ok(!existsSync(join(p.root, "fork3")));
 });
+
+test("a custom tool's identity includes where it runs: editing data bound into its toolset's sandbox misses", async () => {
+	const root = tmp("wallis-tool-env-");
+	const dir = join(root, "wf");
+	mkdirSync(join(dir, "tools"), { recursive: true });
+	mkdirSync(join(dir, "data"));
+	writeFileSync(join(dir, "data", "words"), "one");
+	writeFileSync(join(dir, "tools", "lib.ts"), toolText("first"));
+	writeFileSync(
+		join(dir, "workflow.ts"),
+		`import { defineModels, defineSandbox, toolset, Type, workflow } from "wallis";
+const box = defineSandbox({}, { name: "box", requires: ["node"], volumes: ["./data:/data:ro"] });
+const lib = toolset<typeof import("./tools/lib.ts")>("./tools/lib.ts", { sandbox: box });
+export default workflow({ name: "te", models: defineModels({ default: "fake/default" }), agents: [], toolsets: [lib], input: Type.Null(), output: Type.Any(), run: async (ctx) => ctx.call(lib.say, {}) });\n`,
+	);
+	const opts = { ...base, bins: { node: process.execPath }, workflow: join(dir, "workflow.ts"), root, executor: new FakeExecutor({}) };
+	const toolDigest = (run: string) => new EventLog(join(run, "log.jsonl")).read().flatMap((e) => (e.type === "requested" ? [e.node_digest] : []))[0];
+	const first = join(root, "r1");
+	await runWorkflow({ ...opts, dir: first, input: null });
+	const same = forkRun(first, join(root, "r2"));
+	await runWorkflow({ ...opts, dir: same.dir });
+	const requests = (run: string) => new EventLog(join(run, "log.jsonl")).read().filter((e) => e.type === "requested").length;
+	assert.equal(requests(same.dir), 1, "unchanged: a hit (hits are not logged as requests)");
+	assert.ok(toolDigest(first));
+	writeFileSync(join(dir, "data", "words"), "two");
+	const edited = forkRun(first, join(root, "r3"));
+	await runWorkflow({ ...opts, dir: edited.dir });
+	const digests = new EventLog(join(edited.dir, "log.jsonl")).read().flatMap((e) => (e.type === "requested" ? [e.node_digest] : []));
+	assert.equal(digests.length, 2, "the fork's tool call is a new call");
+	assert.notEqual(digests[1], digests[0]);
+});
