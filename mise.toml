@@ -24,11 +24,18 @@ depends = ["build"]
 run = "npx tsc --noEmit -p . && npx tsc --noEmit -p ../.agents/workflows"
 
 [tasks."test:host"]
-description = "Host tests: sandbox, log, resume (fake executor)"
+description = "Host tests: sandbox, log, resume (fake executor), and the escape suite"
 dir = "host"
 depends = ["build"]
-run = "node --test 'test/*.test.ts'"
+run = "node --test 'test/*.test.ts' 'test/escape/*.test.ts'"
 # Every host session checks, after each event, that the state rebuilt from the log equals the live one.
+env = { WALLIS_DIFFERENTIAL = "1" }
+
+[tasks."test:escape"]
+description = "Red-team sandbox-escape gate (real bwrap where available; open holes are node:test todos)"
+dir = "host"
+depends = ["build"]
+run = "node --test 'test/escape/*.test.ts'"
 env = { WALLIS_DIFFERENTIAL = "1" }
 
 [tasks.test]
