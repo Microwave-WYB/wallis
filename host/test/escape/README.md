@@ -58,16 +58,10 @@ shut:
 
 ## Documented residual risks (not gated)
 
-- **ESCAPE-01** (see `sandbox.test.ts`) — `/proc/1/cmdline` leaks the host-side
-  bwrap argv (bind-volume **host source paths**, `$HOME` layout via program
-  install prefixes, cache dirs, and every `--setenv` value) into the sandbox,
-  because bwrap runs as PID 1 of the sandbox's PID namespace. Information
-  disclosure, not a read/write escape; **secrets are not leaked** for agent and
-  command sandboxes (their host-side bwrap env is empty). Fix: pass `--as-pid-1`
-  to bwrap so `/proc/1` is the sandboxed program itself (verified: with
-  `--as-pid-1`, `/proc/1/cmdline` is the program's own argv and no host path
-  appears; `/proc/1/environ` then holds only the inside `--setenv` vars the
-  process already has, so no new exposure).
+- **ESCAPE-01** — CLOSED: bwrap now runs with `--as-pid-1`, so `/proc/1`
+  is the sandboxed program itself and its cmdline is its own argv; no host
+  path or `--setenv` value of the bwrap argv is visible
+  (`sandbox.test.ts`, now a normal test).
 - **Resource exhaustion** inside a sandbox (fork bombs, huge `/w` files, deep
   directories) is **not** bounded by wallis itself for agent/command sandboxes:
   bwrap applies no memory/pids cgroup to them (only a command that declares

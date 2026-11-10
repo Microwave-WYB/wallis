@@ -116,11 +116,11 @@ test("a bind volume is read-only inside the sandbox; the host source is never wr
 	assert.equal(readdirSync(src).sort().join(","), "hi.txt", "no new file in the host source");
 });
 
-// --- A confirmed hole, reported as a todo so the gate stays green ------------------
+// --- ESCAPE-01, closed: bwrap runs the program as PID 1 (--as-pid-1) ----------------
 
 test(
 	"a sandboxed agent/command cannot read the host-side bwrap argv via /proc/1/cmdline",
-	{ skip, todo: "ESCAPE-01: bwrap runs as PID 1, so /proc/1/cmdline leaks host paths (bind sources, $HOME layout, cache dirs) and --setenv values into the sandbox" },
+	{ skip },
 	() => {
 		const wd = tmp("SECRET-PROJECT-");
 		const src = join(wd, "trainer");

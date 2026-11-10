@@ -261,7 +261,9 @@ export class Sandboxes {
 	spawn(name: string, argv: readonly string[], dirs: CallDirs, options: SpawnOptions = {}): Spawn {
 		const s = this.#decl(name);
 		const envDir = options.setup?.envDir ?? this.#envs.get(name) ?? null;
-		const args = ["--die-with-parent", "--new-session", "--unshare-all"];
+		// --as-pid-1: the program is PID 1 of the sandbox, not bwrap, so /proc/1/cmdline is its own argv,
+		// never bwrap's (host paths of binds and prefixes, --setenv values).
+		const args = ["--die-with-parent", "--new-session", "--unshare-all", "--as-pid-1"];
 		if (options.setup || options.network === "host" || s.network === "host") args.push("--share-net");
 		args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 		if (options.gpu) args.push(...gpuDevices());
