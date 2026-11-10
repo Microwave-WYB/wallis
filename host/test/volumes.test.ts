@@ -334,3 +334,61 @@ test("a required program called by its real path still sees the name it was aske
 	const r = spawnSync(sp.command, sp.args, { env: sp.env, cwd: sp.cwd, encoding: "utf8" });
 	assert.equal(r.stdout.trim(), "multi++", r.stderr);
 });
+
+test("the host parses the VM's declarations and holds them to its rules: a hand-built volume, network or sandbox is refused", async () => {
+	const { DeclarationError, parseDeclarations } = await import("../src/host/declarations.ts");
+	const { FakeExecutor, RunRefused, runWorkflow } = await import("../src/host/index.ts");
+	// The reviewer's repro: workflow code hands the host a bind of "/", which would be snapshotted with `cp -a /`.
+	const root = tmp("wallis-decl-");
+	mkdirSync(join(root, "wf"));
+	const file = join(root, "wf", "workflow.ts");
+	const write = (mutate: string) =>
+		writeFileSync(
+			file,
+			`import { command, defineModels, defineSandbox, Type, workflow } from "wallis";
+const box = defineSandbox({}, { name: "box", requires: ["sh"] });
+${mutate}
+const c = command({ name: "c", sandbox: box, input: Type.Null(), output: Type.Any(), run: ["sh", "-c", "true"] });
+export default workflow({ name: "d", models: defineModels({ default: "fake/default" }), agents: [], commands: [c], input: Type.Null(), output: Type.Any(), run: async () => null });\n`,
+		);
+	const refusal = async () => {
+		try {
+			await runWorkflow({ workflow: file, dir: join(tmp(), "run"), root, input: null, executor: new FakeExecutor({}), confine: "off", bins: { sh: "/bin/sh" }, inboxPollMs: null });
+			return null;
+		} catch (e) {
+			return e instanceof RunRefused ? e.refusal : String(e);
+		}
+	};
+	write(`(box as { volumes: unknown[] }).volumes.push({ kind: "bind", host: "/", target: "/x" });`);
+	assert.deepEqual(await refusal(), { type: "invalid_volume", sandbox: "box", volume: "/:/x", reason: "a bind's host path is relative (./ or ../) or starts with ~/" });
+	write(`(box as { volumes: unknown[] }).volumes.push({ kind: "bind", host: "./a:b", target: "/x" });`);
+	assert.equal(((await refusal()) as { type: string }).type, "invalid_volume");
+	// Rules the VM also checks, now on the host: a well-formed declarations object that breaks them.
+	const ok = {
+		core: { name: "d", agents: [], commands: ["c"], orchestrators: [], budget: { turns: null, compute_minutes: null } },
+		models: { default: "fake/default" },
+		pin: { files: [] },
+		agents: {},
+		commands: { c: { description: "", input: {}, output: {}, sandbox: "box", resources: {}, code: [] } },
+		orchestrators: {},
+		toolsets: {},
+		mcp: null,
+		mcpServers: {},
+		sandboxes: { box: { requires: [], setup: [], volumes: [], devices: [], network: "none", environment: {}, image: null } },
+		input: {},
+		output: {},
+	};
+	assert.doesNotThrow(() => parseDeclarations(ok));
+	const refused = (d: unknown) => {
+		try {
+			parseDeclarations(d);
+			return null;
+		} catch (e) {
+			return e instanceof DeclarationError ? e.refusal : String(e);
+		}
+	};
+	assert.match((refused({ ...ok, sandboxes: { box: { ...ok.sandboxes.box, network: "host" } } }) as { message: string }).message, /commands never get network/);
+	assert.match((refused({ ...ok, commands: { c: { ...ok.commands.c, sandbox: "ghost" } } }) as { message: string }).message, /sandbox ghost is not declared/);
+	assert.equal((refused({ ...ok, sandboxes: { box: { ...ok.sandboxes.box, network: "full" } } }) as { type: string }).type, "invalid_declaration", "malformed: refused, typed");
+	assert.equal((refused("not declarations") as { type: string }).type, "invalid_declaration");
+});

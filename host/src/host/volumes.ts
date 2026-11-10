@@ -30,7 +30,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpat
 import { homedir } from "node:os";
 import { dirname, join, posix, relative, resolve } from "node:path";
 import type { Refusal } from "../sdk/index.ts";
-import type { Volume } from "../sdk/volumes.ts";
+import { parseVolume, type Volume } from "../sdk/volumes.ts";
 import { sandboxEnvProblem, secretEnvProblem } from "./hostbin.ts";
 
 /** Per workflow (or for all), the caller's host dir for a bind volume's target. */
@@ -78,7 +78,10 @@ export function resolveVolumes(
 			const refuse = (reason: string): never => {
 				throw new VolumeError({ type: "invalid_volume", sandbox, volume: v.kind === "invalid" ? v.text : `${v.kind === "bind" ? v.host : v.name}:${v.target}`, reason });
 			};
-			if (v.kind === "invalid") refuse(v.reason);
+			// The VM's parse is not trusted: each volume is parsed again from its text, here.
+			const again = v.kind === "invalid" ? v : parseVolume(v.kind === "bind" ? `${v.host}:${v.target}:ro` : `${v.name}:${v.target}`);
+			if (again.kind === "invalid") refuse(again.reason);
+			else if (again.kind !== v.kind || again.target !== v.target || (again.kind === "bind" && v.kind === "bind" && again.host !== v.host) || (again.kind === "named" && v.kind === "named" && again.name !== v.name)) refuse("not a volume as declared");
 			else {
 				const target = v.target.replace(/\/+$/, "") || "/";
 				if (target !== v.target || target.split("/").some((p) => p === "." || p === "..")) refuse("the target must be a plain absolute path");

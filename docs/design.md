@@ -1197,6 +1197,12 @@ reads as a subset of a compose service.
   all a volume can be; their file tools see each volume at its target (a
   bind read-only, a named volume writable with `write`).
 - `describe` lists each sandbox's volumes, devices and network.
+- The host parses the workflow VM's declarations (a TypeBox schema,
+  `host/src/host/declarations.ts`) and checks every sandbox rule again:
+  volumes are parsed again from their text, devices, environment keys,
+  network on agents and commands, exec needing bash, every named sandbox
+  declared (`invalid_declaration`, `invalid_volume`, ...). The VM's own
+  checks are early errors only: workflow code runs there (review fixes).
 
 Prototype choices:
 

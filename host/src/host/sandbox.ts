@@ -3,6 +3,7 @@
 // only through the three functions installed here; the host calls into it
 // to start, deliver, and evaluate a command's pure `run` and `parse`.
 
+import { parseDeclarations } from "./declarations.ts";
 import { readFileSync } from "node:fs";
 import { QuickJS } from "quickjs-wasi";
 import type { Json } from "../sdk/index.ts";
@@ -62,8 +63,10 @@ export class Sandbox {
 		return new Sandbox(vm);
 	}
 
+	/** The workflow's declarations: unknown until the host parses them and checks its rules (`DeclarationError`). */
 	declare(): Declarations {
-		return JSON.parse(this.#vm.evalCode("__wallis_declare()").consume((h) => h.toString())) as Declarations;
+		const raw: unknown = JSON.parse(this.#vm.evalCode("__wallis_declare()").consume((h) => h.toString()));
+		return parseDeclarations(raw);
 	}
 
 	start(input: Json, seed: number): void {

@@ -49,6 +49,7 @@ import { type BudgetKind, type CallAgentEffect, Core, type Effect, type Event, t
 import type { AgentSandbox, Executor, NodeSession, NodeSpec, TranscriptEntry } from "./executor.ts";
 import { EventLog } from "./log.ts";
 import { type Profile, resolveModels } from "./models.ts";
+import { DeclarationError } from "./declarations.ts";
 import { bindDigest, bindSnapshotDir, checkDevices, checkEnvironments, commandOutputsDir, storeCommandOutputs, type ResolvedVolume, resolveVolumes, snapshotBind, VolumeError } from "./volumes.ts";
 import { type LocalProfile, loadProfile } from "./profile.ts";
 import { renderInput, windowCheck } from "./render.ts";
@@ -416,7 +417,13 @@ export class Session {
 		// The bundle as it runs, in the run's store under its digest (the pin's workflow_digest).
 		if (putBlob(this.paths.dir, code) !== this.#digest) throw new Error("the workflow bundle's digest does not match its code");
 		this.#sandbox = await this.#newSandbox();
-		const decl = this.#sandbox.declare();
+		let decl: Declarations;
+		try {
+			decl = this.#sandbox.declare();
+		} catch (error) {
+			if (error instanceof DeclarationError) throw new RunRefused(error.refusal);
+			throw error;
+		}
 		this.#decl = decl;
 		this.#local = o.local ?? loadProfile(this.#root);
 		try {
