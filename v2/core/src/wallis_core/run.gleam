@@ -13,6 +13,9 @@
 //// call: issued again if this process has not issued it (it was in flight
 //// when the last one stopped). A slot whose live attempt failed gets a new
 //// attempt: a failure is not a completed call, so resuming runs it again.
+//// Except a decided failure (an agent's turn limit or invalid output, an
+//// unsafe tool call whose outcome is unknown): it is the call's result, and
+//// runs again only when the caller names it (`Retried`).
 ////
 //// Resume is the only reuse, and only within one run: nothing here is
 //// shared across runs.
@@ -97,6 +100,7 @@ type Kind {
   /// A call of a session value (`None`: a new session, whose workspace
   /// starts from the layers `from`).
   AgentKind(session: Option(SessionId), from: List(Digest))
+  ToolKind(replay_safe: Bool)
 }
 
 /// A call of the body. `attempts` are newest first and never empty.
@@ -119,12 +123,17 @@ type Call {
 /// One attempt at a call. A running agent attempt keeps its newest
 /// checkpoint (a dialogue blob) and the messages it took, newest first.
 type Attempt {
-  Running(issued: Issued, checkpoint: Option(Digest), taken: List(types.Taken))
+  Running(
+    issued: Issued,
+    checkpoint: Option(Digest),
+    taken: List(types.Taken),
+    continuation: types.Continuation,
+  )
   Settled(entry: Entry)
 }
 
 fn running() -> Attempt {
-  Running(IssuedNow, None, [])
+  Running(IssuedNow, None, [], types.Fresh)
 }
 
 /// Whether a running call's effect was emitted by this process: a call in
@@ -137,6 +146,10 @@ type Issued {
 type Entry {
   Answered(Value)
   Errored(FailReason)
+  /// A failure that is the call's own outcome: answered from the journal
+  /// like a result, and run again only when retried. `dialogue`: an agent's
+  /// dialogue after it, which a retry continues.
+  Decided(FailReason, dialogue: Option(Digest))
 }
 
 pub fn new() -> RunState {
@@ -166,6 +179,9 @@ fn phase(event: Event) -> Phase {
     | types.AgentReturned(..)
     | types.AgentFailed(..)
     | types.Sent(..)
+    | types.ToolReturned(..)
+    | types.ToolFailed(..)
+    | types.Retried(..)
     | types.CommandReturned(..)
     | types.CommandFailed(..)
     | types.WorkflowReturned(..)
@@ -260,8 +276,11 @@ fn resume(run: Run, digest: String) -> #(Run, List(Effect)) {
 
 fn unissued(call: Call) -> Call {
   case call.attempts {
-    [Running(_, checkpoint, taken), ..older] ->
-      Call(..call, attempts: [Running(NotIssued, checkpoint, taken), ..older])
+    [Running(_, checkpoint, taken, continuation), ..older] ->
+      Call(..call, attempts: [
+        Running(NotIssued, checkpoint, taken, continuation),
+        ..older
+      ])
     // Nothing in flight: nothing to issue again.
     [Settled(_), ..] | [] -> call
   }
@@ -303,23 +322,29 @@ fn live_event(run: Run, event: Event) -> #(Run, List(Effect)) {
       })
     types.AgentFailed(id:, failure:, dialogue:, layers:, ..) ->
       settle(run, rid(id), is_agent, fn(slot, call) {
-        case dialogue {
-          // A failure with a dialogue after it can be continued from.
-          Some(d) -> {
-            let #(run, session) =
-              register(run, slot, call, Some(ids.digest(d)), layers)
-            #(
-              run,
-              Errored(types.AgentError(
-                call.name,
-                failure,
-                Some(ids.session_text(session)),
-              )),
-            )
+        let dialogue = option.map(dialogue, ids.digest)
+        // A failure with a dialogue after it can be continued from.
+        let #(run, session) = case dialogue {
+          Some(_) -> {
+            let #(run, session) = register(run, slot, call, dialogue, layers)
+            #(run, Some(ids.session_text(session)))
           }
-          None -> #(run, Errored(types.AgentError(call.name, failure, None)))
+          None -> #(run, None)
         }
+        let reason = types.AgentError(call.name, failure, session)
+        #(run, case failure {
+          types.TurnLimitReached(..) | types.InvalidOutput(..) ->
+            Decided(reason, dialogue)
+          types.GaveUp(..) | types.ContextExhausted -> Errored(reason)
+        })
       })
+    types.ToolReturned(id:, output:) ->
+      settle(run, rid(id), is_tool, fn(_, _) { #(run, Answered(output)) })
+    types.ToolFailed(id:, message:) ->
+      settle(run, rid(id), is_tool, fn(_, call) {
+        #(run, Errored(types.ToolError(call.name, message)))
+      })
+    types.Retried(call:, turns:) -> retried(run, call, turns)
     types.AgentProgressed(id:, checkpoint:) ->
       update_running(run, rid(id), fn(_, taken) {
         #(Some(ids.digest(checkpoint)), taken)
@@ -356,6 +381,11 @@ fn kind_of(request: Request) -> #(Kind, String, Value) {
       name,
       input,
     )
+    types.ToolCall(name:, input:, replay_safe:) -> #(
+      ToolKind(replay_safe),
+      name,
+      input,
+    )
   }
 }
 
@@ -364,27 +394,72 @@ fn kind_text(kind: Kind) -> String {
     CommandKind -> "command"
     WorkflowKind -> "workflow"
     AgentKind(..) -> "agent"
+    ToolKind(..) -> "tool"
   }
 }
 
 fn is_command(kind: Kind) -> Bool {
   case kind {
     CommandKind -> True
-    WorkflowKind | AgentKind(..) -> False
+    WorkflowKind | AgentKind(..) | ToolKind(..) -> False
   }
 }
 
 fn is_workflow(kind: Kind) -> Bool {
   case kind {
     WorkflowKind -> True
-    CommandKind | AgentKind(..) -> False
+    CommandKind | AgentKind(..) | ToolKind(..) -> False
   }
 }
 
 fn is_agent(kind: Kind) -> Bool {
   case kind {
     AgentKind(..) -> True
-    CommandKind | WorkflowKind -> False
+    CommandKind | WorkflowKind | ToolKind(..) -> False
+  }
+}
+
+fn is_tool(kind: Kind) -> Bool {
+  case kind {
+    ToolKind(..) -> True
+    CommandKind | WorkflowKind | AgentKind(..) -> False
+  }
+}
+
+/// The caller names a failed call to run again: its next request opens a
+/// new attempt. An agent's decided failure continues its own dialogue (with
+/// more turns, or with its output's errors); anything else starts fresh.
+fn retried(run: Run, text: String, turns: Int) -> #(Run, List(Effect)) {
+  let found =
+    dict.to_list(run.calls)
+    |> list.find(fn(e) { ids.slot_text(e.0) == text })
+  case found {
+    Error(Nil) -> #(run, [types.Refuse(None, types.NotRetriable(text))])
+    Ok(#(slot, call)) ->
+      case call.attempts {
+        [Settled(Decided(reason, dialogue)), ..] -> {
+          let continuation = case reason {
+            types.AgentError(failure: types.TurnLimitReached(..), ..) ->
+              types.MoreTurns(turns)
+            types.AgentError(failure: types.InvalidOutput(errors), ..) ->
+              types.FixOutput(errors)
+            types.AgentError(..)
+            | types.BodyError(..)
+            | types.CommandError(..)
+            | types.WorkflowError(..)
+            | types.ToolError(..)
+            | types.SchemaMismatch(..) -> types.Fresh
+          }
+          let attempt = Running(NotIssued, dialogue, [], continuation)
+          let call = Call(..call, attempts: [attempt, ..call.attempts])
+          #(put(run, slot, call), [types.Checkpoint])
+        }
+        // A failure runs again on resume anyway; naming it changes nothing.
+        [Settled(Errored(_)), ..] -> #(run, [])
+        [Settled(Answered(_)), ..] | [Running(..), ..] | [] -> #(run, [
+          types.Refuse(None, types.NotRetriable(text)),
+        ])
+      }
   }
 }
 
@@ -403,7 +478,8 @@ fn session_check(
           Error(types.SessionOfAnotherAgent(ids.session_text(s)))
         Ok(origin) -> Ok(Some(origin))
       }
-    AgentKind(session: None, ..) | CommandKind | WorkflowKind -> Ok(None)
+    AgentKind(session: None, ..) | CommandKind | WorkflowKind | ToolKind(..) ->
+      Ok(None)
   }
 }
 
@@ -468,7 +544,7 @@ fn requested_checked(
           "new:" <> string.join(list.map(from, ids.digest_text), ","),
         ),
       )
-    CommandKind | WorkflowKind -> None
+    CommandKind | WorkflowKind | ToolKind(..) -> None
   }
   let slot =
     ids.slot(
@@ -502,9 +578,26 @@ fn requested_checked(
         [Settled(Answered(v)), ..] -> #(call, [
           types.Deliver(ids.request_text(id), v),
         ])
-        [Running(NotIssued, checkpoint, taken), ..older] -> {
+        [Settled(Decided(reason, _)), ..] -> #(call, [
+          types.Fail(ids.request_text(id), reason),
+        ])
+        // A body tool call in flight as a process stopped, not safe to make
+        // again: its outcome is unknown, decided so until it is retried.
+        [Running(NotIssued, ..), ..older] if call.kind == ToolKind(False) -> {
+          let reason =
+            types.ToolError(
+              call.name,
+              "outcome unknown: it was in flight when the run stopped; check, then retry it",
+            )
+          let call = Call(..call, attempts: [Settled(Decided(reason, None)), ..older])
+          #(call, [types.Checkpoint, types.Fail(ids.request_text(id), reason)])
+        }
+        [Running(NotIssued, checkpoint, taken, continuation), ..older] -> {
           let call =
-            Call(..call, attempts: [Running(IssuedNow, checkpoint, taken), ..older])
+            Call(..call, attempts: [
+              Running(IssuedNow, checkpoint, taken, continuation),
+              ..older
+            ])
           #(call, [issue(run, slot, call)])
         }
         [Running(IssuedNow, ..), ..] -> #(call, [])
@@ -529,6 +622,7 @@ fn issue(run: Run, slot: Slot, call: Call) -> Effect {
   let attempt = list.length(call.attempts)
   case call.kind {
     CommandKind -> types.RunCommand(id, attempt)
+    ToolKind(..) -> types.RunTool(id, attempt)
     WorkflowKind -> types.RunWorkflow(id, ids.slot_text(slot), attempt)
     AgentKind(session:, from:) -> {
       // Checked when it was requested: a session call's origin exists.
@@ -540,9 +634,13 @@ fn issue(run: Run, slot: Slot, call: Call) -> Effect {
         Some(o) -> #(o.dialogue, o.layers)
         None -> #(None, from)
       }
-      let #(checkpoint, taken) = case call.attempts {
-        [Running(_, checkpoint, taken), ..] -> #(checkpoint, taken)
-        [Settled(_), ..] | [] -> #(None, [])
+      let #(checkpoint, taken, continuation) = case call.attempts {
+        [Running(_, checkpoint, taken, continuation), ..] -> #(
+          checkpoint,
+          taken,
+          continuation,
+        )
+        [Settled(_), ..] | [] -> #(None, [], types.Fresh)
       }
       types.CallAgent(
         id:,
@@ -552,6 +650,7 @@ fn issue(run: Run, slot: Slot, call: Call) -> Effect {
         layers: list.map(layers, ids.digest_text),
         checkpoint: option.map(checkpoint, ids.digest_text),
         taken: list.reverse(taken),
+        continuation:,
       )
     }
   }
@@ -575,10 +674,13 @@ fn update_running(
     Error(Nil) -> #(run, [types.Refuse(Some(text), types.UnknownRequest(text))])
     Ok(#(slot, call)) ->
       case call.attempts, is_agent(call.kind) {
-        [Running(issued, checkpoint, taken), ..older], True -> {
+        [Running(issued, checkpoint, taken, continuation), ..older], True -> {
           let #(checkpoint, taken) = f(checkpoint, taken)
           let call =
-            Call(..call, attempts: [Running(issued, checkpoint, taken), ..older])
+            Call(..call, attempts: [
+              Running(issued, checkpoint, taken, continuation),
+              ..older
+            ])
           #(put(run, slot, call), [types.Checkpoint])
         }
         [Running(..), ..], False | [Settled(_), ..], _ | [], _ -> #(run, [
@@ -661,7 +763,7 @@ fn settle(
           let call = Call(..call, attempts: [Settled(entry), ..older])
           let answer = case entry {
             Answered(v) -> types.Deliver(text, v)
-            Errored(reason) -> types.Fail(text, reason)
+            Errored(reason) | Decided(reason, _) -> types.Fail(text, reason)
           }
           #(put(run, slot, call), [types.Checkpoint, answer])
         }
@@ -769,6 +871,13 @@ fn attempt_json(attempt: Attempt) -> json.Json {
       json.object([
         #("type", json.string("failed")),
         #("reason", types.fail_reason_to_json(reason)),
+        #("decided", json.bool(False)),
+      ])
+    Settled(Decided(reason, _)) ->
+      json.object([
+        #("type", json.string("failed")),
+        #("reason", types.fail_reason_to_json(reason)),
+        #("decided", json.bool(True)),
       ])
   }
 }
@@ -787,5 +896,25 @@ pub fn mailbox(state: RunState, address: String) -> List(types.Envelope) {
   case state {
     NotYetStarted -> []
     Active(r) -> list.reverse(result_or(dict.get(r.mailboxes, address), []))
+  }
+}
+
+/// The journal key (slot) the request id names, "" when none.
+pub fn slot_of(state: RunState, id: String) -> String {
+  case state {
+    NotYetStarted -> ""
+    Active(r) ->
+      case dict.get(r.ids, ids.request_id(id)) {
+        Ok(slot) -> ids.slot_text(slot)
+        Error(Nil) -> ""
+      }
+  }
+}
+
+/// The id a journaled send's key was delivered as, "" when none.
+pub fn sent_id(state: RunState, key: String) -> String {
+  case state {
+    NotYetStarted -> ""
+    Active(r) -> result_or(dict.get(r.sends, key), "")
   }
 }

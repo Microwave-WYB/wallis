@@ -1,17 +1,33 @@
 {
   "compilerOptions": {
     "target": "es2024",
-    "lib": ["es2024", "esnext.disposable"],
+    "lib": [
+      "es2024",
+      "esnext.disposable"
+    ],
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "paths": { "wallis": ["./api.d.ts"] }
+    "paths": {
+      "wallis": [
+        "../lib/src/index.ts"
+      ],
+      "wallis/testing": [
+        "../lib/src/testing.ts"
+      ]
+    },
+    "skipLibCheck": true
   },
-  "include": ["api.d.ts", "film", "chat"]
+  "include": [
+    "film",
+    "chat"
+  ]
 }

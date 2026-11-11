@@ -31,6 +31,8 @@ pub fn workflow_decoder() -> decode.Decoder(Workflow) {
 
 
 
+
+
 pub type Event {
   /// The run begins: its workflow, its input and the core's semantics.
   Started(workflow: Workflow, input: Value, semantics: String)
@@ -80,6 +82,13 @@ pub type Event {
     reply_to: Option(String),
     body: Value,
   )
+  ToolReturned(id: String, output: Value)
+  ToolFailed(id: String, message: String)
+  /// The caller names a failed call to run again (`resume({ retry })`): a
+  /// decided failure re-runs only so. An agent continues its own session:
+  /// with `turns` more turns after a turn limit, or with the validation
+  /// errors as its next message after an invalid output.
+  Retried(call: String, turns: Int)
   CommandReturned(id: String, output: Value)
   CommandFailed(id: String, failure: CommandFailure)
   WorkflowReturned(id: String, output: Value)
@@ -152,6 +161,21 @@ pub fn event_to_json(event: Event) -> json.Json {
         option.Some(value) -> json.string(value)
       }),
       #("body", json_value.to_json(body)),
+    ])
+    ToolReturned(id:, output:) -> json.object([
+      #("type", json.string("tool_returned")),
+      #("id", json.string(id)),
+      #("output", json_value.to_json(output)),
+    ])
+    ToolFailed(id:, message:) -> json.object([
+      #("type", json.string("tool_failed")),
+      #("id", json.string(id)),
+      #("message", json.string(message)),
+    ])
+    Retried(call:, turns:) -> json.object([
+      #("type", json.string("retried")),
+      #("call", json.string(call)),
+      #("turns", json.int(turns)),
     ])
     CommandReturned(id:, output:) -> json.object([
       #("type", json.string("command_returned")),
@@ -246,6 +270,21 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use body <- decode.field("body", json_value.decoder())
       decode.success(Sent(key:, to:, from:, reply_to:, body:))
     }
+    "tool_returned" -> {
+      use id <- decode.field("id", decode.string)
+      use output <- decode.field("output", json_value.decoder())
+      decode.success(ToolReturned(id:, output:))
+    }
+    "tool_failed" -> {
+      use id <- decode.field("id", decode.string)
+      use message <- decode.field("message", decode.string)
+      decode.success(ToolFailed(id:, message:))
+    }
+    "retried" -> {
+      use call <- decode.field("call", decode.string)
+      use turns <- decode.field("turns", decode.int)
+      decode.success(Retried(call:, turns:))
+    }
     "command_returned" -> {
       use id <- decode.field("id", decode.string)
       use output <- decode.field("output", json_value.decoder())
@@ -285,6 +324,8 @@ pub fn event_decoder() -> decode.Decoder(Event) {
 
 
 
+
+
 /// What the body asks for. Names are labels: the node digest is the call's
 /// identity.
 pub type Request {
@@ -298,6 +339,9 @@ pub type Request {
     session: Option(String),
     from: List(String),
   )
+  /// A tool called by the body; `replay_safe`: it may be made again when it
+  /// was in flight as a process stopped.
+  ToolCall(name: String, input: Value, replay_safe: Bool)
 }
 
 pub fn request_to_json(request: Request) -> json.Json {
@@ -322,6 +366,12 @@ pub fn request_to_json(request: Request) -> json.Json {
       }),
       #("from", json.array(from, json.string)),
     ])
+    ToolCall(name:, input:, replay_safe:) -> json.object([
+      #("type", json.string("tool_call")),
+      #("name", json.string(name)),
+      #("input", json_value.to_json(input)),
+      #("replay_safe", json.bool(replay_safe)),
+    ])
   }
 }
 
@@ -345,9 +395,58 @@ pub fn request_decoder() -> decode.Decoder(Request) {
       use from <- decode.field("from", decode.list(decode.string))
       decode.success(AgentCall(name:, input:, session:, from:))
     }
+    "tool_call" -> {
+      use name <- decode.field("name", decode.string)
+      use input <- decode.field("input", json_value.decoder())
+      use replay_safe <- decode.field("replay_safe", decode.bool)
+      decode.success(ToolCall(name:, input:, replay_safe:))
+    }
     _ -> decode.failure(CommandCall(name: "", input: json_value.JNull), "Request")
   }
 }
+
+/// How an agent attempt starts: fresh, or (a retried decided failure)
+/// continuing its own dialogue with more turns or with the errors of its
+/// invalid output.
+pub type Continuation {
+  Fresh
+  MoreTurns(turns: Int)
+  FixOutput(errors: List(String))
+}
+
+pub fn continuation_to_json(continuation: Continuation) -> json.Json {
+  case continuation {
+    Fresh -> json.object([
+      #("type", json.string("fresh")),
+    ])
+    MoreTurns(turns:) -> json.object([
+      #("type", json.string("more_turns")),
+      #("turns", json.int(turns)),
+    ])
+    FixOutput(errors:) -> json.object([
+      #("type", json.string("fix_output")),
+      #("errors", json.array(errors, json.string)),
+    ])
+  }
+}
+
+pub fn continuation_decoder() -> decode.Decoder(Continuation) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "fresh" -> decode.success(Fresh)
+    "more_turns" -> {
+      use turns <- decode.field("turns", decode.int)
+      decode.success(MoreTurns(turns:))
+    }
+    "fix_output" -> {
+      use errors <- decode.field("errors", decode.list(decode.string))
+      decode.success(FixOutput(errors:))
+    }
+    _ -> decode.failure(Fresh, "Continuation")
+  }
+}
+
+
 
 pub type AgentFailure {
   /// It used its turn budget; the session after it can continue.
@@ -399,6 +498,8 @@ pub fn agent_failure_decoder() -> decode.Decoder(AgentFailure) {
   }
 }
 
+
+
 /// A message as a mailbox yields it. `id` is `<mailbox>/<seq>`, the
 /// sequence from the journaled delivery order.
 pub type Envelope {
@@ -426,6 +527,8 @@ pub fn envelope_decoder() -> decode.Decoder(Envelope) {
   decode.success(Envelope(id:, from:, reply_to:, body:))
 }
 
+
+
 /// The messages an agent call took into the turn after `turn`.
 pub type Taken {
   Taken(turn: Int, messages: List(String))
@@ -444,6 +547,8 @@ pub fn taken_decoder() -> decode.Decoder(Taken) {
   use messages <- decode.field("messages", decode.list(decode.string))
   decode.success(Taken(turn:, messages:))
 }
+
+
 
 
 
@@ -527,6 +632,8 @@ pub fn command_failure_decoder() -> decode.Decoder(CommandFailure) {
 
 
 
+
+
 /// Why a call, or the body, failed. The body sees it as `NodeFailed.reason`.
 pub type FailReason {
   /// The body threw something that is not a node failure.
@@ -536,6 +643,7 @@ pub type FailReason {
   WorkflowError(workflow: String, reason: FailReason)
   /// An agent call failed; `session` is the session after it, if any.
   AgentError(agent: String, failure: AgentFailure, session: Option(String))
+  ToolError(tool: String, message: String)
   /// A call's input, or a workflow's output, does not match its schema.
   SchemaMismatch(node: String, errors: List(String))
 }
@@ -564,6 +672,11 @@ pub fn fail_reason_to_json(fail_reason: FailReason) -> json.Json {
         option.None -> json.null()
         option.Some(value) -> json.string(value)
       }),
+    ])
+    ToolError(tool:, message:) -> json.object([
+      #("type", json.string("tool_error")),
+      #("tool", json.string(tool)),
+      #("message", json.string(message)),
     ])
     SchemaMismatch(node:, errors:) -> json.object([
       #("type", json.string("schema_mismatch")),
@@ -596,6 +709,11 @@ pub fn fail_reason_decoder() -> decode.Decoder(FailReason) {
       use session <- decode.field("session", decode.optional(decode.string))
       decode.success(AgentError(agent:, failure:, session:))
     }
+    "tool_error" -> {
+      use tool <- decode.field("tool", decode.string)
+      use message <- decode.field("message", decode.string)
+      decode.success(ToolError(tool:, message:))
+    }
     "schema_mismatch" -> {
       use node <- decode.field("node", decode.string)
       use errors <- decode.field("errors", decode.list(decode.string))
@@ -604,6 +722,8 @@ pub fn fail_reason_decoder() -> decode.Decoder(FailReason) {
     _ -> decode.failure(BodyError(message: ""), "FailReason")
   }
 }
+
+
 
 
 
@@ -642,6 +762,8 @@ pub fn outcome_decoder() -> decode.Decoder(Outcome) {
 
 
 
+
+
 pub type Refusal {
   NotStarted
   AlreadyStarted
@@ -657,6 +779,8 @@ pub type Refusal {
   UnknownSession(session: String)
   /// A session value of another agent (by definition digest).
   SessionOfAnotherAgent(session: String)
+  /// Only a call whose newest attempt failed can be retried.
+  NotRetriable(call: String)
   InvalidEvent(message: String)
 }
 
@@ -692,6 +816,10 @@ pub fn refusal_to_json(refusal: Refusal) -> json.Json {
       #("type", json.string("session_of_another_agent")),
       #("session", json.string(session)),
     ])
+    NotRetriable(call:) -> json.object([
+      #("type", json.string("not_retriable")),
+      #("call", json.string(call)),
+    ])
     InvalidEvent(message:) -> json.object([
       #("type", json.string("invalid_event")),
       #("message", json.string(message)),
@@ -726,6 +854,10 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
       use session <- decode.field("session", decode.string)
       decode.success(SessionOfAnotherAgent(session:))
     }
+    "not_retriable" -> {
+      use call <- decode.field("call", decode.string)
+      decode.success(NotRetriable(call:))
+    }
     "invalid_event" -> {
       use message <- decode.field("message", decode.string)
       decode.success(InvalidEvent(message:))
@@ -733,6 +865,8 @@ pub fn refusal_decoder() -> decode.Decoder(Refusal) {
     _ -> decode.failure(NotStarted, "Refusal")
   }
 }
+
+
 
 
 
@@ -754,7 +888,9 @@ pub type Effect {
     layers: List(String),
     checkpoint: Option(String),
     taken: List(Taken),
+    continuation: Continuation,
   )
+  RunTool(id: String, attempt: Int)
   /// A new message for a mailbox: route it to its live owner.
   Delivered(mailbox: String, message: Envelope)
   Deliver(id: String, value: Value)
@@ -779,7 +915,7 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
       #("scope", json.string(scope)),
       #("attempt", json.int(attempt)),
     ])
-    CallAgent(id:, attempt:, mailbox:, history:, layers:, checkpoint:, taken:) -> json.object([
+    CallAgent(id:, attempt:, mailbox:, history:, layers:, checkpoint:, taken:, continuation:) -> json.object([
       #("type", json.string("call_agent")),
       #("id", json.string(id)),
       #("attempt", json.int(attempt)),
@@ -794,6 +930,12 @@ pub fn effect_to_json(effect: Effect) -> json.Json {
         option.Some(value) -> json.string(value)
       }),
       #("taken", json.array(taken, taken_to_json)),
+      #("continuation", continuation_to_json(continuation)),
+    ])
+    RunTool(id:, attempt:) -> json.object([
+      #("type", json.string("run_tool")),
+      #("id", json.string(id)),
+      #("attempt", json.int(attempt)),
     ])
     Delivered(mailbox:, message:) -> json.object([
       #("type", json.string("delivered")),
@@ -848,7 +990,13 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
       use layers <- decode.field("layers", decode.list(decode.string))
       use checkpoint <- decode.field("checkpoint", decode.optional(decode.string))
       use taken <- decode.field("taken", decode.list(taken_decoder()))
-      decode.success(CallAgent(id:, attempt:, mailbox:, history:, layers:, checkpoint:, taken:))
+      use continuation <- decode.field("continuation", continuation_decoder())
+      decode.success(CallAgent(id:, attempt:, mailbox:, history:, layers:, checkpoint:, taken:, continuation:))
+    }
+    "run_tool" -> {
+      use id <- decode.field("id", decode.string)
+      use attempt <- decode.field("attempt", decode.int)
+      decode.success(RunTool(id:, attempt:))
     }
     "delivered" -> {
       use mailbox <- decode.field("mailbox", decode.string)
@@ -877,5 +1025,7 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
     _ -> decode.failure(Checkpoint, "Effect")
   }
 }
+
+
 
 

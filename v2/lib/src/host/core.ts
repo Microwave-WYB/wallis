@@ -11,7 +11,10 @@ export type Workflow = { name: string; digest: string };
 export type Request =
 	| { type: "command_call"; name: string; input: Json }
 	| { type: "workflow_call"; name: string; input: Json }
-	| { type: "agent_call"; name: string; input: Json; session: string | null; from: string[] };
+	| { type: "agent_call"; name: string; input: Json; session: string | null; from: string[] }
+	| { type: "tool_call"; name: string; input: Json; replay_safe: boolean };
+
+export type Continuation = { type: "fresh" } | { type: "more_turns"; turns: number } | { type: "fix_output"; errors: string[] };
 
 export type AgentFailure =
 	| { type: "turn_limit_reached"; turns: number }
@@ -32,6 +35,7 @@ export type FailReason =
 	| { type: "command_error"; command: string; failure: CommandFailure }
 	| { type: "workflow_error"; workflow: string; reason: FailReason }
 	| { type: "agent_error"; agent: string; failure: AgentFailure; session: string | null }
+	| { type: "tool_error"; tool: string; message: string }
 	| { type: "schema_mismatch"; node: string; errors: string[] };
 
 export type Outcome = { type: "done"; value: Json } | { type: "failed"; reason: FailReason };
@@ -48,6 +52,9 @@ export type Event =
 	| { type: "agent_returned"; id: string; output: Json; model: string; dialogue: string; layers: string[] }
 	| { type: "agent_failed"; id: string; failure: AgentFailure; model: string; dialogue: string | null; layers: string[] }
 	| { type: "sent"; key: string; to: string; from: string; reply_to: string | null; body: Json }
+	| { type: "tool_returned"; id: string; output: Json }
+	| { type: "tool_failed"; id: string; message: string }
+	| { type: "retried"; call: string; turns: number }
 	| { type: "command_returned"; id: string; output: Json }
 	| { type: "command_failed"; id: string; failure: CommandFailure }
 	| { type: "workflow_returned"; id: string; output: Json }
@@ -65,25 +72,27 @@ export type Refusal =
 	| { type: "not_running"; id: string }
 	| { type: "unknown_session"; session: string }
 	| { type: "session_of_another_agent"; session: string }
+	| { type: "not_retriable"; call: string }
 	| { type: "invalid_event"; message: string };
 
 export type Effect =
 	| { type: "checkpoint" }
 	| { type: "run_command"; id: string; attempt: number }
 	| { type: "run_workflow"; id: string; scope: string; attempt: number }
-	| { type: "call_agent"; id: string; attempt: number; mailbox: string; history: string | null; layers: string[]; checkpoint: string | null; taken: Taken[] }
+	| { type: "call_agent"; id: string; attempt: number; mailbox: string; history: string | null; layers: string[]; checkpoint: string | null; taken: Taken[]; continuation: Continuation }
+	| { type: "run_tool"; id: string; attempt: number }
 	| { type: "delivered"; mailbox: string; message: Envelope }
 	| { type: "deliver"; id: string; value: Json }
 	| { type: "fail"; id: string; reason: FailReason }
 	| { type: "refuse"; id: string | null; refusal: Refusal }
 	| { type: "finish"; outcome: Outcome };
 
-export type Attempt = { type: "running" } | { type: "answered"; output: Json } | { type: "failed"; reason: FailReason };
+export type Attempt = { type: "running" } | { type: "answered"; output: Json } | { type: "failed"; reason: FailReason; decided: boolean };
 
 export type CallView = {
 	id: string;
 	slot: string;
-	kind: "command" | "workflow" | "agent";
+	kind: "command" | "workflow" | "agent" | "tool";
 	name: string;
 	node: string;
 	scope: string;
@@ -104,6 +113,11 @@ export type Snapshot =
 	  };
 
 export const SEMANTICS: string = gleam.semantics();
+
+/** A call's journal key, computed as the core computes it (`within`: "" for none). */
+export function slotText(node: string, kind: "command" | "workflow" | "agent" | "tool", input: Json, scope: string, within: string, occurrence: number): string {
+	return gleam.slot_text(node, kind, JSON.stringify(input), scope, within, occurrence);
+}
 
 export class Core {
 	#state = gleam.init();
@@ -130,6 +144,16 @@ export class Core {
 	/** A mailbox's messages in their journaled delivery order. */
 	mailbox(address: string): Envelope[] {
 		return JSON.parse(gleam.mailbox_json(this.#state, address)) as Envelope[];
+	}
+
+	/** The journal key (CallId) a request id names; "" for none. */
+	slotOf(id: string): string {
+		return gleam.slot_of(this.#state, id);
+	}
+
+	/** The id a journaled send's key was delivered as; "" for none. */
+	sentId(key: string): string {
+		return gleam.sent_id(this.#state, key);
 	}
 
 	attemptCount(id: string): number {

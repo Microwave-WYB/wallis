@@ -454,3 +454,100 @@ pub fn messages_taken_by_a_call_that_is_not_running_are_refused_test() {
     ])
     == [Refuse(Some("0"), NotRunning("0"))]
 }
+
+// --- Decided failures and retry ---
+
+fn turn_limited() {
+  [
+    started(),
+    agent("0", "a", None, JNull),
+    AgentFailed("0", TurnLimitReached(30), "m", Some("d1"), []),
+    types.BodyFailed(AgentError("a", TurnLimitReached(30), None)),
+  ]
+}
+
+pub fn a_decided_failure_is_answered_from_the_journal_on_resume_test() {
+  let #(s, _, _) = replay(turn_limited())
+  let assert [Fail("0", AgentError("a", TurnLimitReached(30), Some(_)))] =
+    replay_from(s, [resumed(), agent("0", "a", None, JNull)]).1
+}
+
+pub fn a_retried_turn_limit_continues_its_own_dialogue_with_more_turns_test() {
+  let #(s, _, _) = replay(turn_limited())
+  let #(s, effects, _) = replay_from(s, [resumed()])
+  assert effects == [Checkpoint]
+  let assert [Checkpoint, CallAgent(..)] = last([started(), agent("0", "a", None, JNull)])
+  let slot = ids.slot_text(ids.slot(ids.digest("a"), "agent", JNull, "", None, "0"))
+  let #(s, effects, _) = replay_from(s, [types.Retried(slot, 20)])
+  assert effects == [Checkpoint]
+  let assert [
+    CallAgent(attempt: 2, checkpoint: Some("d1"), continuation: types.MoreTurns(20), ..),
+  ] = replay_from(s, [agent("0", "a", None, JNull)]).1
+}
+
+pub fn an_invalid_output_retried_continues_with_its_errors_test() {
+  let #(s, _, _) =
+    replay([
+      started(),
+      agent("0", "a", None, JNull),
+      AgentFailed("0", types.InvalidOutput(["/n: expected integer"]), "m", Some("d1"), []),
+    ])
+  let slot = ids.slot_text(ids.slot(ids.digest("a"), "agent", JNull, "", None, "0"))
+  let #(s, _, _) = replay_from(s, [types.Retried(slot, 30)])
+  let assert [
+    CallAgent(continuation: types.FixOutput(["/n: expected integer"]), ..),
+  ] = replay_from(s, [agent("0", "a", None, JNull)]).1
+}
+
+pub fn retrying_a_finished_call_is_refused_test() {
+  let #(s, _, _) = replay(done_first())
+  let slot = ids.slot_text(ids.slot(ids.digest("c"), "command", JInt(1), "", None, "0"))
+  let #(_, effects, _) = replay_from(s, [types.Retried(slot, 30)])
+  assert effects == [Refuse(None, types.NotRetriable(slot))]
+  assert last([started(), types.Retried("nope", 1)])
+    == [Refuse(None, types.NotRetriable("nope"))]
+}
+
+pub fn a_model_error_is_not_decided_and_runs_again_on_resume_test() {
+  let #(s, _, _) =
+    replay([
+      started(),
+      agent("0", "a", None, JNull),
+      AgentFailed("0", types.GaveUp("529"), "m", None, []),
+    ])
+  let assert [Checkpoint, CallAgent(attempt: 2, continuation: types.Fresh, ..)] =
+    replay_from(s, [resumed(), agent("0", "a", None, JNull)]).1
+}
+
+// --- Body tool calls ---
+
+fn tool(id, safe) {
+  types.Requested(
+    id:,
+    request: types.ToolCall(name: "list", input: JNull, replay_safe: safe),
+    node: "t",
+    scope: "",
+    occurrence: 0,
+  )
+}
+
+pub fn a_body_tool_call_is_journaled_and_hit_on_resume_test() {
+  let #(s, effects, _) =
+    replay([started(), tool("0", True)])
+  assert effects == [Checkpoint, types.RunTool("0", 1)]
+  let #(s, _, _) = replay_from(s, [types.ToolReturned("0", out(1))])
+  assert replay_from(s, [resumed(), tool("0", True)]).1 == [Deliver("0", out(1))]
+}
+
+pub fn a_tool_call_in_flight_at_a_stop_runs_again_only_if_safe_test() {
+  let #(s, _, _) = replay([started(), tool("0", True)])
+  assert replay_from(s, [resumed(), tool("0", True)]).1 == [types.RunTool("0", 1)]
+  let #(s, _, _) = replay([started(), tool("0", False)])
+  let assert [Checkpoint, Fail("0", types.ToolError("list", _))] =
+    replay_from(s, [resumed(), tool("0", False)]).1
+}
+
+pub fn a_tool_failure_is_typed_test() {
+  assert last([started(), tool("0", True), types.ToolFailed("0", "boom")])
+    == [Checkpoint, Fail("0", types.ToolError("list", "boom"))]
+}

@@ -8,12 +8,16 @@
 //// The host holds `RunState` as an opaque handle; events, effects and state
 //// snapshots cross the boundary as JSON text.
 
+import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/string
 import wallis_core/run.{type RunState}
+
+import wallis_core/ids
 import wallis_core/types.{type Effect, type Event, InvalidEvent, Refuse}
+import wallis_core/value
 
 pub fn init() -> RunState {
   run.new()
@@ -71,4 +75,42 @@ pub fn attempt_count(state: RunState, id: String) -> Int {
 /// The core's semantics version, recorded with every run.
 pub fn semantics() -> String {
   run.semantics
+}
+
+/// The journal key of a call, as the core computes it (see `run.requested`):
+/// a running agent's mailbox address and a call's id derive from it.
+/// `within` is "" for none. Returns "" when the input is not JSON.
+pub fn slot_text(
+  node: String,
+  kind: String,
+  input: String,
+  scope: String,
+  within: String,
+  occurrence: Int,
+) -> String {
+  case value.parse(input) {
+    Error(_) -> ""
+    Ok(v) -> {
+      let within = case within {
+        "" -> None
+        w -> Some(ids.session_id(w))
+      }
+      ids.slot_text(ids.slot(
+        ids.digest(node),
+        kind,
+        v,
+        scope,
+        within,
+        int.to_string(occurrence),
+      ))
+    }
+  }
+}
+
+pub fn slot_of(state: RunState, id: String) -> String {
+  run.slot_of(state, id)
+}
+
+pub fn sent_id(state: RunState, key: String) -> String {
+  run.sent_id(state, key)
 }

@@ -1,9 +1,9 @@
 # v2 target examples
 
-Written before the implementation, as its target. `api.d.ts` declares the public `wallis`
-surface; the examples typecheck against it (`npm install && npm run typecheck`). `v2/lib` is
-done when it exports this surface and these examples run unchanged (the film ones beside the
-owner's private scripts).
+Written before the implementation, as its target. They declared the public `wallis` surface
+(first as `api.d.ts`, now replaced by `v2/lib`'s own types); they typecheck against `v2/lib`
+(`npm install && npm run typecheck`) and run unchanged (the film ones beside the owner's
+private scripts).
 
 | File | Shows |
 |---|---|

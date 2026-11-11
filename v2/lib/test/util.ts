@@ -21,3 +21,31 @@ export function tmp(prefix = "wallis-v2-"): string {
 	made.push(d);
 	return d;
 }
+
+import { mkdirSync as mkdir, writeFileSync as write } from "node:fs";
+import { dirname as dirOf } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const INDEX = new URL("../src/index.ts", import.meta.url).href;
+const TESTING = new URL("../src/testing.ts", import.meta.url).href;
+
+/**
+ * A throwaway project: `files` written under a fresh dir with a
+ * package.json (so it is the project root); `from "wallis"` imports point at
+ * this lib. `config` becomes `.wallis/config.json`.
+ */
+export function project(files: Record<string, string>, config?: object): string {
+	const root = tmp("wallis-v2-project-");
+	write(join(root, "package.json"), '{ "type": "module" }\n');
+	for (const [name, text] of Object.entries(files)) {
+		mkdir(dirOf(join(root, name)), { recursive: true });
+		write(join(root, name), text.replaceAll('from "wallis/testing"', `from ${JSON.stringify(TESTING)}`).replaceAll('from "wallis"', `from ${JSON.stringify(INDEX)}`));
+	}
+	if (config) {
+		mkdir(join(root, ".wallis"), { recursive: true });
+		write(join(root, ".wallis", "config.json"), JSON.stringify(config));
+	}
+	return root;
+}
+
+export const here = dirOf(fileURLToPath(import.meta.url));
