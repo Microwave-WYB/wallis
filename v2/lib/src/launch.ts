@@ -92,8 +92,8 @@ export async function launch(options: { root: string; paths: RunPaths; def: Work
 		for (const call of options.resume?.retry ?? []) session.step({ type: "retried", call, turns: options.resume?.turns ?? 0 });
 		if (facts().ended_at !== undefined && !session.ended) session.step({ type: "noted", key: "ended_at", value: null });
 	}
+	// Also what keeps a run's process alive while its body only waits for messages.
 	const timer = setInterval(() => session.applyInbox(), 250);
-	timer.unref();
 	const stop = () => {
 		session.abort();
 		release();

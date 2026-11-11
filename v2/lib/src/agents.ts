@@ -306,6 +306,12 @@ class AgentCall {
 			transformContext: (messages, signal) => this.#fit(messages, streamFn, signal).then((m) => this.#quota(m)),
 		});
 		this.#agent.subscribe((event) => {
+			// Every rejected result counts, whether pi's argument check or ours rejected it.
+			if (event.type === "tool_execution_end" && event.toolName === "submit_result" && event.isError) {
+				this.#invalid++;
+				const said = ((event.result as { content?: { text?: string }[] } | undefined)?.content ?? []).map((c) => c.text ?? "").join("\n");
+				if (this.#invalidErrors.length === 0 || !said.includes("does not match the output schema")) this.#invalidErrors = said.split("\n").filter((l) => l.trim() !== "").slice(0, 12);
+			}
 			if (event.type !== "turn_end") return;
 			const last = this.#agent.state.messages.at(-1);
 			if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) return;
@@ -564,9 +570,8 @@ class AgentCall {
 	}
 
 	#invalidResult(errors: string[]): never {
-		this.#invalid++;
 		this.#invalidErrors = errors;
-		throw new Error(`Your result does not match the output schema:\n${errors.join("\n")}${this.#invalid >= MAX_INVALID ? "" : "\nFix it and call submit_result again."}`);
+		throw new Error(`Your result does not match the output schema:\n${errors.join("\n")}\nFix it and call submit_result again.`);
 	}
 
 	/** File positions of the output (paths in /w) as artifacts and Trees: stored from the call's workspace. */
