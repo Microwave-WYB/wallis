@@ -1,5 +1,5 @@
 // Counterexamples: each line must fail to typecheck (the API rejects these mistakes).
-import { run, Tree, workflow, Type, type Mailbox } from "wallis";
+import { run, Tree, workflow, Type } from "wallis";
 import { develop, Look, Negs } from "./workflow.ts";
 
 declare const look: import("wallis").Static<typeof Look>;
@@ -16,7 +16,7 @@ workflow({
 	input: Type.Object({}),
 	output: Type.Object({ n: Type.Integer() }),
 	run: async (ctx) => {
-		const a = ctx.spawn(async (_c, mailbox: Mailbox<{ frame: string }>) => {
+		const a = ctx.spawn(Type.Object({ frame: Type.String() }), async (_c, mailbox) => {
 			for await (const m of mailbox) {
 				// @ts-expect-error: the message body has no `size`
 				m.body.size;

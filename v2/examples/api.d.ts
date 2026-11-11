@@ -39,7 +39,17 @@ export interface Address<M = unknown> {
 
 export type MessageId = string & { readonly __messageId: true };
 
-/** What a mailbox yields. `from` is the sender's own address, so a server replies without wiring. */
+/**
+ * What a mailbox yields. `from` is the sender's own address, so a server replies without wiring.
+ *
+ * Every mailbox has a schema (an agent's or workflow's `mailbox`, an actor's first `spawn`
+ * argument, an outbox's). Every message is checked against the RECIPIENT's schema when it is
+ * sent, wherever it comes from, before it is journaled; a rejected message is never delivered:
+ * - from an agent (its `send` tool): the tool call fails with the errors, so the agent sees what
+ *   was wrong and can send again (it costs a turn like any tool error);
+ * - from a body or actor (`ctx.send`): throws `MessageRejected`, a bug in the workflow;
+ * - from the caller (`run.send`): rejects with `MessageRejected`.
+ */
 export interface Envelope<M> {
 	readonly id: MessageId;
 	readonly from: Address<unknown>;
@@ -68,7 +78,11 @@ export declare const Tree: {
 	from(hostPath: string): TreeRef;
 };
 
-/** An address whose messages match `message`. As an agent input field, it gives the agent a `send` tool. */
+/**
+ * An address whose messages match `message`. As an agent input field, it gives the agent a `send`
+ * tool whose parameters are `message`. Passing an address whose recipient's mailbox schema differs
+ * from `message` fails the call before the agent starts (schema digests must be equal).
+ */
 export declare function Address<S extends TSchema>(message: S): TUnsafe<Address<Static<S>>>;
 
 // ---------------------------------------------------------------------------
@@ -237,13 +251,13 @@ export interface Ctx<Self = never> {
 	session<I, O, M>(agent: Agent<I, O, M>, options?: { readonly from?: TreeRef }): Session<I, O, M>;
 	/** A session's workspace `/w`, as a Tree. */
 	files(session: Session<any, any, any>): TreeRef;
-	/** An actor: a body task with its own branch and mailbox. Annotate `mailbox` to type its messages. */
-	spawn<M, R>(body: (ctx: Ctx<M>, mailbox: Mailbox<M>) => Promise<R>): Running<R, M>;
+	/** An actor: a body task with its own branch and a mailbox whose messages match `mailbox`. */
+	spawn<S extends TSchema, R>(mailbox: S, body: (ctx: Ctx<Static<S>>, mailbox: Mailbox<Static<S>>) => Promise<R>): Running<R, Static<S>>;
 	/** One spawn per item, results in order. Limit concurrency with plain code (batches). */
 	map<T, R>(items: readonly T[], f: (ctx: Ctx, item: T, index: number) => Promise<R>): Promise<R[]>;
 	/** A typed fold; each iteration is a branch. */
 	loop<S, O>(init: S, step: (ctx: Ctx, state: S) => Promise<Step<S, O>>): Promise<O>;
-	/** Never blocks. Returns the message id, which replies name in `replyTo`. */
+	/** Never blocks. Checks `body` against the recipient's schema (throws `MessageRejected`). Returns the id replies name in `replyTo`. */
 	send<M>(to: Address<M>, body: M, options?: { readonly replyTo?: MessageId; readonly interrupt?: boolean }): MessageId;
 	/** This body's or actor's own address. */
 	readonly self: Address<Self>;
@@ -251,6 +265,12 @@ export interface Ctx<Self = never> {
 	register<M>(name: string, address: Address<M>): void;
 	/** An address whose messages go to the caller (`run.next()`). */
 	outbox<S extends TSchema>(name: string, message: S): Address<Static<S>>;
+}
+
+/** A message that does not match its recipient's mailbox schema. Nothing was delivered. */
+export declare class MessageRejected extends Error {
+	readonly to: Address<unknown>;
+	readonly errors: readonly { readonly path: string; readonly message: string }[];
 }
 
 /** A failed call. `reason` is a typed union. */
@@ -290,7 +310,7 @@ export interface Run<O> {
 	transcript(label: string): Promise<unknown>;
 	/** The next outbox message, the end of the run, or `timeout` (harnesses cap background waits). */
 	next(options?: { readonly timeout?: Duration }): Promise<Next<O>>;
-	/** Send to a registered address. Persisted; a stopped run receives it on resume. */
+	/** Send to a registered address; rejects with `MessageRejected` if the body does not match its schema. Persisted; a stopped run receives it on resume. */
 	send(name: string, body: unknown, options?: { readonly replyTo?: MessageId; readonly interrupt?: boolean }): Promise<MessageId>;
 	stop(): Promise<void>;
 	resume(options?: { readonly detach?: boolean }): Promise<Run<O>>;

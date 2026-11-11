@@ -23,10 +23,14 @@ owner's private scripts).
    `r.dir(name)` turn scratch-dir results into an Artifact or a Tree; the media comes from the
    output schema.
 4. **Workflows may declare `mailbox`.** The body gets it as a third argument and its address as
-   `ctx.self` (the approval pattern in §6). Actors type their mailbox by annotating the
-   parameter: `ctx.spawn(async (ctx, mailbox: Mailbox<Job>) => …)`.
-5. **Envelopes:** `{ id, from, replyTo?, body }`; `from` is `Address<unknown>`, checked at runtime
-   against the recipient's declared mailbox schema.
+   `ctx.self` (the approval pattern in §6). Actors declare theirs as the first argument:
+   `ctx.spawn(Job, async (ctx, mailbox) => …)`. Every mailbox has a schema.
+5. **Envelopes:** `{ id, from, replyTo?, body }`. **Every message is validated against the
+   recipient's schema when sent**, before it is journaled; a rejected message is never delivered.
+   An agent's `send` tool call fails with the errors (the agent corrects it and sends again); a
+   body's `ctx.send` throws `MessageRejected`; the caller's `run.send` rejects with it. `from` is
+   `Address<unknown>` at compile time, so a reply is checked at runtime only. Passing an address
+   into an agent's `Address(T)` input requires the recipient's schema to equal `T`.
 6. **An agent's mailbox may be a union** (`{ jpg } | { error }`): an actor reports failures as
    messages and the agent decides.
 7. **Artifacts that arrive by mail are readable** by the receiving agent (the grader looks at

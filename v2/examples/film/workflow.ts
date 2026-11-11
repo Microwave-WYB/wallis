@@ -12,7 +12,7 @@
 import { readFileSync } from "node:fs";
 import {
 	Address, agent, Artifact, command, NodeFailed, sandbox, toolset, Tree, Type, workflow,
-	type ArtifactRef, type Mailbox, type Static,
+	type ArtifactRef, type Static,
 } from "wallis";
 
 const text = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -246,7 +246,7 @@ export const grade = workflow({
 	output: Type.Object({ look: Look, notes: Type.String() }),
 	run: async (ctx, { negs, frames, start, reference }) => {
 		// Rendering is memory-heavy, so one actor owns it and runs jobs one at a time.
-		const renderer = ctx.spawn(async (ctx, mailbox: Mailbox<Job>) => {
+		const renderer = ctx.spawn(Job, async (ctx, mailbox) => {
 			for await (const m of mailbox) {
 				try {
 					const { jpg } = await ctx.call(render, { neg: negs.frames[m.body.frame]!, look: m.body.look, dmin: negs.dmin, ratio: negs.ratio, mode: { preview: m.body.size } });
