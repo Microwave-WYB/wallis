@@ -164,6 +164,38 @@ export class Store {
 		return [digest];
 	}
 
+	// --- Trees -----------------------------------------------------------------------
+
+	/**
+	 * A Tree as one digest: a blob naming its layers, bottom first. A Tree
+	 * ingested from a dir has one layer; one derived from another (an agent's
+	 * workspace) has the layers below it plus its own.
+	 */
+	putTree(layers: readonly string[]): string {
+		for (const l of layers) if (!this.hasLayer(l)) throw new StoreError(`layer ${l} is not in the store`);
+		return this.putText(JSON.stringify({ wallis_tree: 1, layers }));
+	}
+
+	/** A Tree's layers, bottom first; null when the store does not have it (or it is not a Tree). */
+	treeLayers(digest: string): string[] | null {
+		const text = this.readText(digest);
+		if (text === null) return null;
+		let raw: unknown;
+		try {
+			raw = JSON.parse(text);
+		} catch {
+			return null;
+		}
+		if (raw === null || typeof raw !== "object" || (raw as { wallis_tree?: unknown }).wallis_tree !== 1) return null;
+		const layers = (raw as { layers?: unknown }).layers;
+		return Array.isArray(layers) && layers.every(isDigest) ? layers : null;
+	}
+
+	/** A directory snapshot as a Tree digest (see `ingestTree`, `putTree`). */
+	snapshot(dir: string, options: { readonly move: boolean }): string {
+		return this.putTree(this.ingestTree(dir, options));
+	}
+
 	// --- The hash cache ------------------------------------------------------------
 
 	/** sha256 (hex) of a file, from the cache while its real path, size and mtime are unchanged. */

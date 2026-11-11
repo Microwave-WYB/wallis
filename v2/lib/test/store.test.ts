@@ -115,3 +115,23 @@ test("prune deletes only what no run's log names, directly or through a dialogue
 	assert.ok(!store.hasBlob(gone));
 	assert.ok(store.hasLayer(layer!) && !store.hasLayer(orphanLayer!));
 });
+
+test("a Tree is one digest naming its layers; prune keeps the layers a kept Tree names", () => {
+	const { root, store } = project();
+	const dir = join(root, "d");
+	mkdirSync(dir);
+	writeFileSync(join(dir, "a"), "a");
+	const tree = store.snapshot(dir, { move: false });
+	const layers = store.treeLayers(tree)!;
+	assert.equal(layers.length, 1);
+	assert.equal(store.snapshot(dir, { move: false }), tree, "the same content is the same Tree");
+	assert.equal(store.treeLayers(store.putText("not a tree")), null);
+	assert.throws(() => store.putTree([`sha256:${"3".repeat(64)}`]), /not in the store/);
+	const log = join(root, "log.jsonl");
+	writeFileSync(log, `${JSON.stringify({ type: "body_finished", output: { kind: "tree", digest: tree } })}\n`);
+	store.prune([log], null);
+	assert.ok(store.hasLayer(layers[0]!));
+	writeFileSync(log, "");
+	store.prune([log], null);
+	assert.ok(!store.hasLayer(layers[0]!) && !store.hasBlob(tree));
+});
