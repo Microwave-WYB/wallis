@@ -280,8 +280,35 @@ export declare class MessageRejected extends Error {
 	readonly errors: readonly { readonly path: string; readonly message: string }[];
 }
 
+/** A call's journal identity, stable across resumes. */
+export type CallId = string & { readonly __callId: true };
+
+/**
+ * Where a call is, for people and the orchestrating agent. `label` is the node's const name and
+ * definition site (`stitch (film/workflow.ts:93)`), taken when the node is defined; `path` lists
+ * the enclosing calls' labels, outermost first.
+ */
+export interface CallRef {
+	readonly id: CallId;
+	readonly label: string;
+	readonly path: readonly string[];
+	readonly attempt: number;
+}
+
+export type FailureReason = NodeFailed["reason"];
+
+/** A failed call, with what the caller needs to decide how to recover. */
+export interface FailedCall extends CallRef {
+	readonly reason: FailureReason;
+	/** Re-runs on resume by itself (crash, OOM, exit, model or tool error), or only when retried (a decided failure). */
+	readonly recovery: "resume" | "retry";
+	/** The last lines of stderr (commands), or of the transcript (agents). */
+	readonly tail: string;
+}
+
 /** A failed call. `reason` is a typed union. */
 export declare class NodeFailed extends Error {
+	readonly call: CallRef;
 	readonly reason:
 		| { readonly type: "command_exited"; readonly code: number; readonly stderr: string }
 		| { readonly type: "output_invalid"; readonly errors: readonly string[] }
@@ -299,7 +326,7 @@ export type Duration = `${number}${"s" | "m" | "h"}`;
 export type Next<O> =
 	| { readonly type: "message"; readonly outbox: string; readonly id: MessageId; readonly replyTo?: MessageId; readonly body: unknown }
 	| { readonly type: "finished"; readonly output: O }
-	| { readonly type: "failed"; readonly error: NodeFailed["reason"] }
+	| { readonly type: "failed"; readonly failed: readonly FailedCall[] }
 	| { readonly type: "stopped" }
 	| { readonly type: "timeout"; readonly progress: Status };
 
@@ -307,20 +334,32 @@ export interface Status {
 	readonly state: "running" | "stopped" | "finished" | "failed";
 	readonly elapsed: Duration;
 	readonly completed: number;
-	readonly running: readonly string[];
+	readonly running: readonly CallRef[];
+	/** Calls whose newest attempt failed (the body may have caught some and gone on). */
+	readonly failed: readonly FailedCall[];
 }
 
 export interface Run<O> {
 	readonly id: string;
 	status(): Promise<Status>;
 	tree(): Promise<unknown>;
-	transcript(label: string): Promise<unknown>;
+	/** An agent call's dialogue, every attempt. */
+	transcript(call: CallId): Promise<unknown>;
 	/** The next outbox message, the end of the run, or `timeout` (harnesses cap background waits). */
 	next(options?: { readonly timeout?: Duration }): Promise<Next<O>>;
 	/** Send to a registered address; rejects with `MessageRejected` if the body does not match its schema. Persisted; a stopped run receives it on resume. */
 	send(name: string, body: unknown, options?: { readonly replyTo?: MessageId; readonly interrupt?: boolean }): Promise<MessageId>;
 	stop(): Promise<void>;
-	resume(options?: { readonly detach?: boolean }): Promise<Run<O>>;
+	/**
+	 * Continue a stopped, crashed or failed run in place: the body runs again, finished calls are
+	 * answered from the journal, failed ones run again as new attempts. Fix the cause first (free
+	 * memory, edit a script or the workflow); a changed node definition re-runs that node.
+	 * `retry` also re-runs decided failures (`recovery: "retry"`): an agent that hit its turn
+	 * budget continues its session with `turns` more turns (default: its budget again); an
+	 * `output_invalid` agent continues with the errors as its next message. Only failed calls can
+	 * be retried; to redo a finished one, start a new run.
+	 */
+	resume(options?: { readonly detach?: boolean; readonly retry?: readonly CallId[]; readonly turns?: number }): Promise<Run<O>>;
 	/** Waits for the end; throws NodeFailed on failure. */
 	done(): Promise<Finished<O>>;
 }

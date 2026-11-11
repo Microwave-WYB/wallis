@@ -7,9 +7,10 @@
 //   node iterate.ts final <negatives run> <look.json> <export dir>
 //   node iterate.ts deliver <negatives run> <look.json> <album>      (only after the human said yes)
 //   node iterate.ts grade <negatives run> <look.json> <reference.jpg> <frame...>
+//   node iterate.ts recover <run> [<call id> <turns>]                 after a failure (see below)
 
 import { readFileSync } from "node:fs";
-import { Artifact, attach, run, Tree, type Static } from "wallis";
+import { Artifact, attach, run, Tree, type CallId, type FailedCall, type Static } from "wallis";
 import { deliver, develop, grade, Look, negatives, RollMeta } from "./workflow.ts";
 
 const [step, ...args] = process.argv.slice(2);
@@ -32,6 +33,11 @@ const rollMeta = (dir: string): Static<typeof RollMeta> => {
 /** Stage 1's output, typed, from the run id the conversation kept. */
 const negsOf = async (id: string) => (await attach(negatives, id).done()).output.negs;
 
+/** What the orchestrating agent reads to decide: which call, why, and whether resume alone re-runs it. */
+const report = (failed: readonly FailedCall[]) => {
+	for (const f of failed) console.log(`${[...f.path, f.label].join(" > ")} attempt ${f.attempt}: ${f.reason.type} (${f.recovery}) id=${f.id}\n${f.tail}`);
+};
+
 switch (step) {
 	case "negatives": {
 		// About 10 minutes, once per roll. Detached: the harness's 2 h limit on background commands
@@ -42,7 +48,7 @@ switch (step) {
 		for (;;) {
 			const n = await r.next({ timeout: "100m" });
 			if (n.type === "finished") break;
-			if (n.type === "failed") throw new Error(JSON.stringify(n.error));
+			if (n.type === "failed") { report(n.failed); process.exit(1); }
 			if (n.type === "stopped") throw new Error(`stopped; resume with attach(negatives, "${r.id}").resume()`);
 			if (n.type === "timeout") console.log(n.progress);
 		}
@@ -73,6 +79,20 @@ switch (step) {
 		const [id, lookFile, reference, ...frames] = args;
 		const r = await run(grade, { negs: await negsOf(id!), frames, start: look(lookFile!), reference: Artifact.from(reference!, { media: "image/jpeg" }) });
 		console.log(JSON.stringify(r.output, null, 1));
+		break;
+	}
+	case "recover": {
+		// Recovery, in place. The agent reads the failure, fixes the cause, then resumes:
+		// - stitch OOM-killed, or a script bug fixed in scripts/: plain resume; finished frames are
+		//   answered from the journal and only the failed stitch runs again;
+		// - the uploader hit its turn budget (recovery "retry"): resume with that call retried and
+		//   more turns; it continues its own session, nothing else re-runs.
+		const [id, call, turns] = args;
+		const r = attach(id!);
+		report((await r.status()).failed);
+		const resumed = await r.resume({ detach: true, ...(call ? { retry: [call as CallId], turns: Number(turns ?? 40) } : {}) });
+		const n = await resumed.next({ timeout: "100m" });
+		if (n.type === "failed") report(n.failed); else console.log(n.type);
 		break;
 	}
 	default:

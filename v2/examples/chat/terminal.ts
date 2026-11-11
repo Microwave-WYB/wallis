@@ -19,7 +19,7 @@ const printer = (async () => {
 		const n = await r.next({ timeout: "1h" });
 		if (n.type === "message") console.log(`\n${String(n.body)}\n`);
 		if (n.type === "finished") { console.log(`\n${n.output.summary}\nchanges: ${n.output.changes.digest}`); return rl.close(); }
-		if (n.type === "failed") { console.error(n.error); return rl.close(); }
+		if (n.type === "failed") { console.error(n.failed); return rl.close(); }
 		if (n.type === "stopped") return rl.close(); // resume later with attach(chat, id).resume()
 	}
 })();
