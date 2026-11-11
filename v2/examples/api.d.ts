@@ -179,6 +179,8 @@ export declare function command<IS extends TSchema, OS extends TSchema>(def: {
 
 export interface Agent<I = unknown, O = unknown, M = never> {
 	readonly kind: "agent";
+	readonly input: TSchema;
+	readonly output: TSchema;
 	__io?(i: I, m: M): O;
 }
 export declare function agent<IS extends TSchema, OS extends TSchema, MS extends TSchema = never>(def: {
@@ -229,22 +231,27 @@ export interface Running<R, M = never> {
 export type Step<S, O> = { readonly next: S } | { readonly done: O };
 
 type Out<N> =
+	N extends Agent<any, infer O, any> ? O :
 	N extends Command<any, infer O> ? O :
 	N extends Tool<any, infer O> ? O :
 	N extends Workflow<any, infer OS> ? Static<OS> :
 	N extends Session<any, infer O, infer M> ? readonly [O, Session<InOf<N>, O, M>] :
 	never;
 type InOf<N> =
+	N extends Agent<infer I, any, any> ? I :
 	N extends Command<infer I, any> ? I :
 	N extends Tool<infer I, any> ? I :
 	N extends Workflow<infer IS, any> ? Static<IS> :
 	N extends Session<infer I, any, any> ? I :
 	never;
-type MailOf<N> = N extends Session<any, any, infer M> ? M : N extends Workflow<any, any, infer M> ? M : never;
-type Callable = Command<any, any> | Tool<any, any> | Workflow<any, any, any> | Session<any, any, any>;
+type MailOf<N> = N extends Agent<any, any, infer M> ? M : N extends Session<any, any, infer M> ? M : N extends Workflow<any, any, infer M> ? M : never;
+type Callable = Agent<any, any, any> | Command<any, any> | Tool<any, any> | Workflow<any, any, any> | Session<any, any, any>;
 
 export interface Ctx<Self = never> {
-	/** Run a node and wait. A session call returns `[output, nextSession]`. */
+	/**
+	 * Run a node and wait. An agent called directly is one-shot: a fresh session, the output only.
+	 * A session call returns `[output, nextSession]`, for continuing the same dialogue.
+	 */
 	call<N extends Callable>(node: N, input: InOf<N>, options?: { readonly turns?: number }): Promise<Out<N>>;
 	/** Start a call without waiting. */
 	start<N extends Callable>(node: N, input: InOf<N>, options?: { readonly turns?: number }): Running<Out<N>, MailOf<N>>;

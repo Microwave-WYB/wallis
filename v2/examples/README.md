@@ -43,7 +43,14 @@ owner's private scripts).
    - `next()` returns `message | finished | failed | stopped | timeout`.
 10. **`NodeFailed.reason`** lists the failure kinds. `turn_limit_reached` carries the session, so
     a body can continue it with more turns.
-11. **Prompts are plain strings.** A long prompt is read with `readFileSync` next to the
+11. **One-shot agent calls.** `ctx.call(agent, input)` returns the output only, in a fresh
+    session; `ctx.session` is for continuing a dialogue or seeding a workspace (the chat).
+12. **Inputs: data as data, files as Trees.** Small metadata (the roll's pairs, crops, EXIF) is
+    parsed by the caller and passed as plain input; Trees carry only bulk files (NEFs, Hugin
+    projects, the base scan). Collections are arrays of records (`[{ frame, tiff, … }]`), not
+    maps keyed by name, so bodies do not index with `!`.
+13. **Concurrency is a 10-line `pool` in the workflow file**, not a framework feature.
+14. **Prompts are plain strings.** A long prompt is read with `readFileSync` next to the
     workflow. It is part of the agent's definition digest.
 
 ## Not covered yet

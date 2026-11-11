@@ -10,10 +10,25 @@
 
 import { readFileSync } from "node:fs";
 import { Artifact, attach, run, Tree, type Static } from "wallis";
-import { deliver, develop, grade, Look, negatives } from "./workflow.ts";
+import { deliver, develop, grade, Look, negatives, RollMeta } from "./workflow.ts";
 
 const [step, ...args] = process.argv.slice(2);
-const look = (path: string): Static<typeof Look> => JSON.parse(readFileSync(path, "utf8"));
+const json = (path: string) => JSON.parse(readFileSync(path, "utf8"));
+const look = (path: string): Static<typeof Look> => json(path);
+/** The roll directory's JSON files, as plain input data (the run checks it against RollMeta). */
+const rollMeta = (dir: string): Static<typeof RollMeta> => {
+	const pairs: [string, string][] = json(`${dir}/pairs.json`);
+	const crops = json(`${dir}/crops.json`);
+	const { base, exif } = json(`${dir}/roll.json`);
+	return {
+		frames: pairs.map(([a, b]) => {
+			const frame = a.replace(/^DSC_/, "");
+			return { frame, halves: [`${a}.NEF`, `${b}.NEF`], crop: { angle: crops[frame].angle, box: crops[frame].box } };
+		}),
+		base: `base/${base}.NEF`,
+		exif,
+	};
+};
 /** Stage 1's output, typed, from the run id the conversation kept. */
 const negsOf = async (id: string) => (await attach(negatives, id).done()).output.negs;
 
@@ -21,7 +36,8 @@ switch (step) {
 	case "negatives": {
 		// About 10 minutes, once per roll. Detached: the harness's 2 h limit on background commands
 		// does not matter, and `next` reports progress until it finishes.
-		const r = await run(negatives, { raw: Tree.from(args[0]!), roll: Tree.from(args[1]!) }, { detach: true });
+		const [raw, roll] = args;
+		const r = await run(negatives, { raw: Tree.from(raw!), roll: Tree.from(roll!), meta: rollMeta(roll!) }, { detach: true });
 		console.log(r.id);
 		for (;;) {
 			const n = await r.next({ timeout: "100m" });
