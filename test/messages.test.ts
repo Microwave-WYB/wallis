@@ -5,13 +5,13 @@
 // detached run awaited with `next`, stopped and resumed.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { lockHolder, runPaths, runsDir } from "../src/host/runs.ts";
 import { bwrapAvailable } from "../src/host/sandbox.ts";
-import { MessageRejected, run } from "../src/index.ts";
+import { attach, MessageRejected, run } from "../src/index.ts";
 import { RunView } from "../src/status.ts";
 import { here, project } from "./util.ts";
 
@@ -80,4 +80,48 @@ test("a send to a recipient that has ended is rejected as closed: ctx.send and r
 	await r.send("user", "bye");
 	assert.equal((await r.next({ timeout: "10s" })).type, "finished");
 	await assert.rejects(r.send("user", "anyone there?"), (e: unknown) => e instanceof MessageRejected && e.reason === "closed");
+});
+
+const waitFor = async (f: () => Promise<boolean> | boolean, ms = 10_000) => {
+	for (let t = Date.now(); Date.now() - t < ms; ) {
+		if (await f()) return;
+		await sleep(50);
+	}
+	throw new Error("timed out");
+};
+
+test("a message sent while the run is stopped is delivered on resume, also to a recipient the body re-creates after an await", opts, async () => {
+	const { wf } = await fixture();
+	const r = await run(wf.lateRecipient, {}, { detach: true });
+	await waitFor(async () => "registered:a" in (r as unknown as { view(): RunView }).view().facts);
+	await r.stop();
+	assert.equal((await r.status()).state, "stopped");
+	await r.send("a", "hello");
+	const resumed = await r.resume({ detach: true });
+	assert.deepEqual(await resumed.next({ timeout: "20s" }), { type: "finished", output: { got: "hello" } });
+});
+
+test("after a failed run is resumed, the caller reaches its body's mailbox again", opts, async () => {
+	const { root, wf } = await fixture();
+	const flag = join(root, "flag");
+	writeFileSync(flag, "");
+	await assert.rejects(run(wf.approval, { flag }));
+	rmSync(flag);
+	const id = readdirSync(join(root, ".wallis/runs"))[0]!;
+	const r = await attach(wf.approval, id).resume({ detach: true });
+	await waitFor(async () => (await r.status()).state === "running" && (r as unknown as { view(): RunView }).view().facts.epoch === 2);
+	await r.send("answer", "yes");
+	assert.deepEqual(await r.next({ timeout: "20s" }), { type: "finished", output: { got: "yes" } });
+});
+
+test("an actor's reply to the caller (m.from) reaches next() as a message with replyTo", opts, async () => {
+	const { wf } = await fixture();
+	const r = await run(wf.server, {}, { detach: true });
+	await waitFor(async () => "registered:server" in (r as unknown as { view(): RunView }).view().facts);
+	const id = await r.send("server", "ping");
+	const reply = await r.next({ timeout: "10s" });
+	assert.deepEqual(reply.type === "message" && [reply.outbox, reply.replyTo, reply.body], ["server", id, "pong: ping"]);
+	await r.send("server", "ping2");
+	assert.equal((await r.next({ timeout: "10s" })).type, "message");
+	assert.deepEqual(await r.next({ timeout: "10s" }), { type: "finished", output: { n: 2 } });
 });

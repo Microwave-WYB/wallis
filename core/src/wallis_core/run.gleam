@@ -932,8 +932,9 @@ pub fn sent_id(state: RunState, key: String) -> String {
 }
 
 /// Where the call at this slot is: "running" (its newest attempt is open),
-/// "settled", or "none" (the run has no such call). A settled agent call's
-/// mailbox is closed.
+/// "answered", "decided" (a failure that is its outcome), "errored" (a
+/// failure a resume runs again), or "none". An answered or decided agent
+/// call's mailbox is closed; an errored one's reopens on resume.
 pub fn call_state(state: RunState, slot_text: String) -> String {
   case state {
     NotYetStarted -> "none"
@@ -943,7 +944,9 @@ pub fn call_state(state: RunState, slot_text: String) -> String {
         Ok(#(_, call)) ->
           case call.attempts {
             [Running(..), ..] -> "running"
-            [Settled(_), ..] -> "settled"
+            [Settled(Answered(_)), ..] -> "answered"
+            [Settled(Decided(..)), ..] -> "decided"
+            [Settled(Errored(_)), ..] -> "errored"
             [] -> "none"
           }
       }

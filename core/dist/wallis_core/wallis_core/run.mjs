@@ -1872,8 +1872,9 @@ export function sent_id(state, key) {
 
 /**
  * Where the call at this slot is: "running" (its newest attempt is open),
- * "settled", or "none" (the run has no such call). A settled agent call's
- * mailbox is closed.
+ * "answered", "decided" (a failure that is its outcome), "errored" (a
+ * failure a resume runs again), or "none". An answered or decided agent
+ * call's mailbox is closed; an errored one's reopens on resume.
  */
 export function call_state(state, slot_text) {
   if (state instanceof NotYetStarted) {
@@ -1892,10 +1893,20 @@ export function call_state(state, slot_text) {
       let $1 = call.attempts;
       if ($1 instanceof $Empty) {
         return "none";
-      } else if ($1.head instanceof Running) {
-        return "running";
       } else {
-        return "settled";
+        let $2 = $1.head;
+        if ($2 instanceof Running) {
+          return "running";
+        } else {
+          let $3 = $2.entry;
+          if ($3 instanceof Answered) {
+            return "answered";
+          } else if ($3 instanceof Errored) {
+            return "errored";
+          } else {
+            return "decided";
+          }
+        }
       }
     } else {
       return "none";

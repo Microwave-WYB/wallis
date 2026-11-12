@@ -17,7 +17,7 @@ import { acquireLock, listRuns, lockHolder, newRunId, oldestLiveLock, projectOf,
 import { Store } from "./host/store.ts";
 import { workflowDef } from "./nodes.ts";
 import { importWorkflow, launch, notInRunner, processLog, readStart, type StartRequest, workflowName, writeStart } from "./launch.ts";
-import type { Workflow } from "./runtime.ts";
+import { isClosed, type Workflow } from "./runtime.ts";
 import { type Duration, parseDuration, RunView, type Status, transcriptText } from "./status.ts";
 import { type Address, declaredMedia, guessMedia, HostPath, type MessageId, refsIn, schemaErrors, stripPaths, toJson, walkMarked, withPaths } from "./values.ts";
 
@@ -171,9 +171,10 @@ class RunHandle<O> implements Run<O> {
 		if (errors.length > 0) throw new MessageRejected(to, errors);
 		// A recipient that has ended reads nothing more: a finished run, a settled agent call, a closed actor.
 		const closed = [{ path: "/", message: `${registered.address} is closed: it has ended and reads no more messages` }];
+		// A finished run reads nothing more. A live one: as the run sees it (this epoch). A stopped or failed
+		// run keeps the message for its resume, which reopens what the earlier process closed.
 		if (v.ended?.type === "done") throw new MessageRejected(to, closed, "closed");
-		if (registered.address.startsWith("agent:") && v.core.callState(registered.address.slice(6)) === "settled") throw new MessageRejected(to, closed, "closed");
-		if (v.facts[`closed:${registered.address}`] === true) throw new MessageRejected(to, closed, "closed");
+		if (v.live && isClosed(v.core, registered.address)) throw new MessageRejected(to, closed, "closed");
 		const key = `caller:${randomUUID()}`;
 		appendFileSync(join(this.paths.dir, "inbox.jsonl"), `${JSON.stringify({ key, name, body: stripPaths(json.value), ...(options.replyTo ? { replyTo: options.replyTo } : {}), ...(options.interrupt ? { interrupt: true } : {}) })}\n`);
 		// A live run journals it within moments (its id comes from the journal), or rejects it (the

@@ -15,7 +15,7 @@
 // `outbox:<name>`, the caller `caller`. Each mailbox has a schema; every
 // message is validated against the recipient's before it is journaled.
 
-import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import Type, { type Static, type TSchema } from "typebox";
 import type { AgentHost, AgentRunner } from "./agents.ts";
@@ -242,6 +242,22 @@ type Pending = {
 };
 
 export type Outcome = { readonly type: "done"; readonly output: Json } | { readonly type: "failed"; readonly reason: FailReason };
+
+/**
+ * Whether a recipient has ended, for this process generation (`epoch`, noted at every start and
+ * resume): an agent call that answered or failed decided (an errored one runs again on resume and
+ * reads its mailbox then); an actor or body whose live mailbox closed, or that was noted closed in
+ * this epoch (a resume reopens what an earlier process closed).
+ */
+export function isClosed(core: { callState(slot: string): string; facts(): Record<string, unknown> }, address: string, live?: { readonly closed: boolean }): boolean {
+	if (address.startsWith("agent:")) return ["answered", "decided"].includes(core.callState(address.slice("agent:".length)));
+	if (address.startsWith("actor:") || address.startsWith("wf:")) {
+		if (live) return live.closed;
+		const facts = core.facts();
+		return facts[`closed:${address}`] !== undefined && facts[`closed:${address}`] === (facts.epoch ?? 1);
+	}
+	return false;
+}
 
 /** A NodeFailed's core reason (kept beside it, so a nested workflow fails with its leaf's reason). */
 const CORE_REASON = new WeakMap<object, FailReason>();
@@ -485,19 +501,14 @@ export class RunSession implements AgentHost {
 	 * workflow body that returned (its live mailbox, else the fact noted when it closed).
 	 */
 	closed(address: string): boolean {
-		if (address.startsWith("agent:")) return this.journal.core.callState(address.slice("agent:".length)) === "settled";
-		if (address.startsWith("actor:") || address.startsWith("wf:")) {
-			const live = this.#mailboxes.get(address);
-			if (live) return live.closed;
-			return this.journal.core.facts()[`closed:${address}`] === true;
-		}
-		return false;
+		return isClosed(this.journal.core, address, this.#mailboxes.get(address));
 	}
 
-	/** An actor's or body's mailbox closed: noted, so a caller (another process) knows it too. */
+	/** An actor's or body's mailbox closed: noted with this process's epoch, so a caller (another process) knows it too. */
 	#closedNote(address: string): void {
-		if (this.#ended || this.journal.core.facts()[`closed:${address}`] === true) return;
-		this.step({ type: "noted", key: `closed:${address}`, value: true });
+		const epoch = this.journal.core.facts().epoch ?? 1;
+		if (this.#ended || this.journal.core.facts()[`closed:${address}`] === epoch) return;
+		this.step({ type: "noted", key: `closed:${address}`, value: epoch });
 	}
 
 	/**
@@ -526,35 +537,49 @@ export class RunSession implements AgentHost {
 	/** Delivers what the caller sent (`run.send`): by name, through the run's inbox file. */
 	applyInbox(): void {
 		const file = join(this.paths.dir, "inbox.jsonl");
-		if (!existsSync(file) || this.#ended) return;
-		const size = statSync(file).size;
-		if (size === this.#inboxAt) return;
-		const lines = readFileSync(file, "utf8").split("\n");
-		lines.pop();
-		const facts = this.journal.core.facts();
-		for (const line of lines) {
-			let entry: unknown;
+		if (this.#ended) return;
+		// New complete lines since the last read: parsed once, then kept until they can be delivered.
+		if (existsSync(file) && statSync(file).size > this.#inboxAt) {
+			const fd = openSync(file, "r");
 			try {
-				entry = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (entry === null || typeof entry !== "object") continue;
-			const { key, name, body, replyTo, interrupt } = entry as { key?: unknown; name?: unknown; body?: unknown; replyTo?: unknown; interrupt?: unknown };
-			if (typeof key !== "string" || typeof name !== "string" || this.journal.core.sentId(key) !== "" || this.#rejected.has(key)) continue;
-			const registered = facts[`registered:${name}`] as { address?: string } | undefined;
-			if (!registered?.address || !this.#schemas.has(registered.address)) continue; // not yet: it stays in the inbox
-			const r = this.send(key, "caller", registered.address, body, { replyTo: typeof replyTo === "string" ? replyTo : undefined, interrupt: interrupt === true });
-			if (!r.ok) {
-				// Told to the caller (run.send waits for its message's id or for this).
-				this.#rejected.add(key);
-				appendFileSync(join(this.paths.dir, "inbox.rejected.jsonl"), `${JSON.stringify({ key, reason: r.reason, errors: r.errors })}\n`);
+				const size = fstatSync(fd).size;
+				const buf = Buffer.alloc(size - this.#inboxAt);
+				readSync(fd, buf, 0, buf.length, this.#inboxAt);
+				const text = buf.toString("utf8");
+				const end = text.lastIndexOf("\n") + 1;
+				this.#inboxAt += Buffer.byteLength(text.slice(0, end));
+				for (const line of text.slice(0, end).split("\n")) {
+					if (!line) continue;
+					let entry: unknown;
+					try {
+						entry = JSON.parse(line);
+					} catch {
+						continue;
+					}
+					if (entry === null || typeof entry !== "object") continue;
+					const { key, name, body, replyTo, interrupt } = entry as { key?: unknown; name?: unknown; body?: unknown; replyTo?: unknown; interrupt?: unknown };
+					if (typeof key !== "string" || typeof name !== "string") continue;
+					this.#inbox.push({ key, name, body, replyTo: typeof replyTo === "string" ? replyTo : undefined, interrupt: interrupt === true });
+				}
+			} finally {
+				closeSync(fd);
 			}
 		}
-		this.#inboxAt = size;
+		if (this.#inbox.length === 0) return;
+		const facts = this.journal.core.facts();
+		this.#inbox = this.#inbox.filter((e) => {
+			if (this.journal.core.sentId(e.key) !== "") return false;
+			const registered = facts[`registered:${e.name}`] as { address?: string } | undefined;
+			// Not deliverable yet (the resumed body has not re-created its recipient): kept for later.
+			if (!registered?.address || !this.#schemas.has(registered.address)) return true;
+			const r = this.send(e.key, "caller", registered.address, e.body, { replyTo: e.replyTo, interrupt: e.interrupt });
+			// Told to the caller (run.send waits for its message's id or for this).
+			if (!r.ok) appendFileSync(join(this.paths.dir, "inbox.rejected.jsonl"), `${JSON.stringify({ key: e.key, reason: r.reason, errors: r.errors })}\n`);
+			return false;
+		});
 	}
-	#inboxAt = -1;
-	readonly #rejected = new Set<string>();
+	#inboxAt = 0;
+	#inbox: { key: string; name: string; body: unknown; replyTo: string | undefined; interrupt: boolean }[] = [];
 
 	/** A value as bodies and callers see it: every ref with its host path in the store. */
 	hostView(value: Json): unknown {

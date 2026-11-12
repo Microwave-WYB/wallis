@@ -249,7 +249,10 @@ class AgentCall {
 	#save(progress: boolean): string {
 		const data: Checkpoint = { messages: this.#agent.state.messages, turns: this.#turns, compacted: this.#compacted };
 		const digest = putDialogue(this.#store, JSON.parse(JSON.stringify(data)) as Json, this.#history);
-		if (progress) this.#s.host.step({ type: "agent_progressed", id: this.#s.effect.id, checkpoint: digest });
+		if (progress) {
+			this.#s.host.step({ type: "agent_progressed", id: this.#s.effect.id, checkpoint: digest });
+			crashPoint("agent-progress");
+		}
 		return digest;
 	}
 
@@ -278,6 +281,11 @@ class AgentCall {
 		const saved = effect.checkpoint !== null ? loadCheckpoint(readDialogue(this.#store, effect.checkpoint)) : null;
 		const before = saved ?? loadCheckpoint(this.#history?.state);
 		this.#turns = saved?.turns ?? 0;
+		// The messages this attempt took before a stop: their files are readable again (/in), as they were.
+		if (effect.taken.length > 0) {
+			const recorded = new Map(this.#s.host.journal.core.mailbox(effect.mailbox).map((e) => [e.id, e]));
+			for (const t of effect.taken) for (const id of t.messages) if (recorded.has(id)) this.#refs.push(recorded.get(id)!.body);
+		}
 		this.#compacted = saved?.compacted ?? before?.compacted ?? null;
 		if (def.workspace) {
 			// A workspace's commits must tell opaque dirs from merged ones: refused up front without the tool.
@@ -685,6 +693,7 @@ class AgentCall {
 				description: "Read a file (text, or an image you can look at). Relative paths are in /w.",
 				parameters: Type.Object({ path: Type.String(), offset: Type.Optional(Type.Integer({ minimum: 1 })), limit: Type.Optional(Type.Integer({ minimum: 1 })) }) as never,
 				execute: async (_id, params) => {
+					crashPoint("agent-read");
 					const p = params as { path: string; offset?: number; limit?: number };
 					const data = Buffer.from((await run(["sh", "-c", 'base64 -w0 -- "$1"', "sh", abs(p.path)])).trim(), "base64");
 					const image = /\.(png|jpe?g|gif|webp)$/i.exec(p.path);

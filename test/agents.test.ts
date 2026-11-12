@@ -198,7 +198,7 @@ test("an agent's send to a closed recipient fails with closed; run.send to a set
 		id = ids.find((x) => x.startsWith("lingering")) ?? "";
 	}
 	const r = attach(wf.lingering, id);
-	for (let i = 0; i < 400 && view(root, id).core.callState(view(root, id).calls[0]?.slot ?? "") !== "settled"; i++) await new Promise((d) => setTimeout(d, 25));
+	for (let i = 0; i < 400 && view(root, id).core.callState(view(root, id).calls[0]?.slot ?? "") !== "answered"; i++) await new Promise((d) => setTimeout(d, 25));
 	await assert.rejects(r.send("steer", "too late"), (e: unknown) => e instanceof MessageRejected && e.reason === "closed");
 	await r.send("self", "done");
 	assert.deepEqual((await finished).output, { heard: "nothing" });
@@ -236,4 +236,36 @@ test("a session's later call can rewrite a file an earlier call wrote (read-only
 	]);
 	const r = await run(wf.notes, {});
 	assert.equal(readFileSync(r.output.tree.path + "/notes.txt", "utf8"), "third\n");
+});
+
+test("a resumed agent can read again the files of messages it took before the crash", opts, async () => {
+	const root = project({ "wf.ts": readFileSync(join(here, "fixtures/agents.ts"), "utf8") }, { models: { default: "faux/m" }, executor: join(here, "fixtures/viewer-executor.ts") });
+	const wf = (await import(pathToFileURL(join(root, "wf.ts")).href)) as typeof import("./fixtures/agents.ts");
+	// The run's process dies as the agent starts reading the file that arrived by mail.
+	process.env.WALLIS_CRASH_AT = "agent-read:1";
+	const r = await run(wf.viewing, {}, { detach: true });
+	delete process.env.WALLIS_CRASH_AT;
+	assert.equal((await r.next({ timeout: "20s" })).type, "stopped");
+	assert.ok(view(root, r.id).events.some((e) => e.type === "messages_taken"), "the message was taken before the crash");
+	const resumed = await r.resume({ detach: true });
+	assert.deepEqual(await resumed.next({ timeout: "20s" }), { type: "finished", output: { seen: "frame 2835 rendered" } });
+});
+
+test("a registered agent whose failed attempt will run again still accepts messages (they wait for its resume)", opts, async () => {
+	const { root, wf } = await fixture();
+	faux.setResponses([() => fauxAssistantMessage([fauxText("")], { stopReason: "error", errorMessage: "401 Unauthorized: invalid api key" })]);
+	await assert.rejects(run(wf.steered, {}), (e: unknown) => e instanceof NodeFailed && e.reason.type === "model_failed");
+	const id = (await import("node:fs")).readdirSync(runsDir(root))[0]!;
+	const h = attach(wf.steered, id);
+	await h.send("steer", "now report");
+	faux.setResponses([
+		// Attempt 2 starts from its input; the message enters a later turn.
+		() => say("Nothing to do yet."),
+		(ctx) => {
+			assert.match(text(messages(ctx).at(-1)), /now report/);
+			return submit({ heard: "now report" });
+		},
+	]);
+	await h.resume();
+	assert.deepEqual((await h.done()).output, { heard: "now report" });
 });

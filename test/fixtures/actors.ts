@@ -80,3 +80,53 @@ export const late = workflow({
 		}
 	},
 });
+
+const pause = command({ sandbox: box, input: Type.Object({}), output: Type.Object({}), run: () => ["sh", "-c", 'sleep 0.3; echo "{}"'] });
+
+/** The registered recipient is created after an await: a message sent while stopped waits for it. */
+export const lateRecipient = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ got: Type.String() }),
+	run: async (ctx) => {
+		await ctx.call(pause, {});
+		const a = ctx.spawn(Type.String(), async (_c, mb) => {
+			for await (const m of mb) return m.body;
+			return "closed";
+		});
+		ctx.register("a", a.address);
+		await ctx.call(pause, {});
+		return { got: await a.result };
+	},
+});
+
+/** A body that registers its own mailbox, then fails while a flag file exists. */
+export const approval = workflow({
+	input: Type.Object({ flag: Type.String() }),
+	output: Type.Object({ got: Type.String() }),
+	mailbox: Type.String(),
+	run: async (ctx, { flag }, mailbox) => {
+		ctx.register("answer", ctx.self);
+		if ((await import("node:fs")).existsSync(flag)) throw new Error("not yet");
+		for await (const m of mailbox) return { got: m.body };
+		return { got: "closed" };
+	},
+});
+
+/** A server that answers each caller message by replying to m.from. */
+export const server = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ n: Type.Integer() }),
+	run: async (ctx) => {
+		const s = ctx.spawn(Type.String(), async (c, mb) => {
+			let n = 0;
+			for await (const m of mb) {
+				n++;
+				c.send(m.from, `pong: ${m.body}`, { replyTo: m.id });
+				if (n === 2) break;
+			}
+			return n;
+		});
+		ctx.register("server", s.address);
+		return { n: await s.result };
+	},
+});

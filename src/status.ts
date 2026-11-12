@@ -205,8 +205,22 @@ export class RunView {
 	}
 
 	/** Outbox messages in the order they were sent: `[outbox name, message id, replyTo, body]`. */
+	/**
+	 * Messages to the caller in the order they were sent: an outbox's, and replies sent to `caller`
+	 * (an actor answering `m.from` of a message the caller sent), which carry the registered name
+	 * the caller sent to.
+	 */
 	outboxMessages(): { outbox: string; id: string; replyTo: string | null; body: Json }[] {
-		return this.events.flatMap((e) => (e.type === "sent" && e.to.startsWith("outbox:") ? [{ outbox: e.to.slice("outbox:".length), id: this.core.sentId(e.key), replyTo: e.reply_to, body: e.body }] : []));
+		const facts = this.facts;
+		const names = new Map(Object.entries(facts).flatMap(([k, v]) => (k.startsWith("registered:") && v !== null && typeof v === "object" ? [[(v as { address: string }).address, k.slice("registered:".length)]] : [])));
+		const sentTo = new Map<string, string>();
+		for (const e of this.events) if (e.type === "sent" && e.from === "caller") sentTo.set(this.core.sentId(e.key), e.to);
+		return this.events.flatMap((e) => {
+			if (e.type !== "sent") return [];
+			if (e.to.startsWith("outbox:")) return [{ outbox: e.to.slice("outbox:".length), id: this.core.sentId(e.key), replyTo: e.reply_to, body: e.body }];
+			if (e.to === "caller") return [{ outbox: names.get(sentTo.get(e.reply_to ?? "") ?? "") ?? "caller", id: this.core.sentId(e.key), replyTo: e.reply_to, body: e.body }];
+			return [];
+		});
 	}
 
 	/** The call tree: every call under the call it was made in, with its attempts. */

@@ -95,10 +95,14 @@ export async function launch(options: { root: string; paths: RunPaths; def: Work
 		session.step({ type: "noted", key: "workflow", value: { label: def.label, file: def.site.file, name: def.site.name, digest: def.digest } });
 		session.step({ type: "noted", key: "created", value: new Date().toISOString() });
 		session.step({ type: "noted", key: "root", value: root });
+		// The process generation: what was closed in an earlier one is open again after a resume.
+		session.step({ type: "noted", key: "epoch", value: 1 });
 	} else {
 		const snap = journal.core.snapshot();
 		if ("input" in snap) input = snap.input;
 		session.step({ type: "resumed", digest: def.digest, semantics: SEMANTICS });
+		const epoch = facts().epoch;
+		session.step({ type: "noted", key: "epoch", value: (typeof epoch === "number" ? epoch : 1) + 1 });
 		for (const call of options.resume?.retry ?? []) session.step({ type: "retried", call, turns: options.resume?.turns ?? 0 });
 		if (facts().ended_at !== undefined && !session.ended) session.step({ type: "noted", key: "ended_at", value: null });
 	}

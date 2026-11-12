@@ -1,7 +1,7 @@
 // Agents on the faux provider: one-shot and session calls, the send tool,
 // mailbox turns, the turn budget.
 
-import { Address, agent, Tree, Type, workflow } from "wallis";
+import { Address, agent, Artifact, command, sandbox, Tree, Type, workflow } from "wallis";
 
 const answerer = agent({
 	model: "default",
@@ -139,5 +139,28 @@ export const notes = workflow({
 		const [, s1] = await ctx.call(ctx.session(noter), { n: 1 });
 		const [out, s2] = await ctx.call(s1, { n: 2 });
 		return { text: out.text, tree: ctx.files(s2) };
+	},
+});
+
+const draw = command({ sandbox: sandbox({ requires: ["sh"] }), input: Type.Object({ frame: Type.String() }), output: Type.Object({ img: Artifact("text/plain") }), run: (i) => ["sh", "-c", 'echo "frame $1 rendered" > img.txt; echo "{}"', "sh", i.frame], parse: (r) => ({ img: r.file("img.txt") }) });
+const viewer = agent({
+	model: "default",
+	prompt: "Ask for the image, then read it.",
+	input: Type.Object({ renderer: Address(Job) }),
+	output: Type.Object({ seen: Type.String() }),
+	mailbox: Type.Object({ img: Artifact("text/plain") }),
+	workspace: { access: "read" },
+	turns: 10,
+});
+
+/** An agent that reads a file that arrived by mail. */
+export const viewing = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ seen: Type.String() }),
+	run: async (ctx) => {
+		const renderer = ctx.spawn(Job, async (c, mailbox) => {
+			for await (const m of mailbox) c.send(m.from, await c.call(draw, { frame: m.body.frame }), { replyTo: m.id });
+		});
+		return ctx.call(viewer, { renderer: renderer.address });
 	},
 });
