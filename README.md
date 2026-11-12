@@ -69,9 +69,16 @@ Every message is checked against its recipient's schema.
 ## Install
 
 ```sh
-npm install github:Microwave-WYB/wallis   # the package (builds dist/ on install)
-npx skills add Microwave-WYB/wallis        # the agent skill, for Claude Code, pi and others
+npm install github:Microwave-WYB/wallis#main   # the package
+npx skills add Microwave-WYB/wallis             # the agent skill, for Claude Code, pi and others
 ```
+
+Installing from git runs the package's `prepare` script, which builds
+`dist/` with TypeScript (Node does not strip types inside `node_modules`).
+So scripts must not be disabled: with `--ignore-scripts` (or
+`ignore-scripts=true` in `.npmrc`) the package installs without `dist/` and
+cannot be imported. The Gleam core is committed as JavaScript
+(`core/dist/`), so the install needs no Gleam.
 
 Model aliases come from `<project>/.wallis/config.json`
 (`{ "models": { "default": "provider/model" } }`), served by pi-ai's

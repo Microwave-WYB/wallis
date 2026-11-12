@@ -76,7 +76,9 @@ Rules that matter:
   workflow file, `"name:/target"` named volumes that persist), `environment`,
   `devices`, `network: "none" | "host"`. Nothing else is visible: not the
   workflow dir, not `$HOME`. A call sees `/in` (its inputs, read-only), `/w`
-  (its scratch dir), its volumes and `/tmp`.
+  (its scratch dir, also `$HOME`), its volumes and an empty `/tmp` (new for
+  every process: in an agent, for every tool call). A script's `#!`
+  interpreter must be in the host base (`/usr`, `/bin`, …) or in `requires`.
 - **Agents** are called one-shot (`ctx.call(agent, input)` → output) or
   through sessions to continue a dialogue (`ctx.call(ctx.session(agent), input)`
   → `[output, next]`). File tools come from `workspace.access`
@@ -191,9 +193,13 @@ await r.resume({ detach: true });
   whose outcome is unknown. It re-runs only when named:
   `resume({ retry: [failed[0].id], turns: 20 })` continues that agent's own
   session with more turns (or, for `output_invalid`, with the errors).
-- `failed[].tail` holds the last lines of stderr or of the transcript;
-  `r.transcript(callId)` the whole dialogue. Finished calls are never
-  retried: to redo one, start a new run.
+- `failed` lists the failure that ended the run first, then the others by
+  time. `failed[].tail` holds the last lines of stderr or of the transcript;
+  `r.transcript(callId)` the dialogue of the call's last attempt. Finished
+  calls are never retried: to redo one, start a new run.
+- Editing a nested workflow's body re-runs everything inside it on resume
+  (its calls are keyed under it); editing the top-level body re-runs only
+  what it now calls differently.
 
 ## Pitfalls
 

@@ -203,8 +203,13 @@ await run(deliver, { negs, look: L2, album: "20261107_autocord_portra160" }); //
   - The file tools (pi-compatible `read`, `write`, `edit`, `ls`, `bash`) come
     from the access level, never from `tools`.
   - `ctx.files(s)` returns the session's `/w` as a Tree.
-- **Tools.** `tools` holds custom tools and MCP tools only. Tools annotated as
-  writing outside produce a warning in `describe()`, nothing more.
+- **Tools.** `tools` holds custom tools and MCP tools only. A tool's
+  annotations decide only whether it may run again when a stop cut it off
+  (§12.3); wallis shows no warning for tools that write outside.
+  - Given a whole MCP server (`server`), an agent sees only that server's
+    tools annotated `readOnlyHint: true`. A tool that writes must be named
+    (`server.tool`), so giving an agent a server never hands it a write by
+    accident.
 - **Turn budget.** `turns: N` (default 30) caps the model turns of one call.
   This is the only budget in the framework. Reaching it fails the call with
   `turn_limit_reached`; the body may catch it and continue from the returned
@@ -230,8 +235,9 @@ The body is plain TypeScript. Its wallis operations are `ctx.call`,
   with its own branch and a mailbox. It returns `{ address, result }`.
   `ctx.map(items, f)` is sugar for one spawn per item. To limit concurrency,
   use plain code: a loop, or batches.
-- **`ctx.loop(init, (ctx, state) => next(s) | done(o))`** is a typed fold.
-  State and output types are separate, and each iteration is a branch.
+- **`ctx.loop(init, (ctx, state) => ({ next: s }) | ({ done: o }))`** is a
+  typed fold: each step returns the literal `{ next }` or `{ done }`. State
+  and output types are separate, and each iteration is a branch.
 - **Errors.** A failed call throws one `NodeFailed` whose `reason` is a typed
   union.
 
@@ -251,11 +257,18 @@ The body is plain TypeScript. Its wallis operations are `ctx.call`,
     for agents. This is where environments live (e.g. `"uv-env:/opt/venv"`,
     prepared by a setup command), because environments embed absolute paths
     and must not be moved.
-- **`environment`**, **`devices`**, **`network: "none" | "host"`** (default
-  `"none"`), and **`image`** (reserved for a future Docker backend).
-  Network is all or nothing: `"none"` is bwrap's `--unshare-all` (loopback
-  only), `"host"` adds `--share-net`. Per-host allow lists are out of scope.
-  Commands and toolsets that declare `"host"` are listed in `describe()`.
+- **`environment`**, **`devices`** and **`network: "none" | "host"`**
+  (default `"none"`). Network is all or nothing: `"none"` is bwrap's
+  `--unshare-all` (loopback only), `"host"` adds `--share-net`. Per-host allow
+  lists are out of scope. A network is visible in the definition (`network:
+  "host"`) and in an agent's `bash` tool description, nowhere implicit.
+  - Named volumes belong to the project: they live in
+    `<project>/.wallis/volumes/<name>`, so two projects never share one by
+    name. Commands whose sandboxes mount the same named volume run one at
+    a time (a lock per volume, held while the command runs), so concurrent
+    setups of one environment never interleave.
+  - `environment` may not set `HOME` (it is `/w`); a `PATH` there is put
+    before the sandbox's own PATH, never replacing it.
 
 ## 5. Semantics
 
@@ -331,7 +344,10 @@ A run executes one workflow on one input.
 Identity is a digest or a structural position, never a name. Names are
 labels:
 
-- a tool is (bundle digest, export key), or (MCP server, tool);
+- a custom tool is (the digest of its module's source text, its sandbox and
+  network, export key), or (MCP server, command, args, tool); the bundle
+  wallis builds from the module is recorded in the run, so a resumed run
+  serves the same bundle;
 - a node is its definition digest;
 - a workflow is its module digest.
 
@@ -343,6 +359,15 @@ module) nor the files a sandbox binds. So after editing a helper, the
 journal still matches the calls made before the edit. To redo them, either
 retry the affected calls (`resume({ retry: [id] })` for a failed one) or
 start a new run: resume reuses, by design, what the record says was done.
+
+**A nested workflow's body is part of its digest.** Editing the body of a
+workflow that is called with `ctx.call` changes that call's identity, and
+every call inside it is keyed under that call (§5.3). So after the edit
+everything inside the nested workflow runs again on resume, even the calls
+whose nodes did not change. The top-level body is different: its calls are
+keyed by the run, so editing it re-runs only what it now calls differently.
+To keep finished work across an edit, put the edit in the top-level body or
+a node, not in a nested workflow's body.
 
 ## 6. Actors and interaction
 
@@ -384,9 +409,11 @@ value.
   reports is the common case.
 - **Resume.** The order in which messages are delivered to each mailbox is
   journaled. On resume the runtime delivers in the recorded order, then
-  continues live. Each send is journaled once, by a key (the sender's scope
-  and occurrence, or the caller's own id), so a body that runs again after a
-  resume re-sends nothing.
+  continues live. Each send is journaled once, by a key, so a body that runs
+  again after a resume re-sends nothing: a body's key is its scope, a hash of
+  (recipient, content, `replyTo`) and the count of that hash in the scope; a
+  caller's is its own id. A body whose message content differs on resume
+  (it includes a time, say) sends a new message.
 - **Shutdown.** When a body returns, the mailboxes of the actors it spawned
   close: their `for await` loops end and the actors finish. A body that
   needs an actor's result awaits `result` before returning.
@@ -416,7 +443,9 @@ value.
   - Several messages that arrived during one turn are delivered together.
   - A message sent with `{ interrupt: true }` aborts the current turn.
   - An agent with a mailbox and nothing to do waits for the next message.
-    Its caller ends the wait by sending a message, or by closing the call.
+    A message ends the wait (from the body, an actor or the caller; "finish
+    now", say). A stop or a run failure cancels it. There is no operation
+    that closes a running call from outside.
   - Each message is journaled with the turn it was delivered after.
 - **`Address(T)`** as an input field gives the agent a `send` tool for that
   address. Sending never blocks, so the agent may send a question and keep
@@ -432,8 +461,9 @@ value.
   resume.
 - **`ctx.outbox(name, T)`** returns an address whose messages go to the
   caller. They persist in the run directory and never block. The caller
-  reads them with `attach(id).next({ timeout })`, which returns
-  `message | finished | timeout`.
+  reads them with `attach(id).next({ timeout })`, which returns `message`
+  (with `replyTo` for a reply to one of the caller's messages), `finished`,
+  `failed`, `stopped` or `timeout`.
 - **Envelopes.** A mailbox yields `{ id, from, replyTo?, body }`. `from` is
   the sender's own address, as in BEAM where a request carries `self()`, so
   a server replies with `ctx.send(m.from, result, { replyTo: m.id })` and
@@ -494,16 +524,23 @@ import { run, attach, list, prune } from "wallis";
 
 const r = await run(workflow, input, { detach?: true, onExit?: "<shell command>" });
 r.id;                                   // run id: <workflow>-<time>-<rand>
-r.output;                               // once finished
-await r.status();                       // completed and running calls, elapsed time
-await r.tree();                         // call tree, intermediate outputs, loop iterations
-await r.transcript("uploader");         // an agent call's dialogue
-await r.next({ timeout: "110m" });      // message | finished | timeout
+await r.status();                       // completed, running and failed calls, elapsed time
+await r.tree();                         // the call tree: each call's id, label, kind, attempts, inner calls
+await r.transcript(callId);             // an agent call's dialogue (its last attempt)
+await r.next({ timeout: "110m" });      // message | finished | failed | stopped | timeout
 await r.send("guidance", "rename the album", { interrupt: true });
 await r.stop();  await r.resume({ detach: true });
-await r.exportOutput("~/Pictures/150ND610-work/final-v2");
+const f = await attach(workflow, id).done();   // Finished: f.output, f.exportOutput(dir)
+await f.exportOutput("~/Pictures/150ND610-work/final-v2");
 attach(id);  await list("./negative/workflow.ts");  await prune();
 ```
+
+- **Output.** `output` and `exportOutput` are on `Finished`, which a
+  foreground `run` returns and `done()` resolves to; a detached `Run` has
+  neither until it is done. `exportOutput` copies every Artifact and Tree of
+  the output into the dir (`~` is the home dir) and fails if a copy fails.
+- **Who may attach.** `attach(wf, id)` checks that the run is a run of `wf`
+  (its file and export), and throws otherwise.
 
 - **Detaching.** `detach` starts the run as a detached Node process and
   returns at once. `onExit` runs when the run process exits normally.
@@ -512,8 +549,14 @@ attach(id);  await list("./negative/workflow.ts");  await prune();
   waits again.
 - **Where runs live.** A run belongs to the project of its workflow file (the
   nearest ancestor with `.wallis/` or `package.json`), not to the cwd.
-- **Locking.** A run directory has a lock file, so two processes never write
-  the same run.
+- **Locking.** A run directory has a lock file naming its holder's pid and
+  start time, so two processes never write the same run, and a reused pid is
+  never taken for the holder. A dead holder's lock is taken over atomically;
+  `stop` signals only the process the lock names.
+- **Epochs.** Each start or resume is a new epoch (a fact in the log).
+  Mailboxes that closed in an earlier epoch (a failed actor, a body that
+  ended) are open again in the resumed one, so a resumed run is reachable
+  as before.
 - **Recovery is in place.** A failure names its calls: `next()` returns
   `failed` with each `FailedCall` (id, label as const name plus definition
   site, the enclosing calls, the attempt, the reason, a stderr or transcript
@@ -602,7 +645,7 @@ Acceptance numbers:
 
 1. **Budgets.** Only the agent turn budget (§4.2). No cost or time budgets.
 2. **Commands with network.** Off by default; on when declared
-   (`network: "host"`), shown in `describe()` (§4.4).
+   (`network: "host"`), visible in the definition (§4.4).
 3. **The core stays in Gleam.** With caching, interventions and ownership
    gone, it holds the journal, attempts, sessions, turn budgets and mailbox
    delivery order: a pure state machine, tested without I/O, where
@@ -633,7 +676,8 @@ examples left room. None changes the authoring API.
 3. **Decided failures** also include a body tool call that was in flight
    when the run stopped and is not `replay: "safe"`. Its outcome is unknown,
    so it fails as `tool_failed` with `recovery: "retry"` until it is named
-   in `resume({ retry })`. The same rule applies to `output_invalid`: an
+   in `resume({ retry })`; then it runs again (once: the retry's request is
+   journaled when it is issued, so a further stop does not issue it twice). The same rule applies to `output_invalid`: an
    agent gets three submissions, then the call fails decided.
 4. **Agents.**
    - There is one `send` tool. Its `to` names the `Address` input field, and
@@ -652,9 +696,18 @@ examples left room. None changes the authoring API.
    - A tool call that a crash cut off returns an error to the model ("it may
      or may not have taken effect") when the call resumes from its
      checkpoint; a cut-off `send` returns its journaled result instead.
-   - Closed actors and bodies are noted (`closed:<address>`), so a caller in
-     another process rejects sends to them too; agent calls are closed when
-     their journal entry settles.
+   - Closed actors and bodies are noted (`closed:<address>`, with the epoch
+     they closed in), so a caller in another process rejects sends to them
+     too, until a resume opens a new epoch. An agent call is closed when its
+     journal entry settles with an answer or a decided failure; one whose
+     failed attempt will run again on resume still takes messages.
+   - The `bash` tool is killed after `workspace.bashTimeout` (default
+     `"10m"`), and says so; its description states the network.
+   - A writable workspace (`write`, `exec`) may write files that earlier
+     layers hold read-only (store files are a-w): the tool processes get
+     `CAP_DAC_OVERRIDE` inside their own user namespace, with the user's
+     uid, so overlayfs copies the file up. Nothing outside the sandbox is
+     affected.
 5. **Paths in values.** The journal keeps refs without `path`. A body or a
    caller sees the blob's path in the store, or a Tree's top layer dir.
    `ctx.files(s)` squashes a session's layers into one, so that path is the
@@ -663,7 +716,8 @@ examples left room. None changes the authoring API.
    mise, asdf, pyenv), because a shim needs its manager's config. `node`
    falls back to the Node that runs wallis.
 7. **Detached runs** are `node runner.ts <run dir>`, reading
-   `start.json`. The caller writes the child's pid into the lock at once,
+   `start.json` (with its `onExit`, also on a detached resume). The caller
+   writes the child's pid and start time into the lock at once,
    so the run is never seen as stopped while it starts. A handle from
    `resume({ detach: true })` treats the run as running until the new
    process logs.
