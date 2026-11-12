@@ -126,7 +126,7 @@ class RunHandle<O> implements Run<O> {
 	#finished(v: RunView, value: Json): Finished<O> {
 		const output = hostView(this.store, value) as O;
 		const store = this.store;
-		return Object.assign(Object.create(this) as RunHandle<O>, {
+		return Object.assign(new RunHandle<O>(this.root, this.paths), {
 			output,
 			async exportOutput(hostDir: string): Promise<void> {
 				exportRefs(store, value, hostDir);

@@ -379,15 +379,18 @@ class AgentCall {
 	async #idle(): Promise<void> {
 		const mailbox = this.#s.mailbox;
 		if (mailbox === null) return this.#agent.prompt(this.#user("You ended your turn without a result. Call submit_result with your result."));
-		const waiting: CoreEnvelope[] = [];
-		if (mailbox.pending === 0) {
-			const first = await mailbox.next();
-			if (first === null) return this.#agent.prompt(this.#user("Your mailbox is closed: no more messages will arrive. Call submit_result with your result now."));
-			waiting.push(first);
+		// Wait for a message the dialogue does not hold yet: a resumed call's mailbox replays the
+		// recorded ones, and those it already took are skipped.
+		for (;;) {
+			const waiting: CoreEnvelope[] = [];
+			if (mailbox.pending === 0) {
+				const first = await mailbox.next();
+				if (first === null) return this.#agent.prompt(this.#user("Your mailbox is closed: no more messages will arrive. Call submit_result with your result now."));
+				waiting.push(first);
+			}
+			const batch = this.#take([...waiting, ...mailbox.drain()]);
+			if (batch !== null) return this.#agent.prompt(batch);
 		}
-		const batch = this.#take([...waiting, ...mailbox.drain()]);
-		if (batch !== null) return this.#agent.prompt(batch);
-		return this.#agent.continue();
 	}
 
 	/** Takes waiting messages into the next turn (a steering message while a turn runs). */
