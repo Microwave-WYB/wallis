@@ -28,6 +28,7 @@
   },
   "include": [
     "film",
-    "chat"
+    "chat",
+    "siderius"
   ]
 }

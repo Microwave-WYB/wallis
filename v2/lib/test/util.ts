@@ -39,7 +39,9 @@ export function project(files: Record<string, string>, config?: object): string 
 	write(join(root, "package.json"), '{ "type": "module" }\n');
 	for (const [name, text] of Object.entries(files)) {
 		mkdir(dirOf(join(root, name)), { recursive: true });
-		write(join(root, name), text.replaceAll('from "wallis/testing"', `from ${JSON.stringify(TESTING)}`).replaceAll('from "wallis"', `from ${JSON.stringify(INDEX)}`));
+		// A toolset module keeps its bare "wallis" import: the bundler gives it the schema builder.
+		const toolset = /(^|\/)tools\//.test(name);
+		write(join(root, name), toolset ? text : text.replaceAll('from "wallis/testing"', `from ${JSON.stringify(TESTING)}`).replaceAll('from "wallis"', `from ${JSON.stringify(INDEX)}`));
 	}
 	if (config) {
 		mkdir(join(root, ".wallis"), { recursive: true });
