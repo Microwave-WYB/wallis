@@ -24,7 +24,7 @@ import { type CallId, type CallRef, type FailureReason, MessageRejected, NodeFai
 import type { Effect, Envelope as CoreEnvelope, Event, FailReason, Json, Request } from "./host/core.ts";
 import { slotText } from "./host/core.ts";
 import type { Journal } from "./host/journal.ts";
-import type { RunPaths } from "./host/runs.ts";
+import { callDir, type RunPaths } from "./host/runs.ts";
 import { type SandboxPlan } from "./host/sandbox.ts";
 import { squash } from "./host/layers.ts";
 import type { Store } from "./host/store.ts";
@@ -371,7 +371,7 @@ export class RunSession implements AgentHost {
 		const p = this.#pending.get(id);
 		if (!p?.command) return;
 		const abort = this.#signal();
-		void runCommand({ store: this.store, work: join(this.paths.work, `${p.slot.slice(0, 16)}-${attempt}`), def: p.command, input: p.input, plan: () => this.plans.plan(p.command!.sandbox), signal: abort.signal })
+		void runCommand({ store: this.store, work: join(this.paths.work, callDir(p.slot, attempt)), def: p.command, input: p.input, plan: () => this.plans.plan(p.command!.sandbox), signal: abort.signal })
 			.then((r) => this.step(r.type === "returned" ? { type: "command_returned", id, output: r.output } : { type: "command_failed", id, failure: r.failure }))
 			.catch((error) => this.#crash(error))
 			.finally(() => this.#aborts.delete(abort));

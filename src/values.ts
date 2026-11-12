@@ -237,7 +237,8 @@ export function walkMarked(schema: unknown, value: unknown, at: (mark: string, n
 		if (schema.items !== undefined) return value.map((v, i) => walkMarked(schema.items, v, at, `${path}/${i}`));
 		return value;
 	}
-	if (isObj(value)) {
+	// Plain objects only: a class instance (a command's `r.file` draft) is a leaf.
+	if (isObj(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value))) {
 		const props = isObj(schema.properties) ? schema.properties : {};
 		const pattern = isObj(schema.patternProperties) ? Object.values(schema.patternProperties)[0] : undefined;
 		const extra = isObj(schema.additionalProperties) ? schema.additionalProperties : pattern;

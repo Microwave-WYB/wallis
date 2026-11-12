@@ -4,7 +4,7 @@
 // run's log names.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { putDialogue } from "../src/host/dialogues.ts";
@@ -134,4 +134,17 @@ test("a Tree is one digest naming its layers; prune keeps the layers a kept Tree
 	writeFileSync(log, "");
 	store.prune([log], null);
 	assert.ok(!store.hasLayer(layers[0]!) && !store.hasBlob(tree));
+});
+
+test("prune removes layers that hold read-only dirs", () => {
+	const { root, store } = project();
+	const dir = join(root, "ro");
+	mkdirSync(join(dir, "pkg"), { recursive: true });
+	writeFileSync(join(dir, "pkg", "f"), "f");
+	chmodSync(join(dir, "pkg"), 0o555);
+	const [layer] = store.ingestTree(dir, { move: true });
+	const log = join(root, "log.jsonl");
+	writeFileSync(log, "");
+	assert.equal(store.prune([log], null).layers, 1);
+	assert.ok(!store.hasLayer(layer!));
 });

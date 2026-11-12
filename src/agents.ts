@@ -40,8 +40,8 @@ import { putDialogue, readDialogue } from "./host/dialogues.ts";
 import { crashPoint } from "./host/faults.ts";
 import { splitImages } from "./host/images.ts";
 import type { Journal } from "./host/journal.ts";
-import { commitLayer, layersAfter, prepareWork, removeWork, type Work } from "./host/layers.ts";
-import type { RunPaths } from "./host/runs.ts";
+import { commitLayer, layersAfter, prepareWork, removeWork, type Work, xattrToolsMissing } from "./host/layers.ts";
+import { callDir, type RunPaths } from "./host/runs.ts";
 import { head, runSpawn, type SandboxPlan, sandboxed } from "./host/sandbox.ts";
 import type { Store } from "./host/store.ts";
 import type { AgentDef } from "./nodes.ts";
@@ -220,7 +220,7 @@ class AgentCall {
 		this.#o = options;
 		this.#store = spec.host.store;
 		this.#limit = spec.turns;
-		this.#root = join(spec.host.paths.work, `agent-${spec.slot.slice(0, 16)}`);
+		this.#root = join(spec.host.paths.work, `agent-${callDir(spec.slot, spec.effect.attempt)}`);
 		this.#refs.push(spec.input);
 	}
 
@@ -280,6 +280,9 @@ class AgentCall {
 		this.#turns = saved?.turns ?? 0;
 		this.#compacted = saved?.compacted ?? before?.compacted ?? null;
 		if (def.workspace) {
+			// A workspace's commits must tell opaque dirs from merged ones: refused up front without the tool.
+			const missing = xattrToolsMissing();
+			if (missing !== null) return this.#fail({ type: "gave_up", error: `${missing} is not installed (the attr package): an agent workspace needs it; install attr` }, false);
 			const work = prepareWork(this.#store.dir, this.#root, effect.layers, effect.attempt);
 			if ("missing" in work) return this.#fail({ type: "gave_up", error: `layer ${work.missing} of the session's workspace is not in the store` }, false);
 			this.#work = work;

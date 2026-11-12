@@ -4,10 +4,10 @@
 // committed changes.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { commitLayer, layerDir, layersAfter, MAX_DEPTH, prepareWork, readManifest, squash } from "../src/host/layers.ts";
+import { commitLayer, layerDir, layersAfter, MAX_DEPTH, prepareWork, readManifest, removeWork, squash, xattrToolsMissing } from "../src/host/layers.ts";
 import { tmp } from "./util.ts";
 
 function layerOf(store: string, build: (upper: string) => void): string {
@@ -83,4 +83,39 @@ test("a commit marker restores only its own attempt, from the layer, replacing a
 	if ("missing" in mine) throw new Error("no work");
 	assert.deepEqual(readdirSync(mine.upper), ["done.txt"]);
 	assert.equal(readFileSync(join(mine.upper, "done.txt"), "utf8"), "done");
+});
+
+/** A layer holding a read-only tree (a Go module cache: 0444 files in 0555 dirs). */
+function readOnlyLayer(store: string, name: string): string {
+	return layerOf(store, (u) => {
+		mkdirSync(join(u, "pkg", "mod"), { recursive: true });
+		writeFileSync(join(u, "pkg", "mod", `${name}.go`), name);
+		chmodSync(join(u, "pkg", "mod", `${name}.go`), 0o444);
+		chmodSync(join(u, "pkg", "mod"), 0o555);
+	});
+}
+
+test("read-only dirs in a layer: a duplicate commit, a squash and a removal all work", () => {
+	const store = tmp();
+	const a = readOnlyLayer(store, "a");
+	// The same content again: the second upper dir is dropped (it holds a 0555 dir).
+	assert.equal(readOnlyLayer(store, "a"), a);
+	const b = layerOf(store, (u) => writeFileSync(join(u, "b"), "b"));
+	const squashed = squash(store, [a, b]);
+	assert.equal(statSync(join(layerDir(store, squashed), "pkg", "mod")).mode & 0o777, 0o555);
+	assert.equal(readFileSync(join(layerDir(store, squashed), "pkg", "mod", "a.go"), "utf8"), "a");
+	removeWork(layerDir(store, squashed));
+	assert.ok(!existsSync(layerDir(store, squashed)));
+});
+
+test("without getfattr an overlay layer's opaque dirs cannot be told: a clear error, never a silent merge", () => {
+	const store = tmp();
+	const path = process.env.PATH;
+	process.env.PATH = "/nonexistent";
+	try {
+		assert.equal(xattrToolsMissing(), "getfattr");
+		assert.throws(() => layerOf(store, (u) => mkdirSync(join(u, "d"))), /getfattr.*attr/);
+	} finally {
+		process.env.PATH = path;
+	}
 });

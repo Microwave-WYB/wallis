@@ -6,7 +6,7 @@
 // moving them into the store: nothing is copied, and the scratch dir is
 // discarded (docs/v2.md §8: artifacts only).
 
-import { lstatSync, mkdirSync, rmSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { CommandFailure, Json } from "./host/core.ts";
 import { removeWork } from "./host/layers.ts";
@@ -50,6 +50,7 @@ class Draft {
 export type CommandOutcome = { type: "returned"; output: Json } | { type: "failed"; failure: CommandFailure };
 
 class Missing extends Error {}
+class Leaves extends Error {}
 
 export async function runCommand(call: { store: Store; work: string; def: CommandDef; input: Json; plan: () => SandboxPlan; signal: AbortSignal }): Promise<CommandOutcome> {
 	const { store, def } = call;
@@ -91,6 +92,7 @@ export async function runCommand(call: { store: Store; work: string; def: Comman
 			output = resolveDrafts(store, scratch, def.output, parsed);
 		} catch (error) {
 			if (error instanceof Missing) return { type: "failed", failure: { type: "missing_file", name: error.message } };
+			if (error instanceof Leaves) return { type: "failed", failure: { type: "output_mismatch", errors: [error.message] } };
 			throw error;
 		}
 		const json = toJson(output);
@@ -100,28 +102,39 @@ export async function runCommand(call: { store: Store; work: string; def: Comman
 		if (errors.length > 0) return { type: "failed", failure: { type: "output_mismatch", errors: errorText(errors) } };
 		return { type: "returned", output: value };
 	} finally {
-		rmSync(call.work, { recursive: true, force: true });
+		removeWork(call.work);
 	}
 }
 
-/** `r.file` / `r.dir` drafts, moved into the store: media from the output schema where it declares one. */
+/**
+ * `r.file` / `r.dir` drafts, into the store: media from the output schema where it declares one.
+ * The whole path is resolved inside the scratch dir: anything that leads out of it (a symlink to
+ * a host path) is refused, never read. A regular file the command owns, reached without a
+ * symlink, is moved (no copy); anything else (a file reached through a symlink inside /w, a hard
+ * link) is copied, so nothing outside the call's own files is ever moved.
+ */
 function resolveDrafts(store: Store, scratch: string, schema: unknown, value: unknown): unknown {
+	const realScratch = realpathSync(scratch);
 	const ingest = (d: Draft, media: string | undefined) => {
 		const path = resolve(scratch, d.name);
 		const rel = relative(scratch, path);
-		if (rel === "" || rel.startsWith("..") || rel.startsWith(sep)) throw new Missing(`${d.name} (outside the scratch dir)`);
-		let st;
+		if (rel === "" || rel.startsWith("..") || rel.startsWith(sep)) throw new Leaves(`${d.name} is not a path inside the command's scratch dir`);
+		let real: string;
 		try {
-			st = lstatSync(path);
+			real = realpathSync(path);
 		} catch {
 			throw new Missing(d.name);
 		}
+		if (real !== realScratch && !real.startsWith(`${realScratch}${sep}`)) throw new Leaves(`${d.name} leads to ${real}, which leaves the command's scratch dir: a result must be a file the command wrote in /w`);
+		const direct = real === resolve(realScratch, rel);
+		const st = lstatSync(real);
 		if (d.kind === "file") {
 			if (!st.isFile()) throw new Missing(`${d.name} (not a regular file)`);
-			return { kind: "artifact", digest: store.ingestFile(path, { move: true }), name: basename(d.name), media: media ?? guessMedia(d.name) };
+			const owned = direct && st.nlink === 1 && st.uid === process.getuid?.();
+			return { kind: "artifact", digest: store.ingestFile(real, { move: owned }), name: basename(d.name), media: media ?? guessMedia(d.name) };
 		}
 		if (!st.isDirectory()) throw new Missing(`${d.name} (not a directory)`);
-		return { kind: "tree", digest: store.snapshot(path, { move: true }) };
+		return { kind: "tree", digest: store.snapshot(real, { move: direct }) };
 	};
 	const marked = walkMarked(schema, value, (mark, node, v) => (v instanceof Draft ? ingest(v, mark === "artifact" ? declaredMedia(node) : undefined) : v));
 	const rest = (v: unknown): unknown => {

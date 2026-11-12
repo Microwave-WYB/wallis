@@ -249,11 +249,12 @@ export function runSpawn(sp: Spawn, stdin: string, options: { readonly signal?: 
 	const started = Date.now();
 	return new Promise((done, fail) => {
 		const child = spawn(sp.command, sp.args, { cwd: existsSync(sp.cwd) ? sp.cwd : undefined, stdio: ["pipe", "pipe", "pipe"], env: {} });
-		let stdout = "";
-		let stderr = "";
+		// Bytes, decoded once at the end: a multibyte character split across chunks stays whole.
+		const out: Buffer[] = [];
+		const err: Buffer[] = [];
 		let aborted = false;
-		child.stdout.on("data", (d) => (stdout += d));
-		child.stderr.on("data", (d) => (stderr += d));
+		child.stdout.on("data", (d: Buffer) => out.push(d));
+		child.stderr.on("data", (d: Buffer) => err.push(d));
 		const onAbort = () => ((aborted = true), child.kill("SIGKILL"));
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		child.on("error", fail);
@@ -261,7 +262,7 @@ export function runSpawn(sp: Spawn, stdin: string, options: { readonly signal?: 
 			options.signal?.removeEventListener("abort", onAbort);
 			// bwrap as pid 1's parent reports a killed child as 128 + n.
 			const killed = signal ?? (code !== null && code > 128 && code < 160 ? signalName(code - 128) : null);
-			done({ exit: code ?? 128, signal: killed, stdout, stderr, ms: Date.now() - started, aborted });
+			done({ exit: code ?? 128, signal: killed, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), ms: Date.now() - started, aborted });
 		});
 		child.stdin.on("error", () => {});
 		child.stdin.end(stdin);

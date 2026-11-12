@@ -28,6 +28,11 @@ export interface RunPaths {
 	readonly work: string;
 }
 
+/** A call's own dir under the run's `work/`: its whole slot (node, input, scope, occurrence) and attempt, so identical calls at once never share one. */
+export function callDir(slot: string, attempt: number): string {
+	return `${slot.replace(/[^A-Za-z0-9._-]/g, "_")}-a${attempt}`;
+}
+
 export function runPaths(dir: string): RunPaths {
 	const abs = resolve(dir);
 	return { dir: abs, id: basename(abs), log: join(abs, "log.jsonl"), meta: join(abs, "meta.json"), lock: join(abs, "lock"), work: join(abs, "work") };

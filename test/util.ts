@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after } from "node:test";
+import { removeWork } from "../src/host/layers.ts";
 
 process.env.WALLIS_DIFFERENTIAL = "1";
 // Named volumes and wallis's own caches go to a throwaway dir, never the user's ~/.cache.
@@ -12,7 +13,8 @@ process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), "wallis-v2-cache-"));
 
 const made: string[] = [process.env.XDG_CACHE_HOME];
 after(() => {
-	for (const d of made) rmSync(d, { recursive: true, force: true });
+	// Tests leave read-only trees (0555 dirs) behind: made writable first.
+	for (const d of made) removeWork(d);
 });
 
 /** A throwaway dir, removed after the test file. */

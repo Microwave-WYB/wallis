@@ -105,21 +105,40 @@ export function prepareWork(store: string, root: string, layers: readonly string
 }
 
 /** Removes a call's dirs; overlayfs leaves `ovl/work` with mode 000, so it is opened first. */
+/**
+ * Removes a dir whatever its contents' modes: every dir under it is made
+ * writable first (a command may leave a read-only tree, a Go module cache, in
+ * its /w; overlayfs leaves `ovl/work` with mode 000). Symlinks are never
+ * followed.
+ */
 export function removeWork(root: string): void {
-	const inner = join(root, "ovl", "work");
-	if (existsSync(inner)) chmodSync(inner, 0o700);
+	const open = (dir: string) => {
+		let st;
+		try {
+			st = lstatSync(dir);
+		} catch {
+			return;
+		}
+		if (!st.isDirectory()) return;
+		if ((st.mode & 0o700) !== 0o700) chmodSync(dir, (st.mode & 0o7777) | 0o700);
+		for (const name of readdirSync(dir)) open(join(dir, name));
+	};
+	open(root);
 	rmSync(root, { recursive: true, force: true });
 }
 
-/** The xattr tools overlay emulation needs (opaque dirs): a workspace is refused without them. */
+/** The xattr tool a workspace's commits need (to tell opaque dirs), when it is missing: an agent with a workspace is refused without it. */
 export function xattrToolsMissing(): string | null {
-	for (const tool of ["getfattr", "setfattr"]) if (spawnSync(tool, ["--version"], { stdio: "ignore" }).status !== 0) return tool;
-	return null;
+	return spawnSync("getfattr", ["--version"], { stdio: "ignore" }).error ? "getfattr" : null;
 }
+
+const NO_GETFATTR = "getfattr is not installed (the attr package): wallis needs it to tell an overlay's opaque dirs (a dir replaced by the agent) from merged ones; install attr";
 
 /** Whether this one dir is marked opaque (asked per dir, with its raw path: nothing is escaped). */
 function opaque(dir: string): boolean {
 	const r = spawnSync("getfattr", ["--absolute-names", "--only-values", "-n", "user.overlay.opaque", "--", dir]);
+	// Never a guess: without the tool, an opaque dir would be taken for a merged one and deleted files would come back.
+	if (r.error) throw new Error(NO_GETFATTR);
 	return r.status === 0 && r.stdout.toString() === "y";
 }
 
@@ -184,7 +203,7 @@ export function commitLayer(store: string, work: Pick<Work, "upper">, root: stri
 	if (!existsSync(`${dir}.json`)) writeDurably(`${dir}.json`, text);
 	// Named in the call's dir first: a host that dies before the event restores the upper dir from it.
 	if (root !== null) writeDurably(join(root, "committed"), `${digest} ${attempt}`);
-	if (existsSync(dir)) rmSync(work.upper, { recursive: true, force: true });
+	if (existsSync(dir)) removeWork(work.upper);
 	else {
 		syncTree(work.upper);
 		renameSync(work.upper, dir);
@@ -245,17 +264,18 @@ export function squash(store: string, layers: readonly string[]): string {
 	const dir = layerDir(store, digest);
 	if (existsSync(dir)) return digest;
 	const temp = `${dir}.${process.pid}.tmp`;
-	rmSync(temp, { recursive: true, force: true });
+	removeWork(temp);
 	mkdirSync(temp, { recursive: true });
-	for (const [path, { entry, from }] of [...merged].sort(([a], [b]) => (a < b ? -1 : 1))) {
+	const sorted = [...merged].sort(([a], [b]) => (a < b ? -1 : 1));
+	for (const [path, { entry, from }] of sorted) {
 		const target = join(temp, path);
 		mkdirSync(dirname(target), { recursive: true });
-		if (entry.type === "dir") {
-			mkdirSync(target, { recursive: true });
-			chmodSync(target, entry.mode);
-		} else if (entry.type === "symlink") symlinkSync(entry.target, target);
+		if (entry.type === "dir") mkdirSync(target, { recursive: true });
+		else if (entry.type === "symlink") symlinkSync(entry.target, target);
 		else linkSync(join(layerDir(store, from), path), target);
 	}
+	// Dir modes last, deepest first: a read-only dir (0555) is set only once its children are in.
+	for (const [path, { entry }] of sorted.reverse()) if (entry.type === "dir") chmodSync(join(temp, path), entry.mode);
 	syncTree(temp);
 	writeDurably(`${dir}.json`, text);
 	renameSync(temp, dir);
