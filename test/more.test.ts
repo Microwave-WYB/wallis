@@ -2,7 +2,7 @@
 // agent), ctx.loop (each iteration a branch), and an agent returning a workspace file as an Artifact.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -58,10 +58,12 @@ test("ctx.loop: a typed fold whose iterations are branches; the same call in two
 });
 
 test("an agent returns a file it wrote in its workspace as an Artifact", opts, async () => {
-	const { wf } = await fixture();
+	const { root, wf } = await fixture();
 	faux.setResponses([() => call("write", { path: "notes/report.md", content: "# Film\n\nPortra 160.\n" }), () => call("submit_result", { result: { report: "/w/notes/report.md" } })]);
 	const r = await run(wf.writing, { topic: "film" });
 	assert.equal(r.output.report.name, "report.md");
 	assert.equal(r.output.report.media, "text/markdown");
 	assert.equal(readFileSync(r.output.report.path, "utf8"), "# Film\n\nPortra 160.\n");
+	// The copy-out dir, the agent's root and the run's work/ are gone once the run ends.
+	assert.ok(!existsSync(runPaths(join(runsDir(root), r.id)).work), "the run leaves no work/ behind");
 });

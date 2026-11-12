@@ -88,7 +88,7 @@ export type CheckVolumes<V extends readonly string[]> = { readonly [K in keyof V
 /** A volume as a sandbox sees it: a host dir at a target. */
 export type ResolvedVolume =
 	| { readonly kind: "bind"; readonly target: string; readonly dir: string }
-	| { readonly kind: "named"; readonly target: string; readonly dir: string; readonly name: string };
+	| { readonly kind: "named"; readonly target: string; readonly dir: string };
 
 export class VolumeError extends Error {
 	override readonly name = "VolumeError";
@@ -142,7 +142,7 @@ export function resolveVolumes(texts: readonly string[], workflowDir: string, op
 			} else {
 				const dir = join(namedVolumesDir(options.root ?? workflowDir), v.name);
 				mkdirSync(dir, { recursive: true });
-				resolved.push({ kind: "named", target, dir, name: v.name });
+				resolved.push({ kind: "named", target, dir });
 			}
 		}
 	}

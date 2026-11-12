@@ -265,13 +265,21 @@ export class Store {
 			}
 		}
 		const young = (path: string) => since !== null && lstatSync(path).ctimeMs >= since;
+		const drop = (path: string) => {
+			bytes += duBytes(path);
+			removeWork(path);
+		};
 		let blobs = 0;
 		let layers = 0;
 		let bytes = 0;
 		if (existsSync(this.blobs)) {
 			for (const name of readdirSync(this.blobs)) {
 				const path = join(this.blobs, name);
-				if (name.startsWith(".") || live.has(`sha256:${name}`) || young(path)) continue;
+				if (name.startsWith(".")) {
+					if (leftover(name)) drop(path);
+					continue;
+				}
+				if (live.has(`sha256:${name}`) || young(path)) continue;
 				bytes += lstatSync(path).size;
 				rmSync(path, { force: true });
 				blobs++;
@@ -280,8 +288,11 @@ export class Store {
 		const ldir = layersDir(this.dir);
 		if (existsSync(ldir)) {
 			for (const name of readdirSync(ldir)) {
-				if (!/^[0-9a-f]{64}$/.test(name)) continue;
 				const path = join(ldir, name);
+				if (!/^[0-9a-f]{64}$/.test(name)) {
+					if (leftover(name)) drop(path);
+					continue;
+				}
 				if (live.has(`sha256:${name}`) || young(`${path}.json`)) continue;
 				bytes += duBytes(path);
 				removeWork(path);
@@ -290,6 +301,19 @@ export class Store {
 			}
 		}
 		return { blobs, layers, bytes };
+	}
+}
+
+/** A temp file or dir (`.in-<pid>-…`, `….<pid>.tmp`) of a process that has died: what a crash left behind. */
+function leftover(name: string): boolean {
+	const pid = /^\.in-(\d+)-/.exec(name)?.[1] ?? /\.(\d+)\.tmp$/.exec(name)?.[1];
+	if (pid === undefined) return false;
+	try {
+		process.kill(Number(pid), 0);
+		return false;
+	} catch (e) {
+		// EPERM: alive, someone else's.
+		return (e as NodeJS.ErrnoException).code === "ESRCH";
 	}
 }
 

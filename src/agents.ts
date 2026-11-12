@@ -620,14 +620,18 @@ class AgentCall {
 			const dir = join(this.#s.host.paths.work, `out-${Math.random().toString(36).slice(2)}`);
 			mkdirSync(dir, { recursive: true });
 			const target = join(dir, posix.basename(rel));
-			// Copied out through the sandbox's view of /w (the layers and the upper dir together).
-			const r = await this.#inSandbox(["sh", "-c", `cp -a -- "/w/$1" "${LAYOUT.out}/$2"`, "sh", rel, posix.basename(rel)], { extra: dir });
-			if (r.exit !== 0) throw new Error(`${value}: ${head(r.stderr) || "not found in /w"}`);
-			if (s[MARK] === "artifact") {
-				const media = (s.properties as Record<string, { const?: string }> | undefined)?.media?.const ?? guessMedia(rel);
-				return { kind: "artifact", digest: this.#store.ingestFile(target, { move: true }), name: posix.basename(rel), media };
+			try {
+				// Copied out through the sandbox's view of /w (the layers and the upper dir together).
+				const r = await this.#inSandbox(["sh", "-c", `cp -a -- "/w/$1" "${LAYOUT.out}/$2"`, "sh", rel, posix.basename(rel)], { extra: dir });
+				if (r.exit !== 0) throw new Error(`${value}: ${head(r.stderr) || "not found in /w"}`);
+				if (s[MARK] === "artifact") {
+					const media = (s.properties as Record<string, { const?: string }> | undefined)?.media?.const ?? guessMedia(rel);
+					return { kind: "artifact", digest: this.#store.ingestFile(target, { move: true }), name: posix.basename(rel), media };
+				}
+				return { kind: "tree", digest: this.#store.snapshot(target, { move: true }) };
+			} finally {
+				removeWork(dir);
 			}
-			return { kind: "tree", digest: this.#store.snapshot(target, { move: true }) };
 		}
 		if (Array.isArray(value)) return Promise.all(value.map((v) => this.#resolveFiles(s?.items, v)));
 		if (value !== null && typeof value === "object") {
@@ -667,8 +671,10 @@ class AgentCall {
 		const plan = this.#s.host.planFor(this.#s.def);
 		const mounts = mountsOf(this.#store, this.#refs);
 		const work = this.#work;
+		// Only workspace tools and output files run here, and only while the workspace is open.
+		if (work === null) throw new Error("this agent has no open workspace");
 		const view = {
-			work: work === null ? { kind: "dir" as const, dir: this.#root } : work.lowers.length > 0 ? { kind: "overlay" as const, lowers: work.lowers, upper: work.upper, ovl: work.ovl } : { kind: "dir" as const, dir: work.upper },
+			work: work.lowers.length > 0 ? { kind: "overlay" as const, lowers: work.lowers, upper: work.upper, ovl: work.ovl } : { kind: "dir" as const, dir: work.upper },
 			inputs: mounts.inputs,
 			trees: mounts.trees,
 			agent: true,

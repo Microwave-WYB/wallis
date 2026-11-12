@@ -52,7 +52,7 @@ test("a bind resolves against the workflow dir or ~/; its host dir must exist; a
 	mkdirSync(join(dir, "scripts"));
 	const [bind, named] = resolveVolumes(["./scripts:/s:ro", "cache:/c"], dir);
 	assert.deepEqual(bind, { kind: "bind", target: "/s", dir: join(dir, "scripts") });
-	assert.deepEqual(named, { kind: "named", target: "/c", dir: join(namedVolumesDir(dir), "cache"), name: "cache" });
+	assert.deepEqual(named, { kind: "named", target: "/c", dir: join(namedVolumesDir(dir), "cache") });
 	assert.match(refusal(["./missing:/m:ro"], dir) ?? "", /does not exist/);
 	assert.equal(resolveVolumes(["~/:/home-ro:ro"], dir)[0]!.dir, homedir());
 	assert.match(refusal(["./:/p:ro"], dir, [join(dir, ".wallis")]) ?? "", /wallis's own/);

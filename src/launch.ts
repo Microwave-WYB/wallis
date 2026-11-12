@@ -3,7 +3,7 @@
 // The process takes the run's lock, opens its journal, builds the session
 // and runs the body; the caller's messages arrive through the run's inbox.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { AgentRunner } from "./agents.ts";
@@ -123,9 +123,21 @@ export async function launch(options: { root: string; paths: RunPaths; def: Work
 		clearInterval(timer);
 		process.off("SIGTERM", stop);
 		process.off("SIGINT", stop);
+		// Every call removes its own scratch dir; what is left is the run's empty work/.
+		rmEmpty(paths.work);
 		release();
 	});
 	return { session, result };
+}
+
+function rmEmpty(dir: string): void {
+	try {
+		rmdirSync(dir);
+	} catch (e) {
+		// Absent (no call needed one), or not empty (a call left its dir: kept for a look).
+		const code = (e as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && code !== "ENOTEMPTY") throw e;
+	}
 }
 
 /** Records what a detached run process should do, for it to read. */

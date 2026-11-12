@@ -26,25 +26,29 @@ export class EventLog {
 		});
 	}
 
+	/** The byte length of the complete lines, once known: appends then never read the file. */
+	#end: number | null = null;
+
 	/**
 	 * Appends one event. A line a crash cut short is cut off first (back to
-	 * the last newline), so the new line never continues it.
+	 * the last newline), so the new line never continues it. The file is read
+	 * for that only when its size is not the end this log last wrote.
 	 */
 	append(event: Event): void {
-		if (existsSync(this.path)) {
-			const size = statSync(this.path).size;
-			if (size > 0) {
-				const text = readFileSync(this.path);
-				const end = text.lastIndexOf(0x0a) + 1;
-				if (end !== size) truncateSync(this.path, end);
-			}
+		const size = existsSync(this.path) ? statSync(this.path).size : 0;
+		if (size !== this.#end) {
+			const end = size === 0 ? 0 : readFileSync(this.path).lastIndexOf(0x0a) + 1;
+			if (end !== size) truncateSync(this.path, end);
+			this.#end = end;
 		}
+		const line = Buffer.from(`${JSON.stringify(event)}\n`);
 		const fd = openSync(this.path, "a");
 		try {
-			writeSync(fd, `${JSON.stringify(event)}\n`);
+			writeSync(fd, line);
 			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
 		}
+		this.#end += line.length;
 	}
 }

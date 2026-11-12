@@ -163,3 +163,26 @@ test("store files are read-only: writing into a ref's path is EACCES, not a sile
 	const blob = store.putText("an artifact");
 	assert.throws(() => writeFileSync(store.blobPath(blob), "changed"), /EACCES/);
 });
+
+test("prune removes the temp files and dirs a dead process left, never a live one's", () => {
+	const root = tmp();
+	const store = new Store(root);
+	store.putText("x");
+	const blobs = join(root, ".wallis/store/blobs");
+	const layers = join(root, ".wallis/store/layers");
+	mkdirSync(layers, { recursive: true });
+	// A pid that is not running (pid_max is at most 2^22).
+	const dead = 4_194_303;
+	const leftovers = [join(blobs, `.in-${dead}-abcd`), join(layers, `${"a".repeat(64)}.${dead}.tmp`), join(layers, `${"b".repeat(64)}.json.${dead}.tmp`)];
+	const live = [join(blobs, `.in-${process.pid}-abcd`), join(layers, `${"c".repeat(64)}.${process.pid}.tmp`)];
+	writeFileSync(leftovers[0]!, "partial");
+	mkdirSync(join(leftovers[1]!, "sub"), { recursive: true });
+	writeFileSync(join(leftovers[1]!, "sub", "f"), "f");
+	chmodSync(join(leftovers[1]!, "sub"), 0o555);
+	writeFileSync(leftovers[2]!, "{");
+	writeFileSync(live[0]!, "being written");
+	mkdirSync(live[1]!);
+	store.prune([], null);
+	for (const p of leftovers) assert.ok(!existsSync(p), `${p} is gone`);
+	for (const p of live) assert.ok(existsSync(p), `${p} is kept`);
+});

@@ -25,7 +25,7 @@ test("identical calls at once each get their own scratch dir (commands)", opts, 
 	const { root, wf } = await fixture();
 	const r = await run(wf.vote, {});
 	assert.notEqual(r.output.a.digest, r.output.b.digest, "two random samples");
-	assert.deepEqual(readdirSync(join(root, ".wallis/runs", r.id, "work")), [], "the call dirs are removed afterwards");
+	assert.ok(!existsSync(join(root, ".wallis/runs", r.id, "work")), "the call dirs, and then work/, are removed afterwards");
 });
 
 test("identical agent calls at once each get their own workspace (majority voting)", opts, async () => {
