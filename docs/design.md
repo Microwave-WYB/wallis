@@ -390,9 +390,24 @@ value.
 - **Shutdown.** When a body returns, the mailboxes of the actors it spawned
   close: their `for await` loops end and the actors finish. A body that
   needs an actor's result awaits `result` before returning.
+- **An actor's failure is never swallowed.**
+  - If its spawner awaits `result` (or attaches a handler to it), the
+    spawner gets the `NodeFailed` or the thrown error and handles it in code.
+  - If nobody handles `result`, the failure propagates to the spawning body,
+    like an unhandled rejection, and from there up the call chain. If nothing
+    catches it, the run fails, and its first `FailedCall` names the actor (its
+    const name and spawn site).
+  - A failed actor's mailbox closes: later sends are rejected as `closed` on
+    every path (an agent's `send` tool fails, `ctx.send` throws, `run.send`
+    rejects). An agent waiting for its reply is not left hanging: the run
+    fails, which cancels the waiting call.
+- **No supervisors.** There is no supervisor, no restart policy and no `down`
+  message in the framework. A restarting actor is plain code: a loop with a
+  try/catch around each message, as the grade renderer does per job.
+  Recovery of a whole run stays with the journal and `resume`; the
+  orchestrating agent decides how to recover.
 - **Not taken from BEAM:** selective receive (use `switch`), links and
-  supervisors (a failed call fails its caller, which handles it in code),
-  hot code loading.
+  supervisors (above), hot code loading.
 
 **Agents as actors:**
 

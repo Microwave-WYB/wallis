@@ -29,7 +29,7 @@ import { type SandboxPlan } from "./host/sandbox.ts";
 import { squash } from "./host/layers.ts";
 import type { Store } from "./host/store.ts";
 import {
-	agentDef, type Agent, type AgentDef, commandDef, type Command, DEF, isNode, type Session, type SessionData, sessionAgent, sessionValue, type Tool, toolDef, type ToolDef, type WorkflowDef, workflowDef,
+	agentDef, type Agent, type AgentDef, commandDef, type Command, DEF, definitionSite, isNode, type Session, type SessionData, sessionAgent, sessionValue, type Tool, toolDef, type ToolDef, type WorkflowDef, workflowDef,
 } from "./nodes.ts";
 import type { Plans } from "./plans.ts";
 import type { ToolCaller } from "./toolcalls.ts";
@@ -201,12 +201,19 @@ class Scope {
 	readonly sends = new Map<string, number>();
 	/** Actors spawned here: their mailboxes close when this body returns. */
 	readonly children: LiveMailbox[] = [];
+	/** Rejects when an actor spawned here fails and nobody handles its `result`: the body fails with it. */
+	readonly failure: Promise<never>;
+	fail!: (error: unknown) => void;
+	/** The body returned or failed: it makes no more calls. */
+	dead = false;
 
 	constructor(scope: string, prefix: string, path: readonly string[], self: string) {
 		this.scope = scope;
 		this.prefix = prefix;
 		this.path = path;
 		this.self = self;
+		this.failure = new Promise<never>((_, reject) => (this.fail = reject));
+		this.failure.catch(() => {});
 	}
 
 	occurrence(key: string): number {
@@ -238,6 +245,33 @@ export type Outcome = { readonly type: "done"; readonly output: Json } | { reado
 
 /** A NodeFailed's core reason (kept beside it, so a nested workflow fails with its leaf's reason). */
 const CORE_REASON = new WeakMap<object, FailReason>();
+
+/** An actor that failed with nobody handling its `result`: its spawning body fails with this. */
+export class ActorFailed extends Error {
+	override readonly name = "ActorFailed";
+	readonly label: string;
+	override readonly cause: unknown;
+	constructor(label: string, cause: unknown) {
+		super(`actor ${label} failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+		this.label = label;
+		this.cause = cause;
+	}
+}
+
+/**
+ * An actor's `result`: it records whether anyone handles it (awaits it, or attaches then/catch),
+ * which decides whether a failure goes to the result's handler or to the spawning body.
+ */
+class ActorResult<T> extends Promise<T> {
+	handled = false;
+	static override get [Symbol.species](): PromiseConstructor {
+		return Promise;
+	}
+	override then<A = T, B = never>(onFulfilled?: ((v: T) => A | PromiseLike<A>) | null, onRejected?: ((e: unknown) => B | PromiseLike<B>) | null): Promise<A | B> {
+		this.handled = true;
+		return super.then(onFulfilled, onRejected);
+	}
+}
 
 export function coreReasonOf(error: unknown): FailReason {
 	if (error !== null && typeof error === "object" && CORE_REASON.has(error)) return CORE_REASON.get(error)!;
@@ -547,7 +581,8 @@ export class RunSession implements AgentHost {
 		if (!wf.mailbox) mailbox.close();
 		const ctx = this.#ctx(scope);
 		try {
-			const out = await (wf.run as (c: unknown, i: unknown, m: unknown) => Promise<unknown>)(ctx, this.hostView(input), mailbox);
+			// An actor failing unhandled fails this body, as an unhandled rejection would.
+			const out = await Promise.race([(wf.run as (c: unknown, i: unknown, m: unknown) => Promise<unknown>)(ctx, this.hostView(input), mailbox), scope.failure]);
 			const json = toJson(out);
 			if (!json.ok) throw this.#nodeFailed(this.#ref(scope.scope, wf.label, scope.path, 1), { type: "schema_mismatch", node: wf.label, errors: [json.error] });
 			const value = stripPaths(json.value);
@@ -555,6 +590,7 @@ export class RunSession implements AgentHost {
 			if (errors.length > 0) throw this.#nodeFailed(this.#ref(scope.scope, wf.label, scope.path, 1), { type: "schema_mismatch", node: wf.label, errors: errors.map((e) => `${e.path} ${e.message}`) });
 			return value;
 		} finally {
+			scope.dead = true;
 			for (const m of scope.children) m.close();
 			mailbox.close();
 			if (wf.mailbox) this.#closedNote(scope.self);
@@ -594,14 +630,21 @@ export class RunSession implements AgentHost {
 				const digest = session.store.putTree(layers);
 				return { kind: "tree", digest, path: session.treePath(digest) };
 			},
-			spawn: (schema, body) => session.#spawn(scope, schema, body as never) as never,
-			map: (items, f) => Promise.all(items.map((item, i) => session.#spawn(scope, Type.Never(), (c) => f(c as Ctx, item, i)).result)),
+			spawn: (schema, body) => session.#spawn(scope, schema, body as never, definitionSite("actor").label) as never,
+			map: (items, f) => Promise.all(items.map((item, i) => session.#spawn(scope, Type.Never(), (c) => f(c as Ctx, item, i), `map item ${i}`).result)),
 			loop: async (init, step) => {
 				const k = scope.loops++;
 				let state = init;
 				for (let i = 0; ; i++) {
 					const branch = new Scope(`${scope.scope}|loop${k}#${i}`, `${scope.prefix}l${k}.${i}.`, scope.path, scope.self);
-					const r = await step(session.#ctx(branch) as Ctx, state);
+					let r: Awaited<ReturnType<typeof step>>;
+					try {
+						r = await Promise.race([step(session.#ctx(branch) as Ctx, state), branch.failure]);
+					} finally {
+						// The iteration's actors close when its branch returns.
+						branch.dead = true;
+						for (const m of branch.children) m.close();
+					}
 					if ("done" in r) return r.done;
 					state = r.next;
 				}
@@ -636,23 +679,40 @@ export class RunSession implements AgentHost {
 		this.step({ type: "noted", key, value });
 	}
 
-	#spawn<R>(scope: Scope, schema: TSchema, body: (ctx: Ctx<unknown>, mailbox: Mailbox<unknown>) => Promise<R>): Running<R, unknown> {
+	#spawn<R>(scope: Scope, schema: TSchema, body: (ctx: Ctx<unknown>, mailbox: Mailbox<unknown>) => Promise<R>, label: string): Running<R, unknown> {
 		const k = scope.spawns++;
 		const actorScope = `${scope.scope}|actor${k}`;
 		const address = `actor:${actorScope}`;
 		const mailbox = this.#mailbox(address, schema);
 		scope.children.push(mailbox);
 		const child = new Scope(actorScope, `${scope.prefix}a${k}.`, scope.path, address);
-		const result = (async () => {
+		const inner = (async () => {
 			try {
-				return await body(this.#ctx(child), mailbox);
+				// Its own unhandled actors fail it in turn.
+				return await Promise.race([body(this.#ctx(child), mailbox), child.failure]);
 			} finally {
+				// A failed actor's mailbox closes too: later sends are rejected as closed.
+				child.dead = true;
 				for (const m of child.children) m.close();
 				mailbox.close();
 				this.#closedNote(address);
 			}
 		})();
-		result.catch(() => {});
+		const result = new ActorResult<R>((resolve, reject) => {
+			inner.then(resolve, (error: unknown) => {
+				reject(error);
+				// A failure nobody handles (by now: a body attaches handlers synchronously, or awaits) is
+				// the spawning body's: it propagates up the call chain like an unhandled rejection.
+				setImmediate(() => {
+					if (result.handled || scope.dead) return;
+					const failed = new ActorFailed(label, error);
+					this.#note(`actor_failed:${address}`, { label, path: [...scope.path], message: failed.message });
+					scope.fail(failed);
+				});
+			});
+		});
+		// Observed internally without marking it handled.
+		Promise.prototype.then.call(result, undefined, () => {});
 		return { address: { kind: "address", id: address }, result };
 	}
 
@@ -698,6 +758,8 @@ export class RunSession implements AgentHost {
 			r.catch(() => {});
 			return { address: { kind: "address", id: "" }, result: r };
 		};
+		// A body that has returned or failed (its leftover code, say after an actor failed it) makes no more calls.
+		if (scope.dead) return failNow(`${label} was called after its body ended`);
 		const json = toJson(rawInput);
 		if (!json.ok) return failNow(`the input of ${label} is not JSON: ${json.error}`);
 		const input = stripPaths(json.value);

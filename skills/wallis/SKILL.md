@@ -163,6 +163,10 @@ recipient's schema when it is sent; a rejected one is never delivered.
   caller: `run.next()` returns its messages.
 - A message to a recipient that has ended is rejected (`closed`); to a
   stopped run it persists and is delivered on resume.
+- An actor's failure is never swallowed: await its `result` to handle it;
+  unhandled, it fails the spawning body (and the run, naming the actor). A
+  failed actor's mailbox is closed. There are no supervisors: to keep an
+  actor alive across bad jobs, put a try/catch around each message.
 
 Steering a running agent, asking the human, approvals and a compute actor
 are worked through in [references/patterns.md](references/patterns.md).

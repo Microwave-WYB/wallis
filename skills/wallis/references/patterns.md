@@ -51,6 +51,14 @@ export const grade = workflow({ …, run: async (ctx, { negs, frames }) => {
 }});
 ```
 
+The try/catch around each job is the restart policy: a render that fails
+becomes an `{ error }` reply and the actor goes on. Without it, the first
+failing render would end the actor; since nobody awaits `renderer.result`,
+its failure fails the `grade` body (and the run, naming `renderer`), which
+also cancels the grader waiting for the reply. wallis has no supervisors:
+an actor that should survive bad messages catches per message, and a run
+that failed is recovered with `resume`.
+
 An invalid job (size 50) fails the agent's `send` call with the validation
 errors, and the agent sends it again. Renders that arrive by mail are
 readable by the agent (`read` on their `/in` path). On resume, finished

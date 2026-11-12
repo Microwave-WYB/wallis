@@ -148,22 +148,47 @@ export class RunView {
 		return "";
 	}
 
+	/**
+	 * Calls whose newest attempt failed, and actors that failed with nobody handling their result.
+	 * The failure that ended the run comes first (the one `done()` throws), then the others in the
+	 * order they failed (their last event in the log).
+	 */
 	failed(store: Store): FailedCall[] {
-		const out: FailedCall[] = [];
 		const why = this.unresumable;
 		if (why !== null) return [{ id: "workflow" as CallId, label: this.workflowLabel, path: [], attempt: 1, reason: { type: "workflow_threw", message: why }, recovery: "resume", tail: why }];
+		// When each call last changed: the index of the last event that names it.
+		const when = new Map<string, number>();
+		this.events.forEach((e, i) => {
+			if ("id" in e && typeof e.id === "string") {
+				const slot = this.core.slotOf(e.id);
+				if (slot !== "") when.set(slot, i);
+			}
+		});
+		const leaf = (r: FailReason): FailReason => (r.type === "workflow_error" ? leaf(r.reason) : r);
+		const ended = this.ended;
+		const fatal = ended?.type === "failed" ? JSON.stringify(leaf(ended.reason)) : null;
+		const entries: { at: number; fatal: boolean; call: FailedCall }[] = [];
 		for (const c of this.calls) {
 			const last = c.attempts.at(-1);
 			if (last?.type !== "failed") continue;
 			// A nested workflow that failed because a call in it failed: that call is listed instead.
 			if (c.kind === "workflow" && last.reason.type === "workflow_error" && last.reason.reason.type !== "body_error" && last.reason.reason.type !== "schema_mismatch") continue;
-			out.push({ ...this.ref(c), reason: publicReason(last.reason, (id) => ({ kind: "session", agent: c.node, id, layers: [] })), recovery: last.decided ? "retry" : "resume", tail: this.tail(store, c, last.reason) });
+			const call: FailedCall = { ...this.ref(c), reason: publicReason(last.reason, (id) => ({ kind: "session", agent: c.node, id, layers: [] })), recovery: last.decided ? "retry" : "resume", tail: this.tail(store, c, last.reason) };
+			entries.push({ at: when.get(c.slot) ?? 0, fatal: fatal !== null && JSON.stringify(leaf(last.reason)) === fatal, call });
 		}
-		const ended = this.ended;
-		if (ended?.type === "failed" && (ended.reason.type === "body_error" || ended.reason.type === "schema_mismatch")) {
-			out.push({ id: "workflow" as CallId, label: this.workflowLabel, path: [], attempt: 1, reason: publicReason(ended.reason, () => ({ kind: "session", agent: "", id: null, layers: [] })), recovery: "resume", tail: ended.reason.type === "body_error" ? ended.reason.message : ended.reason.errors.join("\n") });
+		this.events.forEach((e, i) => {
+			if (e.type !== "noted" || !e.key.startsWith("actor_failed:")) return;
+			const v = e.value as { label: string; path: string[]; message: string };
+			const reason = { type: "workflow_threw" as const, message: v.message };
+			entries.push({ at: i, fatal: fatal !== null && JSON.stringify({ type: "body_error", message: v.message }) === fatal, call: { id: e.key.slice("actor_failed:".length) as CallId, label: v.label, path: v.path, attempt: 1, reason, recovery: "resume", tail: v.message } });
+		});
+		if (ended?.type === "failed" && (ended.reason.type === "body_error" || ended.reason.type === "schema_mismatch") && !entries.some((x) => x.fatal)) {
+			const reason = publicReason(ended.reason, () => ({ kind: "session", agent: "", id: null, layers: [] }));
+			entries.push({ at: this.events.length, fatal: true, call: { id: "workflow" as CallId, label: this.workflowLabel, path: [], attempt: 1, reason, recovery: "resume", tail: ended.reason.type === "body_error" ? ended.reason.message : ended.reason.errors.join("\n") } });
 		}
-		return out;
+		// The fatal one first (the latest, if several calls failed alike), then by time.
+		const firstFatal = entries.filter((x) => x.fatal).sort((a, b) => b.at - a.at)[0];
+		return [...(firstFatal ? [firstFatal] : []), ...entries.filter((x) => x !== firstFatal).sort((a, b) => a.at - b.at)].map((x) => x.call);
 	}
 
 	status(store: Store): Status {
