@@ -110,7 +110,7 @@ const RESERVE = 0.2;
 const MAX_INVALID = 3;
 
 const SYSTEM = `Work only with the tools you are given. When you are done, call submit_result with a result that matches its schema; if it does not match, you get the errors and may submit again.`;
-const WORKSPACE = "Your files: /w is your workspace (it carries over to the next call of this conversation; files from earlier calls are read-only until you `chmod u+w` them, which write and edit do for you); /in holds your input files and the files of messages you received (read-only); /tmp is empty again in every tool call.";
+const WORKSPACE = "Your files: /w is your workspace (it carries over to the next call of this conversation; files from earlier calls may show read-only modes, and you can still write them); /in holds your input files and the files of messages you received (read-only); /tmp is empty again in every tool call.";
 
 /** A checkpoint: the whole dialogue after a completed turn, and the turns used. */
 interface Checkpoint {
@@ -660,6 +660,7 @@ class AgentCall {
 			inputs: mounts.inputs,
 			trees: mounts.trees,
 			agent: true,
+			writeLowers: this.#s.def.workspace?.access === "write" || this.#s.def.workspace?.access === "exec",
 		};
 		const sp = sandboxed(options.extra ? { ...plan, volumes: [...plan.volumes, { kind: "named", target: "/out", dir: options.extra, name: "out" }] } : plan, argv, view, { root: this.#s.host.paths.dir });
 		// Writes to /out (an export of a result file) are the host's, not the agent's.
