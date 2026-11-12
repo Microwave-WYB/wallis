@@ -72,6 +72,7 @@ export async function runCommand(call: { store: Store; work: string; def: Comman
 	mkdirSync(scratch, { recursive: true });
 	try {
 		const r = await withVolumeLocks(plan.volumes, () => runSpawn(sandboxed(plan, argv, { work: { kind: "dir", dir: scratch }, inputs: mounts.inputs, trees: mounts.trees }), JSON.stringify(mounted), { signal: call.signal }));
+		if (r.setup !== null) return { type: "failed", failure: { type: "unrunnable", error: `the sandbox could not start the command: ${r.setup}` } };
 		if (r.aborted) return { type: "failed", failure: { type: "killed", signal: "SIGKILL", stderr_head: "stopped by wallis" } };
 		if (r.signal !== null) return { type: "failed", failure: { type: "killed", signal: r.signal, stderr_head: head(r.stderr) } };
 		if (r.exit !== 0) return { type: "failed", failure: { type: "exit_code", code: r.exit, stderr_head: head(r.stderr || r.stdout) } };

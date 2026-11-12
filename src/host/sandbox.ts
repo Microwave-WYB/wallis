@@ -18,9 +18,9 @@
 // (`--unshare-all`, loopback only) unless the sandbox declares
 // `network: "host"` (`--share-net`). Declared devices are dev-bound.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, constants, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type { ResolvedVolume } from "./volumes.ts";
@@ -91,7 +91,44 @@ export function resolvePrograms(requires: readonly string[], path = HOST_PATH): 
 		else out[name] = found;
 	}
 	if (missing.length > 0) throw new SandboxError(`required programs not found on PATH: ${missing.join(", ")}; install them or fix the sandbox's \`requires\``);
+	const unseen = Object.entries(out).flatMap(([name, program]) => {
+		const interpreter = missingInterpreter(program, out);
+		return interpreter === null ? [] : [`${name} (${program}) runs under ${interpreter}, from its #! line, which the sandbox would not have`];
+	});
+	if (unseen.length > 0) throw new SandboxError(`${unseen.join("; ")}; add the interpreter to the sandbox's \`requires\``);
 	return out;
+}
+
+/** A script's `#!` interpreter, when the sandbox would not have it: not in the host base, and not required. */
+function missingInterpreter(program: string, programs: Readonly<Record<string, string>>): string | null {
+	const line = firstLine(program);
+	if (!line?.startsWith("#!")) return null;
+	const [interpreter, ...rest] = line.slice(2).trim().split(/\s+/);
+	if (!interpreter || !isAbsolute(interpreter)) return null;
+	const required = new Set(Object.values(programs));
+	const present = (p: string) => underBase(p) || required.has(p) || (existsSync(p) && required.has(realpathSync(p)));
+	if (!present(interpreter)) return interpreter;
+	// `#!/usr/bin/env name`: name is looked up on the sandbox's PATH.
+	const name = basename(interpreter) === "env" ? rest.find((a) => !a.startsWith("-")) : undefined;
+	if (name === undefined || name in programs) return null;
+	const found = onPath(name, "/usr/local/bin:/usr/bin:/bin");
+	return found !== null && underBase(found) ? null : `${name} (through ${interpreter})`;
+}
+
+function firstLine(file: string): string | null {
+	const buf = Buffer.alloc(256);
+	let fd: number;
+	try {
+		fd = openSync(file, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const n = readSync(fd, buf, 0, buf.length, 0);
+		return buf.subarray(0, n).toString("utf8").split("\n")[0] ?? null;
+	} finally {
+		closeSync(fd);
+	}
 }
 
 /** The host base every sandbox sees read-only. */
@@ -142,7 +179,6 @@ let bwrapChecked: boolean | null = null;
 /** Whether bubblewrap can create a sandbox here (user namespaces may be off). */
 export async function bwrapAvailable(): Promise<boolean> {
 	if (bwrapChecked === null) {
-		const { spawnSync } = await import("node:child_process");
 		bwrapChecked = spawnSync(hostProgram("bwrap"), ["--ro-bind", "/", "/", "--unshare-all", "--", "/bin/true"], { stdio: "ignore" }).status === 0;
 	}
 	return bwrapChecked;
@@ -256,6 +292,8 @@ export interface SpawnResult {
 	readonly aborted: boolean;
 	/** Killed by its timeout. */
 	readonly timedOut: boolean;
+	/** bwrap's own error when the sandbox failed before the command ran (a bind it could not make, an exec that failed), else null. */
+	readonly setup: string | null;
 }
 
 /** Runs a sandboxed process with `stdin`; resolves with its result. Aborting kills it. */
@@ -279,11 +317,18 @@ export function runSpawn(sp: Spawn, stdin: string, options: { readonly signal?: 
 			if (timer) clearTimeout(timer);
 			// bwrap as pid 1's parent reports a killed child as 128 + n.
 			const killed = signal ?? (code !== null && code > 128 && code < 160 ? signalName(code - 128) : null);
-			done({ exit: code ?? 128, signal: killed, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), ms: Date.now() - started, aborted, timedOut });
+			const stderr = Buffer.concat(err).toString("utf8");
+			done({ exit: code ?? 128, signal: killed, stdout: Buffer.concat(out).toString("utf8"), stderr, ms: Date.now() - started, aborted, timedOut, setup: code === 1 ? setupError(stderr) : null });
 		});
 		child.stdin.on("error", () => {});
 		child.stdin.end(stdin);
 	});
+}
+
+/** bwrap exits 1 with a last line `bwrap: …` when it cannot set up the sandbox or exec the command. */
+function setupError(stderr: string): string | null {
+	const last = stderr.trimEnd().split("\n").at(-1) ?? "";
+	return last.startsWith("bwrap: ") ? last : null;
 }
 
 function signalName(n: number): string {

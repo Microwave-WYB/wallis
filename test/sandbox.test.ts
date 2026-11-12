@@ -131,3 +131,32 @@ test("a killed process reports its signal; stdin carries the input", { skip, tim
 	const echo = await runSpawn(sandboxed(plan(), ["sh", "-c", "cat"], { work: { kind: "dir", dir: w }, inputs: [], trees: [] }), '{"frame":"2835"}');
 	assert.equal(echo.stdout, '{"frame":"2835"}');
 });
+
+test("a required script whose #! interpreter the sandbox would not have is refused, naming the interpreter", { skip, timeout: 30_000 }, async () => {
+	const d = tmp();
+	mkdirSync(join(d, "interp/bin"), { recursive: true });
+	mkdirSync(join(d, "tool/bin"), { recursive: true });
+	// The interpreter: a copy of sh outside the host base.
+	writeFileSync(join(d, "interp/bin/myinterp"), readFileSync("/bin/sh"));
+	chmodSync(join(d, "interp/bin/myinterp"), 0o755);
+	writeFileSync(join(d, "tool/bin/mytool"), `#!${join(d, "interp/bin/myinterp")}\necho ran\n`);
+	chmodSync(join(d, "tool/bin/mytool"), 0o755);
+	const path = `${join(d, "tool/bin")}:${join(d, "interp/bin")}:/usr/bin`;
+	assert.throws(() => resolvePrograms(["mytool"], path), /mytool \(.*\) runs under .*\/interp\/bin\/myinterp, from its #! line, which the sandbox would not have; add the interpreter/);
+	writeFileSync(join(d, "tool/bin/envtool"), "#!/usr/bin/env myinterp\necho ran\n");
+	chmodSync(join(d, "tool/bin/envtool"), 0o755);
+	assert.throws(() => resolvePrograms(["envtool"], path), /runs under myinterp \(through \/usr\/bin\/env\)/);
+	// Required, the interpreter is there and the script runs.
+	const programs = resolvePrograms(["mytool", "myinterp"], path);
+	const r = await runSpawn(sandboxed(plan({ programs }), ["mytool"], { work: { kind: "dir", dir: tmp() }, inputs: [], trees: [] }), "");
+	assert.deepEqual([r.exit, r.stdout, r.setup], [0, "ran\n", null]);
+});
+
+test("a sandbox that cannot start its command is told apart from the command's own exit", { skip, timeout: 30_000 }, async () => {
+	const view: CallView = { work: { kind: "dir", dir: tmp() }, inputs: [], trees: [] };
+	const failed = await runSpawn(sandboxed(plan(), ["/no/such/program"], view), "");
+	assert.equal(failed.exit, 1);
+	assert.match(failed.setup ?? "", /^bwrap: execvp \/no\/such\/program/);
+	const own = await runSpawn(sandboxed(plan(), ["sh", "-c", "echo oops >&2; exit 1"], view), "");
+	assert.deepEqual([own.exit, own.setup], [1, null]);
+});

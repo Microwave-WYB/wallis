@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { bwrapAvailable } from "../src/host/sandbox.ts";
-import { attach, run, Tree } from "../src/index.ts";
+import { attach, NodeFailed, run, Tree } from "../src/index.ts";
 import { faux } from "./fixtures/faux.ts";
 import { here, project, tmp } from "./util.ts";
 
@@ -97,4 +97,13 @@ test("attach(wf, id) refuses a run of another workflow", opts, async () => {
 	const id = readdirSync(join(root, ".wallis/runs"))[0]!;
 	assert.throws(() => attach(wf.reads, id), /is a run of flaky .*not of reads/);
 	attach(wf.flaky, id);
+});
+
+test("a command its sandbox could not start fails as unrunnable (127), with bwrap's error, not as the command's exit 1", opts, async () => {
+	const { wf } = await fixture();
+	const e = await run(wf.haunted, {}).then(() => null, (x: unknown) => x);
+	assert.ok(e instanceof NodeFailed);
+	assert.ok(e.reason.type === "command_exited");
+	assert.equal(e.reason.code, 127);
+	assert.match(e.reason.stderr, /^the sandbox could not start the command: bwrap: execvp \/no\/such\/program/);
 });

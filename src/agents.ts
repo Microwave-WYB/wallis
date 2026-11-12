@@ -755,7 +755,7 @@ class AgentCall {
 				execute: async (_id, params) => {
 					const limit = this.#s.def.workspace!.bashTimeoutMs;
 					const r = await this.#inSandbox(["sh", "-c", (params as { command: string }).command], { timeoutMs: limit });
-					const end = r.timedOut ? `[killed after ${Math.round(limit / 1000)} s: the bash timeout]` : `[exit ${r.exit}]`;
+					const end = r.timedOut ? `[killed after ${Math.round(limit / 1000)} s: the bash timeout]` : r.setup !== null ? `[the sandbox could not start the command: ${r.setup}]` : `[exit ${r.exit}]`;
 					const text = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}\n${end}`;
 					return { content: [{ type: "text", text: text.slice(-50_000) }], details: undefined };
 				},

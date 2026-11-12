@@ -7,7 +7,7 @@
 
 import type { McpClient } from "@earendil-works/pi-mcp";
 import type { Json } from "./host/core.ts";
-import { bundleToolset, type Source, type ToolInfo, ToolSources } from "./host/sources.ts";
+import { bundleToolset, type Opened, type Source, type ToolInfo, ToolSources } from "./host/sources.ts";
 import type { Store } from "./host/store.ts";
 import type { ToolDef, ToolSourceDef } from "./nodes.ts";
 import type { Plans } from "./plans.ts";
@@ -20,6 +20,7 @@ export interface Connection {
 	readonly source: Source;
 	readonly tools: readonly ToolInfo[];
 	readonly client: McpClient;
+	readonly opened: Opened;
 }
 
 const sourceKey = (s: ToolSourceDef) => sha256(canonical(s.kind === "toolset" ? { toolset: sha256(s.source), sandbox: s.sandbox.digest } : { mcp: s.server, command: s.command, args: s.args }));
@@ -30,7 +31,7 @@ export class ToolCaller {
 	readonly #plans: Plans;
 	readonly #bundles = new Map<string, Promise<string>>();
 	readonly #listings = new Map<string, readonly ToolInfo[]>();
-	readonly #open = new Set<McpClient>();
+	readonly #open = new Set<Opened>();
 	/** A recorded bundle (by source key), and a way to record a new one. */
 	readonly #recorded: (key: string) => string | undefined;
 	readonly #record: (key: string, bundle: string) => void;
@@ -55,28 +56,34 @@ export class ToolCaller {
 	}
 
 	async connect(s: ToolSourceDef): Promise<Connection> {
-		let client: McpClient;
+		let opened: Opened;
 		let source: Source;
 		if (s.kind === "toolset") {
 			const bundle = await this.#bundle(s);
 			const plan = { ...this.#plans.plan(s.sandbox, ["node"]), network: s.network };
 			const secrets = Object.fromEntries(s.secrets.flatMap((k) => (process.env[k] === undefined ? [] : [[k, process.env[k]!]])));
-			client = await this.#sources.connectToolset(bundle, plan, secrets);
+			opened = await this.#sources.connectToolset(bundle, plan, secrets);
 			source = { kind: "toolset", bundle };
 		} else {
 			const plan = { ...this.#plans.plan(s.sandbox, [s.command]), network: s.network };
-			client = await this.#sources.connectServer({ command: s.command, args: s.args, env: s.env }, plan);
+			opened = await this.#sources.connectServer({ command: s.command, args: s.args, env: s.env }, plan);
 			source = { kind: "mcp", server: s.server };
 		}
-		this.#open.add(client);
-		const tools = await ToolSources.list(client, source);
+		this.#open.add(opened);
+		let tools: ToolInfo[];
+		try {
+			tools = await ToolSources.list(opened.client, source);
+		} catch (e) {
+			await this.disconnect({ source, tools: [], client: opened.client, opened });
+			throw e;
+		}
 		this.#listings.set(sourceKey(s), tools);
-		return { source, tools, client };
+		return { source, tools, client: opened.client, opened };
 	}
 
 	async disconnect(c: Connection): Promise<void> {
-		this.#open.delete(c.client);
-		await c.client.close().catch(() => {});
+		this.#open.delete(c.opened);
+		await c.opened.close().catch(() => {});
 	}
 
 	/** Lists a tool's source once, so `replaySafe` knows (a body tool call is requested after this). */

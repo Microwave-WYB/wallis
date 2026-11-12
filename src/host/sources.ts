@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { McpClient, StdioTransport } from "@earendil-works/pi-mcp";
 import { build } from "esbuild";
 import type { Json } from "./core.ts";
+import { removeWork } from "./layers.ts";
 import { LAYOUT, type SandboxPlan, sandboxed } from "./sandbox.ts";
 import type { Store } from "./store.ts";
 
@@ -126,6 +127,12 @@ export function fillSecrets(env: Readonly<Record<string, string>> | undefined, f
 	return Object.fromEntries(Object.entries(env ?? {}).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_m, name: string) => from[name] ?? "")]));
 }
 
+/** A connected source: closing it ends its process and removes its scratch dir. */
+export interface Opened {
+	readonly client: McpClient;
+	close(): Promise<void>;
+}
+
 /** Connections to tool sources: a new process and scratch dir each time. */
 export class ToolSources {
 	readonly #store: Store;
@@ -142,27 +149,46 @@ export class ToolSources {
 		return mkdtempSync(join(this.#work, `${prefix}-`));
 	}
 
-	/** A bundled toolset under `node` in its sandbox (which must require `node`), with only `secrets` in its environment. */
-	async connectToolset(bundle: string, plan: SandboxPlan, secrets: Readonly<Record<string, string>> = {}): Promise<McpClient> {
+	/** A bundled toolset under `node` in its sandbox (whose plan provides `node`), with only `secrets` in its environment. */
+	async connectToolset(bundle: string, plan: SandboxPlan, secrets: Readonly<Record<string, string>> = {}): Promise<Opened> {
 		if (!this.#store.hasBlob(bundle)) throw new Error(`toolset bundle ${bundle} is not in the store`);
 		if (plan.programs.node === undefined) throw new Error("a toolset's sandbox must require node");
 		const dir = this.#scratch(`toolset-${bundle.slice(7, 19)}`);
 		const sp = sandboxed(plan, ["node", `${LAYOUT.inputs}/runner.mjs`], { work: { kind: "dir", dir }, inputs: [{ at: `${LAYOUT.inputs}/runner.mjs`, file: this.#store.blobPath(bundle) }], trees: [], env: secrets });
-		return this.#connect(sp);
+		return this.#connect(sp, dir, `toolset ${bundle.slice(0, 19)}`);
 	}
 
 	/** An MCP server's command in its sandbox, with its env's secrets filled from `from`. */
-	async connectServer(config: McpServerConfig, plan: SandboxPlan, from: Readonly<Record<string, string | undefined>> = process.env): Promise<McpClient> {
+	async connectServer(config: McpServerConfig, plan: SandboxPlan, from: Readonly<Record<string, string | undefined>> = process.env): Promise<Opened> {
 		const dir = this.#scratch("mcp");
 		const sp = sandboxed(plan, [config.command, ...(config.args ?? [])], { work: { kind: "dir", dir }, inputs: [], trees: [], env: fillSecrets(config.env, from) });
-		return this.#connect(sp);
+		return this.#connect(sp, dir, `MCP server ${config.command}`);
 	}
 
-	async #connect(sp: { command: string; args: readonly string[]; cwd: string }): Promise<McpClient> {
+	/** A failed start names the source and keeps the process's stderr: the cause is usually there. */
+	async #connect(sp: { command: string; args: readonly string[]; cwd: string }, dir: string, what: string): Promise<Opened> {
 		const transport = new StdioTransport({ command: sp.command, args: [...sp.args], env: {}, inheritEnv: false, stderr: "pipe", cwd: sp.cwd });
 		const client = new McpClient({ name: "wallis", version: "2.0.0" });
-		await client.connect(transport);
-		return client;
+		try {
+			await client.connect(transport);
+		} catch (e) {
+			// Give a dying process a moment to finish writing its stderr.
+			await new Promise((r) => setTimeout(r, 100));
+			const stderr = transport.stderr.trim().split("\n").slice(-20).join("\n");
+			await client.close().catch(() => {});
+			removeWork(dir);
+			throw new Error(`${what} did not start: ${e instanceof Error ? e.message : String(e)}${stderr ? `\nits stderr:\n${stderr}` : " (it wrote nothing to stderr)"}`, { cause: e });
+		}
+		return {
+			client,
+			close: async () => {
+				try {
+					await client.close();
+				} finally {
+					removeWork(dir);
+				}
+			},
+		};
 	}
 
 	/** Every tool of a source. */

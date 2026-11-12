@@ -4,7 +4,7 @@
 // secrets. Skipped without bwrap.
 
 import assert from "node:assert/strict";
-import { realpathSync, writeFileSync } from "node:fs";
+import { readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { bwrapAvailable, resolvePrograms, type SandboxPlan } from "../src/host/sandbox.ts";
@@ -38,14 +38,14 @@ test("each MCP connection gets its own scratch dir; a server keeps state within 
 	writeFileSync(join(srv, "server.mjs"), SERVER);
 	const sources = new ToolSources(new Store(tmp()), join(tmp(), "work"));
 	const box = plan({ volumes: resolveVolumes(["./:/srv:ro"], srv) });
-	const probe = async (client: Awaited<ReturnType<ToolSources["connectServer"]>>) => JSON.parse(((await client.callTool("probe", {})).content[0] as { text: string }).text) as { seen: boolean; cwd: string };
+	const probe = async (client: Awaited<ReturnType<ToolSources["connectServer"]>>) => JSON.parse(((await client.client.callTool("probe", {})).content[0] as { text: string }).text) as { seen: boolean; cwd: string };
 	const a = await sources.connectServer({ command: "node", args: ["/srv/server.mjs"] }, box);
 	const b = await sources.connectServer({ command: "node", args: ["/srv/server.mjs"] }, box);
 	try {
 		assert.deepEqual(await probe(a), { seen: false, cwd: "/w" });
 		assert.deepEqual(await probe(a), { seen: true, cwd: "/w" });
 		assert.deepEqual(await probe(b), { seen: false, cwd: "/w" });
-		const [info] = await ToolSources.list(a, { kind: "mcp", server: "probe" });
+		const [info] = await ToolSources.list(a.client, { kind: "mcp", server: "probe" });
 		assert.equal(info!.id, "mcp:probe/probe");
 		assert.equal(info!.name, "mcp__probe__probe");
 		assert.equal(info!.replay, "safe");
@@ -73,15 +73,34 @@ export const notATool = 3;\n`,
 	const sources = new ToolSources(store, join(tmp(), "work"));
 	const t = await sources.connectToolset(bundle, plan(), { TOKEN: "s3cret" });
 	try {
-		const infos = await ToolSources.list(t, { kind: "toolset", bundle });
+		const infos = await ToolSources.list(t.client, { kind: "toolset", bundle });
 		assert.deepEqual(infos.map((i) => [i.id, i.name, i.replay, writesOutside(i.annotations)]), [
 			[toolId({ kind: "toolset", bundle }, "post"), "post", "never", true],
 			[toolId({ kind: "toolset", bundle }, "where"), "where", "safe", false],
 		]);
 		assert.deepEqual(infos[1]!.outputSchema, { type: "object", properties: { cwd: { type: "string" } }, required: ["cwd"] });
-		const r = await t.callTool("where", {});
+		const r = await t.client.callTool("where", {});
 		assert.deepEqual(r.structuredContent, { cwd: "/w", secret: "s3cret", other: null, home: "/w" });
 	} finally {
 		await t.close();
 	}
+});
+
+test("a source that dies at startup is reported with its stderr; closing a connection removes its scratch dir", { skip, timeout: 60_000 }, async () => {
+	const srv = tmp();
+	writeFileSync(join(srv, "dies.mjs"), 'console.error("cannot open the catalog: no such file"); process.exit(3);\n');
+	writeFileSync(join(srv, "server.mjs"), SERVER);
+	const work = join(tmp(), "work");
+	const sources = new ToolSources(new Store(tmp()), work);
+	const box = plan({ volumes: resolveVolumes(["./:/srv:ro"], srv) });
+	await assert.rejects(sources.connectServer({ command: "node", args: ["/srv/dies.mjs"] }, box), (e: Error) => {
+		assert.match(e.message, /^MCP server node did not start: /);
+		assert.match(e.message, /its stderr:\ncannot open the catalog: no such file/);
+		return true;
+	});
+	assert.deepEqual(readdirSync(work), [], "a failed start leaves no scratch dir");
+	const a = await sources.connectServer({ command: "node", args: ["/srv/server.mjs"] }, box);
+	assert.equal(readdirSync(work).length, 1);
+	await a.close();
+	assert.deepEqual(readdirSync(work), [], "a closed connection leaves no scratch dir");
 });

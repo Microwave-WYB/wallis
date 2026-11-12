@@ -37,3 +37,8 @@ export const keepDraft = workflow({
 		}
 	},
 });
+
+const ghost = command({ sandbox: box, input: Type.Object({}), output: Type.Object({}), run: () => ["/no/such/program"] });
+
+/** Calls a command the sandbox cannot start. */
+export const haunted = workflow({ input: Type.Object({}), output: Type.Object({}), run: (ctx) => ctx.call(ghost, {}) });
