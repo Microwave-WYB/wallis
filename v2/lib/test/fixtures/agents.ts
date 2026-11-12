@@ -76,3 +76,22 @@ export const budget = workflow({
 	output: Type.Object({ uploaded: Type.Integer() }),
 	run: async (ctx, i) => ctx.call(limited, i),
 });
+
+const steerable = agent({
+	model: "default",
+	prompt: "Work until told otherwise.",
+	input: Type.Object({}),
+	output: Type.Object({ heard: Type.String() }),
+	mailbox: Type.String(),
+	turns: 6,
+});
+
+export const steered = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ heard: Type.String() }),
+	run: async (ctx) => {
+		const job = ctx.start(steerable, {});
+		ctx.register("steer", job.address);
+		return job.result;
+	},
+});

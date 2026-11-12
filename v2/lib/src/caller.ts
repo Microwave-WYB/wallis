@@ -75,16 +75,25 @@ class RunHandle<O> implements Run<O> {
 	readonly root: string;
 	readonly store: Store;
 	#cursor = 0;
+	/** A detached resume just started: the log's size then. Until the new process logs, the old ending is not the run's. */
+	#resumedAt: number | null;
 
-	constructor(root: string, paths: RunPaths) {
+	constructor(root: string, paths: RunPaths, resumedAt: number | null = null) {
 		this.root = root;
 		this.paths = paths;
 		this.id = paths.id;
 		this.store = new Store(root);
+		this.#resumedAt = resumedAt;
 	}
 
 	view(): RunView {
-		return new RunView(this.paths);
+		const v = new RunView(this.paths);
+		if (this.#resumedAt !== null) {
+			const size = existsSync(this.paths.log) ? statSync(this.paths.log).size : 0;
+			if (size > this.#resumedAt || !v.live) this.#resumedAt = null;
+			else v.resuming = true;
+		}
+		return v;
 	}
 
 	async status(): Promise<Status> {
@@ -195,8 +204,10 @@ class RunHandle<O> implements Run<O> {
 		const resume = { retry: [...retry], turns: options.turns ?? null };
 		const input = "input" in v.snapshot ? v.snapshot.input : null;
 		if (options.detach) {
+			const size = existsSync(this.paths.log) ? statSync(this.paths.log).size : 0;
 			detach(this.paths, { module: wf.file, digest: wf.digest, name: wf.name, input, resume });
-			return new RunHandle<O>(this.root, this.paths);
+			this.#resumedAt = size;
+			return new RunHandle<O>(this.root, this.paths, size);
 		}
 		const def = await importWorkflow(wf.file, wf.digest, wf.name);
 		const { result } = await launch({ root: this.root, paths: this.paths, def, input, resume });

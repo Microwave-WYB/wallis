@@ -4,7 +4,7 @@
 // decided failure recovered with resume({ retry, turns }), invalid output.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -139,3 +139,40 @@ test("three invalid results are a decided output_invalid with the errors", opts,
 	faux.setResponses([() => submit({ answer: "x" }), () => submit({ answer: "y" }), () => submit({ answer: "z" })]);
 	await assert.rejects(run(wf.one, { question: "?" }), (e: unknown) => e instanceof NodeFailed && e.reason.type === "output_invalid" && e.reason.errors.some((x) => /answer/.test(x)));
 });
+
+test("a message sent with interrupt aborts the current turn and enters the next one", opts, async () => {
+	const { root, wf } = await fixture();
+	let sawCutOff = true;
+	faux.setResponses([
+		// A long turn (3 s): the interrupt aborts it before it is done.
+		() => new Promise((done) => setTimeout(() => done(say("the long turn finished")), 3000)),
+		(ctx) => {
+			assert.match(text(messages(ctx).at(-1)), /stop and report/);
+			// The aborted turn's reply is not in the dialogue.
+			sawCutOff = messages(ctx).some((m) => /the long turn finished/.test(text(m)));
+			return submit({ heard: "stop and report" });
+		},
+	]);
+	const finished = run(wf.steered, {});
+	const { readdirSync } = await import("node:fs");
+	let id = "";
+	for (let i = 0; i < 200 && !id; i++) {
+		await new Promise((d) => setTimeout(d, 25));
+		id = existsSync(runsDir(root)) ? (readdirSync(runsDir(root))[0] ?? "") : "";
+	}
+	const r = attach(wf.steered, id);
+	for (let i = 0; i < 200; i++) {
+		try {
+			await r.send("steer", "stop and report", { interrupt: true });
+			break;
+		} catch (e) {
+			if (!/registered no address/.test(String(e))) throw e;
+			await new Promise((d) => setTimeout(d, 25));
+		}
+	}
+	const started = Date.now();
+	assert.deepEqual((await finished).output, { heard: "stop and report" });
+	assert.equal(sawCutOff, false);
+	assert.ok(Date.now() - started < 2900, "the interrupt did not wait for the turn to finish");
+});
+

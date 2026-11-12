@@ -299,8 +299,9 @@ class AgentCall {
 			steeringMode: "all",
 			finishTurn: async () => {
 				if (this.#submitted !== undefined || this.#invalid >= MAX_INVALID) return { action: "end" };
-				// Messages that arrived during this turn enter the next, together.
-				this.#deliver();
+				// Messages that arrived during this turn enter the next, together (after an abort, the
+				// loop ends here and the next round takes them).
+				if (!this.#interrupted && !this.#limitHit && !this.#exhausted && !this.#s.signal.aborted) this.#deliver();
 				return undefined;
 			},
 			transformContext: (messages, signal) => this.#fit(messages, streamFn, signal).then((m) => this.#quota(m)),

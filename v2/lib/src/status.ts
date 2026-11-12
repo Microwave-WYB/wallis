@@ -42,6 +42,8 @@ export class RunView {
 	readonly core: Core;
 	readonly snapshot: Snapshot;
 	readonly #bySlot: Map<string, CallView>;
+	/** A resume was just started and its process has not logged yet: the run is running, whatever its last ending. */
+	resuming = false;
 
 	constructor(paths: RunPaths) {
 		this.paths = paths;
@@ -60,6 +62,7 @@ export class RunView {
 	}
 
 	get ended(): { type: "done"; value: Json } | { type: "failed"; reason: FailReason } | null {
+		if (this.resuming) return null;
 		if (!("status" in this.snapshot) || typeof this.snapshot.status === "string") return null;
 		return this.snapshot.status.type === "ended" ? this.snapshot.status.outcome : null;
 	}
