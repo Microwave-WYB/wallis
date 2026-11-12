@@ -30,7 +30,8 @@ export interface Site {
 export function definitionSite(fallback: string): Site {
 	const stack = new Error().stack?.split("\n").slice(1) ?? [];
 	for (const frame of stack) {
-		const m = /\(?((?:file:\/\/)?\/[^():]+):(\d+):\d+\)?\s*$/.exec(frame);
+		// `at fn (/path:line:col)` or `at /path:line:col`; the path itself may hold ( ) : and spaces.
+		const m = /^\s*at (?:.*? \()?((?:file:\/\/)?\/.*):(\d+):\d+\)?\s*$/.exec(frame);
 		if (!m) continue;
 		const file = m[1]!.startsWith("file://") ? fileURLToPath(m[1]!) : m[1]!;
 		if (file.startsWith(`${LIB}/`)) continue;
@@ -238,10 +239,11 @@ export function command<IS extends TSchema, OS extends TSchema>(def: {
 
 // --- Agents -----------------------------------------------------------------------
 
-export interface Agent<I = unknown, O = unknown, M = never> {
+export interface Agent<I = unknown, O = unknown, M = never, IS extends TSchema = TSchema, OS extends TSchema = TSchema> {
 	readonly kind: "agent";
-	readonly input: TSchema;
-	readonly output: TSchema;
+	/** Its input schema, typed: `input: Type.Object({ report: uploader.output })` checks. */
+	readonly input: IS;
+	readonly output: OS;
 	__io?(i: I, m: M): O;
 }
 
@@ -288,7 +290,7 @@ export function agent<IS extends TSchema, OS extends TSchema, MS extends TSchema
 		/** The turn budget of one call. Default 30. Mailbox deliveries count. */
 		readonly turns?: number;
 	},
-): Agent<Static<IS>, Static<OS>, [MS] extends [never] ? never : Static<MS>> {
+): Agent<Static<IS>, Static<OS>, [MS] extends [never] ? never : Static<MS>, IS, OS> {
 	const site = definitionSite("agent");
 	const tools = (def.tools ?? []).map((t) => toolDef(t));
 	const declared = def.workspace;

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import { here } from "./util.ts";
 
@@ -40,7 +40,7 @@ test("SKILL.md follows the Agent Skills spec", () => {
 	const { fields, body } = frontmatter();
 	const name = fields.name as string;
 	assert.equal(name, "wallis");
-	assert.equal(name, "wallis", "name equals the directory name");
+	assert.equal(name, basename(dir), "name equals the directory name");
 	assert.match(name, /^[a-z0-9]+(-[a-z0-9]+)*$/, "lowercase letters, digits and single hyphens");
 	assert.ok(name.length <= 64);
 	const description = fields.description as string;

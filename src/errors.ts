@@ -3,6 +3,7 @@
 // not match its recipient's mailbox schema). Both carry plain data only.
 
 import type { CommandFailure, FailReason } from "./host/core.ts";
+import type { Session } from "./nodes.ts";
 import type { Address } from "./values.ts";
 
 /** A call's journal identity, stable across resumes. */
@@ -31,7 +32,7 @@ export interface SessionValue {
 export type FailureReason =
 	| { readonly type: "command_exited"; readonly code: number; readonly stderr: string }
 	| { readonly type: "output_invalid"; readonly errors: readonly string[] }
-	| { readonly type: "turn_limit_reached"; readonly turns: number; readonly session: SessionValue }
+	| { readonly type: "turn_limit_reached"; readonly turns: number; readonly session: Session<any, any, any> }
 	| { readonly type: "model_failed"; readonly message: string }
 	| { readonly type: "tool_failed"; readonly message: string }
 	| { readonly type: "workflow_threw"; readonly message: string };
@@ -63,10 +64,11 @@ export class NodeFailed extends Error {
  */
 export class MessageRejected extends Error {
 	override readonly name = "MessageRejected";
-	readonly to: Address<unknown>;
+	/** Any address: Address is invariant in its message type. */
+	readonly to: Address<any>;
 	readonly reason: "invalid" | "closed";
 	readonly errors: readonly { readonly path: string; readonly message: string }[];
-	constructor(to: Address<unknown>, errors: readonly { path: string; message: string }[], reason: "invalid" | "closed" = "invalid") {
+	constructor(to: Address<any>, errors: readonly { path: string; message: string }[], reason: "invalid" | "closed" = "invalid") {
 		super(reason === "closed" ? `message to ${to.id} rejected: the recipient is closed (it has ended and reads no more messages)` : `message to ${to.id} rejected: ${errors.map((e) => `${e.path} ${e.message}`).join("; ")}`);
 		this.to = to;
 		this.reason = reason;
@@ -112,6 +114,7 @@ function commandReason(f: CommandFailure): FailureReason {
 
 /** The public reason of a core failure; a nested workflow's failure is its leaf's reason. */
 export function publicReason(r: FailReason, session: (id: string) => SessionValue): FailureReason {
+	// A session value is data and, in a body, carries its agent: it is the Session the types promise.
 	switch (r.type) {
 		case "body_error":
 			return { type: "workflow_threw", message: r.message };
@@ -122,7 +125,7 @@ export function publicReason(r: FailReason, session: (id: string) => SessionValu
 		case "agent_error":
 			switch (r.failure.type) {
 				case "turn_limit_reached":
-					return { type: "turn_limit_reached", turns: r.failure.turns, session: session(r.session ?? "") };
+					return { type: "turn_limit_reached", turns: r.failure.turns, session: session(r.session ?? "") as unknown as Session<any, any, any> };
 				case "invalid_output":
 					return { type: "output_invalid", errors: r.failure.errors };
 				case "gave_up":

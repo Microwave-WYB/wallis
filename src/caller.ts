@@ -6,7 +6,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Static, TSchema } from "typebox";
@@ -19,7 +19,7 @@ import { workflowDef } from "./nodes.ts";
 import { importWorkflow, launch, notInRunner, processLog, readStart, type StartRequest, workflowName, writeStart } from "./launch.ts";
 import { isClosed, type Workflow } from "./runtime.ts";
 import { type Duration, parseDuration, RunView, type Status, transcriptText } from "./status.ts";
-import { type Address, declaredMedia, guessMedia, HostPath, type MessageId, refsIn, schemaErrors, stripPaths, toJson, walkMarked, withPaths } from "./values.ts";
+import { type Address, declaredMedia, expandHome, guessMedia, HostPath, type MessageId, refsIn, schemaErrors, stripPaths, toJson, walkMarked, withPaths } from "./values.ts";
 
 export type Next<O> =
 	| { readonly type: "message"; readonly outbox: string; readonly id: MessageId; readonly replyTo?: MessageId; readonly body: unknown }
@@ -130,7 +130,7 @@ class RunHandle<O> implements Run<O> {
 		return Object.assign(new RunHandle<O>(this.root, this.paths), {
 			output,
 			async exportOutput(hostDir: string): Promise<void> {
-				exportRefs(store, value, hostDir);
+				exportRefs(store, value, resolve(expandHome(hostDir)));
 			},
 		}) as unknown as Finished<O>;
 	}
@@ -227,7 +227,9 @@ class RunHandle<O> implements Run<O> {
 		const input = "input" in v.snapshot ? v.snapshot.input : null;
 		if (options.detach) {
 			const size = existsSync(this.paths.log) ? statSync(this.paths.log).size : 0;
-			detach(this.paths, { module: wf.file, digest: wf.digest, name: wf.name, input, resume });
+			// The run's onExit, as it was started: a detached resume runs it too.
+			const onExit = existsSync(join(this.paths.dir, "start.json")) ? readStart(this.paths).onExit : undefined;
+			detach(this.paths, { module: wf.file, digest: wf.digest, name: wf.name, input, resume, ...(onExit ? { onExit } : {}) });
 			this.#resumedAt = size;
 			return new RunHandle<O>(this.root, this.paths, size);
 		}
@@ -270,9 +272,16 @@ function exportRefs(store: Store, value: Json, dir: string): void {
 			if (prior !== undefined && prior !== r.digest) name = `${basename(name, extname(name))}-${r.digest.slice(7, 15)}${extname(name)}`;
 			used.set(name, r.digest);
 			cpSync(store.blobPath(r.digest), join(dir, name));
+			chmodSync(join(dir, name), 0o644);
 		} else {
 			const target = join(dir, r.digest.slice(7, 19));
-			for (const l of store.treeLayers(r.digest) ?? []) spawnSync("cp", ["-a", "--reflink=auto", "-T", store.layerDir(l), target]);
+			const layers = store.treeLayers(r.digest);
+			if (layers === null) throw new Error(`exportOutput: Tree ${r.digest} is not in the project's store`);
+			for (const l of layers) {
+				const c = spawnSync("cp", ["-a", "--reflink=auto", "-T", store.layerDir(l), target], { encoding: "utf8" });
+				if (c.status !== 0) throw new Error(`exportOutput: copying Tree ${r.digest} to ${target} failed: ${(c.stderr || String(c.error)).trim()}`);
+			}
+			spawnSync("chmod", ["-R", "u+w", target]);
 		}
 	}
 }
@@ -345,6 +354,9 @@ export function attach(a: unknown, b?: string): Run<unknown> {
 	}
 	const def = workflowDef(a as Workflow);
 	const { root, paths } = findRun(b!, dirname(def.site.file));
+	// Typed by `wf`, so it must be a run of `wf`: the same module and const (its digest may have changed since).
+	const wf = new RunView(paths).facts.workflow as { file?: string; name?: string | null; label?: string } | undefined;
+	if (wf && (wf.file !== def.site.file || (wf.name ?? null) !== def.site.name)) throw new Error(`run ${b} is a run of ${wf.label ?? "another workflow"}, not of ${def.label}`);
 	return new RunHandle(root, paths);
 }
 

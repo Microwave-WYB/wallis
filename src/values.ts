@@ -7,7 +7,8 @@
 // commands and agents (`withPaths`, `stripPaths`).
 
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import Type, { type Static, type TSchema, type TUnsafe } from "typebox";
 import Value from "typebox/value";
 import type { Json } from "./host/core.ts";
@@ -38,8 +39,8 @@ export interface TreeRef {
 export interface Address<M = unknown> {
 	readonly kind: "address";
 	readonly id: string;
-	/** Phantom: the message type. */
-	__message?(m: M): void;
+	/** Phantom: the message type, invariant (an Address<A> is no Address<B>, nor a mailbox-less Address<never>). */
+	readonly __message?: (m: M) => M;
 }
 
 export type MessageId = string & { readonly __messageId: true };
@@ -49,6 +50,11 @@ const DIGEST_RE = new RegExp(DIGEST);
 
 // --- Caller-only host files -------------------------------------------------------
 
+/** `~` and `~/…` as the user's home dir. */
+export function expandHome(path: string): string {
+	return path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
+
 /** `Artifact.from` / `Tree.from`: a host path the caller's `run` ingests into the store when the run starts. */
 export class HostPath {
 	readonly kind: "artifact" | "tree";
@@ -57,7 +63,7 @@ export class HostPath {
 	readonly name: string | undefined;
 	constructor(kind: "artifact" | "tree", host: string, media?: string, name?: string) {
 		this.kind = kind;
-		this.host = resolve(host);
+		this.host = resolve(expandHome(host));
 		this.media = media;
 		this.name = name;
 	}

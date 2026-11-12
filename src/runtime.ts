@@ -456,7 +456,7 @@ export class RunSession implements AgentHost {
 			.run({ host: this, effect: e, def: p.agent, input: p.input, slot: p.slot, label: p.label, turns: p.turns ?? p.agent.turns, mailbox, signal: abort.signal })
 			.then((events) => {
 				for (const ev of events) {
-					if (ev.type === "agent_failed") this.#failedLayers.set(ev.id, ev.layers);
+					if (ev.type === "agent_failed" && ev.layers.length > 0) this.#failedLayers.set(ev.id, ev.layers);
 					this.step(ev);
 				}
 			})
@@ -656,7 +656,7 @@ export class RunSession implements AgentHost {
 				return { kind: "tree", digest, path: session.treePath(digest) };
 			},
 			spawn: (schema, body) => session.#spawn(scope, schema, body as never, definitionSite("actor").label) as never,
-			map: (items, f) => Promise.all(items.map((item, i) => session.#spawn(scope, Type.Never(), (c) => f(c as Ctx, item, i), `map item ${i}`).result)),
+			map: (items, f) => Promise.all(items.map((item, i) => session.#spawn(scope, Type.Never(), (c) => f(c as unknown as Ctx, item, i), `map item ${i}`).result)),
 			loop: async (init, step) => {
 				const k = scope.loops++;
 				let state = init;
@@ -664,7 +664,7 @@ export class RunSession implements AgentHost {
 					const branch = new Scope(`${scope.scope}|loop${k}#${i}`, `${scope.prefix}l${k}.${i}.`, scope.path, scope.self);
 					let r: Awaited<ReturnType<typeof step>>;
 					try {
-						r = await Promise.race([step(session.#ctx(branch) as Ctx, state), branch.failure]);
+						r = await Promise.race([step(session.#ctx(branch) as unknown as Ctx, state), branch.failure]);
 					} finally {
 						// The iteration's actors close when its branch returns.
 						branch.dead = true;
@@ -821,7 +821,14 @@ export class RunSession implements AgentHost {
 					resolve(one ? this.hostView(v.output) : [this.hostView(v.output), next]);
 				},
 				fail: (reason) => {
-					if (reason.type === "agent_error" && reason.session !== null) this.#sessionIndex.set(reason.session, sessionValue(extra.agent!, reason.session, this.#failedLayers.get(id) ?? []));
+					if (reason.type === "agent_error" && reason.session !== null) {
+						// The layers of a failure's session: noted, so a later process (a resume answering it from the journal) has them.
+						const fact = `session_layers:${reason.session}`;
+						const known = this.journal.core.facts()[fact];
+						const layers = this.#failedLayers.get(id) ?? (Array.isArray(known) ? (known as string[]) : []);
+						if (layers.length > 0 && !Array.isArray(known)) this.#note(fact, layers);
+						this.#sessionIndex.set(reason.session, sessionValue(extra.agent!, reason.session, layers));
+					}
 					reject(this.#nodeFailed(call(this.journal.core.attemptCount(id)), reason));
 				},
 				refuse: (message) => reject(new Error(message)),
