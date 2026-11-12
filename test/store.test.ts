@@ -148,3 +148,18 @@ test("prune removes layers that hold read-only dirs", () => {
 	assert.equal(store.prune([log], null).layers, 1);
 	assert.ok(!store.hasLayer(layer!));
 });
+
+test("store files are read-only: writing into a ref's path is EACCES, not a silent change to every Tree that shares it", () => {
+	const { root, store } = project();
+	const dir = join(root, "t");
+	mkdirSync(dir);
+	writeFileSync(join(dir, "a.txt"), "a");
+	for (const move of [false, true]) {
+		const tree = store.snapshot(move ? dir : dir, { move });
+		const layer = store.treeLayers(tree)![0]!;
+		assert.throws(() => writeFileSync(join(store.layerDir(layer), "a.txt"), "changed"), /EACCES/);
+		if (!move) assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "a", "a copy leaves the source writable");
+	}
+	const blob = store.putText("an artifact");
+	assert.throws(() => writeFileSync(store.blobPath(blob), "changed"), /EACCES/);
+});

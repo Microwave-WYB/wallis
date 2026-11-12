@@ -1,7 +1,7 @@
 // Agents on the faux provider: one-shot and session calls, the send tool,
 // mailbox turns, the turn budget.
 
-import { Address, agent, Type, workflow } from "wallis";
+import { Address, agent, Tree, Type, workflow } from "wallis";
 
 const answerer = agent({
 	model: "default",
@@ -120,5 +120,24 @@ export const lingering = workflow({
 		// The agent has returned; the body waits for the caller's last word.
 		await mailbox.receive();
 		return out;
+	},
+});
+
+const noter = agent({
+	model: "default",
+	prompt: "Keep notes.",
+	input: Type.Object({ n: Type.Integer() }),
+	output: Type.Object({ text: Type.String() }),
+	workspace: { access: "write" },
+	turns: 6,
+});
+
+export const notes = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ text: Type.String(), tree: Tree() }),
+	run: async (ctx) => {
+		const [, s1] = await ctx.call(ctx.session(noter), { n: 1 });
+		const [out, s2] = await ctx.call(s1, { n: 2 });
+		return { text: out.text, tree: ctx.files(s2) };
 	},
 });

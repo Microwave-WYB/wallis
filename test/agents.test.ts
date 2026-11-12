@@ -221,3 +221,19 @@ test("an agent's send is delivered once, also when the run crashes inside the tu
 	assert.equal(sent.filter((e) => e.type === "sent" && e.to.startsWith("actor:")).length, 1);
 	assert.equal(sent.length, 2);
 });
+
+test("a session's later call can rewrite a file an earlier call wrote (read-only in its layer)", opts, async () => {
+	const { wf } = await fixture();
+	faux.setResponses([
+		() => call("write", { path: "notes.txt", content: "first\n" }),
+		() => submit({ text: "first" }),
+		() => call("write", { path: "notes.txt", content: "second\n" }),
+		() => call("edit", { path: "notes.txt", old: "second", new: "third" }),
+		(ctx) => {
+			assert.ok(!messages(ctx).some((m) => m.isError), "write and edit over an earlier call's file work");
+			return submit({ text: "third" });
+		},
+	]);
+	const r = await run(wf.notes, {});
+	assert.equal(readFileSync(r.output.tree.path + "/notes.txt", "utf8"), "third\n");
+});
