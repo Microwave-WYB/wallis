@@ -918,3 +918,22 @@ pub fn sent_id(state: RunState, key: String) -> String {
     Active(r) -> result_or(dict.get(r.sends, key), "")
   }
 }
+
+/// Where the call at this slot is: "running" (its newest attempt is open),
+/// "settled", or "none" (the run has no such call). A settled agent call's
+/// mailbox is closed.
+pub fn call_state(state: RunState, slot_text: String) -> String {
+  case state {
+    NotYetStarted -> "none"
+    Active(r) ->
+      case dict.to_list(r.calls) |> list.find(fn(e) { ids.slot_text(e.0) == slot_text }) {
+        Error(Nil) -> "none"
+        Ok(#(_, call)) ->
+          case call.attempts {
+            [Running(..), ..] -> "running"
+            [Settled(_), ..] -> "settled"
+            [] -> "none"
+          }
+      }
+  }
+}

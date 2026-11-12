@@ -151,6 +151,11 @@ export class Core {
 		return gleam.slot_of(this.#state, id);
 	}
 
+	/** Where the call with this key is: "running", "settled" (an agent's mailbox is then closed) or "none". */
+	callState(slot: string): "running" | "settled" | "none" {
+		return gleam.call_state(this.#state, slot) as "running" | "settled" | "none";
+	}
+
 	/** The id a journaled send's key was delivered as; "" for none. */
 	sentId(key: string): string {
 		return gleam.sent_id(this.#state, key);

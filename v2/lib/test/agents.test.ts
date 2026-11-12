@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { runPaths, runsDir } from "../src/host/runs.ts";
 import { bwrapAvailable } from "../src/host/sandbox.ts";
-import { attach, NodeFailed, run } from "../src/index.ts";
+import { attach, MessageRejected, NodeFailed, run } from "../src/index.ts";
 import { RunView } from "../src/status.ts";
 import { faux, messages, text } from "./fixtures/faux.ts";
 import { here, project } from "./util.ts";
@@ -176,3 +176,48 @@ test("a message sent with interrupt aborts the current turn and enters the next 
 	assert.ok(Date.now() - started < 2900, "the interrupt did not wait for the turn to finish");
 });
 
+
+test("an agent's send to a closed recipient fails with closed; run.send to a settled agent call is rejected", opts, async () => {
+	const { root, wf } = await fixture();
+	faux.setResponses([
+		() => call("send", { to: "renderer", message: { frame: "2835" } }),
+		(ctx) => {
+			const last = messages(ctx).at(-1)!;
+			assert.equal(last.isError, true);
+			assert.match(text(last), /closed/);
+			return submit({ got: "closed" });
+		},
+	]);
+	assert.deepEqual((await run(wf.toClosed, {})).output, { got: "closed", jobs: 0 });
+	faux.setResponses([() => submit({ heard: "nothing" })]);
+	const finished = run(wf.lingering, {});
+	let id = "";
+	for (let i = 0; i < 200 && !id; i++) {
+		await new Promise((d) => setTimeout(d, 25));
+		const ids = existsSync(runsDir(root)) ? (await import("node:fs")).readdirSync(runsDir(root)) : [];
+		id = ids.find((x) => x.startsWith("lingering")) ?? "";
+	}
+	const r = attach(wf.lingering, id);
+	for (let i = 0; i < 400 && view(root, id).core.callState(view(root, id).calls[0]?.slot ?? "") !== "settled"; i++) await new Promise((d) => setTimeout(d, 25));
+	await assert.rejects(r.send("steer", "too late"), (e: unknown) => e instanceof MessageRejected && e.reason === "closed");
+	await r.send("self", "done");
+	assert.deepEqual((await finished).output, { heard: "nothing" });
+});
+
+test("an agent's send is delivered once, also when the run crashes inside the turn that sent it", opts, async () => {
+	const root = project({ "wf.ts": readFileSync(join(here, "fixtures/agents.ts"), "utf8") }, { models: { default: "faux/m" }, executor: join(here, "fixtures/send-executor.ts") });
+	const wf = (await import(pathToFileURL(join(root, "wf.ts")).href)) as typeof import("./fixtures/agents.ts");
+	// The run's process kills itself right after the agent's send is journaled, inside the turn.
+	process.env.WALLIS_CRASH_AT = "agent-send:1";
+	const r = await run(wf.asking, {}, { detach: true });
+	delete process.env.WALLIS_CRASH_AT;
+	assert.equal((await r.next({ timeout: "20s" })).type, "stopped");
+	const before = view(root, r.id).events.filter((e) => e.type === "sent");
+	assert.equal(before.length, 1, "the job was sent before the crash");
+	const resumed = await r.resume({ detach: true });
+	assert.deepEqual(await resumed.next({ timeout: "20s" }), { type: "finished", output: { got: "rendered 2835", jobs: 1 } });
+	const sent = view(root, r.id).events.filter((e) => e.type === "sent");
+	// Exactly one job (the replayed turn answered its send from the journal) and its one reply.
+	assert.equal(sent.filter((e) => e.type === "sent" && e.to.startsWith("actor:")).length, 1);
+	assert.equal(sent.length, 2);
+});

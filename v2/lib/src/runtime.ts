@@ -15,7 +15,7 @@
 // `outbox:<name>`, the caller `caller`. Each mailbox has a schema; every
 // message is validated against the recipient's before it is journaled.
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import Type, { type Static, type TSchema } from "typebox";
 import type { AgentHost, AgentRunner } from "./agents.ts";
@@ -166,6 +166,10 @@ export class LiveMailbox implements Mailbox<unknown> {
 	async receive(): Promise<Envelope<unknown> | { readonly closed: true }> {
 		const e = await this.next();
 		return e === null ? { closed: true } : this.#view(e);
+	}
+
+	get closed(): boolean {
+		return this.#closed;
 	}
 
 	close(): void {
@@ -443,19 +447,40 @@ export class RunSession implements AgentHost {
 	}
 
 	/**
+	 * Whether a recipient has ended: an agent call that settled (the journal says), an actor or
+	 * workflow body that returned (its live mailbox, else the fact noted when it closed).
+	 */
+	closed(address: string): boolean {
+		if (address.startsWith("agent:")) return this.journal.core.callState(address.slice("agent:".length)) === "settled";
+		if (address.startsWith("actor:") || address.startsWith("wf:")) {
+			const live = this.#mailboxes.get(address);
+			if (live) return live.closed;
+			return this.journal.core.facts()[`closed:${address}`] === true;
+		}
+		return false;
+	}
+
+	/** An actor's or body's mailbox closed: noted, so a caller (another process) knows it too. */
+	#closedNote(address: string): void {
+		if (this.#ended || this.journal.core.facts()[`closed:${address}`] === true) return;
+		this.step({ type: "noted", key: `closed:${address}`, value: true });
+	}
+
+	/**
 	 * Sends a message: validated against the recipient's schema, then journaled
 	 * once by `key`. Returns its id, or the validation errors (nothing was sent).
 	 */
-	send(key: string, from: string, to: string, body: unknown, options: { readonly replyTo?: string | undefined; readonly interrupt?: boolean | undefined } = {}): { ok: true; id: MessageId } | { ok: false; errors: { path: string; message: string }[] } {
-		const schema = this.#schemas.get(to);
-		if (schema === undefined) return { ok: false, errors: [{ path: "/", message: `no mailbox at ${to} in this run (it is not running, or it has none)` }] };
-		const json = toJson(body);
-		if (!json.ok) return { ok: false, errors: [{ path: "/", message: json.error }] };
-		const value = stripPaths(json.value);
-		const errors = schemaErrors(schema, value);
-		if (errors.length > 0) return { ok: false, errors };
+	send(key: string, from: string, to: string, body: unknown, options: { readonly replyTo?: string | undefined; readonly interrupt?: boolean | undefined } = {}): { ok: true; id: MessageId } | { ok: false; reason: "invalid" | "closed"; errors: { path: string; message: string }[] } {
 		const known = this.journal.core.sentId(key);
 		if (known !== "") return { ok: true, id: known as MessageId };
+		if (this.closed(to)) return { ok: false, reason: "closed", errors: [{ path: "/", message: `${to} is closed: it has ended and reads no more messages` }] };
+		const schema = this.#schemas.get(to);
+		if (schema === undefined) return { ok: false, reason: "invalid", errors: [{ path: "/", message: `no mailbox at ${to} in this run (it is not running, or it has none)` }] };
+		const json = toJson(body);
+		if (!json.ok) return { ok: false, reason: "invalid", errors: [{ path: "/", message: json.error }] };
+		const value = stripPaths(json.value);
+		const errors = schemaErrors(schema, value);
+		if (errors.length > 0) return { ok: false, reason: "invalid", errors };
 		// The id is assigned by the core when it journals the send; an interrupt goes with its delivery.
 		const effects = this.journal.step({ type: "sent", key, to, from, reply_to: options.replyTo ?? null, body: value });
 		const id = this.journal.core.sentId(key);
@@ -486,7 +511,11 @@ export class RunSession implements AgentHost {
 			const registered = facts[`registered:${name}`] as { address?: string } | undefined;
 			if (!registered?.address || !this.#schemas.has(registered.address)) continue; // not yet: it stays in the inbox
 			const r = this.send(key, "caller", registered.address, body, { replyTo: typeof replyTo === "string" ? replyTo : undefined, interrupt: interrupt === true });
-			if (!r.ok) this.#rejected.add(key);
+			if (!r.ok) {
+				// Told to the caller (run.send waits for its message's id or for this).
+				this.#rejected.add(key);
+				appendFileSync(join(this.paths.dir, "inbox.rejected.jsonl"), `${JSON.stringify({ key, reason: r.reason, errors: r.errors })}\n`);
+			}
 		}
 		this.#inboxAt = size;
 	}
@@ -528,6 +557,7 @@ export class RunSession implements AgentHost {
 		} finally {
 			for (const m of scope.children) m.close();
 			mailbox.close();
+			if (wf.mailbox) this.#closedNote(scope.self);
 		}
 	}
 
@@ -581,7 +611,7 @@ export class RunSession implements AgentHost {
 				const n = scope.sends.get(sig) ?? 0;
 				scope.sends.set(sig, n + 1);
 				const r = session.send(`${scope.scope}|send|${sig}#${n}`, scope.self, to.id, body, options);
-				if (!r.ok) throw new MessageRejected(to, r.errors);
+				if (!r.ok) throw new MessageRejected(to, r.errors, r.reason);
 				return r.id;
 			},
 			self: { kind: "address", id: scope.self },
@@ -619,6 +649,7 @@ export class RunSession implements AgentHost {
 			} finally {
 				for (const m of child.children) m.close();
 				mailbox.close();
+				this.#closedNote(address);
 			}
 		})();
 		result.catch(() => {});

@@ -57,14 +57,19 @@ export class NodeFailed extends Error {
 	}
 }
 
-/** A message that does not match its recipient's mailbox schema. Nothing was delivered. */
+/**
+ * A message that was not delivered: it does not match its recipient's mailbox schema (`invalid`,
+ * with the errors), or its recipient is closed (`closed`: its call or actor has ended).
+ */
 export class MessageRejected extends Error {
 	override readonly name = "MessageRejected";
 	readonly to: Address<unknown>;
+	readonly reason: "invalid" | "closed";
 	readonly errors: readonly { readonly path: string; readonly message: string }[];
-	constructor(to: Address<unknown>, errors: readonly { path: string; message: string }[]) {
-		super(`message to ${to.id} rejected: ${errors.map((e) => `${e.path} ${e.message}`).join("; ")}`);
+	constructor(to: Address<unknown>, errors: readonly { path: string; message: string }[], reason: "invalid" | "closed" = "invalid") {
+		super(reason === "closed" ? `message to ${to.id} rejected: the recipient is closed (it has ended and reads no more messages)` : `message to ${to.id} rejected: ${errors.map((e) => `${e.path} ${e.message}`).join("; ")}`);
 		this.to = to;
+		this.reason = reason;
 		this.errors = errors;
 	}
 }

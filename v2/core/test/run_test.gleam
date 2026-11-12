@@ -551,3 +551,13 @@ pub fn a_tool_failure_is_typed_test() {
   assert last([started(), tool("0", True), types.ToolFailed("0", "boom")])
     == [Checkpoint, Fail("0", types.ToolError("list", "boom"))]
 }
+
+pub fn a_calls_state_says_whether_its_mailbox_is_open_test() {
+  let assert [_, CallAgent(mailbox:, ..)] = last([started(), agent("0", "a", None, JNull)])
+  let slot = string.drop_start(mailbox, 6)
+  let #(s, _, _) = replay([started(), agent("0", "a", None, JNull)])
+  assert run.call_state(s.state, slot) == "running"
+  let #(s, _, _) = replay_from(s, [agent_returned("0", JNull, "d")])
+  assert run.call_state(s.state, slot) == "settled"
+  assert run.call_state(s.state, "nope") == "none"
+}

@@ -37,6 +37,7 @@ import Value from "typebox/value";
 import { mountPoint, mountsOf } from "./commands.ts";
 import type { Effect, Envelope as CoreEnvelope, Event, Json } from "./host/core.ts";
 import { putDialogue, readDialogue } from "./host/dialogues.ts";
+import { crashPoint } from "./host/faults.ts";
 import { splitImages } from "./host/images.ts";
 import type { Journal } from "./host/journal.ts";
 import { commitLayer, layersAfter, prepareWork, removeWork, type Work } from "./host/layers.ts";
@@ -60,7 +61,7 @@ export interface AgentHost {
 	readonly paths: RunPaths;
 	readonly journal: Journal;
 	step(event: Event): void;
-	send(key: string, from: string, to: string, body: unknown, options?: { readonly replyTo?: string | undefined }): { ok: true; id: string } | { ok: false; errors: { path: string; message: string }[] };
+	send(key: string, from: string, to: string, body: unknown, options?: { readonly replyTo?: string | undefined }): { ok: true; id: string } | { ok: false; reason: "invalid" | "closed"; errors: { path: string; message: string }[] };
 	schemaOf(address: string): TSchema | undefined;
 	planFor(def: AgentDef): SandboxPlan;
 }
@@ -313,6 +314,9 @@ class AgentCall {
 				const said = ((event.result as { content?: { text?: string }[] } | undefined)?.content ?? []).map((c) => c.text ?? "").join("\n");
 				if (this.#invalidErrors.length === 0 || !said.includes("does not match the output schema")) this.#invalidErrors = said.split("\n").filter((l) => l.trim() !== "").slice(0, 12);
 			}
+			// A reply with tool calls is checkpointed before its tools run, so a crash inside the turn
+			// resumes knowing which calls it made (a send among them is answered from the journal).
+			if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "toolUse") this.#save(true);
 			if (event.type !== "turn_end") return;
 			const last = this.#agent.state.messages.at(-1);
 			if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) return;
@@ -344,13 +348,21 @@ class AgentCall {
 			this.#limit = this.#turns + this.#s.turns;
 			next = () => this.#agent.prompt(this.#user(`Your result did not match the output schema:\n${c.errors.join("\n")}\nFix it and call submit_result again.`));
 		} else if (saved !== null) {
-			// A reissued call: continue from its last completed turn. Tool calls the stop cut off get an error result.
+			// A reissued call: continue from its last checkpoint. Tool calls a stop cut off: a send that was
+			// journaled gets its result back (it is never sent twice); any other gets an error result.
 			const last = saved.messages.at(-1);
 			if (last?.role === "assistant") {
 				const calls = last.content.filter((p) => p.type === "toolCall");
 				for (const call of calls) {
-					this.#agent.state.messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: `The run stopped while ${call.name} was running; it may or may not have taken effect. Check before relying on it.` }], isError: true, timestamp: Date.now() } as never);
+					const sent = call.name === "send" ? this.#s.host.journal.core.sentId(this.#sendKey(call.id)) : "";
+					const result =
+						sent !== ""
+							? { content: [{ type: "text", text: `sent: message id ${sent}` }], isError: false }
+							: { content: [{ type: "text", text: `The run stopped while ${call.name} was running; it may or may not have taken effect. Check before relying on it.` }], isError: true };
+					this.#agent.state.messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, ...result, timestamp: Date.now() } as never);
 				}
+				// The cut-off turn counts.
+				if (calls.length > 0) this.#turns++;
 				next = calls.length > 0 ? () => this.#agent.continue() : () => this.#idle();
 			} else next = () => this.#agent.continue();
 		} else {
@@ -509,6 +521,11 @@ class AgentCall {
 
 	// --- Tools ---------------------------------------------------------------------------
 
+	/** A send's identity: (call, turn, the model's tool-call id). The journal delivers each key once. */
+	#sendKey(toolCallId: string): string {
+		return `${this.#s.slot}|t${this.#turns}|${toolCallId}`;
+	}
+
 	#sendTargets(): { field: string; id: string; message: TSchema }[] {
 		return addressesIn(this.#s.def.input, this.#s.input).map((a) => ({ field: a.path.replace(/^\//, "").replace(/\//g, "."), id: a.id, message: a.message }));
 	}
@@ -621,8 +638,10 @@ class AgentCall {
 				const p = params as { to: string; message: unknown; reply_to?: string };
 				const target = targets.find((t) => t.field === p.to);
 				if (!target) throw new Error(`no address ${p.to}; you can send to: ${targets.map((t) => t.field).join(", ")}`);
-				const r = this.#s.host.send(`${this.#s.effect.mailbox}|t${this.#turns}|${toolCallId}`, this.#s.effect.mailbox, target.id, p.message, { replyTo: p.reply_to });
+				const r = this.#s.host.send(this.#sendKey(toolCallId), this.#s.effect.mailbox, target.id, p.message, { replyTo: p.reply_to });
+				if (!r.ok && r.reason === "closed") throw new Error(`The message was rejected (nothing was sent): ${p.to} is closed (its call has ended); it reads no more messages.`);
 				if (!r.ok) throw new Error(`The message was rejected (nothing was sent):\n${r.errors.map((e) => `${e.path}: ${e.message}`).join("\n")}\nFix it and send again.`);
+				crashPoint("agent-send");
 				return { content: [{ type: "text", text: `sent: message id ${r.id}` }], details: undefined };
 			},
 		};

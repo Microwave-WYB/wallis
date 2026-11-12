@@ -71,3 +71,13 @@ test("the caller talks to a registered address and reads an outbox; a detached r
 	await r.send("user", "bye");
 	assert.deepEqual(await r.next({ timeout: "10s" }), { type: "finished", output: { heard: 2 } });
 });
+
+test("a send to a recipient that has ended is rejected as closed: ctx.send and run.send", opts, async () => {
+	const { wf } = await fixture();
+	assert.deepEqual((await run(wf.late, {})).output, { reason: "closed" });
+	const r = await run(wf.echo, {}, { detach: true });
+	for (let i = 0; i < 200 && !("registered:user" in (r as unknown as { view(): RunView }).view().facts); i++) await sleep(25);
+	await r.send("user", "bye");
+	assert.equal((await r.next({ timeout: "10s" })).type, "finished");
+	await assert.rejects(r.send("user", "anyone there?"), (e: unknown) => e instanceof MessageRejected && e.reason === "closed");
+});

@@ -114,3 +114,7 @@ pub fn slot_of(state: RunState, id: String) -> String {
 pub fn sent_id(state: RunState, key: String) -> String {
   run.sent_id(state, key)
 }
+
+pub fn call_state(state: RunState, slot: String) -> String {
+  run.call_state(state, slot)
+}

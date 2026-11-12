@@ -64,3 +64,19 @@ export const echo = workflow({
 		return { heard: await listener.result };
 	},
 });
+
+export const late = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ reason: Type.String() }),
+	run: async (ctx) => {
+		const quick = ctx.spawn(Type.String(), async () => 1);
+		await quick.result;
+		try {
+			ctx.send(quick.address, "too late");
+			return { reason: "delivered" };
+		} catch (e) {
+			if (!(e instanceof MessageRejected)) throw e;
+			return { reason: e.reason };
+		}
+	},
+});

@@ -95,3 +95,30 @@ export const steered = workflow({
 		return job.result;
 	},
 });
+
+export const toClosed = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ got: Type.String(), jobs: Type.Integer() }),
+	run: async (ctx) => {
+		// An actor that has already returned: its mailbox is closed.
+		const gone = ctx.spawn(Job, async () => {});
+		await gone.result;
+		const out = await ctx.call(worker, { renderer: gone.address });
+		return { ...out, jobs: 0 };
+	},
+});
+
+export const lingering = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ heard: Type.String() }),
+	mailbox: Type.String(),
+	run: async (ctx, _input, mailbox) => {
+		const job = ctx.start(steerable, {});
+		ctx.register("steer", job.address);
+		ctx.register("self", ctx.self);
+		const out = await job.result;
+		// The agent has returned; the body waits for the caller's last word.
+		await mailbox.receive();
+		return out;
+	},
+});

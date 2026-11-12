@@ -6,7 +6,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Static, TSchema } from "typebox";
@@ -167,12 +167,30 @@ class RunHandle<O> implements Run<O> {
 		if (!json.ok) throw new MessageRejected(to, [{ path: "/", message: json.error }]);
 		const errors = schemaErrors(registered.schema, stripPaths(json.value));
 		if (errors.length > 0) throw new MessageRejected(to, errors);
+		// A recipient that has ended reads nothing more: a finished run, a settled agent call, a closed actor.
+		const closed = [{ path: "/", message: `${registered.address} is closed: it has ended and reads no more messages` }];
+		if (v.ended?.type === "done") throw new MessageRejected(to, closed, "closed");
+		if (registered.address.startsWith("agent:") && v.core.callState(registered.address.slice(6)) === "settled") throw new MessageRejected(to, closed, "closed");
+		if (v.facts[`closed:${registered.address}`] === true) throw new MessageRejected(to, closed, "closed");
 		const key = `caller:${randomUUID()}`;
 		appendFileSync(join(this.paths.dir, "inbox.jsonl"), `${JSON.stringify({ key, name, body: stripPaths(json.value), ...(options.replyTo ? { replyTo: options.replyTo } : {}), ...(options.interrupt ? { interrupt: true } : {}) })}\n`);
-		// A live run journals it within moments: its id comes from the journal. A stopped one gets it on resume.
+		// A live run journals it within moments (its id comes from the journal), or rejects it (the
+		// recipient closed meanwhile). A stopped one persists it and delivers it on resume.
+		const rejectedFile = join(this.paths.dir, "inbox.rejected.jsonl");
+		const rejection = () => {
+			if (!existsSync(rejectedFile)) return null;
+			for (const line of readFileSync(rejectedFile, "utf8").split("\n")) {
+				if (!line) continue;
+				const r = JSON.parse(line) as { key: string; reason: "invalid" | "closed"; errors: { path: string; message: string }[] };
+				if (r.key === key) return r;
+			}
+			return null;
+		};
 		for (let i = 0; i < 120 && this.view().live; i++) {
 			const id = this.view().core.sentId(key);
 			if (id !== "") return id as MessageId;
+			const r = rejection();
+			if (r) throw new MessageRejected(to, r.errors, r.reason);
 			await sleep(50);
 		}
 		const id = this.view().core.sentId(key);
