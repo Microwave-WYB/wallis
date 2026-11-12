@@ -1,6 +1,6 @@
 name = "wallis_core"
-version = "0.1.0"
-description = "Pure core of wallis: journal, replay, budget, pin, status and interventions"
+version = "2.0.0"
+description = "Pure core of wallis: the journal, attempts, resume matching, sessions and mailbox order"
 target = "javascript"
 
 [javascript]

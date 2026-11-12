@@ -1,17 +1,21 @@
-//// The pure core of wallis.
+//// The pure core of wallis v2, compiled to JavaScript.
 ////
-//// The core owns every decision about a run (journal, replay matching,
-//// budget, pin, status, ownership and interventions) and performs no I/O. The host feeds it events and executes
-//// the effects it returns. See docs/design.md at the repository root.
+//// The core owns the run's journal: which calls completed, their attempts,
+//// the session values agent calls answer with, and every mailbox's
+//// delivery order. It performs no I/O. The host feeds it events and
+//// executes the effects it returns. See docs/v2.md at the repository root.
 ////
 //// The host holds `RunState` as an opaque handle; events, effects and state
 //// snapshots cross the boundary as JSON text.
 
+import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/string
 import wallis_core/run.{type RunState}
+
+import wallis_core/ids
 import wallis_core/types.{type Effect, type Event, InvalidEvent, Refuse}
 import wallis_core/value
 
@@ -41,7 +45,7 @@ pub fn step_json(state: RunState, event: String) -> #(RunState, String) {
   )
 }
 
-/// JSON of the run: status, nodes, observations, spend, budget and models.
+/// JSON of the run: workflow, status, mailboxes and every call.
 pub fn snapshot_json(state: RunState) -> String {
   json.to_string(run.snapshot(state))
 }
@@ -56,24 +60,61 @@ pub fn facts_json(state: RunState) -> String {
   json.to_string(run.host_facts(state))
 }
 
-/// The core's semantics version, pinned with every run.
+/// A mailbox's messages in their journaled order, as a JSON array.
+pub fn mailbox_json(state: RunState, address: String) -> String {
+  run.mailbox(state, address)
+  |> json.array(types.envelope_to_json)
+  |> json.to_string
+}
+
+/// How many attempts the call at this request id has had (0: none).
+pub fn attempt_count(state: RunState, id: String) -> Int {
+  run.attempt_count(state, id)
+}
+
+/// The core's semantics version, recorded with every run.
 pub fn semantics() -> String {
   run.semantics
 }
 
-/// How many attempts (tried or forgotten) the call at this request id has
-/// had: 0 for an id the run does not know. The host chains a write's count
-/// into the write epoch of its tool source, so a read after a write that
-/// re-executed misses.
-pub fn attempt_count(state: RunState, id: String) -> Int {
-  list.length(run.attempts(state, id))
+/// The journal key of a call, as the core computes it (see `run.requested`):
+/// a running agent's mailbox address and a call's id derive from it.
+/// `within` is "" for none. Returns "" when the input is not JSON.
+pub fn slot_text(
+  node: String,
+  kind: String,
+  input: String,
+  scope: String,
+  within: String,
+  occurrence: Int,
+) -> String {
+  case value.parse(input) {
+    Error(_) -> ""
+    Ok(v) -> {
+      let within = case within {
+        "" -> None
+        w -> Some(ids.session_id(w))
+      }
+      ids.slot_text(ids.slot(
+        ids.digest(node),
+        kind,
+        v,
+        scope,
+        within,
+        int.to_string(occurrence),
+      ))
+    }
+  }
 }
 
-/// The newest answer of a command or tool call's attempts, as JSON (`null`
-/// when none answered): a re-execution's output is compared with it.
-pub fn previous_answer_json(state: RunState, id: String) -> String {
-  case run.previous_answer(state, id) {
-    option.Some(v) -> json.to_string(value.to_json(v))
-    option.None -> "null"
-  }
+pub fn slot_of(state: RunState, id: String) -> String {
+  run.slot_of(state, id)
+}
+
+pub fn sent_id(state: RunState, key: String) -> String {
+  run.sent_id(state, key)
+}
+
+pub fn call_state(state: RunState, slot: String) -> String {
+  run.call_state(state, slot)
 }

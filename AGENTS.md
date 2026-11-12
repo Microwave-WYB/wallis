@@ -1,156 +1,117 @@
 # wallis
 
+`docs/design.md` is the design and the source of truth. When a design decision
+changes, change it in the same commit as the code. Items marked "proposed"
+there are not settled; ask before building on them. The agent skill
+(`skills/wallis/`) documents the public API for users; keep it in step with
+the code.
+
 ## Everything is a value
 
-The only mutation is appending an event to the run log. Every side file is
-either a content-addressed blob (or layer) that an event names, written
-before that event, or a cache derivable from the log (`meta.json`). The
-journal only grows: a restart, a rewind or a forget adds an attempt. The
-host executes effects and feeds events back; it decides nothing (crash
-policy, attempts, retries are core state).
+The only mutation is appending an event to a run's log. Every side file is
+either a content-addressed blob or layer in the project's store, written
+before the event that names it, or a cache derivable from the log
+(`meta.json`). The journal only grows: a resume, a retry or a new attempt
+adds to it. The host executes effects and feeds events back; the core
+decides what runs and what is answered from the record.
 
-- **Sessions are values.** `ctx.call(s, input)` returns `[output, next]`;
-  `s` is unchanged, so calling it again is a branch. Values are plain data
-  and may go to any branch. A call is keyed by (node digest, parent
-  session, input, occurrence per branch); the next session is a hash chain
-  over the call's slot and attempt. Dialogues are blobs (deltas from the
-  parent session's).
-- **Workspaces are layers.** A session's `/w` is an overlay of immutable
-  layers; a call's changes become a new layer (rename, no copy) before
-  `agent_returned` names it; squashed beyond 16. `ctx.files(s)` is a Tree;
-  `ctx.session(agent, { from })` seeds one copy-on-write.
-- **Identity is structural.** Journal keys come from digests (node
-  definition, canonical input, parent session, occurrence), never from
-  display names or request ids; inside the core they are opaque types
-  (`Slot`, `RequestId`, `SessionId`, `Digest`).
+- **Sessions are values.** `ctx.call(session, input)` returns `[output,
+  next]`; the session is unchanged, so calling it again is a branch. A
+  session id is a hash chain over the call it comes after and that call's
+  attempt.
+- **Workspaces and Trees are layers.** A session's `/w` is an overlay of
+  immutable layers; a call's changes become a new layer (renamed in, never
+  copied) before the event that names it; squashed beyond 16. A Tree is one
+  digest naming its layers.
+- **Identity is structural.** Journal keys come from digests and positions
+  (node definition, canonical input, scope, session, occurrence), never from
+  display names; inside the core they are opaque types (`Slot`, `RequestId`,
+  `SessionId`, `Digest`).
 
 ## Governing principle
 
 Types make illegal states unrepresentable. Where types cannot reach (time,
-external input), the core re-checks when it applies an event and returns a
-typed refusal. Nothing is ever silently dropped.
+other processes, external input), the core re-checks when it applies an
+event and returns a typed refusal. Nothing is ever silently dropped.
 
 1. Every lifecycle is a discriminated union; each variant carries only the
    data meaningful in that state.
-2. A capability is obtainable only through its check (`OwnedRun`,
-   `IdleNode`, `SteerableNode` (agents only), `LiveNode`, `SubmittableNode`, `ResumableRun`): opaque types in
-   Gleam, classes with private constructors in TS. Prefer compiler narrowing
-   over hand-written `x is T` predicates. Brand only raw ids that cross a
-   boundary (`RunId`, `NodeId`).
-3. Everything at a boundary is `unknown` until parsed with its schema (model
-   and script output, MCP and CLI args, artifact refs against the store). No
-   `as` casts there.
+2. Prefer compiler narrowing over hand-written `x is T` predicates. Brand
+   only raw ids that cross a boundary (`CallId`, `MessageId`).
+3. Everything at a boundary is `unknown` until parsed with its schema
+   (command and model output, tool results, messages, files read back from
+   the run directory). No `as` casts there.
 
-**Every new state or operation must name its union variant, the capability
-it requires, and how its boundary input is parsed.** Keep it minimal: no
-generics or wrappers that add no proof.
+**Every new state or operation must name its union variant and how its
+boundary input is parsed.** Keep it minimal: no generics or wrappers that add
+no proof.
 
-## Sources of truth
+## Layout
 
-- `docs/design.md` holds the current design. Change it when a design decision
-  changes, in the same change as the code.
-- Items marked "proposed" there are not settled; ask before building on them.
+- `core/`: the pure Gleam core (journal, attempts, resume matching, sessions,
+  mailbox order). `core/dist/` is its JavaScript, committed so installing
+  the package never needs Gleam: rebuild it with `mise run build`.
+- `src/`: the package `wallis`, the authoring and caller API and the runtime.
+  `src/host/` holds the host's internals (log, store, layers, sandbox, tool
+  sources).
+- `test/`: node:test suites; `test/fixtures/` their workflows and scripted
+  executors.
+- `examples/`: chat, SIDERIUS and a film-style example on tiny synthetic
+  inputs; each runs in a test.
+- `skills/wallis/`: the agent skill (Agent Skills spec).
+- `tools/`: `gleam-codegen.mjs`, `build-core.mjs`.
 
 ## Toolchain
 
-- Tools are declared in `mise.toml` (Gleam, Node). Do not install them globally.
-- npm dependencies live in `host/package.json` with exact versions;
+- Tools are declared in `mise.toml` (Gleam, Node). Do not install them
+  globally. npm dependencies are pinned in `package.json`;
   `mise run install` installs them from the lockfile.
-- `mise run build` builds the core. `mise run test` runs the core and host
-  tests. `mise run typecheck` type-checks `host/` and `.agents/workflows/`.
+- `mise run build` builds the core (and `core/dist`) and `dist/`.
+  `mise run test` runs the core and package tests. `mise run typecheck`
+  type-checks `src/`, `test/`, `examples/` and the skill's starter.
 - After changing a type in `core/src/wallis_core/types.gleam`, delete its
-  old `_decoder`/`_to_json` functions and regenerate them: from `core/`,
-  `node ../tools/gleam-codegen.mjs <file> <Type>...`.
+  generated `_decoder`/`_to_json` functions and regenerate them, from
+  `core/`: `node ../tools/gleam-codegen.mjs src/wallis_core/types.gleam <Type>...`.
+- Run `node --test` with explicit globs (`'test/*.test.ts'`), never bare: a
+  bare run picks up fixtures.
 
 ## Core rules
 
 - `core/` is pure Gleam: no FFI, no I/O, no clocks, no randomness. Everything
   the core needs arrives as an event; everything it wants done leaves as an
   effect.
-- Model run state as explicit custom types and exhaustive `case`; no
-  boolean flags for states.
-- In the core, a match over a union we define has no `_` arm: list every
+- Model run state as explicit custom types and exhaustive `case`; no boolean
+  flags for states. A match over a union we define has no `_` arm: list every
   arm, or say why the rest cannot occur.
-- Generate decoders and JSON encoders with the Gleam language server code
-  actions rather than writing them by hand.
-- Every core behavior gets a test that replays a sequence of events; no test
-  may need a model, network or device.
+- Every core behavior gets a test that replays a sequence of events
+  (`test/support.gleam`'s `replay` also checks that the state refolded from
+  the logged events equals the live one); no test needs a model, network or
+  device.
 
-## Host and SDK rules
+## Package rules
 
-- `host/src/sdk/` runs inside the QuickJS sandbox: no Node imports.
-- Host tests use the fake executor and fake commands (`confine: "off"`);
-  tests that run real commands need bwrap and skip without it; never real model calls
-  or API keys. CLI and MCP tests load `host/test/fixtures/fake-executor.ts`
-  as the executor module and work in throwaway projects (`test/util.ts`).
-- pi executor tests use pi-ai's faux provider (`fauxProvider().setResponses`);
-  never real paid model calls.
-- Host tests run with `WALLIS_DIFFERENTIAL=1` (`mise.toml`, `test/util.ts`):
-  after every event a session checks that the state rebuilt from the log
-  (as the CLI and MCP see it) equals its live state, and ends on a
-  mismatch. Every state change must be logged.
-- CLI tests run detached hosts with `WALLIS_HOST=plain` (set in
-  `test/util.ts`) so SIGKILL tests are not restarted by systemd; tests that
-  need bwrap or systemd skip with a message when unavailable.
-- The workflow body is a pure program over journaled calls; run memory is
-  its local variables. There is no workflow state in the core, no views,
-  reducers or `emit` (owner decision, round 4). Agents get everything they
-  need in their typed input.
-- Codemode is on for every agent; a codemode call costs a turn, so agents
-  need `maxTurns >= 2`. `maxTurns` is an orchestration point
-  (`Idle(turn_limit)`), not a failure.
-- One node union (agent | command | workflow | MCP tool | orchestrator);
-  agents are called through session values only (`[out, next] = await
-  ctx.call(ctx.session(agent), input)`), every
-  other node (and tool values) with `ctx.call`. Agents' `tools` are `ask`,
-  toolset tools and MCP tools only; file tools come from `workspace`
-  access; commands are called by workflow code only. Multi-step concurrent
-  branches use `ctx.parallel`/`ctx.map`.
-- Agents interact with the workflow only through input and output; outward
-  writes happen in the body (ask first with an orchestrator node). Agents
-  and commands never get network; tool processes do. Every tool result is
-  journaled; write-capable tools given to agents are warnings.
-- The sandbox layout is fixed: `/in` (inputs, read-only), `/w` (the
-  workspace; an agent's is an overlay of its session's layers), each volume
-  at its target, `/tmp`. Layers and blobs are written before the event
-  that names them.
-- Sandboxes are declared (`defineSandbox`), bwrap only, nothing implicit,
-  in compose vocabulary: `volumes` (`"./x:/x:ro"` binds, read-only only;
-  `"name:/target"` named caches), `devices`, `network`, `environment`.
-  Never mount the workflow dir implicitly, never add a writable bind. A
-  bind is snapshotted into the run when it starts (a fork takes a new
-  snapshot) and its digest is part of the cache key of every call that
-  binds it; named volumes are outside every key (results must not depend on
-  them). Volume rules are both a type (`CheckVolume`) and a preflight
-  parse (`parseVolume`, `resolveVolumes`).
-- Identity is by digest or structure; names are labels only. Never put a
-  node's, sandbox's or nested workflow's name in a journal key, a node
-  digest or a request id: a node is its definition digest, a custom tool
-  is (bundle digest, export), an MCP tool is (server, tool). A change to
-  what a digest covers bumps the core's semantics version.
-- The workflow VM runs untrusted workflow code: the host parses its
-  declarations (`host/src/host/declarations.ts`) and re-checks every
-  sandbox rule itself; VM-side checks are early errors only. Host programs
-  (bwrap, systemd-run) run by absolute path with an environment holding
-  secrets only; everything else reaches the sandbox via `--setenv`.
-- Recovery is the most important property: keep transient-error retries
-  in the executor, per-turn checkpoints, held node failures, and the
-  journal as a cache (node digest, input, occurrence) working, with tests.
-- The budget (turns, compute minutes) is an attention point; USD and
-  tokens are information only.
-- Interventions carry `by` and go through the capability checks on both
-  sides (host, then core). Verbs: send (idle: reply; running: steer),
-  submit (orchestrator nodes), interrupt (no message), restart, cancel,
-  pause, resume, and fork `--forget` (a `call_forgotten` mark per call in
-  the fork).
-- Every value crossing the sandbox or executor boundary is schema-checked on
-  both sides (`src/sdk/validate.ts`); keep new boundaries that way.
-- The body sees typed errors only (`Refused`, `AgentFailed`,
-  `CommandFailed`, `ToolFailed`, `OrchestratorCancelled`, `WorkflowFailed`,
-  `SchemaError`, each with
-  a typed failure); never make it match on message text.
-- `ctx` is typed by the workflow's declarations (`Ctx<D>`); keep every new
-  ctx method's callbacks on `Ctx<D>`, and every new node kind declared
-  (name literal type) and refused at run time when undeclared.
-- Compile-time guarantees get `@ts-expect-error` tests in
-  `host/test/sdk-types.ts`.
+- Every test runs with `WALLIS_DIFFERENTIAL=1` (`test/util.ts`): after every
+  event the state rebuilt from the log must equal the live state. Every
+  state change is logged.
+- Tests never make real model calls or need API keys: pi-ai's faux provider
+  or a scripted executor module (`test/fixtures/*-executor.ts`). Tests that
+  spawn sandboxes need bwrap, skip with a reason without it, and carry
+  timeouts. Named volumes and caches go to a throwaway `XDG_CACHE_HOME`.
+- The workflow body is plain code over journaled calls; run memory is its
+  local variables. The core holds no workflow state.
+- Every message is validated against its recipient's mailbox schema before
+  it is journaled; a closed recipient rejects.
+- A node's digest covers its own definition (schemas, sandbox, prompt, the
+  source of its own functions), never its name or label, and not the helpers
+  it closes over (docs/design.md §5.5). A change to what a digest or a slot
+  covers bumps the core's semantics version.
+- The sandbox's jobs are preventing accidents and making dependencies
+  explicit (docs/design.md §1): nothing implicit is mounted, binds are
+  read-only, no network unless declared.
+- The body sees typed errors only (`NodeFailed` with a `reason` union,
+  `MessageRejected` with `invalid` or `closed`); never match on message text.
+- Recovery is the most important property: resume in place, attempts,
+  per-turn checkpoints, decided failures retried only when named. Keep them
+  tested.
+- Heavy work in tests and acceptance (stitching, rendering) runs one at a
+  time, under `build-guard` after `wait-for-no-game` on the owner's host.

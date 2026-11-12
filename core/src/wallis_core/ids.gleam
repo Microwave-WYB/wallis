@@ -68,13 +68,15 @@ pub opaque type Slot {
 }
 
 /// The journal slot of a call: the node's definition digest, the request's
-/// kind and canonical input (not its name: names are labels), the session it continues (`None` for a
-/// new session, and for calls that are not session calls), and its
-/// occurrence in its branch of the body.
+/// kind and canonical input (not its name: names are labels), its scope
+/// (the slot of the nested workflow call it is made in, "" at the top), the
+/// session it continues (`None` for a new session, and for calls that are
+/// not session calls), and its occurrence in its scope.
 pub fn slot(
   node: Digest,
   kind: String,
   input: Value,
+  scope: String,
   within: Option(SessionId),
   occurrence: String,
 ) -> Slot {
@@ -84,7 +86,7 @@ pub fn slot(
   }
   Slot(
     sha.hex(string.join(
-      [digest_text(node), kind, value.canonical(input), within],
+      [digest_text(node), kind, value.canonical(input), scope, within],
       "\n",
     ))
     <> "#"

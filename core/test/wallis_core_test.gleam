@@ -8,52 +8,40 @@ pub fn main() -> Nil {
 
 // The JSON entry point: events in, effects out, both as text.
 pub fn step_json_roundtrip_test() {
-  let wf =
-    "{\"name\":\"t\",\"agents\":[{\"name\":\"a\",\"model\":\"default\",\"max_turns\":4,\"steerable\":true}],\"commands\":[],\"orchestrators\":[],\"tools\":[],"
-    <> "\"budget\":{\"turns\":null,\"compute_minutes\":null}}"
-  let pin =
-    "{\"workflow_digest\":\"d\",\"prior_digests\":[],\"models\":{\"default\":\"fake/m\"},\"seed\":1,\"inputs\":{},\"semantics\":\""
-    <> wallis_core.semantics()
-    <> "\"}"
   let #(s, effects) =
     wallis_core.step_json(
       wallis_core.init(),
-      "{\"type\":\"started\",\"workflow\":"
-        <> wf
-        <> ",\"pin\":"
-        <> pin
-        <> ",\"input\":{\"goal\":1}}",
+      "{\"type\":\"started\",\"workflow\":{\"name\":\"t\",\"digest\":\"d\"},\"input\":{\"goal\":1},\"semantics\":\""
+        <> wallis_core.semantics()
+        <> "\"}",
     )
   assert effects == "[{\"type\":\"checkpoint\"}]"
   let #(s, effects) =
     wallis_core.step_json(
       s,
-      "{\"type\":\"requested\",\"id\":\"#0\",\"node_digest\":\"nd\",\"occurrence\":\"0\",\"request\":{\"type\":\"call\",\"agent\":\"a\",\"input\":{\"x\":1},\"session\":null,\"from\":[]}}",
-    )
-  assert string.contains(effects, "\"type\":\"call_agent\"")
-  assert string.contains(effects, "\"model\":\"fake/m\"")
-  assert string.contains(effects, "\"transcript\":[]")
-  assert string.contains(effects, "\"note\":null")
-  let #(s, effects) =
-    wallis_core.step_json(
-      s,
-      "{\"type\":\"agent_returned\",\"id\":\"#0\",\"output\":{\"summary\":\"s1\"},\"usage\":{\"usd\":0.1,\"tokens\":5,\"turns\":1},\"model\":\"fake/m\",\"dialogue\":null,\"layers\":null}",
+      "{\"type\":\"requested\",\"id\":\"0\",\"request\":{\"type\":\"command_call\",\"name\":\"c\",\"input\":1},\"node\":\"n\",\"scope\":\"\",\"occurrence\":0}",
     )
   assert effects
-    == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"#0\",\"value\":{\"layers\":[],\"output\":{\"summary\":\"s1\"},\"session\":\"s42ac7d45c969c501\"}}]"
-  let snapshot = wallis_core.snapshot_json(s)
-  assert string.contains(
-    snapshot,
-    "{\"type\":\"node_done\",\"id\":\"#0\",\"agent\":\"a\",\"model\":\"fake/m\",\"steerable\":true,\"inbox\":[],\"outcome\":{\"type\":\"submitted\"}}",
-  )
-  assert !string.contains(snapshot, "\"state\"")
+    == "[{\"type\":\"checkpoint\"},{\"type\":\"run_command\",\"id\":\"0\",\"attempt\":1}]"
+  let #(_, effects) =
+    wallis_core.step_json(
+      s,
+      "{\"type\":\"command_returned\",\"id\":\"0\",\"output\":{\"x\":2}}",
+    )
+  assert effects
+    == "[{\"type\":\"checkpoint\"},{\"type\":\"deliver\",\"id\":\"0\",\"value\":{\"x\":2}}]"
 }
 
-pub fn step_json_rejects_bad_event_test() {
+pub fn a_bad_event_is_a_typed_refusal_test() {
+  let #(_, effects) = wallis_core.step_json(wallis_core.init(), "{\"type\":1}")
+  assert string.contains(effects, "invalid_event")
+}
+
+pub fn a_log_of_another_semantics_is_refused_test() {
   let #(_, effects) =
-    wallis_core.step_json(wallis_core.init(), "{\"type\":\"nope\"}")
-  assert string.starts_with(
-    effects,
-    "[{\"type\":\"refuse\",\"id\":null,\"refusal\":{\"type\":\"invalid_event\"",
-  )
+    wallis_core.step_json(
+      wallis_core.init(),
+      "{\"type\":\"started\",\"workflow\":{\"name\":\"t\",\"digest\":\"d\"},\"input\":null,\"semantics\":\"wallis-core/0\"}",
+    )
+  assert string.contains(effects, "semantics_changed")
 }

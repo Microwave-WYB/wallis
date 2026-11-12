@@ -1,4 +1,4 @@
 node_modules/
 core/build/
+/dist/
 .wallis/
-v2/core/build/

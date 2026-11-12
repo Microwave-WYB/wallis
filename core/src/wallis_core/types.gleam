@@ -4,290 +4,97 @@
 //// were filled in by the tool, by naming convention, where the action left
 //// a `todo`.
 
-import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{type Option}
 import wallis_core/value.{type Value} as json_value
 
-// --- Declarations (produced by the TS SDK) ---------------------------------
-
+/// The workflow a run executes: its module digest (its identity) and its
+/// name (a label).
 pub type Workflow {
-  Workflow(
-    name: String,
-    agents: List(Agent),
-    commands: List(String),
-    /// Orchestrator nodes: typed questions the orchestrator answers.
-    orchestrators: List(String),
-    budget: Budget,
-  )
+  Workflow(name: String, digest: String)
 }
 
 pub fn workflow_to_json(workflow: Workflow) -> json.Json {
-  let Workflow(name:, agents:, commands:, orchestrators:, budget:) = workflow
+  let Workflow(name:, digest:) = workflow
   json.object([
     #("name", json.string(name)),
-    #("agents", json.array(agents, agent_to_json)),
-    #("commands", json.array(commands, json.string)),
-    #("orchestrators", json.array(orchestrators, json.string)),
-    #("budget", budget_to_json(budget)),
+    #("digest", json.string(digest)),
   ])
 }
 
 pub fn workflow_decoder() -> decode.Decoder(Workflow) {
   use name <- decode.field("name", decode.string)
-  use agents <- decode.field("agents", decode.list(agent_decoder()))
-  use commands <- decode.field("commands", decode.list(decode.string))
-  use orchestrators <- decode.field("orchestrators", decode.list(decode.string))
-  use budget <- decode.field("budget", budget_decoder())
-  decode.success(Workflow(name:, agents:, commands:, orchestrators:, budget:))
+  use digest <- decode.field("digest", decode.string)
+  decode.success(Workflow(name:, digest:))
 }
 
-/// `steerable: False` admits only cancel and a restart without a note.
-pub type Agent {
-  Agent(name: String, model: String, max_turns: Int, steerable: Bool)
-}
 
-pub fn agent_to_json(agent: Agent) -> json.Json {
-  let Agent(name:, model:, max_turns:, steerable:) = agent
-  json.object([
-    #("name", json.string(name)),
-    #("model", json.string(model)),
-    #("max_turns", json.int(max_turns)),
-    #("steerable", json.bool(steerable)),
-  ])
-}
 
-pub fn agent_decoder() -> decode.Decoder(Agent) {
-  use name <- decode.field("name", decode.string)
-  use model <- decode.field("model", decode.string)
-  use max_turns <- decode.field("max_turns", decode.int)
-  use steerable <- decode.field("steerable", decode.bool)
-  decode.success(Agent(name:, model:, max_turns:, steerable:))
-}
 
-/// Attention points, not hard caps: once spend reaches a limit no new call
-/// is admitted and the run goes `Idle(BudgetReached)`; in-flight calls
-/// finish. USD and tokens are recorded for information only.
-pub type Budget {
-  Budget(turns: Option(Int), compute_minutes: Option(Float))
-}
 
-pub fn budget_to_json(budget: Budget) -> json.Json {
-  let Budget(turns:, compute_minutes:) = budget
-  json.object([
-    #("turns", case turns {
-      option.None -> json.null()
-      option.Some(value) -> json.int(value)
-    }),
-    #("compute_minutes", case compute_minutes {
-      option.None -> json.null()
-      option.Some(value) -> json.float(value)
-    }),
-  ])
-}
-
-pub fn budget_decoder() -> decode.Decoder(Budget) {
-  use turns <- decode.field("turns", decode.optional(decode.int))
-  use compute_minutes <- decode.field(
-    "compute_minutes",
-    decode.optional(decode.float),
-  )
-  decode.success(Budget(turns:, compute_minutes:))
-}
-
-pub type BudgetKind {
-  Turns
-  ComputeMinutes
-}
-
-pub fn budget_kind_to_json(budget_kind: BudgetKind) -> json.Json {
-  case budget_kind {
-    Turns -> json.string("turns")
-    ComputeMinutes -> json.string("compute_minutes")
-  }
-}
-
-pub fn budget_kind_decoder() -> decode.Decoder(BudgetKind) {
-  use variant <- decode.then(decode.string)
-  case variant {
-    "turns" -> decode.success(Turns)
-    "compute_minutes" -> decode.success(ComputeMinutes)
-    _ -> decode.failure(Turns, "BudgetKind")
-  }
-}
-
-/// Result-defining fields are compared on resume; `models` is operational
-/// and changes only through `AliasRebound`. `inputs` holds pinned files and
-/// mount digests.
-pub type Pin {
-  Pin(
-    workflow_digest: String,
-    /// Earlier code of this run, oldest first: digests replaced by `CodeChanged`.
-    prior_digests: List(String),
-    models: Dict(String, String),
-    seed: Int,
-    inputs: Dict(String, String),
-    semantics: String,
-  )
-}
-
-pub fn pin_to_json(pin: Pin) -> json.Json {
-  let Pin(workflow_digest:, prior_digests:, models:, seed:, inputs:, semantics:) =
-    pin
-  json.object([
-    #("workflow_digest", json.string(workflow_digest)),
-    #("prior_digests", json.array(prior_digests, json.string)),
-    #("models", json.dict(models, fn(string) { string }, json.string)),
-    #("seed", json.int(seed)),
-    #("inputs", json.dict(inputs, fn(string) { string }, json.string)),
-    #("semantics", json.string(semantics)),
-  ])
-}
-
-pub fn pin_decoder() -> decode.Decoder(Pin) {
-  use workflow_digest <- decode.field("workflow_digest", decode.string)
-  use prior_digests <- decode.field("prior_digests", decode.list(decode.string))
-  use models <- decode.field(
-    "models",
-    decode.dict(decode.string, decode.string),
-  )
-  use seed <- decode.field("seed", decode.int)
-  use inputs <- decode.field(
-    "inputs",
-    decode.dict(decode.string, decode.string),
-  )
-  use semantics <- decode.field("semantics", decode.string)
-  decode.success(Pin(
-    workflow_digest:,
-    prior_digests:,
-    models:,
-    seed:,
-    inputs:,
-    semantics:,
-  ))
-}
-
-// --- Events (host to core) ---------------------------------------------------
-
-/// Intervention events carry `by`, the caller's identity; the core re-checks
-/// ownership when it applies them.
 pub type Event {
-  Started(workflow: Workflow, pin: Pin, input: Value)
-  Resumed(pin: Pin)
-  /// The workflow code changed since the last session; calls whose node
-  /// and input are unchanged still hit the journal.
-  CodeChanged(from: String, to: String)
-  /// The declarations of the changed code: agents, commands and
-  /// orchestrators are looked up in these from now on (names are labels; a
-  /// call's identity is its node's definition digest). The budget is not
-  /// part of it: limits change by `BudgetRaised` only.
-  WorkflowDeclared(workflow: Workflow)
-  /// A call of the body. `node_digest` is the digest of the node's
-  /// definition; with the canonical input and `occurrence` (the nth such
-  /// call in this execution of the body) it keys the journal, a cache.
-  /// `id` is for display and interventions only. `occurrence` is the
-  /// request's place among calls of the same node, session and input in its
-  /// branch of the body (`<branch path>/<n>`), assigned in issue order.
+  /// The run begins: its workflow, its input and the core's semantics.
+  Started(workflow: Workflow, input: Value, semantics: String)
+  /// A new process drives the run: the body runs again from the top, and
+  /// every completed call is answered from the journal.
+  Resumed(digest: String, semantics: String)
+  /// The body calls a node. `node` is the node's definition digest,
+  /// `scope` the call's place (the slot of the nested workflow call it is
+  /// made in; empty at the top) and `occurrence` how many calls of the same
+  /// node and input the body made in that scope before it.
   Requested(
     id: String,
     request: Request,
-    node_digest: String,
-    occurrence: String,
+    node: String,
+    scope: String,
+    occurrence: Int,
   )
-  /// `dialogue`: the digest of the session's dialogue after the call (a
-  /// blob written before this event).
+  /// An agent call stored a checkpoint (a dialogue blob) after a turn.
+  AgentProgressed(id: String, checkpoint: String)
+  /// An agent call took mailbox messages into the turn after `turn`.
+  MessagesTaken(id: String, messages: List(String), turn: Int)
+  /// An agent call answered: the model that served it, the dialogue after
+  /// it (a blob) and its session's workspace layers after it.
   AgentReturned(
     id: String,
     output: Value,
-    usage: Usage,
+    model: String,
+    dialogue: String,
+    layers: List(String),
+  )
+  /// An agent call failed. With a dialogue (a turn limit, say), the call
+  /// still yields a session to continue from.
+  AgentFailed(
+    id: String,
+    failure: AgentFailure,
     model: String,
     dialogue: Option(String),
-    /// The session's layers after the call (its changes as a new layer,
-    /// squashed when deep), written before this event. `None`: unchanged.
-    layers: Option(List(String)),
+    layers: List(String),
   )
-  /// The agent ended its turn with neither a result nor a question.
-  AgentIdle(id: String, message: String, usage: Usage, model: String)
-  AgentFailed(id: String, failure: AgentFailure, usage: Usage, model: String)
-  /// The agent used its turns without submitting: the node waits for more
-  /// turns (or a restart, or a cancel), with its progress kept.
-  TurnLimitReached(
-    id: String,
-    used: Int,
-    limit: Int,
-    usage: Usage,
-    model: String,
+  /// A message to a mailbox. `key` is the send's identity (the sender's
+  /// scope and occurrence, or the caller's own id): a send journaled before
+  /// is not delivered again.
+  Sent(
+    key: String,
+    to: String,
+    from: String,
+    reply_to: Option(String),
+    body: Value,
   )
-  /// A provider, auth or billing error: the call stays incomplete.
-  ExecutorFailed(id: String, error: String)
-  /// The agent called its `ask` tool: the message is its question to its
-  /// caller, and the reply becomes the tool's result.
-  AgentAsked(id: String, message: String, usage: Usage, model: String)
-  /// After a host crash, a tool call that was in flight and is not safe to
-  /// reissue: whether it took effect is unknown. The node waits.
-  CallOutcomeUnknown(
-    id: String,
-    tool: String,
-    args: Value,
-    usage: Usage,
-    model: String,
-  )
-  /// The call continues a session whose previous dialogue blob is missing.
-  PreviousDialogueMissing(id: String)
-  /// The agent call's dialogue so far, written as a content-addressed blob
-  /// before this event: a reissued attempt resumes from the newest one.
-  AgentProgressed(id: String, dialogue: String)
-  /// A reissued agent call found these tool calls in flight in its
-  /// checkpoint (the host died during them): the core decides each.
-  ToolCallsInFlight(id: String, calls: List(InFlightCall))
-  /// The owner's interrupt aborted the turn: the node waits, progress kept.
-  TurnInterrupted(id: String, usage: Usage, model: String)
-  /// The result of an MCP tool an agent call made, journaled so a reissued
-  /// call never calls the outside world again. `call` names the tool call.
-  ToolRecorded(id: String, call: String, result: Value)
-  /// The rendered input does not fit the resolved model's context window.
-  InputRejected(id: String, field: Option(String), chars: Int, limit: Int)
-  CommandReturned(id: String, output: Value, minutes: Float)
-  CommandFailed(id: String, failure: CommandFailure, minutes: Float)
-  /// A body MCP tool call returned (its output parsed and checked).
   ToolReturned(id: String, output: Value)
-  /// A body tool call in flight at a crash and not safe to make again: its
-  /// outcome is unknown (logged, so state rebuilt from the log has it).
-  ToolCallUnknown(id: String)
-  ToolFailed(id: String, failure: ToolFailure)
-  /// The orchestrator's result for an orchestrator node.
-  ResultSubmitted(node: String, value: Value, by: String)
-  /// Monitoring only: never matched on replay, never delivered to the body.
-  Observed(at: String, label: String, value: Value)
-  /// An answer to an idle node; `turns` more turns are granted with it.
-  Sent(node: String, text: String, message_id: String, by: String, turns: Int)
-  /// A message to a running node, delivered at its next step boundary.
-  Steered(node: String, text: String, message_id: String, by: String)
-  /// Abort the running node's current turn; it goes `Idle(Interrupted)`.
-  InterruptRequested(node: String, by: String)
-  /// Discards the node's progress and reissues its call with the original
-  /// input, plus an operator note; `turns` > 0 sets its turn allowance.
-  Restarted(node: String, note: Option(String), by: String, turns: Int)
-  /// Fails one node as an agent failure, for the body to handle.
-  NodeCancelled(node: String, by: String)
-  /// Forgets a settled or open call (`wallis fork --forget`): a `Forgotten`
-  /// mark on its slot, so its next request is a new attempt and executes
-  /// again; calls downstream miss when their inputs change.
-  CallForgotten(node: String, by: String)
-  AliasRebound(alias: String, from: String, to: String)
-  BudgetRaised(kind: BudgetKind, limit: Float)
-  ExecutorChanged(name: String)
-  RetryUnavailable
-  CancelRequested(by: String)
-  /// Issue no new calls until `ResumeRequested`.
-  PauseRequested(by: String)
-  ResumeRequested(by: String)
-  /// Ownership: who may wait on, answer and steer the run.
-  Claimed(owner: String)
-  /// A fact about the run kept for the host (its workflow path, root,
-  /// executor module, binaries, warnings, ...): `meta.json` is derived from
-  /// these. Never matched on replay; the latest value of a key wins.
+  ToolFailed(id: String, message: String)
+  /// The caller names a failed call to run again (`resume({ retry })`): a
+  /// decided failure re-runs only so. An agent continues its own session:
+  /// with `turns` more turns after a turn limit, or with the validation
+  /// errors as its next message after an invalid output.
+  Retried(call: String, turns: Int)
+  CommandReturned(id: String, output: Value)
+  CommandFailed(id: String, failure: CommandFailure)
+  WorkflowReturned(id: String, output: Value)
+  WorkflowFailed(id: String, reason: FailReason)
+  /// A host fact (`meta.json` is derived from them): applied even after the
+  /// end.
   Noted(key: String, value: Value)
   BodyFinished(output: Value)
   BodyFailed(reason: FailReason)
@@ -295,292 +102,114 @@ pub type Event {
 
 pub fn event_to_json(event: Event) -> json.Json {
   case event {
-    Started(workflow:, pin:, input:) ->
-      json.object([
-        #("type", json.string("started")),
-        #("workflow", workflow_to_json(workflow)),
-        #("pin", pin_to_json(pin)),
-        #("input", json_value.to_json(input)),
-      ])
-    Resumed(pin:) ->
-      json.object([
-        #("type", json.string("resumed")),
-        #("pin", pin_to_json(pin)),
-      ])
-    CodeChanged(from:, to:) ->
-      json.object([
-        #("type", json.string("code_changed")),
-        #("from", json.string(from)),
-        #("to", json.string(to)),
-      ])
-    WorkflowDeclared(workflow:) ->
-      json.object([
-        #("type", json.string("workflow_declared")),
-        #("workflow", workflow_to_json(workflow)),
-      ])
-    Requested(id:, request:, node_digest:, occurrence:) ->
-      json.object([
-        #("type", json.string("requested")),
-        #("id", json.string(id)),
-        #("request", request_to_json(request)),
-        #("node_digest", json.string(node_digest)),
-        #("occurrence", json.string(occurrence)),
-      ])
-    AgentReturned(id:, output:, usage:, model:, dialogue:, layers:) ->
-      json.object([
-        #("type", json.string("agent_returned")),
-        #("id", json.string(id)),
-        #("output", json_value.to_json(output)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-        #("dialogue", case dialogue {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("layers", case layers {
-          option.None -> json.null()
-          option.Some(value) -> json.array(value, json.string)
-        }),
-      ])
-    AgentIdle(id:, message:, usage:, model:) ->
-      json.object([
-        #("type", json.string("agent_idle")),
-        #("id", json.string(id)),
-        #("message", json.string(message)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-      ])
-    AgentFailed(id:, failure:, usage:, model:) ->
-      json.object([
-        #("type", json.string("agent_failed")),
-        #("id", json.string(id)),
-        #("failure", agent_failure_to_json(failure)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-      ])
-    TurnLimitReached(id:, used:, limit:, usage:, model:) ->
-      json.object([
-        #("type", json.string("turn_limit_reached")),
-        #("id", json.string(id)),
-        #("used", json.int(used)),
-        #("limit", json.int(limit)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-      ])
-    ExecutorFailed(id:, error:) ->
-      json.object([
-        #("type", json.string("executor_failed")),
-        #("id", json.string(id)),
-        #("error", json.string(error)),
-      ])
-    AgentAsked(id:, message:, usage:, model:) ->
-      json.object([
-        #("type", json.string("agent_asked")),
-        #("id", json.string(id)),
-        #("message", json.string(message)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-      ])
-    CallOutcomeUnknown(id:, tool:, args:, usage:, model:) ->
-      json.object([
-        #("type", json.string("call_outcome_unknown")),
-        #("id", json.string(id)),
-        #("tool", json.string(tool)),
-        #("args", json_value.to_json(args)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-      ])
-    PreviousDialogueMissing(id:) ->
-      json.object([
-        #("type", json.string("previous_dialogue_missing")),
-        #("id", json.string(id)),
-      ])
-    AgentProgressed(id:, dialogue:) ->
-      json.object([
-        #("type", json.string("agent_progressed")),
-        #("id", json.string(id)),
-        #("dialogue", json.string(dialogue)),
-      ])
-    ToolCallsInFlight(id:, calls:) ->
-      json.object([
-        #("type", json.string("tool_calls_in_flight")),
-        #("id", json.string(id)),
-        #("calls", json.array(calls, in_flight_call_to_json)),
-      ])
-    TurnInterrupted(id:, usage:, model:) ->
-      json.object([
-        #("type", json.string("turn_interrupted")),
-        #("id", json.string(id)),
-        #("usage", usage_to_json(usage)),
-        #("model", json.string(model)),
-      ])
-    ToolRecorded(id:, call:, result:) ->
-      json.object([
-        #("type", json.string("tool_recorded")),
-        #("id", json.string(id)),
-        #("call", json.string(call)),
-        #("result", json_value.to_json(result)),
-      ])
-    InputRejected(id:, field:, chars:, limit:) ->
-      json.object([
-        #("type", json.string("input_rejected")),
-        #("id", json.string(id)),
-        #("field", case field {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("chars", json.int(chars)),
-        #("limit", json.int(limit)),
-      ])
-    CommandReturned(id:, output:, minutes:) ->
-      json.object([
-        #("type", json.string("command_returned")),
-        #("id", json.string(id)),
-        #("output", json_value.to_json(output)),
-        #("minutes", json.float(minutes)),
-      ])
-    CommandFailed(id:, failure:, minutes:) ->
-      json.object([
-        #("type", json.string("command_failed")),
-        #("id", json.string(id)),
-        #("failure", command_failure_to_json(failure)),
-        #("minutes", json.float(minutes)),
-      ])
-    ToolReturned(id:, output:) ->
-      json.object([
-        #("type", json.string("tool_returned")),
-        #("id", json.string(id)),
-        #("output", json_value.to_json(output)),
-      ])
-    ToolCallUnknown(id:) ->
-      json.object([
-        #("type", json.string("tool_call_unknown")),
-        #("id", json.string(id)),
-      ])
-    ToolFailed(id:, failure:) ->
-      json.object([
-        #("type", json.string("tool_failed")),
-        #("id", json.string(id)),
-        #("failure", tool_failure_to_json(failure)),
-      ])
-    ResultSubmitted(node:, value:, by:) ->
-      json.object([
-        #("type", json.string("result_submitted")),
-        #("node", json.string(node)),
-        #("value", json_value.to_json(value)),
-        #("by", json.string(by)),
-      ])
-    Observed(at:, label:, value:) ->
-      json.object([
-        #("type", json.string("observed")),
-        #("at", json.string(at)),
-        #("label", json.string(label)),
-        #("value", json_value.to_json(value)),
-      ])
-    Sent(node:, text:, message_id:, by:, turns:) ->
-      json.object([
-        #("type", json.string("sent")),
-        #("node", json.string(node)),
-        #("text", json.string(text)),
-        #("message_id", json.string(message_id)),
-        #("by", json.string(by)),
-        #("turns", json.int(turns)),
-      ])
-    Steered(node:, text:, message_id:, by:) ->
-      json.object([
-        #("type", json.string("steered")),
-        #("node", json.string(node)),
-        #("text", json.string(text)),
-        #("message_id", json.string(message_id)),
-        #("by", json.string(by)),
-      ])
-    InterruptRequested(node:, by:) ->
-      json.object([
-        #("type", json.string("interrupt_requested")),
-        #("node", json.string(node)),
-        #("by", json.string(by)),
-      ])
-    Restarted(node:, note:, by:, turns:) ->
-      json.object([
-        #("type", json.string("restarted")),
-        #("node", json.string(node)),
-        #("note", case note {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("by", json.string(by)),
-        #("turns", json.int(turns)),
-      ])
-    NodeCancelled(node:, by:) ->
-      json.object([
-        #("type", json.string("node_cancelled")),
-        #("node", json.string(node)),
-        #("by", json.string(by)),
-      ])
-    CallForgotten(node:, by:) ->
-      json.object([
-        #("type", json.string("call_forgotten")),
-        #("node", json.string(node)),
-        #("by", json.string(by)),
-      ])
-    AliasRebound(alias:, from:, to:) ->
-      json.object([
-        #("type", json.string("alias_rebound")),
-        #("alias", json.string(alias)),
-        #("from", json.string(from)),
-        #("to", json.string(to)),
-      ])
-    BudgetRaised(kind:, limit:) ->
-      json.object([
-        #("type", json.string("budget_raised")),
-        #("kind", budget_kind_to_json(kind)),
-        #("limit", json.float(limit)),
-      ])
-    ExecutorChanged(name:) ->
-      json.object([
-        #("type", json.string("executor_changed")),
-        #("name", json.string(name)),
-      ])
-    RetryUnavailable ->
-      json.object([
-        #("type", json.string("retry_unavailable")),
-      ])
-    CancelRequested(by:) ->
-      json.object([
-        #("type", json.string("cancel_requested")),
-        #("by", json.string(by)),
-      ])
-    PauseRequested(by:) ->
-      json.object([
-        #("type", json.string("pause_requested")),
-        #("by", json.string(by)),
-      ])
-    ResumeRequested(by:) ->
-      json.object([
-        #("type", json.string("resume_requested")),
-        #("by", json.string(by)),
-      ])
-    Claimed(owner:) ->
-      json.object([
-        #("type", json.string("claimed")),
-        #("owner", json.string(owner)),
-      ])
-    Noted(key:, value:) ->
-      json.object([
-        #("type", json.string("noted")),
-        #("key", json.string(key)),
-        #("value", json_value.to_json(value)),
-      ])
-    BodyFinished(output:) ->
-      json.object([
-        #("type", json.string("body_finished")),
-        #("output", json_value.to_json(output)),
-      ])
-    BodyFailed(reason:) ->
-      json.object([
-        #("type", json.string("body_failed")),
-        #("reason", fail_reason_to_json(reason)),
-      ])
+    Started(workflow:, input:, semantics:) -> json.object([
+      #("type", json.string("started")),
+      #("workflow", workflow_to_json(workflow)),
+      #("input", json_value.to_json(input)),
+      #("semantics", json.string(semantics)),
+    ])
+    Resumed(digest:, semantics:) -> json.object([
+      #("type", json.string("resumed")),
+      #("digest", json.string(digest)),
+      #("semantics", json.string(semantics)),
+    ])
+    Requested(id:, request:, node:, scope:, occurrence:) -> json.object([
+      #("type", json.string("requested")),
+      #("id", json.string(id)),
+      #("request", request_to_json(request)),
+      #("node", json.string(node)),
+      #("scope", json.string(scope)),
+      #("occurrence", json.int(occurrence)),
+    ])
+    AgentProgressed(id:, checkpoint:) -> json.object([
+      #("type", json.string("agent_progressed")),
+      #("id", json.string(id)),
+      #("checkpoint", json.string(checkpoint)),
+    ])
+    MessagesTaken(id:, messages:, turn:) -> json.object([
+      #("type", json.string("messages_taken")),
+      #("id", json.string(id)),
+      #("messages", json.array(messages, json.string)),
+      #("turn", json.int(turn)),
+    ])
+    AgentReturned(id:, output:, model:, dialogue:, layers:) -> json.object([
+      #("type", json.string("agent_returned")),
+      #("id", json.string(id)),
+      #("output", json_value.to_json(output)),
+      #("model", json.string(model)),
+      #("dialogue", json.string(dialogue)),
+      #("layers", json.array(layers, json.string)),
+    ])
+    AgentFailed(id:, failure:, model:, dialogue:, layers:) -> json.object([
+      #("type", json.string("agent_failed")),
+      #("id", json.string(id)),
+      #("failure", agent_failure_to_json(failure)),
+      #("model", json.string(model)),
+      #("dialogue", case dialogue {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+      #("layers", json.array(layers, json.string)),
+    ])
+    Sent(key:, to:, from:, reply_to:, body:) -> json.object([
+      #("type", json.string("sent")),
+      #("key", json.string(key)),
+      #("to", json.string(to)),
+      #("from", json.string(from)),
+      #("reply_to", case reply_to {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+      #("body", json_value.to_json(body)),
+    ])
+    ToolReturned(id:, output:) -> json.object([
+      #("type", json.string("tool_returned")),
+      #("id", json.string(id)),
+      #("output", json_value.to_json(output)),
+    ])
+    ToolFailed(id:, message:) -> json.object([
+      #("type", json.string("tool_failed")),
+      #("id", json.string(id)),
+      #("message", json.string(message)),
+    ])
+    Retried(call:, turns:) -> json.object([
+      #("type", json.string("retried")),
+      #("call", json.string(call)),
+      #("turns", json.int(turns)),
+    ])
+    CommandReturned(id:, output:) -> json.object([
+      #("type", json.string("command_returned")),
+      #("id", json.string(id)),
+      #("output", json_value.to_json(output)),
+    ])
+    CommandFailed(id:, failure:) -> json.object([
+      #("type", json.string("command_failed")),
+      #("id", json.string(id)),
+      #("failure", command_failure_to_json(failure)),
+    ])
+    WorkflowReturned(id:, output:) -> json.object([
+      #("type", json.string("workflow_returned")),
+      #("id", json.string(id)),
+      #("output", json_value.to_json(output)),
+    ])
+    WorkflowFailed(id:, reason:) -> json.object([
+      #("type", json.string("workflow_failed")),
+      #("id", json.string(id)),
+      #("reason", fail_reason_to_json(reason)),
+    ])
+    Noted(key:, value:) -> json.object([
+      #("type", json.string("noted")),
+      #("key", json.string(key)),
+      #("value", json_value.to_json(value)),
+    ])
+    BodyFinished(output:) -> json.object([
+      #("type", json.string("body_finished")),
+      #("output", json_value.to_json(output)),
+    ])
+    BodyFailed(reason:) -> json.object([
+      #("type", json.string("body_failed")),
+      #("reason", fail_reason_to_json(reason)),
+    ])
   }
 }
 
@@ -589,230 +218,92 @@ pub fn event_decoder() -> decode.Decoder(Event) {
   case variant {
     "started" -> {
       use workflow <- decode.field("workflow", workflow_decoder())
-      use pin <- decode.field("pin", pin_decoder())
       use input <- decode.field("input", json_value.decoder())
-      decode.success(Started(workflow:, pin:, input:))
+      use semantics <- decode.field("semantics", decode.string)
+      decode.success(Started(workflow:, input:, semantics:))
     }
     "resumed" -> {
-      use pin <- decode.field("pin", pin_decoder())
-      decode.success(Resumed(pin:))
-    }
-    "code_changed" -> {
-      use from <- decode.field("from", decode.string)
-      use to <- decode.field("to", decode.string)
-      decode.success(CodeChanged(from:, to:))
-    }
-    "workflow_declared" -> {
-      use workflow <- decode.field("workflow", workflow_decoder())
-      decode.success(WorkflowDeclared(workflow:))
+      use digest <- decode.field("digest", decode.string)
+      use semantics <- decode.field("semantics", decode.string)
+      decode.success(Resumed(digest:, semantics:))
     }
     "requested" -> {
       use id <- decode.field("id", decode.string)
       use request <- decode.field("request", request_decoder())
-      use node_digest <- decode.field("node_digest", decode.string)
-      use occurrence <- decode.field("occurrence", decode.string)
-      decode.success(Requested(id:, request:, node_digest:, occurrence:))
+      use node <- decode.field("node", decode.string)
+      use scope <- decode.field("scope", decode.string)
+      use occurrence <- decode.field("occurrence", decode.int)
+      decode.success(Requested(id:, request:, node:, scope:, occurrence:))
+    }
+    "agent_progressed" -> {
+      use id <- decode.field("id", decode.string)
+      use checkpoint <- decode.field("checkpoint", decode.string)
+      decode.success(AgentProgressed(id:, checkpoint:))
+    }
+    "messages_taken" -> {
+      use id <- decode.field("id", decode.string)
+      use messages <- decode.field("messages", decode.list(decode.string))
+      use turn <- decode.field("turn", decode.int)
+      decode.success(MessagesTaken(id:, messages:, turn:))
     }
     "agent_returned" -> {
       use id <- decode.field("id", decode.string)
       use output <- decode.field("output", json_value.decoder())
-      use usage <- decode.field("usage", usage_decoder())
       use model <- decode.field("model", decode.string)
-      use dialogue <- decode.field("dialogue", decode.optional(decode.string))
-      use layers <- decode.field(
-        "layers",
-        decode.optional(decode.list(decode.string)),
-      )
-      decode.success(AgentReturned(
-        id:,
-        output:,
-        usage:,
-        model:,
-        dialogue:,
-        layers:,
-      ))
-    }
-    "agent_idle" -> {
-      use id <- decode.field("id", decode.string)
-      use message <- decode.field("message", decode.string)
-      use usage <- decode.field("usage", usage_decoder())
-      use model <- decode.field("model", decode.string)
-      decode.success(AgentIdle(id:, message:, usage:, model:))
+      use dialogue <- decode.field("dialogue", decode.string)
+      use layers <- decode.field("layers", decode.list(decode.string))
+      decode.success(AgentReturned(id:, output:, model:, dialogue:, layers:))
     }
     "agent_failed" -> {
       use id <- decode.field("id", decode.string)
       use failure <- decode.field("failure", agent_failure_decoder())
-      use usage <- decode.field("usage", usage_decoder())
       use model <- decode.field("model", decode.string)
-      decode.success(AgentFailed(id:, failure:, usage:, model:))
+      use dialogue <- decode.field("dialogue", decode.optional(decode.string))
+      use layers <- decode.field("layers", decode.list(decode.string))
+      decode.success(AgentFailed(id:, failure:, model:, dialogue:, layers:))
     }
-    "turn_limit_reached" -> {
-      use id <- decode.field("id", decode.string)
-      use used <- decode.field("used", decode.int)
-      use limit <- decode.field("limit", decode.int)
-      use usage <- decode.field("usage", usage_decoder())
-      use model <- decode.field("model", decode.string)
-      decode.success(TurnLimitReached(id:, used:, limit:, usage:, model:))
-    }
-    "executor_failed" -> {
-      use id <- decode.field("id", decode.string)
-      use error <- decode.field("error", decode.string)
-      decode.success(ExecutorFailed(id:, error:))
-    }
-    "agent_asked" -> {
-      use id <- decode.field("id", decode.string)
-      use message <- decode.field("message", decode.string)
-      use usage <- decode.field("usage", usage_decoder())
-      use model <- decode.field("model", decode.string)
-      decode.success(AgentAsked(id:, message:, usage:, model:))
-    }
-    "call_outcome_unknown" -> {
-      use id <- decode.field("id", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      use args <- decode.field("args", json_value.decoder())
-      use usage <- decode.field("usage", usage_decoder())
-      use model <- decode.field("model", decode.string)
-      decode.success(CallOutcomeUnknown(id:, tool:, args:, usage:, model:))
-    }
-    "previous_dialogue_missing" -> {
-      use id <- decode.field("id", decode.string)
-      decode.success(PreviousDialogueMissing(id:))
-    }
-    "agent_progressed" -> {
-      use id <- decode.field("id", decode.string)
-      use dialogue <- decode.field("dialogue", decode.string)
-      decode.success(AgentProgressed(id:, dialogue:))
-    }
-    "tool_calls_in_flight" -> {
-      use id <- decode.field("id", decode.string)
-      use calls <- decode.field("calls", decode.list(in_flight_call_decoder()))
-      decode.success(ToolCallsInFlight(id:, calls:))
-    }
-    "turn_interrupted" -> {
-      use id <- decode.field("id", decode.string)
-      use usage <- decode.field("usage", usage_decoder())
-      use model <- decode.field("model", decode.string)
-      decode.success(TurnInterrupted(id:, usage:, model:))
-    }
-    "tool_recorded" -> {
-      use id <- decode.field("id", decode.string)
-      use call <- decode.field("call", decode.string)
-      use result <- decode.field("result", json_value.decoder())
-      decode.success(ToolRecorded(id:, call:, result:))
-    }
-    "input_rejected" -> {
-      use id <- decode.field("id", decode.string)
-      use field <- decode.field("field", decode.optional(decode.string))
-      use chars <- decode.field("chars", decode.int)
-      use limit <- decode.field("limit", decode.int)
-      decode.success(InputRejected(id:, field:, chars:, limit:))
-    }
-    "command_returned" -> {
-      use id <- decode.field("id", decode.string)
-      use output <- decode.field("output", json_value.decoder())
-      use minutes <- decode.field("minutes", decode.float)
-      decode.success(CommandReturned(id:, output:, minutes:))
-    }
-    "command_failed" -> {
-      use id <- decode.field("id", decode.string)
-      use failure <- decode.field("failure", command_failure_decoder())
-      use minutes <- decode.field("minutes", decode.float)
-      decode.success(CommandFailed(id:, failure:, minutes:))
+    "sent" -> {
+      use key <- decode.field("key", decode.string)
+      use to <- decode.field("to", decode.string)
+      use from <- decode.field("from", decode.string)
+      use reply_to <- decode.field("reply_to", decode.optional(decode.string))
+      use body <- decode.field("body", json_value.decoder())
+      decode.success(Sent(key:, to:, from:, reply_to:, body:))
     }
     "tool_returned" -> {
       use id <- decode.field("id", decode.string)
       use output <- decode.field("output", json_value.decoder())
       decode.success(ToolReturned(id:, output:))
     }
-    "tool_call_unknown" -> {
-      use id <- decode.field("id", decode.string)
-      decode.success(ToolCallUnknown(id:))
-    }
     "tool_failed" -> {
       use id <- decode.field("id", decode.string)
-      use failure <- decode.field("failure", tool_failure_decoder())
-      decode.success(ToolFailed(id:, failure:))
+      use message <- decode.field("message", decode.string)
+      decode.success(ToolFailed(id:, message:))
     }
-    "result_submitted" -> {
-      use node <- decode.field("node", decode.string)
-      use value <- decode.field("value", json_value.decoder())
-      use by <- decode.field("by", decode.string)
-      decode.success(ResultSubmitted(node:, value:, by:))
-    }
-    "observed" -> {
-      use at <- decode.field("at", decode.string)
-      use label <- decode.field("label", decode.string)
-      use value <- decode.field("value", json_value.decoder())
-      decode.success(Observed(at:, label:, value:))
-    }
-    "sent" -> {
-      use node <- decode.field("node", decode.string)
-      use text <- decode.field("text", decode.string)
-      use message_id <- decode.field("message_id", decode.string)
-      use by <- decode.field("by", decode.string)
+    "retried" -> {
+      use call <- decode.field("call", decode.string)
       use turns <- decode.field("turns", decode.int)
-      decode.success(Sent(node:, text:, message_id:, by:, turns:))
+      decode.success(Retried(call:, turns:))
     }
-    "steered" -> {
-      use node <- decode.field("node", decode.string)
-      use text <- decode.field("text", decode.string)
-      use message_id <- decode.field("message_id", decode.string)
-      use by <- decode.field("by", decode.string)
-      decode.success(Steered(node:, text:, message_id:, by:))
+    "command_returned" -> {
+      use id <- decode.field("id", decode.string)
+      use output <- decode.field("output", json_value.decoder())
+      decode.success(CommandReturned(id:, output:))
     }
-    "interrupt_requested" -> {
-      use node <- decode.field("node", decode.string)
-      use by <- decode.field("by", decode.string)
-      decode.success(InterruptRequested(node:, by:))
+    "command_failed" -> {
+      use id <- decode.field("id", decode.string)
+      use failure <- decode.field("failure", command_failure_decoder())
+      decode.success(CommandFailed(id:, failure:))
     }
-    "restarted" -> {
-      use node <- decode.field("node", decode.string)
-      use note <- decode.field("note", decode.optional(decode.string))
-      use by <- decode.field("by", decode.string)
-      use turns <- decode.field("turns", decode.int)
-      decode.success(Restarted(node:, note:, by:, turns:))
+    "workflow_returned" -> {
+      use id <- decode.field("id", decode.string)
+      use output <- decode.field("output", json_value.decoder())
+      decode.success(WorkflowReturned(id:, output:))
     }
-    "node_cancelled" -> {
-      use node <- decode.field("node", decode.string)
-      use by <- decode.field("by", decode.string)
-      decode.success(NodeCancelled(node:, by:))
-    }
-    "call_forgotten" -> {
-      use node <- decode.field("node", decode.string)
-      use by <- decode.field("by", decode.string)
-      decode.success(CallForgotten(node:, by:))
-    }
-    "alias_rebound" -> {
-      use alias <- decode.field("alias", decode.string)
-      use from <- decode.field("from", decode.string)
-      use to <- decode.field("to", decode.string)
-      decode.success(AliasRebound(alias:, from:, to:))
-    }
-    "budget_raised" -> {
-      use kind <- decode.field("kind", budget_kind_decoder())
-      use limit <- decode.field("limit", decode.float)
-      decode.success(BudgetRaised(kind:, limit:))
-    }
-    "executor_changed" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(ExecutorChanged(name:))
-    }
-    "retry_unavailable" -> decode.success(RetryUnavailable)
-    "cancel_requested" -> {
-      use by <- decode.field("by", decode.string)
-      decode.success(CancelRequested(by:))
-    }
-    "pause_requested" -> {
-      use by <- decode.field("by", decode.string)
-      decode.success(PauseRequested(by:))
-    }
-    "resume_requested" -> {
-      use by <- decode.field("by", decode.string)
-      decode.success(ResumeRequested(by:))
-    }
-    "claimed" -> {
-      use owner <- decode.field("owner", decode.string)
-      decode.success(Claimed(owner:))
+    "workflow_failed" -> {
+      use id <- decode.field("id", decode.string)
+      use reason <- decode.field("reason", fail_reason_decoder())
+      decode.success(WorkflowFailed(id:, reason:))
     }
     "noted" -> {
       use key <- decode.field("key", decode.string)
@@ -827,476 +318,282 @@ pub fn event_decoder() -> decode.Decoder(Event) {
       use reason <- decode.field("reason", fail_reason_decoder())
       decode.success(BodyFailed(reason:))
     }
-    _ -> decode.failure(RetryUnavailable, "Event")
+    _ -> decode.failure(BodyFinished(output: json_value.JNull), "Event")
   }
 }
 
-/// A tool call in flight at a crash: its journal key, the tool (its id for
-/// a custom or MCP tool), its arguments, and what kind of call it is.
-pub type InFlightCall {
-  InFlightCall(call: String, tool: String, args: Value, kind: InFlightKind)
-}
 
-pub fn in_flight_call_to_json(in_flight_call: InFlightCall) -> json.Json {
-  let InFlightCall(call:, tool:, args:, kind:) = in_flight_call
-  json.object([
-    #("call", json.string(call)),
-    #("tool", json.string(tool)),
-    #("args", json_value.to_json(args)),
-    #("kind", in_flight_kind_to_json(kind)),
-  ])
-}
 
-pub fn in_flight_call_decoder() -> decode.Decoder(InFlightCall) {
-  use call <- decode.field("call", decode.string)
-  use tool <- decode.field("tool", decode.string)
-  use args <- decode.field("args", json_value.decoder())
-  use kind <- decode.field("kind", in_flight_kind_decoder())
-  decode.success(InFlightCall(call:, tool:, args:, kind:))
-}
 
-pub type InFlightKind {
-  /// Reaches the outside (a custom or MCP tool, or codemode, which may call
-  /// them): made again only if safe to replay or already journaled.
-  ExternalCall(replay: Replay)
-  /// Only reads, asks or records: made again.
-  ReadsOnly
-  /// Works on the sandbox only: the model gets an error and decides.
-  SandboxOnly
-}
 
-pub fn in_flight_kind_to_json(in_flight_kind: InFlightKind) -> json.Json {
-  case in_flight_kind {
-    ExternalCall(replay:) ->
-      json.object([
-        #("type", json.string("external_call")),
-        #("replay", replay_to_json(replay)),
-      ])
-    ReadsOnly ->
-      json.object([
-        #("type", json.string("reads_only")),
-      ])
-    SandboxOnly ->
-      json.object([
-        #("type", json.string("sandbox_only")),
-      ])
-  }
-}
-
-pub fn in_flight_kind_decoder() -> decode.Decoder(InFlightKind) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "external_call" -> {
-      use replay <- decode.field("replay", replay_decoder())
-      decode.success(ExternalCall(replay:))
-    }
-    "reads_only" -> decode.success(ReadsOnly)
-    "sandbox_only" -> decode.success(SandboxOnly)
-    _ -> decode.failure(ReadsOnly, "InFlightKind")
-  }
-}
-
-/// What happens to a tool call that was in flight at a crash.
-pub type InFlightDecision {
-  RunAgain(call: String)
-  ErrorToModel(call: String)
-  /// Not safe to make again: the node waits, its outcome unknown.
-  OutcomeIsUnknown(call: String)
-}
-
-pub fn in_flight_decision_to_json(
-  in_flight_decision: InFlightDecision,
-) -> json.Json {
-  case in_flight_decision {
-    RunAgain(call:) ->
-      json.object([
-        #("type", json.string("run_again")),
-        #("call", json.string(call)),
-      ])
-    ErrorToModel(call:) ->
-      json.object([
-        #("type", json.string("error_to_model")),
-        #("call", json.string(call)),
-      ])
-    OutcomeIsUnknown(call:) ->
-      json.object([
-        #("type", json.string("outcome_is_unknown")),
-        #("call", json.string(call)),
-      ])
-  }
-}
-
-pub fn in_flight_decision_decoder() -> decode.Decoder(InFlightDecision) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "run_again" -> {
-      use call <- decode.field("call", decode.string)
-      decode.success(RunAgain(call:))
-    }
-    "error_to_model" -> {
-      use call <- decode.field("call", decode.string)
-      decode.success(ErrorToModel(call:))
-    }
-    "outcome_is_unknown" -> {
-      use call <- decode.field("call", decode.string)
-      decode.success(OutcomeIsUnknown(call:))
-    }
-    _ -> decode.failure(RunAgain(call: ""), "InFlightDecision")
-  }
-}
-
+/// What the body asks for. Names are labels: the node digest is the call's
+/// identity.
 pub type Request {
-  /// A call of a session value: `session` is its id (`None` for a new
-  /// session, which has had no call). The call continues that session's
-  /// dialogue; its answer carries the session after it. Calling the same
-  /// value again is a branch. `from`: the layers a new session's workspace
-  /// starts from (a Tree; empty otherwise).
-  Call(agent: String, input: Value, session: Option(String), from: List(String))
-  Command(command: String, input: Value)
-  /// A tool called by the body (a custom tool or an MCP tool). `replay`
-  /// says whether a call in flight at a crash may be made again.
-  Tool(tool: String, input: Value, replay: Replay)
-  /// A node the orchestrator completes.
-  Orchestrator(name: String, input: Value)
+  CommandCall(name: String, input: Value)
+  WorkflowCall(name: String, input: Value)
+  /// A call of a session value: `session` is `None` for a new session,
+  /// whose workspace starts from the layers `from`.
+  AgentCall(
+    name: String,
+    input: Value,
+    session: Option(String),
+    from: List(String),
+  )
+  /// A tool called by the body; `replay_safe`: it may be made again when it
+  /// was in flight as a process stopped.
+  ToolCall(name: String, input: Value, replay_safe: Bool)
 }
 
 pub fn request_to_json(request: Request) -> json.Json {
   case request {
-    Call(agent:, input:, session:, from:) ->
-      json.object([
-        #("type", json.string("call")),
-        #("agent", json.string(agent)),
-        #("input", json_value.to_json(input)),
-        #("session", case session {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("from", json.array(from, json.string)),
-      ])
-    Command(command:, input:) ->
-      json.object([
-        #("type", json.string("command")),
-        #("command", json.string(command)),
-        #("input", json_value.to_json(input)),
-      ])
-    Tool(tool:, input:, replay:) ->
-      json.object([
-        #("type", json.string("tool")),
-        #("tool", json.string(tool)),
-        #("input", json_value.to_json(input)),
-        #("replay", replay_to_json(replay)),
-      ])
-    Orchestrator(name:, input:) ->
-      json.object([
-        #("type", json.string("orchestrator")),
-        #("name", json.string(name)),
-        #("input", json_value.to_json(input)),
-      ])
+    CommandCall(name:, input:) -> json.object([
+      #("type", json.string("command_call")),
+      #("name", json.string(name)),
+      #("input", json_value.to_json(input)),
+    ])
+    WorkflowCall(name:, input:) -> json.object([
+      #("type", json.string("workflow_call")),
+      #("name", json.string(name)),
+      #("input", json_value.to_json(input)),
+    ])
+    AgentCall(name:, input:, session:, from:) -> json.object([
+      #("type", json.string("agent_call")),
+      #("name", json.string(name)),
+      #("input", json_value.to_json(input)),
+      #("session", case session {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+      #("from", json.array(from, json.string)),
+    ])
+    ToolCall(name:, input:, replay_safe:) -> json.object([
+      #("type", json.string("tool_call")),
+      #("name", json.string(name)),
+      #("input", json_value.to_json(input)),
+      #("replay_safe", json.bool(replay_safe)),
+    ])
   }
 }
 
 pub fn request_decoder() -> decode.Decoder(Request) {
   use variant <- decode.field("type", decode.string)
   case variant {
-    "call" -> {
-      use agent <- decode.field("agent", decode.string)
+    "command_call" -> {
+      use name <- decode.field("name", decode.string)
+      use input <- decode.field("input", json_value.decoder())
+      decode.success(CommandCall(name:, input:))
+    }
+    "workflow_call" -> {
+      use name <- decode.field("name", decode.string)
+      use input <- decode.field("input", json_value.decoder())
+      decode.success(WorkflowCall(name:, input:))
+    }
+    "agent_call" -> {
+      use name <- decode.field("name", decode.string)
       use input <- decode.field("input", json_value.decoder())
       use session <- decode.field("session", decode.optional(decode.string))
       use from <- decode.field("from", decode.list(decode.string))
-      decode.success(Call(agent:, input:, session:, from:))
+      decode.success(AgentCall(name:, input:, session:, from:))
     }
-    "command" -> {
-      use command <- decode.field("command", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      decode.success(Command(command:, input:))
-    }
-    "tool" -> {
-      use tool <- decode.field("tool", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      use replay <- decode.field("replay", replay_decoder())
-      decode.success(Tool(tool:, input:, replay:))
-    }
-    "orchestrator" -> {
+    "tool_call" -> {
       use name <- decode.field("name", decode.string)
       use input <- decode.field("input", json_value.decoder())
-      decode.success(Orchestrator(name:, input:))
+      use replay_safe <- decode.field("replay_safe", decode.bool)
+      decode.success(ToolCall(name:, input:, replay_safe:))
     }
-    _ ->
-      decode.failure(Command(command: "", input: json_value.JNull), "Request")
+    _ -> decode.failure(CommandCall(name: "", input: json_value.JNull), "Request")
   }
 }
 
-pub type Replay {
-  /// Reissued after a crash: a read-only or idempotent tool.
-  ReplaySafe
-  /// Never reissued: its outcome is unknown after a crash.
-  ReplayNever
+/// How an agent attempt starts: fresh, or (a retried decided failure)
+/// continuing its own dialogue with more turns or with the errors of its
+/// invalid output.
+pub type Continuation {
+  Fresh
+  MoreTurns(turns: Int)
+  FixOutput(errors: List(String))
 }
 
-pub fn replay_to_json(replay: Replay) -> json.Json {
-  case replay {
-    ReplaySafe -> json.string("replay_safe")
-    ReplayNever -> json.string("replay_never")
+pub fn continuation_to_json(continuation: Continuation) -> json.Json {
+  case continuation {
+    Fresh -> json.object([
+      #("type", json.string("fresh")),
+    ])
+    MoreTurns(turns:) -> json.object([
+      #("type", json.string("more_turns")),
+      #("turns", json.int(turns)),
+    ])
+    FixOutput(errors:) -> json.object([
+      #("type", json.string("fix_output")),
+      #("errors", json.array(errors, json.string)),
+    ])
   }
 }
 
-pub fn replay_decoder() -> decode.Decoder(Replay) {
-  use variant <- decode.then(decode.string)
-  case variant {
-    "replay_safe" -> decode.success(ReplaySafe)
-    "replay_never" -> decode.success(ReplayNever)
-    _ -> decode.failure(ReplaySafe, "Replay")
-  }
-}
-
-/// A journaled result of an MCP tool call inside an agent call.
-pub type ToolResult {
-  ToolResult(call: String, result: Value)
-}
-
-pub fn tool_result_to_json(tool_result: ToolResult) -> json.Json {
-  let ToolResult(call:, result:) = tool_result
-  json.object([
-    #("call", json.string(call)),
-    #("result", json_value.to_json(result)),
-  ])
-}
-
-pub fn tool_result_decoder() -> decode.Decoder(ToolResult) {
-  use call <- decode.field("call", decode.string)
-  use result <- decode.field("result", json_value.decoder())
-  decode.success(ToolResult(call:, result:))
-}
-
-/// Why a body MCP tool call failed, as the body sees it.
-pub type ToolFailure {
-  /// The server answered with an error result.
-  ToolError(message: String)
-  ToolOutputMismatch(errors: List(String))
-  /// The server could not be reached or started.
-  ToolUnreachable(error: String)
-  ToolCancelled
-  /// The owner cancelled it after it was sent: it may or may not have taken
-  /// effect.
-  ToolUnknownOutcome
-}
-
-pub fn tool_failure_to_json(tool_failure: ToolFailure) -> json.Json {
-  case tool_failure {
-    ToolError(message:) ->
-      json.object([
-        #("type", json.string("tool_error")),
-        #("message", json.string(message)),
-      ])
-    ToolOutputMismatch(errors:) ->
-      json.object([
-        #("type", json.string("tool_output_mismatch")),
-        #("errors", json.array(errors, json.string)),
-      ])
-    ToolUnreachable(error:) ->
-      json.object([
-        #("type", json.string("tool_unreachable")),
-        #("error", json.string(error)),
-      ])
-    ToolCancelled ->
-      json.object([
-        #("type", json.string("tool_cancelled")),
-      ])
-    ToolUnknownOutcome ->
-      json.object([
-        #("type", json.string("tool_unknown_outcome")),
-      ])
-  }
-}
-
-pub fn tool_failure_decoder() -> decode.Decoder(ToolFailure) {
+pub fn continuation_decoder() -> decode.Decoder(Continuation) {
   use variant <- decode.field("type", decode.string)
   case variant {
-    "tool_error" -> {
-      use message <- decode.field("message", decode.string)
-      decode.success(ToolError(message:))
+    "fresh" -> decode.success(Fresh)
+    "more_turns" -> {
+      use turns <- decode.field("turns", decode.int)
+      decode.success(MoreTurns(turns:))
     }
-    "tool_output_mismatch" -> {
+    "fix_output" -> {
       use errors <- decode.field("errors", decode.list(decode.string))
-      decode.success(ToolOutputMismatch(errors:))
+      decode.success(FixOutput(errors:))
     }
-    "tool_unreachable" -> {
-      use error <- decode.field("error", decode.string)
-      decode.success(ToolUnreachable(error:))
-    }
-    "tool_cancelled" -> decode.success(ToolCancelled)
-    "tool_unknown_outcome" -> decode.success(ToolUnknownOutcome)
-    _ -> decode.failure(ToolCancelled, "ToolFailure")
+    _ -> decode.failure(Fresh, "Continuation")
   }
 }
 
-pub type Usage {
-  Usage(usd: Float, tokens: Int, turns: Int)
-}
 
-pub fn usage_to_json(usage: Usage) -> json.Json {
-  let Usage(usd:, tokens:, turns:) = usage
-  json.object([
-    #("usd", json.float(usd)),
-    #("tokens", json.int(tokens)),
-    #("turns", json.int(turns)),
-  ])
-}
 
-pub fn usage_decoder() -> decode.Decoder(Usage) {
-  use usd <- decode.field("usd", decode.float)
-  use tokens <- decode.field("tokens", decode.int)
-  use turns <- decode.field("turns", decode.int)
-  decode.success(Usage(usd:, tokens:, turns:))
-}
-
-pub type Message {
-  Message(role: Role, text: String)
-}
-
-pub fn message_to_json(message: Message) -> json.Json {
-  let Message(role:, text:) = message
-  json.object([
-    #("role", role_to_json(role)),
-    #("text", json.string(text)),
-  ])
-}
-
-pub fn message_decoder() -> decode.Decoder(Message) {
-  use role <- decode.field("role", role_decoder())
-  use text <- decode.field("text", decode.string)
-  decode.success(Message(role:, text:))
-}
-
-pub type Role {
-  User
-  Assistant
-}
-
-pub fn role_to_json(role: Role) -> json.Json {
-  case role {
-    User -> json.string("user")
-    Assistant -> json.string("assistant")
-  }
-}
-
-pub fn role_decoder() -> decode.Decoder(Role) {
-  use variant <- decode.then(decode.string)
-  case variant {
-    "user" -> decode.success(User)
-    "assistant" -> decode.success(Assistant)
-    _ -> decode.failure(User, "Role")
-  }
-}
-
-/// Why an agent call failed, as the body sees it.
 pub type AgentFailure {
-  /// Gave up: never submitted a valid result.
+  /// It used its turn budget; the session after it can continue.
+  TurnLimitReached(turns: Int)
+  /// The executor gave up (retries exhausted, a provider error).
   GaveUp(error: String)
-  /// The conversation outgrew the model's window and compaction is off.
   ContextExhausted
-  CancelledByOwner
-  /// The owner cancelled it while a tool call's outcome was unknown (it may
-  /// or may not have taken effect).
-  UnknownOutcome(tool: String, args: Value)
+  /// Its final output does not match the agent's output schema.
+  InvalidOutput(errors: List(String))
 }
 
 pub fn agent_failure_to_json(agent_failure: AgentFailure) -> json.Json {
   case agent_failure {
-    GaveUp(error:) ->
-      json.object([
-        #("type", json.string("gave_up")),
-        #("error", json.string(error)),
-      ])
-    ContextExhausted ->
-      json.object([
-        #("type", json.string("context_exhausted")),
-      ])
-    CancelledByOwner ->
-      json.object([
-        #("type", json.string("cancelled_by_owner")),
-      ])
-    UnknownOutcome(tool:, args:) ->
-      json.object([
-        #("type", json.string("unknown_outcome")),
-        #("tool", json.string(tool)),
-        #("args", json_value.to_json(args)),
-      ])
+    TurnLimitReached(turns:) -> json.object([
+      #("type", json.string("turn_limit_reached")),
+      #("turns", json.int(turns)),
+    ])
+    GaveUp(error:) -> json.object([
+      #("type", json.string("gave_up")),
+      #("error", json.string(error)),
+    ])
+    ContextExhausted -> json.object([
+      #("type", json.string("context_exhausted")),
+    ])
+    InvalidOutput(errors:) -> json.object([
+      #("type", json.string("invalid_output")),
+      #("errors", json.array(errors, json.string)),
+    ])
   }
 }
 
 pub fn agent_failure_decoder() -> decode.Decoder(AgentFailure) {
   use variant <- decode.field("type", decode.string)
   case variant {
+    "turn_limit_reached" -> {
+      use turns <- decode.field("turns", decode.int)
+      decode.success(TurnLimitReached(turns:))
+    }
     "gave_up" -> {
       use error <- decode.field("error", decode.string)
       decode.success(GaveUp(error:))
     }
     "context_exhausted" -> decode.success(ContextExhausted)
-    "cancelled_by_owner" -> decode.success(CancelledByOwner)
-    "unknown_outcome" -> {
-      use tool <- decode.field("tool", decode.string)
-      use args <- decode.field("args", json_value.decoder())
-      decode.success(UnknownOutcome(tool:, args:))
+    "invalid_output" -> {
+      use errors <- decode.field("errors", decode.list(decode.string))
+      decode.success(InvalidOutput(errors:))
     }
     _ -> decode.failure(ContextExhausted, "AgentFailure")
   }
 }
 
-/// Why a command call failed, as the body sees it.
+
+
+/// A message as a mailbox yields it. `id` is `<mailbox>/<seq>`, the
+/// sequence from the journaled delivery order.
+pub type Envelope {
+  Envelope(id: String, from: String, reply_to: Option(String), body: Value)
+}
+
+pub fn envelope_to_json(envelope: Envelope) -> json.Json {
+  let Envelope(id:, from:, reply_to:, body:) = envelope
+  json.object([
+    #("id", json.string(id)),
+    #("from", json.string(from)),
+    #("reply_to", case reply_to {
+      option.None -> json.null()
+      option.Some(value) -> json.string(value)
+    }),
+    #("body", json_value.to_json(body)),
+  ])
+}
+
+pub fn envelope_decoder() -> decode.Decoder(Envelope) {
+  use id <- decode.field("id", decode.string)
+  use from <- decode.field("from", decode.string)
+  use reply_to <- decode.field("reply_to", decode.optional(decode.string))
+  use body <- decode.field("body", json_value.decoder())
+  decode.success(Envelope(id:, from:, reply_to:, body:))
+}
+
+
+
+/// The messages an agent call took into the turn after `turn`.
+pub type Taken {
+  Taken(turn: Int, messages: List(String))
+}
+
+pub fn taken_to_json(taken: Taken) -> json.Json {
+  let Taken(turn:, messages:) = taken
+  json.object([
+    #("turn", json.int(turn)),
+    #("messages", json.array(messages, json.string)),
+  ])
+}
+
+pub fn taken_decoder() -> decode.Decoder(Taken) {
+  use turn <- decode.field("turn", decode.int)
+  use messages <- decode.field("messages", decode.list(decode.string))
+  decode.success(Taken(turn:, messages:))
+}
+
+
+
+
+
 pub type CommandFailure {
   ExitCode(code: Int, stderr_head: String)
+  /// Killed by a signal (the OOM killer, say).
+  Killed(signal: String, stderr_head: String)
+  /// Its parsed output does not match the command's output schema.
   OutputMismatch(errors: List(String))
-  /// It ran out of compute minutes and was killed.
-  TimedOut(minutes: Float)
-  /// `r.file(name)` named a file the command did not write.
+  /// `r.file(name)` or `r.tree(path)` named something the command did not write.
   MissingFile(name: String)
-  /// It could not be started (no sandbox, an unresolvable binary).
+  /// The command's `parse` threw.
+  ParseError(message: String)
+  /// It could not be started (no sandbox, a missing program, a bad argv).
   Unrunnable(error: String)
-  CommandCancelled
-  /// It hit one of its sandbox's limits (`limit`, at `max`: bytes for
-  /// `mem_limit`, processes for `pids_limit`) and its scope was stopped.
-  ResourceLimit(limit: Limit, max: Int)
 }
 
 pub fn command_failure_to_json(command_failure: CommandFailure) -> json.Json {
   case command_failure {
-    ExitCode(code:, stderr_head:) ->
-      json.object([
-        #("type", json.string("exit_code")),
-        #("code", json.int(code)),
-        #("stderr_head", json.string(stderr_head)),
-      ])
-    OutputMismatch(errors:) ->
-      json.object([
-        #("type", json.string("output_mismatch")),
-        #("errors", json.array(errors, json.string)),
-      ])
-    TimedOut(minutes:) ->
-      json.object([
-        #("type", json.string("timed_out")),
-        #("minutes", json.float(minutes)),
-      ])
-    MissingFile(name:) ->
-      json.object([
-        #("type", json.string("missing_file")),
-        #("name", json.string(name)),
-      ])
-    Unrunnable(error:) ->
-      json.object([
-        #("type", json.string("unrunnable")),
-        #("error", json.string(error)),
-      ])
-    CommandCancelled ->
-      json.object([
-        #("type", json.string("command_cancelled")),
-      ])
-    ResourceLimit(limit:, max:) ->
-      json.object([
-        #("type", json.string("resource_limit")),
-        #("limit", limit_to_json(limit)),
-        #("max", json.int(max)),
-      ])
+    ExitCode(code:, stderr_head:) -> json.object([
+      #("type", json.string("exit_code")),
+      #("code", json.int(code)),
+      #("stderr_head", json.string(stderr_head)),
+    ])
+    Killed(signal:, stderr_head:) -> json.object([
+      #("type", json.string("killed")),
+      #("signal", json.string(signal)),
+      #("stderr_head", json.string(stderr_head)),
+    ])
+    OutputMismatch(errors:) -> json.object([
+      #("type", json.string("output_mismatch")),
+      #("errors", json.array(errors, json.string)),
+    ])
+    MissingFile(name:) -> json.object([
+      #("type", json.string("missing_file")),
+      #("name", json.string(name)),
+    ])
+    ParseError(message:) -> json.object([
+      #("type", json.string("parse_error")),
+      #("message", json.string(message)),
+    ])
+    Unrunnable(error:) -> json.object([
+      #("type", json.string("unrunnable")),
+      #("error", json.string(error)),
+    ])
   }
 }
 
@@ -1308,231 +605,365 @@ pub fn command_failure_decoder() -> decode.Decoder(CommandFailure) {
       use stderr_head <- decode.field("stderr_head", decode.string)
       decode.success(ExitCode(code:, stderr_head:))
     }
+    "killed" -> {
+      use signal <- decode.field("signal", decode.string)
+      use stderr_head <- decode.field("stderr_head", decode.string)
+      decode.success(Killed(signal:, stderr_head:))
+    }
     "output_mismatch" -> {
       use errors <- decode.field("errors", decode.list(decode.string))
       decode.success(OutputMismatch(errors:))
-    }
-    "timed_out" -> {
-      use minutes <- decode.field("minutes", decode.float)
-      decode.success(TimedOut(minutes:))
     }
     "missing_file" -> {
       use name <- decode.field("name", decode.string)
       decode.success(MissingFile(name:))
     }
+    "parse_error" -> {
+      use message <- decode.field("message", decode.string)
+      decode.success(ParseError(message:))
+    }
     "unrunnable" -> {
       use error <- decode.field("error", decode.string)
       decode.success(Unrunnable(error:))
     }
-    "command_cancelled" -> decode.success(CommandCancelled)
-    "resource_limit" -> {
-      use limit <- decode.field("limit", limit_decoder())
-      use max <- decode.field("max", decode.int)
-      decode.success(ResourceLimit(limit:, max:))
-    }
-    _ -> decode.failure(CommandCancelled, "CommandFailure")
+    _ -> decode.failure(OutputMismatch(errors: []), "CommandFailure")
   }
 }
 
-/// A per-sandbox limit, as the sandbox declares it (compose names).
-pub type Limit {
-  MemLimit
-  PidsLimit
+
+
+
+
+/// Why a call, or the body, failed. The body sees it as `NodeFailed.reason`.
+pub type FailReason {
+  /// The body threw something that is not a node failure.
+  BodyError(message: String)
+  CommandError(command: String, failure: CommandFailure)
+  /// A nested workflow failed: its own reason.
+  WorkflowError(workflow: String, reason: FailReason)
+  /// An agent call failed; `session` is the session after it, if any.
+  AgentError(agent: String, failure: AgentFailure, session: Option(String))
+  ToolError(tool: String, message: String)
+  /// A call's input, or a workflow's output, does not match its schema.
+  SchemaMismatch(node: String, errors: List(String))
 }
 
-pub fn limit_to_json(limit: Limit) -> json.Json {
-  case limit {
-    MemLimit -> json.string("mem_limit")
-    PidsLimit -> json.string("pids_limit")
+pub fn fail_reason_to_json(fail_reason: FailReason) -> json.Json {
+  case fail_reason {
+    BodyError(message:) -> json.object([
+      #("type", json.string("body_error")),
+      #("message", json.string(message)),
+    ])
+    CommandError(command:, failure:) -> json.object([
+      #("type", json.string("command_error")),
+      #("command", json.string(command)),
+      #("failure", command_failure_to_json(failure)),
+    ])
+    WorkflowError(workflow:, reason:) -> json.object([
+      #("type", json.string("workflow_error")),
+      #("workflow", json.string(workflow)),
+      #("reason", fail_reason_to_json(reason)),
+    ])
+    AgentError(agent:, failure:, session:) -> json.object([
+      #("type", json.string("agent_error")),
+      #("agent", json.string(agent)),
+      #("failure", agent_failure_to_json(failure)),
+      #("session", case session {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+    ])
+    ToolError(tool:, message:) -> json.object([
+      #("type", json.string("tool_error")),
+      #("tool", json.string(tool)),
+      #("message", json.string(message)),
+    ])
+    SchemaMismatch(node:, errors:) -> json.object([
+      #("type", json.string("schema_mismatch")),
+      #("node", json.string(node)),
+      #("errors", json.array(errors, json.string)),
+    ])
   }
 }
 
-pub fn limit_decoder() -> decode.Decoder(Limit) {
-  use variant <- decode.then(decode.string)
+pub fn fail_reason_decoder() -> decode.Decoder(FailReason) {
+  use variant <- decode.field("type", decode.string)
   case variant {
-    "mem_limit" -> decode.success(MemLimit)
-    "pids_limit" -> decode.success(PidsLimit)
-    _ -> decode.failure(MemLimit, "Limit")
+    "body_error" -> {
+      use message <- decode.field("message", decode.string)
+      decode.success(BodyError(message:))
+    }
+    "command_error" -> {
+      use command <- decode.field("command", decode.string)
+      use failure <- decode.field("failure", command_failure_decoder())
+      decode.success(CommandError(command:, failure:))
+    }
+    "workflow_error" -> {
+      use workflow <- decode.field("workflow", decode.string)
+      use reason <- decode.field("reason", fail_reason_decoder())
+      decode.success(WorkflowError(workflow:, reason:))
+    }
+    "agent_error" -> {
+      use agent <- decode.field("agent", decode.string)
+      use failure <- decode.field("failure", agent_failure_decoder())
+      use session <- decode.field("session", decode.optional(decode.string))
+      decode.success(AgentError(agent:, failure:, session:))
+    }
+    "tool_error" -> {
+      use tool <- decode.field("tool", decode.string)
+      use message <- decode.field("message", decode.string)
+      decode.success(ToolError(tool:, message:))
+    }
+    "schema_mismatch" -> {
+      use node <- decode.field("node", decode.string)
+      use errors <- decode.field("errors", decode.list(decode.string))
+      decode.success(SchemaMismatch(node:, errors:))
+    }
+    _ -> decode.failure(BodyError(message: ""), "FailReason")
   }
 }
 
-// --- Effects (core to host) --------------------------------------------------
+
+
+
+
+pub type Outcome {
+  Done(value: Value)
+  Failed(reason: FailReason)
+}
+
+pub fn outcome_to_json(outcome: Outcome) -> json.Json {
+  case outcome {
+    Done(value:) -> json.object([
+      #("type", json.string("done")),
+      #("value", json_value.to_json(value)),
+    ])
+    Failed(reason:) -> json.object([
+      #("type", json.string("failed")),
+      #("reason", fail_reason_to_json(reason)),
+    ])
+  }
+}
+
+pub fn outcome_decoder() -> decode.Decoder(Outcome) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "done" -> {
+      use value <- decode.field("value", json_value.decoder())
+      decode.success(Done(value:))
+    }
+    "failed" -> {
+      use reason <- decode.field("reason", fail_reason_decoder())
+      decode.success(Failed(reason:))
+    }
+    _ -> decode.failure(Done(value: json_value.JNull), "Outcome")
+  }
+}
+
+
+
+
+
+pub type Refusal {
+  NotStarted
+  AlreadyStarted
+  /// A finished run takes no calls or results.
+  RunEnded
+  /// The log was written by another version of the core.
+  SemanticsChanged(recorded: String, current: String)
+  UnknownRequest(id: String)
+  /// A result for a call that is not running (it settled, or is another
+  /// kind of call).
+  NotRunning(id: String)
+  /// A session value the run never answered with.
+  UnknownSession(session: String)
+  /// A session value of another agent (by definition digest).
+  SessionOfAnotherAgent(session: String)
+  /// Only a call whose newest attempt failed can be retried.
+  NotRetriable(call: String)
+  InvalidEvent(message: String)
+}
+
+pub fn refusal_to_json(refusal: Refusal) -> json.Json {
+  case refusal {
+    NotStarted -> json.object([
+      #("type", json.string("not_started")),
+    ])
+    AlreadyStarted -> json.object([
+      #("type", json.string("already_started")),
+    ])
+    RunEnded -> json.object([
+      #("type", json.string("run_ended")),
+    ])
+    SemanticsChanged(recorded:, current:) -> json.object([
+      #("type", json.string("semantics_changed")),
+      #("recorded", json.string(recorded)),
+      #("current", json.string(current)),
+    ])
+    UnknownRequest(id:) -> json.object([
+      #("type", json.string("unknown_request")),
+      #("id", json.string(id)),
+    ])
+    NotRunning(id:) -> json.object([
+      #("type", json.string("not_running")),
+      #("id", json.string(id)),
+    ])
+    UnknownSession(session:) -> json.object([
+      #("type", json.string("unknown_session")),
+      #("session", json.string(session)),
+    ])
+    SessionOfAnotherAgent(session:) -> json.object([
+      #("type", json.string("session_of_another_agent")),
+      #("session", json.string(session)),
+    ])
+    NotRetriable(call:) -> json.object([
+      #("type", json.string("not_retriable")),
+      #("call", json.string(call)),
+    ])
+    InvalidEvent(message:) -> json.object([
+      #("type", json.string("invalid_event")),
+      #("message", json.string(message)),
+    ])
+  }
+}
+
+pub fn refusal_decoder() -> decode.Decoder(Refusal) {
+  use variant <- decode.field("type", decode.string)
+  case variant {
+    "not_started" -> decode.success(NotStarted)
+    "already_started" -> decode.success(AlreadyStarted)
+    "run_ended" -> decode.success(RunEnded)
+    "semantics_changed" -> {
+      use recorded <- decode.field("recorded", decode.string)
+      use current <- decode.field("current", decode.string)
+      decode.success(SemanticsChanged(recorded:, current:))
+    }
+    "unknown_request" -> {
+      use id <- decode.field("id", decode.string)
+      decode.success(UnknownRequest(id:))
+    }
+    "not_running" -> {
+      use id <- decode.field("id", decode.string)
+      decode.success(NotRunning(id:))
+    }
+    "unknown_session" -> {
+      use session <- decode.field("session", decode.string)
+      decode.success(UnknownSession(session:))
+    }
+    "session_of_another_agent" -> {
+      use session <- decode.field("session", decode.string)
+      decode.success(SessionOfAnotherAgent(session:))
+    }
+    "not_retriable" -> {
+      use call <- decode.field("call", decode.string)
+      decode.success(NotRetriable(call:))
+    }
+    "invalid_event" -> {
+      use message <- decode.field("message", decode.string)
+      decode.success(InvalidEvent(message:))
+    }
+    _ -> decode.failure(NotStarted, "Refusal")
+  }
+}
+
+
+
+
 
 pub type Effect {
-  /// Append the event just stepped to the log.
+  /// Append the event to the log: it changed the run.
   Checkpoint
-  /// Start an agent call, or continue it when `transcript` is not empty.
-  /// `note` is an operator note from a restart.
+  RunCommand(id: String, attempt: Int)
+  /// Run a nested workflow's body; its own calls are made in `scope`.
+  RunWorkflow(id: String, scope: String, attempt: Int)
+  /// Run an agent call: the dialogue it continues (a blob), its session's
+  /// workspace layers, this attempt's newest checkpoint, and the messages
+  /// it already took (replayed at the same turns). `mailbox` is its own
+  /// mailbox's address.
   CallAgent(
     id: String,
-    agent: String,
-    model: String,
-    input: Value,
-    /// Model turns this node has used so far, and how many it may use.
-    turn: Int,
-    turn_limit: Int,
-    /// The call's journal slot.
-    slot: String,
-    transcript: List(Message),
-    note: Option(String),
-    /// The session value the call continues (`None`: a new session).
-    session: Option(String),
-    /// The session's workspace: its layers (blob-store dirs), bottom first;
-    /// the call's `/w` is an overlay of them with its own upper dir.
-    layers: List(String),
-    /// The digest of the session's dialogue before this call (a blob): where
-    /// a new attempt starts. `None` for a session's first call.
-    history: Option(String),
-    /// The digest of this attempt's newest dialogue (a blob): where a
-    /// reissued attempt resumes. `None` before its first step.
-    checkpoint: Option(String),
-    /// MCP tool results already journaled for this call.
-    recorded: List(ToolResult),
-    /// The attempt this effect is for (1 for the first): results, steers
-    /// and interrupts are for one attempt only.
     attempt: Int,
+    mailbox: String,
+    history: Option(String),
+    layers: List(String),
+    checkpoint: Option(String),
+    taken: List(Taken),
+    continuation: Continuation,
   )
-  RunCommand(
-    id: String,
-    command: String,
-    input: Value,
-    compute_minutes: Option(Float),
-    /// The call's journal slot.
-    slot: String,
-  )
-  CallTool(id: String, tool: String, input: Value, slot: String)
-  /// Log that this body tool call's outcome is unknown: the host steps
-  /// `ToolCallUnknown(id)`.
-  LogUnknownTool(id: String)
-  /// Abort the current turn of this attempt of an agent call (now, or as
-  /// soon as it starts).
-  InterruptTurn(id: String, attempt: Int)
-  /// The core's decision for each tool call in flight (`ToolCallsInFlight`).
-  InFlightDecided(id: String, decisions: List(InFlightDecision))
+  RunTool(id: String, attempt: Int)
+  /// A new message for a mailbox: route it to its live owner.
+  Delivered(mailbox: String, message: Envelope)
   Deliver(id: String, value: Value)
   Fail(id: String, reason: FailReason)
-  /// `Some(id)`: the body's request is refused. `None`: the event itself is
-  /// refused and not applied; the run's status does not change.
   Refuse(id: Option(String), refusal: Refusal)
   Finish(outcome: Outcome)
 }
 
 pub fn effect_to_json(effect: Effect) -> json.Json {
   case effect {
-    Checkpoint ->
-      json.object([
-        #("type", json.string("checkpoint")),
-      ])
-    CallAgent(
-      id:,
-      agent:,
-      model:,
-      input:,
-      turn:,
-      turn_limit:,
-      slot:,
-      transcript:,
-      note:,
-      session:,
-      layers:,
-      history:,
-      checkpoint:,
-      recorded:,
-      attempt:,
-    ) ->
-      json.object([
-        #("type", json.string("call_agent")),
-        #("id", json.string(id)),
-        #("agent", json.string(agent)),
-        #("model", json.string(model)),
-        #("input", json_value.to_json(input)),
-        #("turn", json.int(turn)),
-        #("turn_limit", json.int(turn_limit)),
-        #("slot", json.string(slot)),
-        #("transcript", json.array(transcript, message_to_json)),
-        #("note", case note {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("session", case session {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("layers", json.array(layers, json.string)),
-        #("history", case history {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("checkpoint", case checkpoint {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("recorded", json.array(recorded, tool_result_to_json)),
-        #("attempt", json.int(attempt)),
-      ])
-    RunCommand(id:, command:, input:, compute_minutes:, slot:) ->
-      json.object([
-        #("type", json.string("run_command")),
-        #("id", json.string(id)),
-        #("command", json.string(command)),
-        #("input", json_value.to_json(input)),
-        #("compute_minutes", case compute_minutes {
-          option.None -> json.null()
-          option.Some(value) -> json.float(value)
-        }),
-        #("slot", json.string(slot)),
-      ])
-    CallTool(id:, tool:, input:, slot:) ->
-      json.object([
-        #("type", json.string("call_tool")),
-        #("id", json.string(id)),
-        #("tool", json.string(tool)),
-        #("input", json_value.to_json(input)),
-        #("slot", json.string(slot)),
-      ])
-    LogUnknownTool(id:) ->
-      json.object([
-        #("type", json.string("log_unknown_tool")),
-        #("id", json.string(id)),
-      ])
-    InterruptTurn(id:, attempt:) ->
-      json.object([
-        #("type", json.string("interrupt_turn")),
-        #("id", json.string(id)),
-        #("attempt", json.int(attempt)),
-      ])
-    InFlightDecided(id:, decisions:) ->
-      json.object([
-        #("type", json.string("in_flight_decided")),
-        #("id", json.string(id)),
-        #("decisions", json.array(decisions, in_flight_decision_to_json)),
-      ])
-    Deliver(id:, value:) ->
-      json.object([
-        #("type", json.string("deliver")),
-        #("id", json.string(id)),
-        #("value", json_value.to_json(value)),
-      ])
-    Fail(id:, reason:) ->
-      json.object([
-        #("type", json.string("fail")),
-        #("id", json.string(id)),
-        #("reason", fail_reason_to_json(reason)),
-      ])
-    Refuse(id:, refusal:) ->
-      json.object([
-        #("type", json.string("refuse")),
-        #("id", case id {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("refusal", refusal_to_json(refusal)),
-      ])
-    Finish(outcome:) ->
-      json.object([
-        #("type", json.string("finish")),
-        #("outcome", outcome_to_json(outcome)),
-      ])
+    Checkpoint -> json.object([
+      #("type", json.string("checkpoint")),
+    ])
+    RunCommand(id:, attempt:) -> json.object([
+      #("type", json.string("run_command")),
+      #("id", json.string(id)),
+      #("attempt", json.int(attempt)),
+    ])
+    RunWorkflow(id:, scope:, attempt:) -> json.object([
+      #("type", json.string("run_workflow")),
+      #("id", json.string(id)),
+      #("scope", json.string(scope)),
+      #("attempt", json.int(attempt)),
+    ])
+    CallAgent(id:, attempt:, mailbox:, history:, layers:, checkpoint:, taken:, continuation:) -> json.object([
+      #("type", json.string("call_agent")),
+      #("id", json.string(id)),
+      #("attempt", json.int(attempt)),
+      #("mailbox", json.string(mailbox)),
+      #("history", case history {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+      #("layers", json.array(layers, json.string)),
+      #("checkpoint", case checkpoint {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+      #("taken", json.array(taken, taken_to_json)),
+      #("continuation", continuation_to_json(continuation)),
+    ])
+    RunTool(id:, attempt:) -> json.object([
+      #("type", json.string("run_tool")),
+      #("id", json.string(id)),
+      #("attempt", json.int(attempt)),
+    ])
+    Delivered(mailbox:, message:) -> json.object([
+      #("type", json.string("delivered")),
+      #("mailbox", json.string(mailbox)),
+      #("message", envelope_to_json(message)),
+    ])
+    Deliver(id:, value:) -> json.object([
+      #("type", json.string("deliver")),
+      #("id", json.string(id)),
+      #("value", json_value.to_json(value)),
+    ])
+    Fail(id:, reason:) -> json.object([
+      #("type", json.string("fail")),
+      #("id", json.string(id)),
+      #("reason", fail_reason_to_json(reason)),
+    ])
+    Refuse(id:, refusal:) -> json.object([
+      #("type", json.string("refuse")),
+      #("id", case id {
+        option.None -> json.null()
+        option.Some(value) -> json.string(value)
+      }),
+      #("refusal", refusal_to_json(refusal)),
+    ])
+    Finish(outcome:) -> json.object([
+      #("type", json.string("finish")),
+      #("outcome", outcome_to_json(outcome)),
+    ])
   }
 }
 
@@ -1540,83 +971,37 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
   use variant <- decode.field("type", decode.string)
   case variant {
     "checkpoint" -> decode.success(Checkpoint)
-    "call_agent" -> {
-      use id <- decode.field("id", decode.string)
-      use agent <- decode.field("agent", decode.string)
-      use model <- decode.field("model", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      use turn <- decode.field("turn", decode.int)
-      use turn_limit <- decode.field("turn_limit", decode.int)
-      use slot <- decode.field("slot", decode.string)
-      use transcript <- decode.field(
-        "transcript",
-        decode.list(message_decoder()),
-      )
-      use note <- decode.field("note", decode.optional(decode.string))
-      use session <- decode.field("session", decode.optional(decode.string))
-      use layers <- decode.field("layers", decode.list(decode.string))
-      use history <- decode.field("history", decode.optional(decode.string))
-      use checkpoint <- decode.field(
-        "checkpoint",
-        decode.optional(decode.string),
-      )
-      use recorded <- decode.field(
-        "recorded",
-        decode.list(tool_result_decoder()),
-      )
-      use attempt <- decode.field("attempt", decode.int)
-      decode.success(CallAgent(
-        id:,
-        agent:,
-        model:,
-        input:,
-        turn:,
-        turn_limit:,
-        slot:,
-        transcript:,
-        note:,
-        session:,
-        layers:,
-        history:,
-        checkpoint:,
-        recorded:,
-        attempt:,
-      ))
-    }
     "run_command" -> {
       use id <- decode.field("id", decode.string)
-      use command <- decode.field("command", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      use compute_minutes <- decode.field(
-        "compute_minutes",
-        decode.optional(decode.float),
-      )
-      use slot <- decode.field("slot", decode.string)
-      decode.success(RunCommand(id:, command:, input:, compute_minutes:, slot:))
+      use attempt <- decode.field("attempt", decode.int)
+      decode.success(RunCommand(id:, attempt:))
     }
-    "call_tool" -> {
+    "run_workflow" -> {
       use id <- decode.field("id", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      use slot <- decode.field("slot", decode.string)
-      decode.success(CallTool(id:, tool:, input:, slot:))
+      use scope <- decode.field("scope", decode.string)
+      use attempt <- decode.field("attempt", decode.int)
+      decode.success(RunWorkflow(id:, scope:, attempt:))
     }
-    "log_unknown_tool" -> {
-      use id <- decode.field("id", decode.string)
-      decode.success(LogUnknownTool(id:))
-    }
-    "interrupt_turn" -> {
+    "call_agent" -> {
       use id <- decode.field("id", decode.string)
       use attempt <- decode.field("attempt", decode.int)
-      decode.success(InterruptTurn(id:, attempt:))
+      use mailbox <- decode.field("mailbox", decode.string)
+      use history <- decode.field("history", decode.optional(decode.string))
+      use layers <- decode.field("layers", decode.list(decode.string))
+      use checkpoint <- decode.field("checkpoint", decode.optional(decode.string))
+      use taken <- decode.field("taken", decode.list(taken_decoder()))
+      use continuation <- decode.field("continuation", continuation_decoder())
+      decode.success(CallAgent(id:, attempt:, mailbox:, history:, layers:, checkpoint:, taken:, continuation:))
     }
-    "in_flight_decided" -> {
+    "run_tool" -> {
       use id <- decode.field("id", decode.string)
-      use decisions <- decode.field(
-        "decisions",
-        decode.list(in_flight_decision_decoder()),
-      )
-      decode.success(InFlightDecided(id:, decisions:))
+      use attempt <- decode.field("attempt", decode.int)
+      decode.success(RunTool(id:, attempt:))
+    }
+    "delivered" -> {
+      use mailbox <- decode.field("mailbox", decode.string)
+      use message <- decode.field("message", envelope_decoder())
+      decode.success(Delivered(mailbox:, message:))
     }
     "deliver" -> {
       use id <- decode.field("id", decode.string)
@@ -1641,1283 +1026,6 @@ pub fn effect_decoder() -> decode.Decoder(Effect) {
   }
 }
 
-pub type Refusal {
-  PinMismatch(field: String, recorded: String, current: String)
-  UnknownAgent(name: String)
-  UnknownCommand(name: String)
-  NeedsUnmet(agent: String, need: String)
-  /// A sandbox volume that is not `<host>:<target>:ro` or `<name>:<target>`,
-  /// or whose target is not absolute or overlaps a reserved dir or another.
-  InvalidVolume(sandbox: String, volume: String, reason: String)
-  /// A bind volume's host dir does not exist.
-  VolumeMissing(sandbox: String, target: String, path: String)
-  /// A caller-given volume path for a target no sandbox binds.
-  UnknownVolume(target: String)
-  /// A device a sandbox declares does not exist on this host.
-  DeviceMissing(sandbox: String, device: String)
-  /// A declared device wallis will not bind: not a plain path whose real
-  /// path is a character device (or a dir of them) under /dev, or one that
-  /// is shared state (/dev/shm, /dev/pts, /dev/mqueue, /dev/fd).
-  InvalidDevice(sandbox: String, device: String, reason: String)
-  /// An environment variable a sandbox may not set: wallis sets `PATH`,
-  /// `HOME` and `WALLIS_*`; `LD_*` would steer the loader. A secret (carried
-  /// in the environment of the host-side spawn) may not be a variable that
-  /// steers the host programs either.
-  InvalidEnvironment(sandbox: String, key: String, reason: String)
-  /// A run input (a fork's new input) that does not match the workflow's
-  /// input schema.
-  InvalidInput(errors: List(String))
-  InputTooLarge(agent: String, field: Option(String), chars: Int, limit: Int)
-  NotOwner(by: String, owner: Option(String))
-  NotIdle(node: String)
-  NodeNotRunning(node: String)
-  NotSteerable(node: String)
-  NotLive(node: String)
-  /// Answers, steering and notes are for agents; a command has no dialogue.
-  NotAnAgent(node: String)
-  /// A node at its turn limit needs more turns with the message.
-  NoTurnsLeft(node: String)
-  RequiresMissing(name: String)
-  RequiresBroken(name: String, exit: Int, stderr_head: String)
-  SetupFailed(sandbox: String, exit: Int, stderr_head: String)
-  /// An allowlisted MCP tool declares writes outside the agent's sandbox.
-  ToolWritesOutside(server: String, tool: String)
-  UnknownBin(name: String)
-  UnknownAlias(alias: String)
-  JournalMissing(request: String)
-  /// Agents are called through session values only: `ctx.call(ctx.session(agent), input)`.
-  SessionRequired(agent: String)
-  /// A session value this run never answered with.
-  UnknownSession(session: String)
-  /// A session value continued by another agent than the one whose
-  /// dialogue it is (`owner`).
-  SessionOfAnotherAgent(session: String, agent: String, owner: String)
-  UnknownOrchestrator(name: String)
-  UnknownTool(name: String)
-  /// A submitted result does not match the node's answer schema.
-  InvalidAnswer(node: String, errors: List(String))
-  /// The node does not wait for a submitted result.
-  NotPending(node: String)
-  /// A session call whose previous call left no dialogue to continue.
-  DialogueMissing(node: String)
-  /// A restart of an unknown outcome retries the call where it stopped: it
-  /// takes no note (the dialogue continues).
-  RetryTakesNoNote(node: String)
-  /// Two tools an agent is given have the same name, or one takes a
-  /// built-in's name.
-  ToolNameTaken(agent: String, name: String)
-  /// Tool processes run only in sandboxes, and none can be built here
-  /// (`confine: "off"` runs them unconfined).
-  SandboxUnavailable(source: String)
-  /// Sandboxes run only under per-sandbox memory and process limits (a
-  /// systemd user scope), and none can be created here.
-  LimitsUnavailable(reason: String)
-  InvalidDeclaration(message: String)
-  InvalidEvent(message: String)
-  NotStarted
-  AlreadyStarted
-  NotRunning
-}
 
-pub fn refusal_to_json(refusal: Refusal) -> json.Json {
-  case refusal {
-    PinMismatch(field:, recorded:, current:) ->
-      json.object([
-        #("type", json.string("pin_mismatch")),
-        #("field", json.string(field)),
-        #("recorded", json.string(recorded)),
-        #("current", json.string(current)),
-      ])
-    UnknownAgent(name:) ->
-      json.object([
-        #("type", json.string("unknown_agent")),
-        #("name", json.string(name)),
-      ])
-    UnknownCommand(name:) ->
-      json.object([
-        #("type", json.string("unknown_command")),
-        #("name", json.string(name)),
-      ])
-    NeedsUnmet(agent:, need:) ->
-      json.object([
-        #("type", json.string("needs_unmet")),
-        #("agent", json.string(agent)),
-        #("need", json.string(need)),
-      ])
-    InvalidVolume(sandbox:, volume:, reason:) ->
-      json.object([
-        #("type", json.string("invalid_volume")),
-        #("sandbox", json.string(sandbox)),
-        #("volume", json.string(volume)),
-        #("reason", json.string(reason)),
-      ])
-    VolumeMissing(sandbox:, target:, path:) ->
-      json.object([
-        #("type", json.string("volume_missing")),
-        #("sandbox", json.string(sandbox)),
-        #("target", json.string(target)),
-        #("path", json.string(path)),
-      ])
-    UnknownVolume(target:) ->
-      json.object([
-        #("type", json.string("unknown_volume")),
-        #("target", json.string(target)),
-      ])
-    DeviceMissing(sandbox:, device:) ->
-      json.object([
-        #("type", json.string("device_missing")),
-        #("sandbox", json.string(sandbox)),
-        #("device", json.string(device)),
-      ])
-    InvalidDevice(sandbox:, device:, reason:) ->
-      json.object([
-        #("type", json.string("invalid_device")),
-        #("sandbox", json.string(sandbox)),
-        #("device", json.string(device)),
-        #("reason", json.string(reason)),
-      ])
-    InvalidEnvironment(sandbox:, key:, reason:) ->
-      json.object([
-        #("type", json.string("invalid_environment")),
-        #("sandbox", json.string(sandbox)),
-        #("key", json.string(key)),
-        #("reason", json.string(reason)),
-      ])
-    InvalidInput(errors:) ->
-      json.object([
-        #("type", json.string("invalid_input")),
-        #("errors", json.array(errors, json.string)),
-      ])
-    InputTooLarge(agent:, field:, chars:, limit:) ->
-      json.object([
-        #("type", json.string("input_too_large")),
-        #("agent", json.string(agent)),
-        #("field", case field {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-        #("chars", json.int(chars)),
-        #("limit", json.int(limit)),
-      ])
-    NotOwner(by:, owner:) ->
-      json.object([
-        #("type", json.string("not_owner")),
-        #("by", json.string(by)),
-        #("owner", case owner {
-          option.None -> json.null()
-          option.Some(value) -> json.string(value)
-        }),
-      ])
-    NotIdle(node:) ->
-      json.object([
-        #("type", json.string("not_idle")),
-        #("node", json.string(node)),
-      ])
-    NodeNotRunning(node:) ->
-      json.object([
-        #("type", json.string("node_not_running")),
-        #("node", json.string(node)),
-      ])
-    NotSteerable(node:) ->
-      json.object([
-        #("type", json.string("not_steerable")),
-        #("node", json.string(node)),
-      ])
-    NotLive(node:) ->
-      json.object([
-        #("type", json.string("not_live")),
-        #("node", json.string(node)),
-      ])
-    NotAnAgent(node:) ->
-      json.object([
-        #("type", json.string("not_an_agent")),
-        #("node", json.string(node)),
-      ])
-    NoTurnsLeft(node:) ->
-      json.object([
-        #("type", json.string("no_turns_left")),
-        #("node", json.string(node)),
-      ])
-    RequiresMissing(name:) ->
-      json.object([
-        #("type", json.string("requires_missing")),
-        #("name", json.string(name)),
-      ])
-    RequiresBroken(name:, exit:, stderr_head:) ->
-      json.object([
-        #("type", json.string("requires_broken")),
-        #("name", json.string(name)),
-        #("exit", json.int(exit)),
-        #("stderr_head", json.string(stderr_head)),
-      ])
-    SetupFailed(sandbox:, exit:, stderr_head:) ->
-      json.object([
-        #("type", json.string("setup_failed")),
-        #("sandbox", json.string(sandbox)),
-        #("exit", json.int(exit)),
-        #("stderr_head", json.string(stderr_head)),
-      ])
-    ToolWritesOutside(server:, tool:) ->
-      json.object([
-        #("type", json.string("tool_writes_outside")),
-        #("server", json.string(server)),
-        #("tool", json.string(tool)),
-      ])
-    UnknownBin(name:) ->
-      json.object([
-        #("type", json.string("unknown_bin")),
-        #("name", json.string(name)),
-      ])
-    UnknownAlias(alias:) ->
-      json.object([
-        #("type", json.string("unknown_alias")),
-        #("alias", json.string(alias)),
-      ])
-    JournalMissing(request:) ->
-      json.object([
-        #("type", json.string("journal_missing")),
-        #("request", json.string(request)),
-      ])
-    SessionRequired(agent:) ->
-      json.object([
-        #("type", json.string("session_required")),
-        #("agent", json.string(agent)),
-      ])
-    UnknownSession(session:) ->
-      json.object([
-        #("type", json.string("unknown_session")),
-        #("session", json.string(session)),
-      ])
-    SessionOfAnotherAgent(session:, agent:, owner:) ->
-      json.object([
-        #("type", json.string("session_of_another_agent")),
-        #("session", json.string(session)),
-        #("agent", json.string(agent)),
-        #("owner", json.string(owner)),
-      ])
-    UnknownOrchestrator(name:) ->
-      json.object([
-        #("type", json.string("unknown_orchestrator")),
-        #("name", json.string(name)),
-      ])
-    UnknownTool(name:) ->
-      json.object([
-        #("type", json.string("unknown_tool")),
-        #("name", json.string(name)),
-      ])
-    InvalidAnswer(node:, errors:) ->
-      json.object([
-        #("type", json.string("invalid_answer")),
-        #("node", json.string(node)),
-        #("errors", json.array(errors, json.string)),
-      ])
-    NotPending(node:) ->
-      json.object([
-        #("type", json.string("not_pending")),
-        #("node", json.string(node)),
-      ])
-    DialogueMissing(node:) ->
-      json.object([
-        #("type", json.string("dialogue_missing")),
-        #("node", json.string(node)),
-      ])
-    RetryTakesNoNote(node:) ->
-      json.object([
-        #("type", json.string("retry_takes_no_note")),
-        #("node", json.string(node)),
-      ])
-    ToolNameTaken(agent:, name:) ->
-      json.object([
-        #("type", json.string("tool_name_taken")),
-        #("agent", json.string(agent)),
-        #("name", json.string(name)),
-      ])
-    SandboxUnavailable(source:) ->
-      json.object([
-        #("type", json.string("sandbox_unavailable")),
-        #("source", json.string(source)),
-      ])
-    LimitsUnavailable(reason:) ->
-      json.object([
-        #("type", json.string("limits_unavailable")),
-        #("reason", json.string(reason)),
-      ])
-    InvalidDeclaration(message:) ->
-      json.object([
-        #("type", json.string("invalid_declaration")),
-        #("message", json.string(message)),
-      ])
-    InvalidEvent(message:) ->
-      json.object([
-        #("type", json.string("invalid_event")),
-        #("message", json.string(message)),
-      ])
-    NotStarted ->
-      json.object([
-        #("type", json.string("not_started")),
-      ])
-    AlreadyStarted ->
-      json.object([
-        #("type", json.string("already_started")),
-      ])
-    NotRunning ->
-      json.object([
-        #("type", json.string("not_running")),
-      ])
-  }
-}
 
-pub fn refusal_decoder() -> decode.Decoder(Refusal) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "pin_mismatch" -> {
-      use field <- decode.field("field", decode.string)
-      use recorded <- decode.field("recorded", decode.string)
-      use current <- decode.field("current", decode.string)
-      decode.success(PinMismatch(field:, recorded:, current:))
-    }
-    "unknown_agent" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(UnknownAgent(name:))
-    }
-    "unknown_command" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(UnknownCommand(name:))
-    }
-    "needs_unmet" -> {
-      use agent <- decode.field("agent", decode.string)
-      use need <- decode.field("need", decode.string)
-      decode.success(NeedsUnmet(agent:, need:))
-    }
-    "invalid_volume" -> {
-      use sandbox <- decode.field("sandbox", decode.string)
-      use volume <- decode.field("volume", decode.string)
-      use reason <- decode.field("reason", decode.string)
-      decode.success(InvalidVolume(sandbox:, volume:, reason:))
-    }
-    "volume_missing" -> {
-      use sandbox <- decode.field("sandbox", decode.string)
-      use target <- decode.field("target", decode.string)
-      use path <- decode.field("path", decode.string)
-      decode.success(VolumeMissing(sandbox:, target:, path:))
-    }
-    "unknown_volume" -> {
-      use target <- decode.field("target", decode.string)
-      decode.success(UnknownVolume(target:))
-    }
-    "device_missing" -> {
-      use sandbox <- decode.field("sandbox", decode.string)
-      use device <- decode.field("device", decode.string)
-      decode.success(DeviceMissing(sandbox:, device:))
-    }
-    "invalid_device" -> {
-      use sandbox <- decode.field("sandbox", decode.string)
-      use device <- decode.field("device", decode.string)
-      use reason <- decode.field("reason", decode.string)
-      decode.success(InvalidDevice(sandbox:, device:, reason:))
-    }
-    "invalid_environment" -> {
-      use sandbox <- decode.field("sandbox", decode.string)
-      use key <- decode.field("key", decode.string)
-      use reason <- decode.field("reason", decode.string)
-      decode.success(InvalidEnvironment(sandbox:, key:, reason:))
-    }
-    "invalid_input" -> {
-      use errors <- decode.field("errors", decode.list(decode.string))
-      decode.success(InvalidInput(errors:))
-    }
-    "input_too_large" -> {
-      use agent <- decode.field("agent", decode.string)
-      use field <- decode.field("field", decode.optional(decode.string))
-      use chars <- decode.field("chars", decode.int)
-      use limit <- decode.field("limit", decode.int)
-      decode.success(InputTooLarge(agent:, field:, chars:, limit:))
-    }
-    "not_owner" -> {
-      use by <- decode.field("by", decode.string)
-      use owner <- decode.field("owner", decode.optional(decode.string))
-      decode.success(NotOwner(by:, owner:))
-    }
-    "not_idle" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NotIdle(node:))
-    }
-    "node_not_running" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NodeNotRunning(node:))
-    }
-    "not_steerable" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NotSteerable(node:))
-    }
-    "not_live" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NotLive(node:))
-    }
-    "not_an_agent" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NotAnAgent(node:))
-    }
-    "no_turns_left" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NoTurnsLeft(node:))
-    }
-    "requires_missing" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(RequiresMissing(name:))
-    }
-    "requires_broken" -> {
-      use name <- decode.field("name", decode.string)
-      use exit <- decode.field("exit", decode.int)
-      use stderr_head <- decode.field("stderr_head", decode.string)
-      decode.success(RequiresBroken(name:, exit:, stderr_head:))
-    }
-    "setup_failed" -> {
-      use sandbox <- decode.field("sandbox", decode.string)
-      use exit <- decode.field("exit", decode.int)
-      use stderr_head <- decode.field("stderr_head", decode.string)
-      decode.success(SetupFailed(sandbox:, exit:, stderr_head:))
-    }
-    "tool_writes_outside" -> {
-      use server <- decode.field("server", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      decode.success(ToolWritesOutside(server:, tool:))
-    }
-    "unknown_bin" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(UnknownBin(name:))
-    }
-    "unknown_alias" -> {
-      use alias <- decode.field("alias", decode.string)
-      decode.success(UnknownAlias(alias:))
-    }
-    "journal_missing" -> {
-      use request <- decode.field("request", decode.string)
-      decode.success(JournalMissing(request:))
-    }
-    "session_required" -> {
-      use agent <- decode.field("agent", decode.string)
-      decode.success(SessionRequired(agent:))
-    }
-    "unknown_session" -> {
-      use session <- decode.field("session", decode.string)
-      decode.success(UnknownSession(session:))
-    }
-    "session_of_another_agent" -> {
-      use session <- decode.field("session", decode.string)
-      use agent <- decode.field("agent", decode.string)
-      use owner <- decode.field("owner", decode.string)
-      decode.success(SessionOfAnotherAgent(session:, agent:, owner:))
-    }
-    "unknown_orchestrator" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(UnknownOrchestrator(name:))
-    }
-    "unknown_tool" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(UnknownTool(name:))
-    }
-    "invalid_answer" -> {
-      use node <- decode.field("node", decode.string)
-      use errors <- decode.field("errors", decode.list(decode.string))
-      decode.success(InvalidAnswer(node:, errors:))
-    }
-    "not_pending" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(NotPending(node:))
-    }
-    "dialogue_missing" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(DialogueMissing(node:))
-    }
-    "retry_takes_no_note" -> {
-      use node <- decode.field("node", decode.string)
-      decode.success(RetryTakesNoNote(node:))
-    }
-    "tool_name_taken" -> {
-      use agent <- decode.field("agent", decode.string)
-      use name <- decode.field("name", decode.string)
-      decode.success(ToolNameTaken(agent:, name:))
-    }
-    "sandbox_unavailable" -> {
-      use source <- decode.field("source", decode.string)
-      decode.success(SandboxUnavailable(source:))
-    }
-    "limits_unavailable" -> {
-      use reason <- decode.field("reason", decode.string)
-      decode.success(LimitsUnavailable(reason:))
-    }
-    "invalid_declaration" -> {
-      use message <- decode.field("message", decode.string)
-      decode.success(InvalidDeclaration(message:))
-    }
-    "invalid_event" -> {
-      use message <- decode.field("message", decode.string)
-      decode.success(InvalidEvent(message:))
-    }
-    "not_started" -> decode.success(NotStarted)
-    "already_started" -> decode.success(AlreadyStarted)
-    "not_running" -> decode.success(NotRunning)
-    _ -> decode.failure(NotStarted, "Refusal")
-  }
-}
 
-pub type FailReason {
-  BodyError(message: String)
-  AgentGaveUp(agent: String, failure: AgentFailure)
-  CommandCrashed(command: String, failure: CommandFailure)
-  ToolCrashed(tool: String, failure: ToolFailure)
-  /// The owner cancelled an orchestrator node.
-  OrchestratorCancelled(name: String)
-  /// A nested workflow failed; its reason propagates.
-  WorkflowFailed(workflow: String, reason: FailReason)
-}
-
-pub fn fail_reason_to_json(fail_reason: FailReason) -> json.Json {
-  case fail_reason {
-    BodyError(message:) ->
-      json.object([
-        #("type", json.string("body_error")),
-        #("message", json.string(message)),
-      ])
-    AgentGaveUp(agent:, failure:) ->
-      json.object([
-        #("type", json.string("agent_gave_up")),
-        #("agent", json.string(agent)),
-        #("failure", agent_failure_to_json(failure)),
-      ])
-    CommandCrashed(command:, failure:) ->
-      json.object([
-        #("type", json.string("command_crashed")),
-        #("command", json.string(command)),
-        #("failure", command_failure_to_json(failure)),
-      ])
-    ToolCrashed(tool:, failure:) ->
-      json.object([
-        #("type", json.string("tool_crashed")),
-        #("tool", json.string(tool)),
-        #("failure", tool_failure_to_json(failure)),
-      ])
-    OrchestratorCancelled(name:) ->
-      json.object([
-        #("type", json.string("orchestrator_cancelled")),
-        #("name", json.string(name)),
-      ])
-    WorkflowFailed(workflow:, reason:) ->
-      json.object([
-        #("type", json.string("workflow_failed")),
-        #("workflow", json.string(workflow)),
-        #("reason", fail_reason_to_json(reason)),
-      ])
-  }
-}
-
-pub fn fail_reason_decoder() -> decode.Decoder(FailReason) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "body_error" -> {
-      use message <- decode.field("message", decode.string)
-      decode.success(BodyError(message:))
-    }
-    "agent_gave_up" -> {
-      use agent <- decode.field("agent", decode.string)
-      use failure <- decode.field("failure", agent_failure_decoder())
-      decode.success(AgentGaveUp(agent:, failure:))
-    }
-    "command_crashed" -> {
-      use command <- decode.field("command", decode.string)
-      use failure <- decode.field("failure", command_failure_decoder())
-      decode.success(CommandCrashed(command:, failure:))
-    }
-    "tool_crashed" -> {
-      use tool <- decode.field("tool", decode.string)
-      use failure <- decode.field("failure", tool_failure_decoder())
-      decode.success(ToolCrashed(tool:, failure:))
-    }
-    "orchestrator_cancelled" -> {
-      use name <- decode.field("name", decode.string)
-      decode.success(OrchestratorCancelled(name:))
-    }
-    "workflow_failed" -> {
-      use workflow <- decode.field("workflow", decode.string)
-      use reason <- decode.field("reason", fail_reason_decoder())
-      decode.success(WorkflowFailed(workflow:, reason:))
-    }
-    _ -> decode.failure(BodyError(message: ""), "FailReason")
-  }
-}
-
-pub type Outcome {
-  Done(value: Value)
-  Failed(reason: FailReason)
-  Cancelled
-}
-
-pub fn outcome_to_json(outcome: Outcome) -> json.Json {
-  case outcome {
-    Done(value:) ->
-      json.object([
-        #("type", json.string("done")),
-        #("value", json_value.to_json(value)),
-      ])
-    Failed(reason:) ->
-      json.object([
-        #("type", json.string("failed")),
-        #("reason", fail_reason_to_json(reason)),
-      ])
-    Cancelled ->
-      json.object([
-        #("type", json.string("cancelled")),
-      ])
-  }
-}
-
-pub fn outcome_decoder() -> decode.Decoder(Outcome) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "done" -> {
-      use value <- decode.field("value", json_value.decoder())
-      decode.success(Done(value:))
-    }
-    "failed" -> {
-      use reason <- decode.field("reason", fail_reason_decoder())
-      decode.success(Failed(reason:))
-    }
-    "cancelled" -> decode.success(Cancelled)
-    _ -> decode.failure(Cancelled, "Outcome")
-  }
-}
-
-// --- Status (core to host, in snapshots) -------------------------------------
-
-pub type RunStatus {
-  Running
-  Idle(reason: Option(IdleReason))
-  Finished(outcome: Outcome)
-}
-
-pub fn run_status_to_json(run_status: RunStatus) -> json.Json {
-  case run_status {
-    Running ->
-      json.object([
-        #("type", json.string("running")),
-      ])
-    Idle(reason:) ->
-      json.object([
-        #("type", json.string("idle")),
-        #("reason", case reason {
-          option.None -> json.null()
-          option.Some(value) -> idle_reason_to_json(value)
-        }),
-      ])
-    Finished(outcome:) ->
-      json.object([
-        #("type", json.string("finished")),
-        #("outcome", outcome_to_json(outcome)),
-      ])
-  }
-}
-
-pub fn run_status_decoder() -> decode.Decoder(RunStatus) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "running" -> decode.success(Running)
-    "idle" -> {
-      use reason <- decode.field(
-        "reason",
-        decode.optional(idle_reason_decoder()),
-      )
-      decode.success(Idle(reason:))
-    }
-    "finished" -> {
-      use outcome <- decode.field("outcome", outcome_decoder())
-      decode.success(Finished(outcome:))
-    }
-    _ -> decode.failure(Running, "RunStatus")
-  }
-}
-
-pub type IdleReason {
-  BudgetReached(kind: BudgetKind, spent: Float, limit: Float)
-  ExecutorUnavailable(alias: String, error: String)
-  PausedByUser
-  /// A node failed and the body did not handle it: restart the node, or
-  /// cancel it to let the failure propagate.
-  NodeFailure(node: String, reason: FailReason)
-}
-
-pub fn idle_reason_to_json(idle_reason: IdleReason) -> json.Json {
-  case idle_reason {
-    BudgetReached(kind:, spent:, limit:) ->
-      json.object([
-        #("type", json.string("budget_reached")),
-        #("kind", budget_kind_to_json(kind)),
-        #("spent", json.float(spent)),
-        #("limit", json.float(limit)),
-      ])
-    ExecutorUnavailable(alias:, error:) ->
-      json.object([
-        #("type", json.string("executor_unavailable")),
-        #("alias", json.string(alias)),
-        #("error", json.string(error)),
-      ])
-    PausedByUser ->
-      json.object([
-        #("type", json.string("paused_by_user")),
-      ])
-    NodeFailure(node:, reason:) ->
-      json.object([
-        #("type", json.string("node_failure")),
-        #("node", json.string(node)),
-        #("reason", fail_reason_to_json(reason)),
-      ])
-  }
-}
-
-pub fn idle_reason_decoder() -> decode.Decoder(IdleReason) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "budget_reached" -> {
-      use kind <- decode.field("kind", budget_kind_decoder())
-      use spent <- decode.field("spent", decode.float)
-      use limit <- decode.field("limit", decode.float)
-      decode.success(BudgetReached(kind:, spent:, limit:))
-    }
-    "executor_unavailable" -> {
-      use alias <- decode.field("alias", decode.string)
-      use error <- decode.field("error", decode.string)
-      decode.success(ExecutorUnavailable(alias:, error:))
-    }
-    "paused_by_user" -> decode.success(PausedByUser)
-    "node_failure" -> {
-      use node <- decode.field("node", decode.string)
-      use reason <- decode.field("reason", fail_reason_decoder())
-      decode.success(NodeFailure(node:, reason:))
-    }
-    _ -> decode.failure(PausedByUser, "IdleReason")
-  }
-}
-
-/// One call of an agent or a command. Each variant carries only what is
-/// meaningful in that state; `inbox` lists the messages that reached it.
-pub type Node {
-  NodeRunning(
-    id: String,
-    agent: String,
-    model: String,
-    steerable: Bool,
-    inbox: List(InboxMessage),
-  )
-  /// Waiting for the owner: a question, or the turn limit.
-  NodeIdle(
-    id: String,
-    agent: String,
-    model: String,
-    steerable: Bool,
-    inbox: List(InboxMessage),
-    cause: IdleCause,
-  )
-  NodeDone(
-    id: String,
-    agent: String,
-    model: String,
-    steerable: Bool,
-    inbox: List(InboxMessage),
-    outcome: NodeOutcome,
-  )
-  /// A command call: no dialogue, so no idle state.
-  CommandRunning(id: String, command: String, inbox: List(InboxMessage))
-  CommandDone(
-    id: String,
-    command: String,
-    inbox: List(InboxMessage),
-    outcome: CommandOutcome,
-  )
-  /// A body MCP tool call.
-  ToolRunning(id: String, tool: String)
-  /// In flight at a crash and not safe to reissue: its outcome is unknown.
-  ToolOutcomeUnknown(id: String, tool: String, input: Value)
-  ToolDone(id: String, tool: String, outcome: ToolOutcome)
-  /// An orchestrator node waiting for its result.
-  OrchestratorPending(id: String, name: String, input: Value)
-  OrchestratorDone(id: String, name: String)
-  /// The owner cancelled it instead of answering.
-  OrchestratorDropped(id: String, name: String)
-  /// An agent call held back before it started: by a pause or the budget,
-  /// or after an executor fault (reissued after a fix).
-  NodeHeld(
-    id: String,
-    agent: String,
-    model: String,
-    steerable: Bool,
-    inbox: List(InboxMessage),
-    reason: IdleReason,
-  )
-  CommandHeld(
-    id: String,
-    command: String,
-    inbox: List(InboxMessage),
-    reason: IdleReason,
-  )
-  ToolHeld(id: String, tool: String, reason: IdleReason)
-  /// A call refused (its input, a missing dialogue, an unknown node).
-  NodeRefused(id: String, refusal: Refusal)
-}
-
-pub fn node_to_json(node: Node) -> json.Json {
-  case node {
-    NodeRunning(id:, agent:, model:, steerable:, inbox:) ->
-      json.object([
-        #("type", json.string("node_running")),
-        #("id", json.string(id)),
-        #("agent", json.string(agent)),
-        #("model", json.string(model)),
-        #("steerable", json.bool(steerable)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-      ])
-    NodeIdle(id:, agent:, model:, steerable:, inbox:, cause:) ->
-      json.object([
-        #("type", json.string("node_idle")),
-        #("id", json.string(id)),
-        #("agent", json.string(agent)),
-        #("model", json.string(model)),
-        #("steerable", json.bool(steerable)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-        #("cause", idle_cause_to_json(cause)),
-      ])
-    NodeDone(id:, agent:, model:, steerable:, inbox:, outcome:) ->
-      json.object([
-        #("type", json.string("node_done")),
-        #("id", json.string(id)),
-        #("agent", json.string(agent)),
-        #("model", json.string(model)),
-        #("steerable", json.bool(steerable)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-        #("outcome", node_outcome_to_json(outcome)),
-      ])
-    CommandRunning(id:, command:, inbox:) ->
-      json.object([
-        #("type", json.string("command_running")),
-        #("id", json.string(id)),
-        #("command", json.string(command)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-      ])
-    CommandDone(id:, command:, inbox:, outcome:) ->
-      json.object([
-        #("type", json.string("command_done")),
-        #("id", json.string(id)),
-        #("command", json.string(command)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-        #("outcome", command_outcome_to_json(outcome)),
-      ])
-    ToolRunning(id:, tool:) ->
-      json.object([
-        #("type", json.string("tool_running")),
-        #("id", json.string(id)),
-        #("tool", json.string(tool)),
-      ])
-    ToolOutcomeUnknown(id:, tool:, input:) ->
-      json.object([
-        #("type", json.string("tool_outcome_unknown")),
-        #("id", json.string(id)),
-        #("tool", json.string(tool)),
-        #("input", json_value.to_json(input)),
-      ])
-    ToolDone(id:, tool:, outcome:) ->
-      json.object([
-        #("type", json.string("tool_done")),
-        #("id", json.string(id)),
-        #("tool", json.string(tool)),
-        #("outcome", tool_outcome_to_json(outcome)),
-      ])
-    OrchestratorPending(id:, name:, input:) ->
-      json.object([
-        #("type", json.string("orchestrator_pending")),
-        #("id", json.string(id)),
-        #("name", json.string(name)),
-        #("input", json_value.to_json(input)),
-      ])
-    OrchestratorDone(id:, name:) ->
-      json.object([
-        #("type", json.string("orchestrator_done")),
-        #("id", json.string(id)),
-        #("name", json.string(name)),
-      ])
-    OrchestratorDropped(id:, name:) ->
-      json.object([
-        #("type", json.string("orchestrator_dropped")),
-        #("id", json.string(id)),
-        #("name", json.string(name)),
-      ])
-    NodeHeld(id:, agent:, model:, steerable:, inbox:, reason:) ->
-      json.object([
-        #("type", json.string("node_held")),
-        #("id", json.string(id)),
-        #("agent", json.string(agent)),
-        #("model", json.string(model)),
-        #("steerable", json.bool(steerable)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-        #("reason", idle_reason_to_json(reason)),
-      ])
-    CommandHeld(id:, command:, inbox:, reason:) ->
-      json.object([
-        #("type", json.string("command_held")),
-        #("id", json.string(id)),
-        #("command", json.string(command)),
-        #("inbox", json.array(inbox, inbox_message_to_json)),
-        #("reason", idle_reason_to_json(reason)),
-      ])
-    ToolHeld(id:, tool:, reason:) ->
-      json.object([
-        #("type", json.string("tool_held")),
-        #("id", json.string(id)),
-        #("tool", json.string(tool)),
-        #("reason", idle_reason_to_json(reason)),
-      ])
-    NodeRefused(id:, refusal:) ->
-      json.object([
-        #("type", json.string("node_refused")),
-        #("id", json.string(id)),
-        #("refusal", refusal_to_json(refusal)),
-      ])
-  }
-}
-
-pub fn node_decoder() -> decode.Decoder(Node) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "node_running" -> {
-      use id <- decode.field("id", decode.string)
-      use agent <- decode.field("agent", decode.string)
-      use model <- decode.field("model", decode.string)
-      use steerable <- decode.field("steerable", decode.bool)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      decode.success(NodeRunning(id:, agent:, model:, steerable:, inbox:))
-    }
-    "node_idle" -> {
-      use id <- decode.field("id", decode.string)
-      use agent <- decode.field("agent", decode.string)
-      use model <- decode.field("model", decode.string)
-      use steerable <- decode.field("steerable", decode.bool)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      use cause <- decode.field("cause", idle_cause_decoder())
-      decode.success(NodeIdle(id:, agent:, model:, steerable:, inbox:, cause:))
-    }
-    "node_done" -> {
-      use id <- decode.field("id", decode.string)
-      use agent <- decode.field("agent", decode.string)
-      use model <- decode.field("model", decode.string)
-      use steerable <- decode.field("steerable", decode.bool)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      use outcome <- decode.field("outcome", node_outcome_decoder())
-      decode.success(NodeDone(id:, agent:, model:, steerable:, inbox:, outcome:))
-    }
-    "command_running" -> {
-      use id <- decode.field("id", decode.string)
-      use command <- decode.field("command", decode.string)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      decode.success(CommandRunning(id:, command:, inbox:))
-    }
-    "command_done" -> {
-      use id <- decode.field("id", decode.string)
-      use command <- decode.field("command", decode.string)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      use outcome <- decode.field("outcome", command_outcome_decoder())
-      decode.success(CommandDone(id:, command:, inbox:, outcome:))
-    }
-    "tool_running" -> {
-      use id <- decode.field("id", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      decode.success(ToolRunning(id:, tool:))
-    }
-    "tool_outcome_unknown" -> {
-      use id <- decode.field("id", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      decode.success(ToolOutcomeUnknown(id:, tool:, input:))
-    }
-    "tool_done" -> {
-      use id <- decode.field("id", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      use outcome <- decode.field("outcome", tool_outcome_decoder())
-      decode.success(ToolDone(id:, tool:, outcome:))
-    }
-    "orchestrator_pending" -> {
-      use id <- decode.field("id", decode.string)
-      use name <- decode.field("name", decode.string)
-      use input <- decode.field("input", json_value.decoder())
-      decode.success(OrchestratorPending(id:, name:, input:))
-    }
-    "orchestrator_done" -> {
-      use id <- decode.field("id", decode.string)
-      use name <- decode.field("name", decode.string)
-      decode.success(OrchestratorDone(id:, name:))
-    }
-    "orchestrator_dropped" -> {
-      use id <- decode.field("id", decode.string)
-      use name <- decode.field("name", decode.string)
-      decode.success(OrchestratorDropped(id:, name:))
-    }
-    "node_held" -> {
-      use id <- decode.field("id", decode.string)
-      use agent <- decode.field("agent", decode.string)
-      use model <- decode.field("model", decode.string)
-      use steerable <- decode.field("steerable", decode.bool)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      use reason <- decode.field("reason", idle_reason_decoder())
-      decode.success(NodeHeld(id:, agent:, model:, steerable:, inbox:, reason:))
-    }
-    "command_held" -> {
-      use id <- decode.field("id", decode.string)
-      use command <- decode.field("command", decode.string)
-      use inbox <- decode.field("inbox", decode.list(inbox_message_decoder()))
-      use reason <- decode.field("reason", idle_reason_decoder())
-      decode.success(CommandHeld(id:, command:, inbox:, reason:))
-    }
-    "tool_held" -> {
-      use id <- decode.field("id", decode.string)
-      use tool <- decode.field("tool", decode.string)
-      use reason <- decode.field("reason", idle_reason_decoder())
-      decode.success(ToolHeld(id:, tool:, reason:))
-    }
-    "node_refused" -> {
-      use id <- decode.field("id", decode.string)
-      use refusal <- decode.field("refusal", refusal_decoder())
-      decode.success(NodeRefused(id:, refusal:))
-    }
-    _ -> decode.failure(ToolRunning(id: "", tool: ""), "Node")
-  }
-}
-
-pub type ToolOutcome {
-  ToolSucceeded
-  ToolFailedWith(failure: ToolFailure)
-}
-
-pub fn tool_outcome_to_json(tool_outcome: ToolOutcome) -> json.Json {
-  case tool_outcome {
-    ToolSucceeded ->
-      json.object([
-        #("type", json.string("tool_succeeded")),
-      ])
-    ToolFailedWith(failure:) ->
-      json.object([
-        #("type", json.string("tool_failed_with")),
-        #("failure", tool_failure_to_json(failure)),
-      ])
-  }
-}
-
-pub fn tool_outcome_decoder() -> decode.Decoder(ToolOutcome) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "tool_succeeded" -> decode.success(ToolSucceeded)
-    "tool_failed_with" -> {
-      use failure <- decode.field("failure", tool_failure_decoder())
-      decode.success(ToolFailedWith(failure:))
-    }
-    _ -> decode.failure(ToolSucceeded, "ToolOutcome")
-  }
-}
-
-/// Why an agent node waits.
-pub type IdleCause {
-  /// It called `ask`: the reply becomes the tool's result.
-  Question(message: String)
-  /// It ended its turn with neither a result nor a question; its final text.
-  EndedWithoutResult(text: String)
-  /// It used `used` of `limit` turns without submitting.
-  TurnLimit(used: Int, limit: Int)
-  /// Its owner interrupted the turn; progress is kept.
-  Interrupted
-  /// After a crash, a tool call in flight that is not safe to reissue.
-  OutcomeUnknown(tool: String, args: Value)
-}
-
-pub fn idle_cause_to_json(idle_cause: IdleCause) -> json.Json {
-  case idle_cause {
-    Question(message:) ->
-      json.object([
-        #("type", json.string("question")),
-        #("message", json.string(message)),
-      ])
-    EndedWithoutResult(text:) ->
-      json.object([
-        #("type", json.string("ended_without_result")),
-        #("text", json.string(text)),
-      ])
-    TurnLimit(used:, limit:) ->
-      json.object([
-        #("type", json.string("turn_limit")),
-        #("used", json.int(used)),
-        #("limit", json.int(limit)),
-      ])
-    Interrupted ->
-      json.object([
-        #("type", json.string("interrupted")),
-      ])
-    OutcomeUnknown(tool:, args:) ->
-      json.object([
-        #("type", json.string("outcome_unknown")),
-        #("tool", json.string(tool)),
-        #("args", json_value.to_json(args)),
-      ])
-  }
-}
-
-pub fn idle_cause_decoder() -> decode.Decoder(IdleCause) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "question" -> {
-      use message <- decode.field("message", decode.string)
-      decode.success(Question(message:))
-    }
-    "ended_without_result" -> {
-      use text <- decode.field("text", decode.string)
-      decode.success(EndedWithoutResult(text:))
-    }
-    "turn_limit" -> {
-      use used <- decode.field("used", decode.int)
-      use limit <- decode.field("limit", decode.int)
-      decode.success(TurnLimit(used:, limit:))
-    }
-    "interrupted" -> decode.success(Interrupted)
-    "outcome_unknown" -> {
-      use tool <- decode.field("tool", decode.string)
-      use args <- decode.field("args", json_value.decoder())
-      decode.success(OutcomeUnknown(tool:, args:))
-    }
-    _ -> decode.failure(Interrupted, "IdleCause")
-  }
-}
-
-pub type CommandOutcome {
-  Succeeded
-  FailedWith(failure: CommandFailure)
-}
-
-pub fn command_outcome_to_json(command_outcome: CommandOutcome) -> json.Json {
-  case command_outcome {
-    Succeeded ->
-      json.object([
-        #("type", json.string("succeeded")),
-      ])
-    FailedWith(failure:) ->
-      json.object([
-        #("type", json.string("failed_with")),
-        #("failure", command_failure_to_json(failure)),
-      ])
-  }
-}
-
-pub fn command_outcome_decoder() -> decode.Decoder(CommandOutcome) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "succeeded" -> decode.success(Succeeded)
-    "failed_with" -> {
-      use failure <- decode.field("failure", command_failure_decoder())
-      decode.success(FailedWith(failure:))
-    }
-    _ -> decode.failure(Succeeded, "CommandOutcome")
-  }
-}
-
-pub type NodeOutcome {
-  Submitted
-  NodeFailed(failure: AgentFailure)
-}
-
-pub fn node_outcome_to_json(node_outcome: NodeOutcome) -> json.Json {
-  case node_outcome {
-    Submitted ->
-      json.object([
-        #("type", json.string("submitted")),
-      ])
-    NodeFailed(failure:) ->
-      json.object([
-        #("type", json.string("node_failed")),
-        #("failure", agent_failure_to_json(failure)),
-      ])
-  }
-}
-
-pub fn node_outcome_decoder() -> decode.Decoder(NodeOutcome) {
-  use variant <- decode.field("type", decode.string)
-  case variant {
-    "submitted" -> decode.success(Submitted)
-    "node_failed" -> {
-      use failure <- decode.field("failure", agent_failure_decoder())
-      decode.success(NodeFailed(failure:))
-    }
-    _ -> decode.failure(Submitted, "NodeOutcome")
-  }
-}
-
-/// A message that reached a node, and the node's step (model turns so far)
-/// when it arrived.
-pub type InboxMessage {
-  InboxMessage(kind: InboxKind, text: String, step: Int)
-}
-
-pub fn inbox_message_to_json(inbox_message: InboxMessage) -> json.Json {
-  let InboxMessage(kind:, text:, step:) = inbox_message
-  json.object([
-    #("kind", inbox_kind_to_json(kind)),
-    #("text", json.string(text)),
-    #("step", json.int(step)),
-  ])
-}
-
-pub fn inbox_message_decoder() -> decode.Decoder(InboxMessage) {
-  use kind <- decode.field("kind", inbox_kind_decoder())
-  use text <- decode.field("text", decode.string)
-  use step <- decode.field("step", decode.int)
-  decode.success(InboxMessage(kind:, text:, step:))
-}
-
-pub type InboxKind {
-  Answer
-  Steer
-  Interrupt
-  Restart
-}
-
-pub fn inbox_kind_to_json(inbox_kind: InboxKind) -> json.Json {
-  case inbox_kind {
-    Answer -> json.string("answer")
-    Steer -> json.string("steer")
-    Interrupt -> json.string("interrupt")
-    Restart -> json.string("restart")
-  }
-}
-
-pub fn inbox_kind_decoder() -> decode.Decoder(InboxKind) {
-  use variant <- decode.then(decode.string)
-  case variant {
-    "answer" -> decode.success(Answer)
-    "steer" -> decode.success(Steer)
-    "interrupt" -> decode.success(Interrupt)
-    "restart" -> decode.success(Restart)
-    _ -> decode.failure(Answer, "InboxKind")
-  }
-}
-
-pub type Observation {
-  Observation(at: String, label: String, value: Value)
-}
-
-pub fn observation_to_json(observation: Observation) -> json.Json {
-  let Observation(at:, label:, value:) = observation
-  json.object([
-    #("at", json.string(at)),
-    #("label", json.string(label)),
-    #("value", json_value.to_json(value)),
-  ])
-}
-
-pub fn observation_decoder() -> decode.Decoder(Observation) {
-  use at <- decode.field("at", decode.string)
-  use label <- decode.field("label", decode.string)
-  use value <- decode.field("value", json_value.decoder())
-  decode.success(Observation(at:, label:, value:))
-}

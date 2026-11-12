@@ -1,5 +1,0 @@
-{
-  "mcpServers": {
-    "fx": { "command": "node", "args": ["../mcp-server.ts"], "env": { "COUNT_FILE": "${COUNT_FILE}" } }
-  }
-}

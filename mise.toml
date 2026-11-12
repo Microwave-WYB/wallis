@@ -3,75 +3,38 @@ gleam = "1.19.2"
 node = "26.13.0"
 
 [tasks.install]
-description = "Install host npm dependencies (exact pins, from the lockfile)"
-dir = "host"
+description = "Install npm dependencies (exact pins, from the lockfile)"
 run = "npm ci --no-fund --no-audit"
 
+[tasks."build:core"]
+description = "Build the Gleam core and copy its JavaScript to core/dist (committed: installs never need Gleam)"
+run = ["cd core && gleam build", "node tools/build-core.mjs"]
+
 [tasks.build]
-description = "Build the Gleam core to JavaScript"
-dir = "core"
-run = "gleam build"
+description = "Build the core, then the package's dist/ (what npm and git installs run)"
+depends = ["build:core"]
+run = "npx tsc -p tsconfig.build.json"
 
 [tasks."test:core"]
 description = "Core event-replay tests (gleeunit)"
 dir = "core"
 run = "gleam test"
 
-[tasks.typecheck]
-description = "Type-check the host, SDK, examples and committed workflows"
-dir = "host"
+[tasks."test:package"]
+description = "Package tests: runtime, sandbox, agents (scripted), examples, skill, packaging; differential check on"
 depends = ["build"]
-run = "npx tsc --noEmit -p . && npx tsc --noEmit -p ../.agents/workflows"
-
-[tasks."test:host"]
-description = "Host tests: sandbox, log, resume (fake executor), and the escape suite"
-dir = "host"
-depends = ["build"]
-run = "node --test 'test/*.test.ts' 'test/escape/*.test.ts'"
-# Every host session checks, after each event, that the state rebuilt from the log equals the live one.
-env = { WALLIS_DIFFERENTIAL = "1" }
-
-[tasks."test:escape"]
-description = "Red-team sandbox-escape gate (real bwrap where available; open holes are node:test todos)"
-dir = "host"
-depends = ["build"]
-run = "node --test 'test/escape/*.test.ts'"
+run = "node --test 'test/*.test.ts'"
 env = { WALLIS_DIFFERENTIAL = "1" }
 
 [tasks.test]
 description = "All tests"
-depends = ["test:core", "test:host"]
+depends = ["test:core", "test:package"]
 
-# --- v2 (docs/v2.md) ---------------------------------------------------------
+[tasks.typecheck]
+description = "Type-check src/, test/, examples/ and the skill's starter (examples' @ts-expect-error lines must keep failing)"
+depends = ["build:core"]
+run = "npx tsc --noEmit -p ."
 
-[tasks."v2:install"]
-description = "v2: install lib npm dependencies (exact pins, from the lockfile)"
-dir = "v2/lib"
-run = "npm ci --no-fund --no-audit"
-
-[tasks."v2:build"]
-description = "v2: build the Gleam core to JavaScript"
-dir = "v2/core"
-run = "gleam build"
-
-[tasks."v2:test:core"]
-description = "v2: core event-replay tests (gleeunit)"
-dir = "v2/core"
-run = "gleam test"
-
-[tasks."v2:test:lib"]
-description = "v2: lib tests (store, log, sandbox, executors), differential check on"
-dir = "v2/lib"
-depends = ["v2:build"]
-run = "node --test 'test/*.test.ts'"
-env = { WALLIS_DIFFERENTIAL = "1" }
-
-[tasks."v2:typecheck"]
-description = "v2: type-check the lib and the target examples (their @ts-expect-error lines must keep failing)"
-dir = "v2/lib"
-depends = ["v2:build"]
-run = "npx tsc --noEmit -p . && cd ../examples && npx tsc --noEmit -p ."
-
-[tasks."v2:test"]
-description = "v2: all tests"
-depends = ["v2:test:core", "v2:test:lib"]
+[tasks."skill:validate"]
+description = "Validate the agent skill with the Agent Skills reference validator, and list it as `npx skills add` would"
+run = ["uvx --from skills-ref agentskills validate skills/wallis", "npx -y skills add . --list"]
