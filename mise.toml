@@ -67,10 +67,10 @@ run = "node --test 'test/*.test.ts'"
 env = { WALLIS_DIFFERENTIAL = "1" }
 
 [tasks."v2:typecheck"]
-description = "v2: type-check the lib"
+description = "v2: type-check the lib and the target examples (their @ts-expect-error lines must keep failing)"
 dir = "v2/lib"
 depends = ["v2:build"]
-run = "npx tsc --noEmit -p ."
+run = "npx tsc --noEmit -p . && cd ../examples && npx tsc --noEmit -p ."
 
 [tasks."v2:test"]
 description = "v2: all tests"

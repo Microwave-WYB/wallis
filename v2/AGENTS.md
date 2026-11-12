@@ -27,7 +27,7 @@ QuickJS, resource limits and the adversarial hardening.
 
 - `mise run v2:build` builds the core.
 - `mise run v2:test` runs the core and lib tests.
-- `mise run v2:typecheck` type-checks `lib/`.
+- `mise run v2:typecheck` type-checks `lib/` and `examples/` (whose `@ts-expect-error` lines must keep failing).
 - After you change a type in `core/src/wallis_core/types.gleam`, delete its
   generated functions and regenerate them. From `v2/core/`, run
   `node ../../tools/gleam-codegen.mjs src/wallis_core/types.gleam <Type>...`.
