@@ -64,7 +64,8 @@ export function listRuns(root: string): RunPaths[] {
 	return readdirSync(dir)
 		.sort()
 		.map((id) => runPaths(join(dir, id)))
-		.filter((p) => existsSync(p.log));
+		// A run that started but has not logged yet counts too: its start.json names its inputs.
+		.filter((p) => existsSync(p.log) || existsSync(join(p.dir, "start.json")) || existsSync(p.lock));
 }
 
 // --- Meta ----------------------------------------------------------------------
@@ -121,48 +122,93 @@ function alive(pid: number): boolean {
 	}
 }
 
-/** The pid of a live lock holder, or null. */
+/** A process's start time (clock ticks since boot, /proc/<pid>/stat field 22), or null when it is gone. */
+export function startTime(pid: number): string | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		// The command name (field 2) may hold spaces and parens: fields are counted after its last ')'.
+		return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/** The lock's content: the holder's pid and its start time, so a reused pid is never taken for it. */
+function lockText(pid: number): string {
+	return `${pid} ${startTime(pid) ?? "?"}\n`;
+}
+
+function readLock(paths: RunPaths): { pid: number; start: string | null } | null {
+	try {
+		const [pid, start] = readFileSync(paths.lock, "utf8").trim().split(/\s+/);
+		return { pid: Number(pid), start: start === undefined || start === "?" ? null : start };
+	} catch {
+		return null;
+	}
+}
+
+/** The pid of a live lock holder, or null: alive, and (when the lock records it) started when the lock says. */
 export function lockHolder(paths: RunPaths): number | null {
-	if (!existsSync(paths.lock)) return null;
-	const pid = Number(readFileSync(paths.lock, "utf8").trim());
-	return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : null;
+	const lock = readLock(paths);
+	if (lock === null || !Number.isInteger(lock.pid) || lock.pid <= 0 || !alive(lock.pid)) return null;
+	if (lock.start !== null && startTime(lock.pid) !== lock.start) return null;
+	return lock.pid;
 }
 
 export class RunLocked extends Error {
 	override readonly name = "RunLocked";
 	readonly pid: number;
 	constructor(paths: RunPaths, pid: number) {
-		super(`run ${paths.id} is driven by process ${pid}`);
+		super(pid > 0 ? `run ${paths.id} is driven by process ${pid}` : `run ${paths.id} is being taken over by another process`);
 		this.pid = pid;
 	}
 }
 
 /**
  * Takes the lock for `pid` (default: this process), so two processes never
- * write one run. A lock held by a dead process is stale and taken over; a
- * lock already naming `pid` is accepted.
+ * write one run. A lock already naming `pid` (with its start time) is
+ * accepted. A stale lock (its holder is dead, or its pid now names another
+ * process) is taken over under a takeover dir, created atomically, so of two
+ * processes resuming a crashed run only one gets it.
  */
 export function acquireLock(paths: RunPaths, pid = process.pid): () => void {
 	mkdirSync(paths.dir, { recursive: true });
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const fd = openSync(paths.lock, "wx");
-			writeSync(fd, `${pid}\n`);
-			closeSync(fd);
-			return () => releaseLock(paths, pid);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const holder = lockHolder(paths);
-			if (holder === pid) return () => releaseLock(paths, pid);
-			if (holder !== null) throw new RunLocked(paths, holder);
-			rmSync(paths.lock, { force: true });
-		}
+	const mine = lockText(pid);
+	try {
+		const fd = openSync(paths.lock, "wx");
+		writeSync(fd, mine);
+		closeSync(fd);
+		return () => releaseLock(paths, pid);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 	}
-	throw new Error(`could not lock run ${paths.id}`);
+	const holder = lockHolder(paths);
+	if (holder === pid) return () => releaseLock(paths, pid);
+	if (holder !== null) throw new RunLocked(paths, holder);
+	// Stale: one process takes it over. A takeover dir older than 10 s is a crashed takeover.
+	const takeover = `${paths.lock}.takeover`;
+	try {
+		mkdirSync(takeover);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		if (Date.now() - statSync(takeover).mtimeMs < 10_000) throw new RunLocked(paths, 0);
+		rmSync(takeover, { recursive: true, force: true });
+		return acquireLock(paths, pid);
+	}
+	try {
+		const now = lockHolder(paths);
+		if (now !== null && now !== pid) throw new RunLocked(paths, now);
+		const temp = `${paths.lock}.${process.pid}.tmp`;
+		writeFileSync(temp, mine);
+		renameSync(temp, paths.lock);
+		return () => releaseLock(paths, pid);
+	} finally {
+		rmSync(takeover, { recursive: true, force: true });
+	}
 }
 
 function releaseLock(paths: RunPaths, pid: number): void {
-	if (existsSync(paths.lock) && Number(readFileSync(paths.lock, "utf8").trim()) === pid) rmSync(paths.lock, { force: true });
+	if (readLock(paths)?.pid === pid) rmSync(paths.lock, { force: true });
 }
 
 /** When the oldest live run of a project took its lock (ms), or null: what `prune` must not race. */

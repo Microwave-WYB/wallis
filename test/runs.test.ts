@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { SEMANTICS } from "../src/host/core.ts";
 import { Journal } from "../src/host/journal.ts";
 import { acquireLock, listRuns, lockHolder, newRunId, projectOf, readMeta, RunLocked, runPaths, runsDir } from "../src/host/runs.ts";
-import { tmp } from "./util.ts";
+import { here, tmp } from "./util.ts";
 
 test("a run id is <workflow>-<utc time>-<random>, sortable", () => {
 	const id = newRunId("negatives", new Date(Date.UTC(2026, 10, 7, 9, 5, 3)));
@@ -61,4 +61,46 @@ test("the lock admits one process; a dead holder's lock is taken over", async ()
 	const again = acquireLock(paths);
 	assert.equal(lockHolder(paths), process.pid);
 	again();
+});
+
+test("a lock whose pid now names another process (reused after a crash) is stale: taken over, and that process is never signalled", async () => {
+	const paths = runPaths(join(tmp(), "r"));
+	mkdirSync(paths.dir, { recursive: true });
+	const bystander = spawn("sleep", ["30"], { stdio: "ignore" });
+	let exited = false;
+	bystander.on("exit", () => (exited = true));
+	try {
+		// The crashed run's lock names the bystander's pid with another start time.
+		writeFileSync(paths.lock, `${bystander.pid} 1\n`);
+		assert.equal(lockHolder(paths), null);
+		const release = acquireLock(paths);
+		assert.equal(lockHolder(paths), process.pid);
+		assert.match(readFileSync(paths.lock, "utf8"), new RegExp(`^${process.pid} \\d+\n$`));
+		release();
+		await new Promise((d) => setTimeout(d, 100));
+		assert.equal(exited, false, "the bystander is untouched");
+	} finally {
+		bystander.kill("SIGKILL");
+	}
+});
+
+test("two processes taking over one stale lock: exactly one wins", async () => {
+	const child = join(here, "fixtures", "lock-child.ts");
+	let doubles = 0;
+	for (let trial = 0; trial < 20; trial++) {
+		const dir = join(tmp(), `t${trial}`);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "lock"), "999999999\n");
+		const start = Date.now() + 700;
+		const outs = await Promise.all(
+			Array.from({ length: 4 }, () => new Promise<string>((done) => {
+				const c = spawn(process.execPath, [child, dir, String(start)]);
+				let out = "";
+				c.stdout.on("data", (d) => (out += d));
+				c.on("exit", () => done(out.trim()));
+			})),
+		);
+		if (outs.filter((o) => o === "got").length !== 1) doubles++;
+	}
+	assert.equal(doubles, 0);
 });

@@ -154,3 +154,19 @@ test("a log written by another core version is reported as such: status, list an
 	assert.deepEqual((await list(join(root, "wf.ts"))).map((x) => [x.id, x.state]), [[r.id, "failed"]]);
 	await assert.rejects(h.resume(), /written by wallis-core\/v0\.9/);
 });
+
+test("prune right after a detached start keeps the run's inputs: a started run that has not logged is live", opts, async () => {
+	const { root, wf } = await fixture();
+	mkdirSync(join(root, "data"));
+	writeFileSync(join(root, "data", "a.txt"), "hello");
+	const cwd = process.cwd();
+	process.chdir(root);
+	try {
+		const r = await run(wf.reading, { data: Tree.from(join(root, "data")) }, { detach: true });
+		const pruned = await prune();
+		assert.equal(pruned.freed, 0);
+		assert.deepEqual(await r.next({ timeout: "20s" }), { type: "finished", output: { text: "hello" } });
+	} finally {
+		process.chdir(cwd);
+	}
+});

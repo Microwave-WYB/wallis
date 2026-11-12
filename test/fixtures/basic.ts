@@ -74,3 +74,8 @@ export const thrower = workflow({
 		throw new Error("the body gave up");
 	},
 });
+
+const show = command({ sandbox: box, input: Type.Object({ data: Tree() }), output: Type.Object({ text: Type.String() }), run: ({ data }) => ["cat", `${data.path}/a.txt`], parse: (r) => ({ text: r.stdout }) });
+
+/** Reads its input Tree: what prune must not delete while the run starts. */
+export const reading = workflow({ input: Type.Object({ data: Tree() }), output: Type.Object({ text: Type.String() }), run: async (ctx, { data }) => ctx.call(show, { data }) });
