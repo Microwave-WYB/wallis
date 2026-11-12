@@ -33,7 +33,7 @@ async function pool<T, R>(items: readonly T[], n: number, f: (item: T) => Promis
 const film = (stage: "stage1" | "stage2") =>
 	sandbox({
 		requires: stage === "stage1" ? ["python3", "darktable-cli", "exiv2", "nona"] : ["python3", "darktable-cli", "exiv2"],
-		volumes: ["./scripts/lib:/film/lib:ro", `./scripts/${stage}:/film/${stage}:ro`, "./pylib:/pylib:ro", "dt-cache:/root/.cache/darktable"],
+		volumes: ["./scripts/lib:/film/lib:ro", `./scripts/${stage}:/film/${stage}:ro`, "./pylib:/pylib:ro", "dt-cache:/dtcache"],
 		environment: { OMP_NUM_THREADS: "4", PYTHONPATH: "/pylib" },
 	});
 const stage1 = film("stage1");
@@ -115,8 +115,9 @@ const render = command({
 		mode: Type.Union([Type.Object({ preview: Type.Integer() }), Type.Object({ final: Type.Record(Type.String(), Type.String()) })]),
 	}),
 	output: Type.Object({ jpg: Jpeg }),
-	run: ({ neg, ...rest }) => py("stage2/render.py", neg.tiff.path, JSON.stringify(rest), "out.jpg"),
-	parse: (r) => ({ jpg: r.file("out.jpg") }),
+	// The pair's density range (`lo`) is a render parameter; each image is named by its frame.
+	run: ({ neg, ...rest }) => py("stage2/render.py", neg.tiff.path, JSON.stringify({ ...rest, lo: neg.lo }), `DSC_${neg.frame}.jpg`),
+	parse: (r, i) => ({ jpg: r.file(`DSC_${i.neg.frame}.jpg`) }),
 });
 
 const sheet = command({

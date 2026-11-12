@@ -57,9 +57,14 @@ export function hostProgram(name: string): string {
 	return path;
 }
 
+/**
+ * A program on PATH, by real path. Version-manager shim dirs (mise, asdf,
+ * pyenv: `…/shims`) are skipped: a shim is a dispatcher that needs its
+ * manager's config, which no sandbox has.
+ */
 function onPath(name: string, path: string): string | null {
 	for (const dir of path.split(delimiter)) {
-		if (!dir || !isAbsolute(dir)) continue;
+		if (!dir || !isAbsolute(dir) || /\/shims\/?$/.test(dir)) continue;
 		const file = join(dir, name);
 		try {
 			accessSync(file, constants.X_OK);
@@ -80,7 +85,8 @@ export function resolvePrograms(requires: readonly string[], path = HOST_PATH): 
 	const out: Record<string, string> = {};
 	const missing: string[] = [];
 	for (const name of [...new Set(requires)].sort()) {
-		const found = name.includes("/") ? (isAbsolute(name) && existsSync(name) ? realpathSync(name) : null) : onPath(name, path);
+		// `node` falls back to the one running wallis (toolsets run under it).
+		const found = name.includes("/") ? (isAbsolute(name) && existsSync(name) ? realpathSync(name) : null) : (onPath(name, path) ?? (name === "node" ? realpathSync(process.execPath) : null));
 		if (found === null) missing.push(name);
 		else out[name] = found;
 	}
