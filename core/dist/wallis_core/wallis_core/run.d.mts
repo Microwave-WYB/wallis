@@ -177,7 +177,9 @@ declare class NotIssued extends _.CustomType {}
 
 declare class IssuedNow extends _.CustomType {}
 
-type Issued$ = NotIssued | IssuedNow;
+declare class Pending extends _.CustomType {}
+
+type Issued$ = NotIssued | IssuedNow | Pending;
 
 declare class Answered extends _.CustomType {
   /** @deprecated */

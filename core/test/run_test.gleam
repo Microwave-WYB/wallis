@@ -481,6 +481,7 @@ pub fn a_retried_turn_limit_continues_its_own_dialogue_with_more_turns_test() {
   let #(s, effects, _) = replay_from(s, [types.Retried(slot, 20)])
   assert effects == [Checkpoint]
   let assert [
+    Checkpoint,
     CallAgent(attempt: 2, checkpoint: Some("d1"), continuation: types.MoreTurns(20), ..),
   ] = replay_from(s, [agent("0", "a", None, JNull)]).1
 }
@@ -495,6 +496,7 @@ pub fn an_invalid_output_retried_continues_with_its_errors_test() {
   let slot = ids.slot_text(ids.slot(ids.digest("a"), "agent", JNull, "", None, "0"))
   let #(s, _, _) = replay_from(s, [types.Retried(slot, 30)])
   let assert [
+    Checkpoint,
     CallAgent(continuation: types.FixOutput(["/n: expected integer"]), ..),
   ] = replay_from(s, [agent("0", "a", None, JNull)]).1
 }
@@ -560,4 +562,30 @@ pub fn a_calls_state_says_whether_its_mailbox_is_open_test() {
   let #(s, _, _) = replay_from(s, [agent_returned("0", JNull, "d")])
   assert run.call_state(s.state, slot) == "settled"
   assert run.call_state(s.state, "nope") == "none"
+}
+
+pub fn a_retried_outcome_unknown_tool_runs_again_test() {
+  // An unsafe tool in flight when the run stopped is decided: outcome unknown.
+  let #(s, _, _) = replay([started(), tool("0", False)])
+  let #(s, effects, _) = replay_from(s, [resumed(), tool("0", False)])
+  let assert [Checkpoint, Fail("0", types.ToolError("list", _))] = effects
+  // Named in resume({ retry }), it runs again: the retry was never in flight.
+  let slot = ids.slot_text(ids.slot(ids.digest("t"), "tool", JNull, "", None, "0"))
+  let #(s, effects, _) = replay_from(s, [resumed(), types.Retried(slot, 0)])
+  assert effects == [Checkpoint]
+  let #(s, effects, _) = replay_from(s, [tool("0", False)])
+  assert effects == [Checkpoint, types.RunTool("0", 2)]
+  // A crash after it was issued leaves it in flight again: decided again on resume.
+  let #(_, effects, _) = replay_from(s, [resumed(), tool("0", False)])
+  let assert [Checkpoint, Fail("0", types.ToolError("list", _))] = effects
+}
+
+pub fn a_retried_call_is_not_reissued_twice_and_survives_a_resume_before_it_runs_test() {
+  let #(s, _, _) = replay(turn_limited())
+  let slot = ids.slot_text(ids.slot(ids.digest("a"), "agent", JNull, "", None, "0"))
+  // Retried, then the process stops before the body asks for it again.
+  let #(s, _, _) = replay_from(s, [resumed(), types.Retried(slot, 5)])
+  let #(s, _, _) = replay_from(s, [resumed()])
+  let assert [Checkpoint, CallAgent(attempt: 2, continuation: types.MoreTurns(5), ..)] =
+    replay_from(s, [agent("0", "a", None, JNull)]).1
 }

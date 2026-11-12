@@ -130,6 +130,9 @@ const Issued$NotIssued$const = new NotIssued();
 class IssuedNow extends $CustomType {}
 const Issued$IssuedNow$const = new IssuedNow();
 
+class Pending extends $CustomType {}
+const Issued$Pending$const = new Pending();
+
 class Answered extends $CustomType {
   constructor($0) {
     super();
@@ -525,7 +528,7 @@ function retried(run, text, turns) {
           }
           let continuation = _block$1;
           let attempt = new Running(
-            Issued$NotIssued$const,
+            Issued$Pending$const,
             dialogue,
             $List$Empty$const,
             continuation,
@@ -868,7 +871,8 @@ function requested_checked(run, id, kind, name, node, input, scope, occurrence) 
     } else {
       let $3 = $2.head;
       if ($3 instanceof Running) {
-        if ($3.issued instanceof NotIssued) {
+        let $4 = $3.issued;
+        if ($4 instanceof NotIssued) {
           if (isEqual(call$1.kind, new ToolKind(false))) {
             let older = $2.tail;
             let reason = new $types.ToolError(
@@ -926,8 +930,38 @@ function requested_checked(run, id, kind, name, node, input, scope, occurrence) 
               listPrepend(issue(run, slot, call$3), $List$Empty$const),
             ];
           }
-        } else {
+        } else if ($4 instanceof IssuedNow) {
           _block$1 = [call$1, $List$Empty$const];
+        } else {
+          let older = $2.tail;
+          let checkpoint = $3.checkpoint;
+          let taken = $3.taken;
+          let continuation = $3.continuation;
+          let call$2 = new Call(
+            call$1.id,
+            call$1.kind,
+            call$1.name,
+            call$1.node,
+            call$1.input,
+            call$1.scope,
+            call$1.occurrence,
+            listPrepend(
+              new Running(
+                Issued$IssuedNow$const,
+                checkpoint,
+                taken,
+                continuation,
+              ),
+              older,
+            ),
+          );
+          _block$1 = [
+            call$2,
+            listPrepend(
+              $types.Effect$Checkpoint$const,
+              listPrepend(issue(run, slot, call$2), $List$Empty$const),
+            ),
+          ];
         }
       } else {
         let $4 = $3.entry;
@@ -1314,23 +1348,46 @@ function unissued(call) {
   } else {
     let $1 = $.head;
     if ($1 instanceof Running) {
-      let older = $.tail;
-      let checkpoint = $1.checkpoint;
-      let taken = $1.taken;
-      let continuation = $1.continuation;
-      return new Call(
-        call.id,
-        call.kind,
-        call.name,
-        call.node,
-        call.input,
-        call.scope,
-        call.occurrence,
-        listPrepend(
-          new Running(Issued$NotIssued$const, checkpoint, taken, continuation),
-          older,
-        ),
-      );
+      let $2 = $1.issued;
+      if ($2 instanceof NotIssued) {
+        let older = $.tail;
+        let checkpoint = $1.checkpoint;
+        let taken = $1.taken;
+        let continuation = $1.continuation;
+        return new Call(
+          call.id,
+          call.kind,
+          call.name,
+          call.node,
+          call.input,
+          call.scope,
+          call.occurrence,
+          listPrepend(
+            new Running(Issued$NotIssued$const, checkpoint, taken, continuation),
+            older,
+          ),
+        );
+      } else if ($2 instanceof IssuedNow) {
+        let older = $.tail;
+        let checkpoint = $1.checkpoint;
+        let taken = $1.taken;
+        let continuation = $1.continuation;
+        return new Call(
+          call.id,
+          call.kind,
+          call.name,
+          call.node,
+          call.input,
+          call.scope,
+          call.occurrence,
+          listPrepend(
+            new Running(Issued$NotIssued$const, checkpoint, taken, continuation),
+            older,
+          ),
+        );
+      } else {
+        return call;
+      }
     } else {
       return call;
     }
@@ -1496,25 +1553,10 @@ export function step(state, event) {
   } else if ($ instanceof Resuming) {
     let r = state[0];
     let digest = $.digest;
-    let s = $.semantics;
-    let $1 = s === semantics;
-    if ($1) {
-      let $2 = resume(r, digest);
-      let r$1 = $2[0];
-      let effects = $2[1];
-      return [new Active(r$1), effects];
-    } else {
-      return [
-        state,
-        listPrepend(
-          new $types.Refuse(
-            Option$None$const,
-            new $types.SemanticsChanged(semantics, s),
-          ),
-          $List$Empty$const,
-        ),
-      ];
-    }
+    let $1 = resume(r, digest);
+    let r$1 = $1[0];
+    let effects = $1[1];
+    return [new Active(r$1), effects];
   } else if ($ instanceof Noting) {
     let r = state[0];
     let key = $.key;

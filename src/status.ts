@@ -4,7 +4,7 @@
 // calls and how each recovers, outbox messages, transcripts.
 
 import { existsSync, statSync } from "node:fs";
-import { type CallView, Core, type Event, type FailReason, type Json, type Snapshot } from "./host/core.ts";
+import { type CallView, Core, type Event, type FailReason, type Json, SEMANTICS, type Snapshot } from "./host/core.ts";
 import { readDialogue } from "./host/dialogues.ts";
 import { EventLog } from "./host/log.ts";
 import { lockHolder, type RunPaths } from "./host/runs.ts";
@@ -54,7 +54,21 @@ export class RunView {
 	}
 
 	get facts(): Record<string, Json> {
+		// A log of another core version folds to nothing: its facts are read from its events.
+		if (this.foreign !== null) return Object.fromEntries(this.events.flatMap((e) => (e.type === "noted" ? [[e.key, e.value]] : [])));
 		return this.core.facts();
+	}
+
+	/** The semantics version that wrote this log, when it is not this core's (the core refuses to fold it). */
+	get foreign(): string | null {
+		const first = this.events[0];
+		return first?.type === "started" && first.semantics !== SEMANTICS ? first.semantics : null;
+	}
+
+	/** Why this core cannot continue the run, or null. */
+	get unresumable(): string | null {
+		const v = this.foreign;
+		return v === null ? null : `run ${this.paths.id} was written by ${v}, and this wallis runs ${SEMANTICS}, which cannot resume or replay it; start a new run (its artifacts are still in the store)`;
 	}
 
 	get started(): boolean {
@@ -72,6 +86,7 @@ export class RunView {
 	}
 
 	get state(): Status["state"] {
+		if (this.foreign !== null) return "failed";
 		const ended = this.ended;
 		if (ended) return ended.type === "done" ? "finished" : "failed";
 		return this.live ? "running" : "stopped";
@@ -135,6 +150,8 @@ export class RunView {
 
 	failed(store: Store): FailedCall[] {
 		const out: FailedCall[] = [];
+		const why = this.unresumable;
+		if (why !== null) return [{ id: "workflow" as CallId, label: this.workflowLabel, path: [], attempt: 1, reason: { type: "workflow_threw", message: why }, recovery: "resume", tail: why }];
 		for (const c of this.calls) {
 			const last = c.attempts.at(-1);
 			if (last?.type !== "failed") continue;

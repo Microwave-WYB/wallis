@@ -213,6 +213,7 @@ class RunHandle<O> implements Run<O> {
 		const holder = lockHolder(this.paths);
 		if (holder !== null) throw new RunLocked(this.paths, holder);
 		const v = this.view();
+		if (v.unresumable !== null) throw new Error(v.unresumable);
 		const wf = v.facts.workflow as { file: string; digest: string; name: string | null } | undefined;
 		if (!wf) throw new Error(`run ${this.id} has no record of its workflow`);
 		const retry = options.retry ?? [];

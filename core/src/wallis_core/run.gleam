@@ -137,10 +137,13 @@ fn running() -> Attempt {
 }
 
 /// Whether a running call's effect was emitted by this process: a call in
-/// flight when the last process stopped is issued again, once.
+/// flight when the last process stopped is issued again, once. `Pending`: a
+/// new attempt (a retry) that no process has issued yet, so it was never in
+/// flight; its request is logged when it is issued.
 type Issued {
   NotIssued
   IssuedNow
+  Pending
 }
 
 type Entry {
@@ -222,16 +225,12 @@ pub fn step(state: RunState, event: Event) -> #(RunState, List(Effect)) {
     Active(_), Starting(..) -> #(state, [
       types.Refuse(None, types.AlreadyStarted),
     ])
-    Active(r), Resuming(digest:, semantics: s) ->
-      case s == semantics {
-        False -> #(state, [
-          types.Refuse(None, types.SemanticsChanged(semantics, s)),
-        ])
-        True -> {
-          let #(r, effects) = resume(r, digest)
-          #(Active(r), effects)
-        }
-      }
+    // A resuming process always runs this core: a log of another version
+    // never got this far (its `Started` was refused; the host reports it).
+    Active(r), Resuming(digest:, ..) -> {
+      let #(r, effects) = resume(r, digest)
+      #(Active(r), effects)
+    }
     Active(r), Noting(key:, value:) -> #(
       Active(Run(..r, facts: dict.insert(r.facts, key, value))),
       [types.Checkpoint],
@@ -276,7 +275,10 @@ fn resume(run: Run, digest: String) -> #(Run, List(Effect)) {
 
 fn unissued(call: Call) -> Call {
   case call.attempts {
-    [Running(_, checkpoint, taken, continuation), ..older] ->
+    // A retry not issued yet was never in flight: it stays pending.
+    [Running(Pending, ..), ..] -> call
+    [Running(NotIssued, checkpoint, taken, continuation), ..older]
+    | [Running(IssuedNow, checkpoint, taken, continuation), ..older] ->
       Call(..call, attempts: [
         Running(NotIssued, checkpoint, taken, continuation),
         ..older
@@ -450,7 +452,7 @@ fn retried(run: Run, text: String, turns: Int) -> #(Run, List(Effect)) {
             | types.ToolError(..)
             | types.SchemaMismatch(..) -> types.Fresh
           }
-          let attempt = Running(NotIssued, dialogue, [], continuation)
+          let attempt = Running(Pending, dialogue, [], continuation)
           let call = Call(..call, attempts: [attempt, ..call.attempts])
           #(put(run, slot, call), [types.Checkpoint])
         }
@@ -601,6 +603,16 @@ fn requested_checked(
           #(call, [issue(run, slot, call)])
         }
         [Running(IssuedNow, ..), ..] -> #(call, [])
+        // A retry: issued now, and the request that issues it is logged (a
+        // crash after it leaves the attempt in flight, as for any call).
+        [Running(Pending, checkpoint, taken, continuation), ..older] -> {
+          let call =
+            Call(..call, attempts: [
+              Running(IssuedNow, checkpoint, taken, continuation),
+              ..older
+            ])
+          #(call, [types.Checkpoint, issue(run, slot, call)])
+        }
         // A failure is not a completed call: it runs again, as a new attempt.
         [Settled(Errored(_)), ..] | [] -> {
           let call = Call(..call, attempts: [running(), ..call.attempts])

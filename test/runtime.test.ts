@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
+import { SEMANTICS } from "../src/host/core.ts";
 import { lockHolder, runPaths, runsDir } from "../src/host/runs.ts";
 import { bwrapAvailable } from "../src/host/sandbox.ts";
 import { Artifact, attach, list, NodeFailed, prune, run, Tree } from "../src/index.ts";
@@ -139,4 +140,17 @@ test("a workflow module that starts a run when imported does not start one per p
 	await new Promise((d) => setTimeout(d, 500));
 	assert.deepEqual(readdirSync(runsDir(root)), [r.id]);
 	assert.match(readFileSync(join(runsDir(root), r.id, "process.log"), "utf8"), /import\.meta\.main/);
+});
+
+test("a log written by another core version is reported as such: status, list and resume say so", opts, async () => {
+	const { root, wf } = await fixture();
+	const r = await run(wf.nested, { n: 1 });
+	const log = runPaths(join(runsDir(root), r.id)).log;
+	writeFileSync(log, readFileSync(log, "utf8").replaceAll(`"semantics":"${SEMANTICS}"`, '"semantics":"wallis-core/v0.9"'));
+	const h = attach(wf.nested, r.id);
+	const status = await h.status();
+	assert.equal(status.state, "failed");
+	assert.match(status.failed[0]!.tail, /written by wallis-core\/v0\.9.*cannot resume/);
+	assert.deepEqual((await list(join(root, "wf.ts"))).map((x) => [x.id, x.state]), [[r.id, "failed"]]);
+	await assert.rejects(h.resume(), /written by wallis-core\/v0\.9/);
 });
