@@ -302,3 +302,11 @@ export function guessMedia(name: string): string {
 	const ext = name.toLowerCase().split(".").pop() ?? "";
 	return MEDIA[ext] ?? "application/octet-stream";
 }
+
+/** `30s`, `110m`, `2h` in ms. */
+export function parseDuration(d: string): number {
+	const m = /^(\d+(?:\.\d+)?)(s|m|h)$/.exec(d);
+	if (!m) throw new Error(`not a duration: ${d} (e.g. "30s", "110m", "2h")`);
+	return Number(m[1]) * { s: 1000, m: 60_000, h: 3_600_000 }[m[2] as "s" | "m" | "h"];
+}
+

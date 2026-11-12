@@ -15,7 +15,7 @@
 // readable message) and a parse (`parseVolume`), so a volume that slips past
 // the types is an error before the run starts, never dropped.
 
-import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -104,8 +104,9 @@ const RESERVED = ["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "
 
 const overlaps = (a: string, b: string) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 
-export function namedVolumesDir(): string {
-	return join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "wallis", "volumes");
+/** A project's named volumes: `<project>/.wallis/volumes/<name>`, so two projects never share one. */
+export function namedVolumesDir(root: string): string {
+	return join(root, ".wallis", "volumes");
 }
 
 /**
@@ -114,7 +115,7 @@ export function namedVolumesDir(): string {
  * dir, a bind inside or around the project's `.wallis`) is a `VolumeError`
  * that names it and says what to fix.
  */
-export function resolveVolumes(texts: readonly string[], workflowDir: string, options: { readonly stores?: readonly string[] } = {}): ResolvedVolume[] {
+export function resolveVolumes(texts: readonly string[], workflowDir: string, options: { readonly stores?: readonly string[]; readonly root?: string } = {}): ResolvedVolume[] {
 	const resolved: ResolvedVolume[] = [];
 	for (const text of texts) {
 		const v = parseVolume(text);
@@ -139,11 +140,48 @@ export function resolveVolumes(texts: readonly string[], workflowDir: string, op
 				}
 				resolved.push({ kind: "bind", target, dir: real });
 			} else {
-				const dir = join(namedVolumesDir(), v.name);
+				const dir = join(namedVolumesDir(options.root ?? workflowDir), v.name);
 				mkdirSync(dir, { recursive: true });
 				resolved.push({ kind: "named", target, dir, name: v.name });
 			}
 		}
 	}
 	return resolved;
+}
+
+/**
+ * Runs `f` holding the lock of every named volume the commands write (`<volume>.lock`, with the
+ * holder's pid; a dead holder's is stale): two commands that share a named volume (an environment
+ * set up in it, a cache) never write it at the same time.
+ */
+export async function withVolumeLocks<T>(volumes: readonly ResolvedVolume[], f: () => Promise<T>): Promise<T> {
+	const dirs = [...new Set(volumes.flatMap((v) => (v.kind === "named" ? [v.dir] : [])))].sort();
+	const held: string[] = [];
+	try {
+		for (const dir of dirs) {
+			const lock = `${dir}.lock`;
+			for (;;) {
+				try {
+					writeFileSync(lock, `${process.pid}\n`, { flag: "wx" });
+					held.push(lock);
+					break;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+					const pid = Number(readFileSync(lock, "utf8").trim());
+					let alive = false;
+					try {
+						process.kill(pid, 0);
+						alive = true;
+					} catch (e) {
+						alive = (e as NodeJS.ErrnoException).code === "EPERM";
+					}
+					if (!alive) rmSync(lock, { force: true });
+					else await new Promise((d) => setTimeout(d, 50));
+				}
+			}
+		}
+		return await f();
+	} finally {
+		for (const lock of held) rmSync(lock, { force: true });
+	}
 }

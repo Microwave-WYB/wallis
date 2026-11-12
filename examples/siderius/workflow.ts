@@ -19,9 +19,9 @@ const text = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8"
 // --- Models -------------------------------------------------------------------
 //
 // One alias per SIDERIUS llm.json route (interpret, analysis, literature, judge, propose,
-// implement, validate, tune, consolidate). They come from the project's .wallis/config.json;
-// an alias that is not configured falls back to `default` (configs/llm/default.json routes every
-// role to the same model).
+// implement, validate, tune, consolidate). They come from the project's .wallis/config.json,
+// which must name each (an unknown alias is an error); configs/llm/default.json routes every role
+// to the same model, so a config may map them all to one.
 
 // --- Schemas -----------------------------------------------------------------
 //

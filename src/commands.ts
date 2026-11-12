@@ -12,6 +12,7 @@ import type { CommandFailure, Json } from "./host/core.ts";
 import { removeWork } from "./host/layers.ts";
 import { head, LAYOUT, runSpawn, type SandboxPlan, sandboxed } from "./host/sandbox.ts";
 import type { Store } from "./host/store.ts";
+import { withVolumeLocks } from "./host/volumes.ts";
 import type { CommandDef, CommandResult } from "./nodes.ts";
 import { declaredMedia, errorText, guessMedia, refsIn, schemaErrors, stripPaths, toJson, walkMarked, withPaths } from "./values.ts";
 
@@ -70,7 +71,7 @@ export async function runCommand(call: { store: Store; work: string; def: Comman
 	removeWork(call.work);
 	mkdirSync(scratch, { recursive: true });
 	try {
-		const r = await runSpawn(sandboxed(plan, argv, { work: { kind: "dir", dir: scratch }, inputs: mounts.inputs, trees: mounts.trees }), JSON.stringify(mounted), { signal: call.signal });
+		const r = await withVolumeLocks(plan.volumes, () => runSpawn(sandboxed(plan, argv, { work: { kind: "dir", dir: scratch }, inputs: mounts.inputs, trees: mounts.trees }), JSON.stringify(mounted), { signal: call.signal }));
 		if (r.aborted) return { type: "failed", failure: { type: "killed", signal: "SIGKILL", stderr_head: "stopped by wallis" } };
 		if (r.signal !== null) return { type: "failed", failure: { type: "killed", signal: r.signal, stderr_head: head(r.stderr) } };
 		if (r.exit !== 0) return { type: "failed", failure: { type: "exit_code", code: r.exit, stderr_head: head(r.stderr || r.stdout) } };

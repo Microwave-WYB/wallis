@@ -4,16 +4,17 @@
 // names it and says what to fix.
 
 import { resolvePrograms, type SandboxPlan } from "./host/sandbox.ts";
+import { join } from "node:path";
 import { resolveVolumes } from "./host/volumes.ts";
 import type { SandboxDef } from "./nodes.ts";
 
 export class Plans {
 	readonly #plans = new Map<string, SandboxPlan>();
-	readonly #stores: readonly string[];
+	readonly #root: string;
 
-	/** `stores`: dirs no bind may overlap (the project's `.wallis`). */
-	constructor(stores: readonly string[]) {
-		this.#stores = stores;
+	/** `root`: the project (its `.wallis` is no bind's, and holds its named volumes). */
+	constructor(root: string) {
+		this.#root = root;
 	}
 
 	plan(def: SandboxDef, extra: readonly string[] = []): SandboxPlan {
@@ -22,7 +23,7 @@ export class Plans {
 		if (!plan) {
 			plan = {
 				programs: resolvePrograms([...def.spec.requires, ...extra]),
-				volumes: resolveVolumes(def.spec.volumes, def.dir, { stores: this.#stores }),
+				volumes: resolveVolumes(def.spec.volumes, def.dir, { stores: [join(this.#root, ".wallis")], root: this.#root }),
 				environment: def.spec.environment,
 				devices: def.spec.devices,
 				network: def.spec.network,

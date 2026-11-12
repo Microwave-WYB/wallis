@@ -8,7 +8,7 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Static, TSchema } from "typebox";
 import { projectOf } from "./host/runs.ts";
-import { type ArtifactRef, canonical, hasFiles, sha256, type TreeRef } from "./values.ts";
+import { type ArtifactRef, canonical, hasFiles, parseDuration, sha256, type TreeRef } from "./values.ts";
 
 /** The key of a node's definition. */
 export const DEF: unique symbol = Symbol("wallis.def");
@@ -76,6 +76,8 @@ export function sandboxDef(s: Sandbox): SandboxDef {
 }
 
 export function sandbox(spec: SandboxSpec): Sandbox {
+	// HOME is the call's workspace (/w) in every sandbox: an author's would silently not apply.
+	if (spec.environment && "HOME" in spec.environment) throw new Error("sandbox environment.HOME: wallis sets HOME to /w, the call's workspace, in every sandbox; use another variable (an author's PATH is prepended to wallis's)");
 	const site = definitionSite("sandbox");
 	const full: Required<SandboxSpec> = { requires: [...(spec.requires ?? [])], volumes: [...(spec.volumes ?? [])], environment: { ...(spec.environment ?? {}) }, devices: [...(spec.devices ?? [])], network: spec.network ?? "none" };
 	const def: SandboxDef = { spec: full, dir: site.file ? dirname(site.file) : process.cwd(), digest: sha256(canonical(full)) };
@@ -250,7 +252,7 @@ export interface AgentDef {
 	readonly output: TSchema;
 	readonly mailbox: TSchema | null;
 	readonly tools: readonly ToolDef[];
-	readonly workspace: { readonly access: "read" | "write" | "exec"; readonly sandbox: SandboxDef } | null;
+	readonly workspace: { readonly access: "read" | "write" | "exec"; readonly sandbox: SandboxDef; readonly bashTimeoutMs: number } | null;
 	readonly turns: number;
 	readonly digest: string;
 	readonly label: string;
@@ -278,8 +280,11 @@ export function agent<IS extends TSchema, OS extends TSchema, MS extends TSchema
 		readonly mailbox?: MS;
 		/** Custom and MCP tools. File tools come from `workspace.access`, never from here. */
 		readonly tools?: readonly Tool<any, any>[];
-		/** Default: inferred from the signature (Artifact/Tree inputs: read; outputs: write). `exec` is never inferred. */
-		readonly workspace?: { readonly access: "read" | "write" | "exec"; readonly sandbox?: Sandbox };
+		/**
+		 * Default: inferred from the signature (Artifact/Tree inputs: read; outputs: write). `exec` is never
+		 * inferred. `bashTimeout` (default "10m") kills a `bash` tool command that runs longer.
+		 */
+		readonly workspace?: { readonly access: "read" | "write" | "exec"; readonly sandbox?: Sandbox; readonly bashTimeout?: `${number}${"s" | "m" | "h"}` };
 		/** The turn budget of one call. Default 30. Mailbox deliveries count. */
 		readonly turns?: number;
 	},
@@ -288,10 +293,10 @@ export function agent<IS extends TSchema, OS extends TSchema, MS extends TSchema
 	const tools = (def.tools ?? []).map((t) => toolDef(t));
 	const declared = def.workspace;
 	const inferred = declared ? declared.access : access(def.input, def.output);
-	const workspace = inferred === null ? null : { access: inferred, sandbox: declared?.sandbox ? sandboxDef(declared.sandbox) : BASE_SANDBOX };
+	const workspace = inferred === null ? null : { access: inferred, sandbox: declared?.sandbox ? sandboxDef(declared.sandbox) : BASE_SANDBOX, bashTimeoutMs: parseDuration(declared?.bashTimeout ?? "10m") };
 	const turns = def.turns ?? 30;
 	const digest = sha256(
-		canonical({ kind: "agent", model: def.model, prompt: def.prompt, input: def.input, output: def.output, mailbox: def.mailbox ?? null, tools: tools.map((t) => t.digest), workspace: workspace ? { access: workspace.access, sandbox: workspace.sandbox.digest } : null, turns }),
+		canonical({ kind: "agent", model: def.model, prompt: def.prompt, input: def.input, output: def.output, mailbox: def.mailbox ?? null, tools: tools.map((t) => t.digest), workspace: workspace ? { access: workspace.access, sandbox: workspace.sandbox.digest, bash_timeout_ms: workspace.bashTimeoutMs } : null, turns }),
 	);
 	const d: AgentDef = { model: def.model, prompt: def.prompt, input: def.input, output: def.output, mailbox: def.mailbox ?? null, tools, workspace, turns, digest, label: site.label };
 	return Object.freeze({ kind: "agent" as const, input: def.input, output: def.output, [DEF]: d });

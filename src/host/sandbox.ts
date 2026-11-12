@@ -26,7 +26,7 @@ import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type { ResolvedVolume } from "./volumes.ts";
 
 /** Paths inside a sandbox. */
-export const LAYOUT = { work: "/w", inputs: "/in", trees: "/in/trees", tmp: "/tmp", bin: "/run/wallis/bin" } as const;
+export const LAYOUT = { work: "/w", inputs: "/in", trees: "/in/trees", tmp: "/tmp", bin: "/run/wallis/bin", out: "/run/wallis/out" } as const;
 
 /** What a sandbox is, resolved: its programs by name (real paths), volumes, environment, devices and network. */
 export interface SandboxPlan {
@@ -168,6 +168,8 @@ export interface CallView {
 	readonly writeLowers?: boolean;
 	/** Variables set inside, after the sandbox's own. */
 	readonly env?: Readonly<Record<string, string>>;
+	/** A host dir bound writable at /run/wallis/out (a target wallis owns): where the host copies an agent's result files out. */
+	readonly out?: string;
 }
 
 export interface Spawn {
@@ -177,7 +179,7 @@ export interface Spawn {
 }
 
 /** The process that runs `argv` (argv[0] a required program, or a path inside the sandbox) in a sandbox. */
-export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: CallView, options: { readonly root?: string; readonly binCache?: string } = {}): Spawn {
+export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: CallView, options: { readonly root?: string } = {}): Spawn {
 	// --as-pid-1: the program is PID 1 of the sandbox, so /proc/1/cmdline is its own argv.
 	const args = ["--die-with-parent", "--new-session", "--unshare-all", "--as-pid-1"];
 	if (view.writeLowers) args.push("--cap-add", "CAP_DAC_OVERRIDE");
@@ -185,7 +187,7 @@ export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: Call
 	args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 	for (const d of plan.devices) args.push("--dev-bind", d, d);
 	for (const path of new Set(Object.values(plan.programs).flatMap((p) => programBinds(p, { root: options.root })))) args.push("--ro-bind", path, path);
-	const binDir = programLinks(plan.programs, options.binCache);
+	const binDir = programLinks(plan.programs);
 	if (binDir) args.push("--ro-bind", binDir, LAYOUT.bin);
 	// /in: a tmpfs holding each input, bound read-only from the store (no links, no copies), then read-only itself.
 	args.push("--tmpfs", LAYOUT.inputs);
@@ -205,9 +207,12 @@ export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: Call
 		args.push("--overlay", view.work.upper, view.work.ovl, LAYOUT.work);
 	} else args.push("--bind", view.work.kind === "dir" ? view.work.dir : view.work.upper, LAYOUT.work);
 	for (const v of plan.volumes) args.push(v.kind === "bind" || view.agent ? "--ro-bind" : "--bind", v.dir, v.target);
+	if (view.out) args.push("--bind", view.out, LAYOUT.out);
+	// An author's PATH comes first, then wallis's (the required programs, the host base); HOME is /w.
+	const path = [...(plan.environment.PATH ? [plan.environment.PATH] : []), ...(binDir ? [LAYOUT.bin] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":");
 	const inside: Record<string, string> = {
 		...plan.environment,
-		PATH: [...(binDir ? [LAYOUT.bin] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
+		PATH: path,
 		HOME: LAYOUT.work,
 		LANG: plan.environment.LANG ?? "C.UTF-8",
 		...(view.env ?? {}),
@@ -222,10 +227,10 @@ export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: Call
 }
 
 /** A dir of links to the required programs not in the host base, by name, for PATH; null when there are none. */
-function programLinks(programs: Readonly<Record<string, string>>, cache?: string): string | null {
+function programLinks(programs: Readonly<Record<string, string>>): string | null {
 	const links = Object.entries(programs).filter(([, p]) => !underBase(p)).sort(([a], [b]) => (a < b ? -1 : 1));
 	if (links.length === 0) return null;
-	const base = cache ?? join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "wallis", "bins");
+	const base = join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "wallis", "bins");
 	const dir = join(base, createHash("sha256").update(JSON.stringify(links)).digest("hex").slice(0, 16));
 	if (!existsSync(dir)) {
 		const temp = `${dir}.${process.pid}.tmp`;
@@ -249,10 +254,12 @@ export interface SpawnResult {
 	readonly stderr: string;
 	readonly ms: number;
 	readonly aborted: boolean;
+	/** Killed by its timeout. */
+	readonly timedOut: boolean;
 }
 
 /** Runs a sandboxed process with `stdin`; resolves with its result. Aborting kills it. */
-export function runSpawn(sp: Spawn, stdin: string, options: { readonly signal?: AbortSignal } = {}): Promise<SpawnResult> {
+export function runSpawn(sp: Spawn, stdin: string, options: { readonly signal?: AbortSignal; readonly timeoutMs?: number } = {}): Promise<SpawnResult> {
 	const started = Date.now();
 	return new Promise((done, fail) => {
 		const child = spawn(sp.command, sp.args, { cwd: existsSync(sp.cwd) ? sp.cwd : undefined, stdio: ["pipe", "pipe", "pipe"], env: {} });
@@ -264,12 +271,15 @@ export function runSpawn(sp: Spawn, stdin: string, options: { readonly signal?: 
 		child.stderr.on("data", (d: Buffer) => err.push(d));
 		const onAbort = () => ((aborted = true), child.kill("SIGKILL"));
 		options.signal?.addEventListener("abort", onAbort, { once: true });
+		let timedOut = false;
+		const timer = options.timeoutMs ? setTimeout(() => ((timedOut = true), child.kill("SIGKILL")), options.timeoutMs) : null;
 		child.on("error", fail);
 		child.on("close", (code, signal) => {
 			options.signal?.removeEventListener("abort", onAbort);
+			if (timer) clearTimeout(timer);
 			// bwrap as pid 1's parent reports a killed child as 128 + n.
 			const killed = signal ?? (code !== null && code > 128 && code < 160 ? signalName(code - 128) : null);
-			done({ exit: code ?? 128, signal: killed, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), ms: Date.now() - started, aborted });
+			done({ exit: code ?? 128, signal: killed, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), ms: Date.now() - started, aborted, timedOut });
 		});
 		child.stdin.on("error", () => {});
 		child.stdin.end(stdin);

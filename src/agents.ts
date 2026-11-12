@@ -42,7 +42,7 @@ import { splitImages } from "./host/images.ts";
 import type { Journal } from "./host/journal.ts";
 import { commitLayer, layersAfter, prepareWork, removeWork, type Work, xattrToolsMissing } from "./host/layers.ts";
 import { callDir, type RunPaths } from "./host/runs.ts";
-import { head, runSpawn, type SandboxPlan, sandboxed } from "./host/sandbox.ts";
+import { head, LAYOUT, runSpawn, type SandboxPlan, sandboxed } from "./host/sandbox.ts";
 import type { Store } from "./host/store.ts";
 import type { AgentDef } from "./nodes.ts";
 import type { LiveMailbox } from "./runtime.ts";
@@ -259,8 +259,12 @@ class AgentCall {
 	async run(): Promise<Settle> {
 		const { effect, def } = this.#s;
 		const alias = def.model;
-		const resolved = this.#o.aliases[alias] ?? this.#o.aliases.default;
-		if (!resolved) return this.#fail({ type: "gave_up", error: `model alias ${alias} is not configured (.wallis/config.json "models")` }, false);
+		// Never a silent substitution: an alias the project does not configure is an error.
+		const resolved = this.#o.aliases[alias];
+		if (!resolved) {
+			const known = Object.keys(this.#o.aliases);
+			return this.#fail({ type: "gave_up", error: `model alias ${alias} is not configured in .wallis/config.json "models" (${known.length > 0 ? `known: ${known.join(", ")}` : "none is"})` }, false);
+		}
 		this.#model = resolved;
 		let model: Model<string>;
 		let thinking: Thinking | undefined;
@@ -617,7 +621,7 @@ class AgentCall {
 			mkdirSync(dir, { recursive: true });
 			const target = join(dir, posix.basename(rel));
 			// Copied out through the sandbox's view of /w (the layers and the upper dir together).
-			const r = await this.#inSandbox(["sh", "-c", 'cp -a -- "/w/$1" "/out/$2"', "sh", rel, posix.basename(rel)], { extra: dir });
+			const r = await this.#inSandbox(["sh", "-c", `cp -a -- "/w/$1" "${LAYOUT.out}/$2"`, "sh", rel, posix.basename(rel)], { extra: dir });
 			if (r.exit !== 0) throw new Error(`${value}: ${head(r.stderr) || "not found in /w"}`);
 			if (s[MARK] === "artifact") {
 				const media = (s.properties as Record<string, { const?: string }> | undefined)?.media?.const ?? guessMedia(rel);
@@ -659,7 +663,7 @@ class AgentCall {
 	}
 
 	/** One process in the call's sandbox, over its current view. */
-	#inSandbox(argv: string[], options: { stdin?: string; extra?: string } = {}) {
+	#inSandbox(argv: string[], options: { stdin?: string; extra?: string; timeoutMs?: number } = {}) {
 		const plan = this.#s.host.planFor(this.#s.def);
 		const mounts = mountsOf(this.#store, this.#refs);
 		const work = this.#work;
@@ -669,14 +673,11 @@ class AgentCall {
 			trees: mounts.trees,
 			agent: true,
 			writeLowers: this.#s.def.workspace?.access === "write" || this.#s.def.workspace?.access === "exec",
+			// A result file is copied out by the host through its own writable bind, at a target wallis owns.
+			...(options.extra ? { out: options.extra } : {}),
 		};
-		const sp = sandboxed(options.extra ? { ...plan, volumes: [...plan.volumes, { kind: "named", target: "/out", dir: options.extra, name: "out" }] } : plan, argv, view, { root: this.#s.host.paths.dir });
-		// Writes to /out (an export of a result file) are the host's, not the agent's.
-		if (options.extra) {
-			const i = sp.args.indexOf("/out");
-			if (i > 0 && sp.args[i - 2] === "--ro-bind") (sp.args as string[])[i - 2] = "--bind";
-		}
-		return runSpawn(sp, options.stdin ?? "", { signal: this.#s.signal });
+		const sp = sandboxed(plan, argv, view, { root: this.#s.host.paths.dir });
+		return runSpawn(sp, options.stdin ?? "", { signal: this.#s.signal, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) });
 	}
 
 	#fileTools(access: "read" | "write" | "exec"): AgentTool[] {
@@ -749,11 +750,13 @@ class AgentCall {
 			tools.push({
 				name: "bash",
 				label: "bash",
-				description: "Run a shell command in /w (no network).",
+				description: `Run a shell command in /w (${this.#s.host.planFor(this.#s.def).network === "host" ? "with the host's network" : "no network"}); it is killed after ${Math.round(this.#s.def.workspace!.bashTimeoutMs / 1000)} s.`,
 				parameters: Type.Object({ command: Type.String() }) as never,
 				execute: async (_id, params) => {
-					const r = await this.#inSandbox(["sh", "-c", (params as { command: string }).command]);
-					const text = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}\n[exit ${r.exit}]`;
+					const limit = this.#s.def.workspace!.bashTimeoutMs;
+					const r = await this.#inSandbox(["sh", "-c", (params as { command: string }).command], { timeoutMs: limit });
+					const end = r.timedOut ? `[killed after ${Math.round(limit / 1000)} s: the bash timeout]` : `[exit ${r.exit}]`;
+					const text = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}\n${end}`;
 					return { content: [{ type: "text", text: text.slice(-50_000) }], details: undefined };
 				},
 			});

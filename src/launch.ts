@@ -72,7 +72,7 @@ export async function launch(options: { root: string; paths: RunPaths; def: Work
 	const store = new Store(root);
 	const config = readConfig(root);
 	const kit = await loadExecutor(config);
-	const plans = new Plans([join(root, ".wallis")]);
+	const plans = new Plans(root);
 	const facts = () => journal.core.facts();
 	const tools = new ToolCaller({
 		store,

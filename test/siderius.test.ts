@@ -58,7 +58,7 @@ async function siderius() {
 			"siderius/config/advice.md": "Prefer simple losses.\n",
 			"siderius/data/train.h5ad": "cells",
 		},
-		{ models: { default: "faux/m" }, executor: join(here, "fixtures/siderius-executor.ts") },
+		{ models: Object.fromEntries(["default", "interpret", "analysis", "literature", "judge", "propose", "implement", "validate", "tune", "consolidate"].map((a) => [a, "faux/m"])), executor: join(here, "fixtures/siderius-executor.ts") },
 	);
 	reset();
 	const wf = ((await import(pathToFileURL(join(root, "siderius/workflow.ts")).href)) as { default: typeof import("../examples/siderius/workflow.ts").default }).default;

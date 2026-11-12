@@ -10,6 +10,7 @@ import { EventLog } from "./host/log.ts";
 import { lockHolder, type RunPaths } from "./host/runs.ts";
 import type { Store } from "./host/store.ts";
 import { type CallId, type CallRef, type FailedCall, publicReason } from "./errors.ts";
+export { parseDuration } from "./values.ts";
 
 export type Duration = `${number}${"s" | "m" | "h"}`;
 
@@ -27,12 +28,6 @@ export function duration(ms: number): Duration {
 	if (s < 120) return `${s}s`;
 	if (s < 7200) return `${Math.round(s / 60)}m`;
 	return `${Math.round(s / 360) / 10}h`;
-}
-
-export function parseDuration(d: string): number {
-	const m = /^(\d+(?:\.\d+)?)(s|m|h)$/.exec(d);
-	if (!m) throw new Error(`not a duration: ${d} (e.g. "30s", "110m", "2h")`);
-	return Number(m[1]) * { s: 1000, m: 60_000, h: 3_600_000 }[m[2] as "s" | "m" | "h"];
 }
 
 /** A run as its log says, read once. */
