@@ -1,5 +1,9 @@
 # SIDERIUS as a wallis workflow
 
+```sh
+mise run install && npm run demo:siderius   # scripted: no models, no API keys; Linux with bubblewrap
+```
+
 `workflow.ts` re-expresses the SIDERIUS research loop
 (github.com/yuema137/SIDERIUS, commit 5ccb436) in wallis: interpretation,
 the evidence stage and judge, proposal, implementation with validation,
@@ -14,31 +18,68 @@ place where the two differ.
 
 ## Run it (no API keys)
 
-The scripted run is `test/siderius.test.ts`. It copies this directory into
-a throwaway project, swaps the placeholder scripts for tiny scripted ones
-(`test/fixtures/siderius/`), and answers every agent from a script
-(`test/fixtures/siderius-executor.ts`, pi-ai's faux provider). No model is
-called. The sandboxes are real, so you need Linux with bubblewrap.
+`npm run demo:siderius` builds the package and runs `demo.ts`, in about 15
+seconds. The demo copies this directory into a throwaway project, swaps the
+placeholder scripts for tiny scripted ones (`demo/scripts/`: training
+sleeps a second and writes a fake checkpoint; scores are fixed per model;
+Health fails model `m2`), and answers every agent from a script
+(`demo/executor.ts`, pi-ai's faux provider). No model is called. The
+sandboxes are real, so you need Linux with bubblewrap. It:
 
-```sh
-git clone https://github.com/Microwave-WYB/wallis && cd wallis
-mise run install                          # Node and npm dependencies, from the lockfile
-node --test test/siderius.test.ts         # about 20 seconds
+1. starts the run detached, in its own process;
+2. answers the JudgeStop questions that arrive in the `stop_check` outbox:
+   `continue` at iteration 2, `stop` at iteration 4;
+3. kills the run's process group with SIGKILL while iteration 3 trains;
+4. resumes the run in place and lets it finish;
+5. prints each iteration from the run's journal (`log.jsonl`), and checks
+   that no training call that finished before the crash ran again.
+
+Abridged output:
+
+```
+[outbox stop_check] iteration 2: the judge recommends stopping ("the evidence has repeated for two iterations")
+[mailbox decision]  answered: continue
+[crash]  SIGKILL to the run's process group (pid 1392630) during training: 6 training calls finished, 1 in flight
+[state]  stopped; resuming in place
+[outbox stop_check] iteration 4: the judge recommends stopping ("the evidence has repeated for two iterations")
+[mailbox decision]  answered: stop
+[done]   stop_reason operator_stop after 5 iterations; incumbent m1 at 0.9
+
+iteration 1
+  judge     continue
+  proposal  m1: a zero-inflated negative-binomial decoder
+  trial     score 0.30
+            Health valid
+  formal    score 0.90
+            Health valid
+iteration 2
+  judge     recommends stopping
+  question  to the operator: stop? (the evidence has repeated for two iterations)
+  answer    continue
+  proposal  m2: a ZINB decoder with a variance penalty
+  trial     score 0.80
+            Health invalid (variance_collapse)
+  formal    score 0.70
+            Health invalid (variance_collapse)
+iteration 3
+  judge     continue
+  proposal  m3: a diffusion denoiser
+  -- crash  resumed in place: everything above came from the journal; the training call in flight runs again
+  trial     score 0.05
+  ...
+training calls: 8
+finished before the crash: 6; of those, run again after the resume: 0
 ```
 
-It runs two scenarios:
+m2 scores 0.8 but fails Health, so it never becomes the incumbent; m1's
+0.9 is the Health-valid Formal best.
 
-1. Seven iterations to `iterations_exhausted`, then checks the carried
-   history: the 5-entry knowledge cache, the consolidated findings and the
-   archive, the prediction memory, the deduped error signatures, the
-   3-iteration collapse window, and the judge's 4000-char projection.
-2. JudgeStop with `on_met: "request_input"`: the judge recommends
-   stopping, the question arrives in the caller's outbox, a malformed
-   answer is rejected, and the answer `stop` ends the run as
-   `operator_stop`.
-
-A standalone demo that prints a readable trace (proposals, scores, judge
-verdicts, the stop question, a crash and resume) is planned.
+The same workflow is also tested (`node --test test/siderius.test.ts`):
+seven iterations with assertions on the carried history (the 5-entry
+knowledge cache, consolidated findings and the archive, prediction memory,
+deduped error signatures, the 3-iteration collapse window, the judge's
+projection), and JudgeStop's `request_input` with a malformed answer
+rejected.
 
 ## Run it with real models
 

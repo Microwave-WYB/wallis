@@ -4,7 +4,7 @@
 (github.com/yuema137/SIDERIUS, commit 5ccb436) as a wallis workflow. The
 mapping is approximate. The prompts, `trainer/` and `checks/` are
 placeholders. The workflow runs end to end only with scripted agents and
-commands (`test/siderius.test.ts`). Start with `README.md` for
+commands (`demo.ts`, `test/siderius.test.ts`). Start with `README.md` for
 the tour.
 
 Claims about SIDERIUS cite its source at 5ccb436, as `file:function`, with
@@ -186,7 +186,7 @@ Two ideas carry most of the mapping:
 
 ### Limits of this example
 
-24. `trainer/` and `checks/` hold placeholders that exit with an error; the test swaps in tiny scripted ones. A real trainer
+24. `trainer/` and `checks/` hold placeholders that exit with an error; the demo and the test swap in tiny scripted ones. A real trainer
     environment (`uv sync`) would live in a named volume prepared by a
     setup command.
 25. The `/config` bind holds the advice and the Health config together, so

@@ -32,7 +32,8 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --test 'test/*.test.ts'"
+    "test": "node --test 'test/*.test.ts'",
+    "demo:siderius": "tsc -p tsconfig.build.json && node examples/siderius/demo.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.5.0",
