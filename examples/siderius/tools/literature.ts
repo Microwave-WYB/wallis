@@ -1,7 +1,7 @@
 // Literature search for the literature_review agent: custom tools, served by
 // wallis from their own sandbox (with the network), read-only and safe to
-// repeat after a crash. They replace the arxiv and Semantic Scholar MCP
-// servers of earlier rounds.
+// repeat after a crash (`replay: "safe"`). A sketch: not run against the live
+// APIs in tests.
 
 import { Type, type WallisTool } from "wallis";
 

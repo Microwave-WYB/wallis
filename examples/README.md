@@ -10,7 +10,7 @@ called: `test/film.test.ts`, `test/chat.test.ts`, `test/siderius.test.ts`.
 | `film/workflow.ts` | on tiny synthetic scans (stdlib python3 scripts in `film/scripts`; the owner's real workflow has the same shape over darktable and Hugin): `negatives` (stage 1, once), `develop` (stage 2, many times), `deliver` (nesting, an agent, a steering address), `grade` (an agent driving a compute actor) |
 | `film/iterate.ts` | the orchestrating agent's side: `run`, detach and `next`, `attach` to reuse an earlier run's output, `exportOutput` |
 | `chat/workflow.ts`, `chat/terminal.ts` | a chat harness: an agent with a mailbox registered as `user`, replies through an outbox, changes back as a Tree |
-| `siderius/workflow.ts` | the SIDERIUS research loop (v1's port, see `siderius/MAPPING.md`): a carried history as the body's local variables, nested workflows, many agents, a toolset, and the stop check as an outbox question answered in the body's mailbox |
+| `siderius/workflow.ts` | the SIDERIUS research loop (see `siderius/README.md` and `siderius/MAPPING.md`): a carried history as the body's local variables, nested workflows, many agents, a toolset, and the stop check as an outbox question answered in the body's mailbox |
 | `film/type-checks.ts` | mistakes the types must reject (each line is `@ts-expect-error`) |
 
 ## Decisions the examples made that docs/v2.md did not have
@@ -56,7 +56,6 @@ called: `test/film.test.ts`, `test/chat.test.ts`, `test/siderius.test.ts`.
 
 ## Not covered yet
 
-- SIDERIUS (the research pipeline);
 - MCP servers;
 - `ctx.loop`;
 - named-volume environments prepared by a setup command;
