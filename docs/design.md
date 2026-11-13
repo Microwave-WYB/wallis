@@ -171,7 +171,7 @@ The main agent iterates with the human:
 const { negs } = (await run(negatives, roll)).output;                       // once, about 10 minutes
 await run(develop, { negs, look: L1, only: ["2835"], size: 1200 });          // seconds
 await run(develop, { negs, look: L2, size: 1500 });                          // a whole-roll preview
-await run(deliver, { negs, look: L2, album: "20261107_autocord_portra160" }); // after the human agrees
+await run(deliver, { negs, look: L2, album: "2026-roll-12" }); // after the human agrees
 ```
 
 ### 4.1 Nodes
@@ -531,7 +531,7 @@ await r.next({ timeout: "110m" });      // message | finished | failed | stopped
 await r.send("guidance", "rename the album", { interrupt: true });
 await r.stop();  await r.resume({ detach: true });
 const f = await attach(workflow, id).done();   // Finished: f.output, f.exportOutput(dir)
-await f.exportOutput("~/Pictures/150ND610-work/final-v2");
+await f.exportOutput("~/exports/roll-12-final");
 attach(id);  await list("./negative/workflow.ts");  await prune();
 ```
 
@@ -724,7 +724,7 @@ examples left room. None changes the authoring API.
 
 ## 13. Acceptance results (phases 3 to 7)
 
-On the real roll (150ND610, 12 frames), with scripted executors only:
+On a real 12-frame roll, with scripted executors only:
 
 - **Finals against the delivered SDR finals** (v1's method: 8-bit RGB after JPEG decode; look
   `cool3` with the owner's per-frame overrides). v2 equals v1 on 11 frames (MAD 1.65 to 3.32,
