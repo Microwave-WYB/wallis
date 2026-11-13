@@ -101,7 +101,7 @@ import { attach, run, Tree } from "wallis";
 import { develop, negatives } from "./workflow.ts";
 
 const r = await run(negatives, { raw: Tree.from("~/scans/roll1"), frames: ["0001", "0002"] }); // waits
-r.output.negs;                                   // refs with host paths into the project store
+r.output.negs;                                   // refs with host paths into the project store: read them, never write into them
 await r.exportOutput("./out");                   // copy the output's files somewhere
 
 const d = await run(negatives, input, { detach: true });   // its own process; returns at once
@@ -203,6 +203,12 @@ await r.resume({ detach: true });
 
 ## Pitfalls
 
+- **Never write into a ref's `path` on the host** (a body, a caller, a
+  script run outside wallis). It is the project store's own file, shared by
+  every Tree and run that holds the same content; the store keeps files'
+  modes, so nothing stops the write. Copy first (`exportOutput`, or a
+  command that copies its input into `/w`) and change the copy. Sandboxes
+  mount inputs read-only, so commands and agents cannot make this mistake.
 - **Node identity covers a node's own source, not its helpers.** A node's
   digest covers its schemas, sandbox, prompt and the source text of its own
   `run`/`parse`/body, but not helpers they close over (an argv builder, a

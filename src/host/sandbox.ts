@@ -196,12 +196,6 @@ export interface CallView {
 	readonly trees: readonly { readonly at: string; readonly lowers: readonly string[] }[];
 	/** An agent's process: named volumes are read-only for it. */
 	readonly agent?: boolean;
-	/**
-	 * A writable agent workspace: CAP_DAC_OVERRIDE in the sandbox's own user namespace, so files
-	 * from earlier calls (read-only in the store's layers) can be written in place: overlayfs copies
-	 * them up into this call's layer. Read-only binds and /in stay read-only (mount flags).
-	 */
-	readonly writeLowers?: boolean;
 	/** Variables set inside, after the sandbox's own. */
 	readonly env?: Readonly<Record<string, string>>;
 	/** A host dir bound writable at /run/wallis/out (a target wallis owns): where the host copies an agent's result files out. */
@@ -218,7 +212,6 @@ export interface Spawn {
 export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: CallView, options: { readonly root?: string } = {}): Spawn {
 	// --as-pid-1: the program is PID 1 of the sandbox, so /proc/1/cmdline is its own argv.
 	const args = ["--die-with-parent", "--new-session", "--unshare-all", "--as-pid-1"];
-	if (view.writeLowers) args.push("--cap-add", "CAP_DAC_OVERRIDE");
 	if (plan.network === "host") args.push("--share-net");
 	args.push(...systemMounts(), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/run/wallis");
 	for (const d of plan.devices) args.push("--dev-bind", d, d);

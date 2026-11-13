@@ -205,28 +205,12 @@ export function commitLayer(store: string, work: Pick<Work, "upper">, root: stri
 	if (root !== null) writeDurably(join(root, "committed"), `${digest} ${attempt}`);
 	if (existsSync(dir)) removeWork(work.upper);
 	else {
-		freeze(work.upper);
 		syncTree(work.upper);
 		renameSync(work.upper, dir);
 		syncPath(layersDir(store));
 	}
 	crashPoint("layer");
 	return digest;
-}
-
-/**
- * Makes a layer's files read-only (a-w), now that it is in the store: a body
- * writing into a Tree's `path` gets EACCES instead of silently changing every
- * Tree that shares the file. Dirs keep their modes (they are part of the
- * manifest); symlinks are left alone.
- */
-export function freeze(root: string): void {
-	const walk = (path: string) => {
-		const st = lstatSync(path);
-		if (st.isDirectory()) for (const name of readdirSync(path)) walk(join(path, name));
-		else if (st.isFile() && (st.mode & 0o222) !== 0) chmodSync(path, st.mode & 0o7555);
-	};
-	walk(root);
 }
 
 /** fsync of one file or dir. */

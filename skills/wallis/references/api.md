@@ -90,9 +90,8 @@ the call, decided, as `output_invalid`), one `send` tool when it has
 recipient's schema), file tools by access (`read`, `ls`; `write`, `edit`;
 `bash`), each in a fresh bwrap process over `/w` (its session's layers) and
 `/in` (its input files and those of every message it took, restored after
-a resume). `/tmp` is empty again in every tool call. A writable workspace
-can rewrite files that earlier layers hold read-only (the tool processes
-get `CAP_DAC_OVERRIDE` in their own user namespace, with the user's uid).
+a resume). `/tmp` is empty again in every tool call. Files keep the modes
+they were written with.
 An Artifact or Tree in its output is the path of a file or dir in `/w`.
 
 ```ts
@@ -165,7 +164,7 @@ and `tail`.
 ```
 <project>/.wallis/config.json   { "models": { alias: "provider/model[:thinking]" }, "executor"?: "./x.ts", "retryDelaysMs"?: number[] }
 <project>/.wallis/runs/<id>/    log.jsonl (the journal), meta.json, lock, inbox.jsonl, work/
-<project>/.wallis/store/        blobs/, layers/: content-addressed, read-only, shared by every run
+<project>/.wallis/store/        blobs/, layers/: content-addressed, shared by every run; never write into them
 <project>/.wallis/volumes/      named volumes, one dir each
 ```
 

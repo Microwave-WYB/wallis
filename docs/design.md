@@ -703,15 +703,20 @@ examples left room. None changes the authoring API.
      failed attempt will run again on resume still takes messages.
    - The `bash` tool is killed after `workspace.bashTimeout` (default
      `"10m"`), and says so; its description states the network.
-   - A writable workspace (`write`, `exec`) may write files that earlier
-     layers hold read-only (store files are a-w): the tool processes get
-     `CAP_DAC_OVERRIDE` inside their own user namespace, with the user's
-     uid, so overlayfs copies the file up. Nothing outside the sandbox is
-     affected.
+   - Files keep the modes they were written with, in `/w` and in the store
+     (the manifest records them). A file an earlier call left writable is
+     written in place (overlayfs copies it up into this call's layer); one
+     it left read-only is read-only, as on any filesystem.
 5. **Paths in values.** The journal keeps refs without `path`. A body or a
    caller sees the blob's path in the store, or a Tree's top layer dir.
    `ctx.files(s)` squashes a session's layers into one, so that path is the
    whole Tree. A sandbox sees its mount points.
+   - **A body or caller must not write into a ref's `path`.** It is the
+     store's own file or dir, hardlinked into every Tree that shares it, and
+     store files keep their modes, so the host does not stop such a write:
+     it would change every run's value at once. Inside sandboxes, inputs are
+     read-only mounts, so a command or agent cannot. To change a file, copy
+     it (a command's `/w`, or `exportOutput`) and change the copy.
 6. **`requires`** skips version-manager shim dirs on `PATH` (`…/shims`:
    mise, asdf, pyenv), because a shim needs its manager's config. `node`
    falls back to the Node that runs wallis.

@@ -110,7 +110,7 @@ const RESERVE = 0.2;
 const MAX_INVALID = 3;
 
 const SYSTEM = `Work only with the tools you are given. When you are done, call submit_result with a result that matches its schema; if it does not match, you get the errors and may submit again.`;
-const WORKSPACE = "Your files: /w is your workspace (it carries over to the next call of this conversation; files from earlier calls may show read-only modes, and you can still write them); /in holds your input files and the files of messages you received (read-only); /tmp is empty again in every tool call.";
+const WORKSPACE = "Your files: /w is your workspace (it carries over to the next call of this conversation; files keep the modes they were written with); /in holds your input files and the files of messages you received (read-only); /tmp is empty again in every tool call.";
 
 /** A checkpoint: the whole dialogue after a completed turn, and the turns used. */
 interface Checkpoint {
@@ -678,7 +678,6 @@ class AgentCall {
 			inputs: mounts.inputs,
 			trees: mounts.trees,
 			agent: true,
-			writeLowers: this.#s.def.workspace?.access === "write" || this.#s.def.workspace?.access === "exec",
 			// A result file is copied out by the host through its own writable bind, at a target wallis owns.
 			...(options.extra ? { out: options.extra } : {}),
 		};
@@ -731,8 +730,7 @@ class AgentCall {
 					parameters: Type.Object({ path: Type.String(), content: Type.String() }) as never,
 					execute: async (_id, params) => {
 						const p = params as { path: string; content: string };
-						// A file from an earlier call is read-only in its layer: made writable (copied up into this call's layer) first.
-						await run(["sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && { [ ! -e "$1" ] || chmod u+w -- "$1"; } && cat > "$1"', "sh", abs(p.path)], p.content);
+						await run(["sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "sh", abs(p.path)], p.content);
 						return { content: [{ type: "text", text: `wrote ${abs(p.path)}` }], details: undefined };
 					},
 				},
@@ -746,7 +744,7 @@ class AgentCall {
 						const text = await run(["cat", "--", abs(p.path)]);
 						const at = text.indexOf(p.old);
 						if (at < 0 || text.indexOf(p.old, at + 1) >= 0) throw new Error(at < 0 ? "`old` is not in the file" : "`old` occurs more than once");
-						await run(["sh", "-c", 'chmod u+w -- "$1" && cat > "$1"', "sh", abs(p.path)], text.slice(0, at) + p.new + text.slice(at + p.old.length));
+						await run(["sh", "-c", 'cat > "$1"', "sh", abs(p.path)], text.slice(0, at) + p.new + text.slice(at + p.old.length));
 						return { content: [{ type: "text", text: `edited ${abs(p.path)}` }], details: undefined };
 					},
 				},

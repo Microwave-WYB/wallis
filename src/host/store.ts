@@ -19,7 +19,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { crashPoint } from "./faults.ts";
-import { commitLayer, digestOf, freeze, hashFile, layerDir, layersDir, manifestOf, removeWork, syncPath, writeDurably } from "./layers.ts";
+import { commitLayer, digestOf, hashFile, layerDir, layersDir, manifestOf, removeWork, syncPath, writeDurably } from "./layers.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const DIGESTS = /sha256:[0-9a-f]{64}/g;
@@ -159,10 +159,7 @@ export class Store {
 		}
 		if (!existsSync(`${target}.json`)) writeDurably(`${target}.json`, text);
 		if (existsSync(target)) removeWork(temp);
-		else {
-			freeze(temp);
-			renameSync(temp, target);
-		}
+		else renameSync(temp, target);
 		syncPath(layersDir(this.dir));
 		return [digest];
 	}
