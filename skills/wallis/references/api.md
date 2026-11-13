@@ -20,7 +20,7 @@ Schemas are TypeBox (`Type` is re-exported).
 ```ts
 sandbox({
 	requires?: string[],            // programs on PATH, called by their real path (shims skipped)
-	volumes?: string[],             // "./host:/target:ro" (relative to the workflow file, or ~/) | "name:/target"
+	volumes?: string[],             // "./host:/target:ro" (relative to the workflow file, or ~/) | "name:/target" (writable, exclusive) | "name:/target:ro" (shared)
 	environment?: Record<string, string>,  // no HOME (it is /w); a PATH goes before the sandbox's own
 	devices?: string[],             // e.g. "/dev/dri"
 	network?: "none" | "host",      // default "none" (loopback only)
@@ -29,8 +29,15 @@ sandbox({
 
 A named volume is a wallis-managed dir that persists across runs, writable by
 commands and tool sources, read-only for agents. It belongs to the project
-(`<project>/.wallis/volumes/<name>`). Commands that mount the same named
-volume run one at a time. A required script's `#!` interpreter must be in
+(`<project>/.wallis/volumes/<name>`). Like a Docker volume it has one writer at a time: `"name:/target"` mounts it writable and holds it
+alone (no other writer and no reader meanwhile); `"name:/target:ro"` mounts
+it read-only and shares it with the other readers, which run at the same
+time. Agents always mount named volumes read-only, as readers. Toolsets and
+MCP servers hold their volumes as long as their connection is open. A call
+that waits for a volume shows in `status().waiting`; a stop ends the wait.
+The locks are `flock(2)` (util-linux's `flock` must be installed), so a
+holder that died never keeps one. One volume may be mounted once per
+sandbox. A required script's `#!` interpreter must be in
 the host base or in `requires`; otherwise the sandbox is refused, naming it.
 
 ```ts
@@ -143,7 +150,7 @@ prune(): Promise<{ freed }>
 | Method | |
 |---|---|
 | `id` | `<workflow>-<utc time>-<rand>` |
-| `status()` | `{ state: running \| stopped \| finished \| failed, elapsed, completed, running: CallRef[], failed: FailedCall[] }` |
+| `status()` | `{ state: running \| stopped \| finished \| failed, elapsed, completed, running: CallRef[], waiting: { call: CallRef, volume }[], failed: FailedCall[] }` |
 | `tree()` | the calls under the calls they were made in, with attempts (`unknown`: for reading) |
 | `transcript(callId)` | the dialogue of an agent call's last attempt |
 | `next({ timeout? })` | `message` (an outbox's, or a reply to the caller with `replyTo`) \| `finished` \| `failed` (`FailedCall[]`, the fatal one first) \| `stopped` \| `timeout` (progress) |

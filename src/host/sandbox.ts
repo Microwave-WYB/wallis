@@ -235,7 +235,7 @@ export function sandboxed(plan: SandboxPlan, argv: readonly string[], view: Call
 		for (const l of view.work.lowers) args.push("--overlay-src", l);
 		args.push("--overlay", view.work.upper, view.work.ovl, LAYOUT.work);
 	} else args.push("--bind", view.work.kind === "dir" ? view.work.dir : view.work.upper, LAYOUT.work);
-	for (const v of plan.volumes) args.push(v.kind === "bind" || view.agent ? "--ro-bind" : "--bind", v.dir, v.target);
+	for (const v of plan.volumes) args.push(v.kind === "bind" || v.readOnly || view.agent ? "--ro-bind" : "--bind", v.dir, v.target);
 	if (view.out) args.push("--bind", view.out, LAYOUT.out);
 	// An author's PATH comes first, then wallis's (the required programs, the host base); HOME is /w.
 	const path = [...(plan.environment.PATH ? [plan.environment.PATH] : []), ...(binDir ? [LAYOUT.bin] : []), "/usr/local/bin", "/usr/bin", "/bin"].join(":");

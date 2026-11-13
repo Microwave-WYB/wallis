@@ -12,7 +12,7 @@ import { tmp } from "./util.ts";
 test("a volume string parses to a bind, a named volume, or an invalid one with its reason", () => {
 	assert.deepEqual(parseVolume("./scripts:/scripts:ro"), { kind: "bind", host: "./scripts", target: "/scripts" });
 	assert.deepEqual(parseVolume("~/data:/data:ro"), { kind: "bind", host: "~/data", target: "/data" });
-	assert.deepEqual(parseVolume("dt-cache:/root/.cache/darktable"), { kind: "named", name: "dt-cache", target: "/root/.cache/darktable" });
+	assert.deepEqual(parseVolume("dt-cache:/root/.cache/darktable"), { kind: "named", name: "dt-cache", target: "/root/.cache/darktable", readOnly: false });
 	const reason = (text: string) => {
 		const v = parseVolume(text);
 		return v.kind === "invalid" ? v.reason : null;
@@ -52,7 +52,7 @@ test("a bind resolves against the workflow dir or ~/; its host dir must exist; a
 	mkdirSync(join(dir, "scripts"));
 	const [bind, named] = resolveVolumes(["./scripts:/s:ro", "cache:/c"], dir);
 	assert.deepEqual(bind, { kind: "bind", target: "/s", dir: join(dir, "scripts") });
-	assert.deepEqual(named, { kind: "named", target: "/c", dir: join(namedVolumesDir(dir), "cache") });
+	assert.deepEqual(named, { kind: "named", target: "/c", dir: join(namedVolumesDir(dir), "cache"), name: "cache", readOnly: false });
 	assert.match(refusal(["./missing:/m:ro"], dir) ?? "", /does not exist/);
 	assert.equal(resolveVolumes(["~/:/home-ro:ro"], dir)[0]!.dir, homedir());
 	assert.match(refusal(["./:/p:ro"], dir, [join(dir, ".wallis")]) ?? "", /wallis's own/);

@@ -257,6 +257,8 @@ The body is plain TypeScript. Its wallis operations are `ctx.call`,
     for agents. This is where environments live (e.g. `"uv-env:/opt/venv"`,
     prepared by a setup command), because environments embed absolute paths
     and must not be moved.
+  - `"<name>:<target>:ro"` mounts the same volume read-only: what a job
+    that only uses an environment or reads a cache should declare.
 - **`environment`**, **`devices`** and **`network: "none" | "host"`**
   (default `"none"`). Network is all or nothing: `"none"` is bwrap's
   `--unshare-all` (loopback only), `"host"` adds `--share-net`. Per-host allow
@@ -264,9 +266,18 @@ The body is plain TypeScript. Its wallis operations are `ctx.call`,
   "host"`) and in an agent's `bash` tool description, nowhere implicit.
   - Named volumes belong to the project: they live in
     `<project>/.wallis/volumes/<name>`, so two projects never share one by
-    name. Commands whose sandboxes mount the same named volume run one at
-    a time (a lock per volume, held while the command runs), so concurrent
-    setups of one environment never interleave.
+    name.
+  - As in Docker, a named volume has one writer at a time: `"name:/target"` mounts it writable and holds it
+    alone (no other writer and no reader meanwhile); `"name:/target:ro"` mounts
+    it read-only and shares it with the other readers, which run at the same
+    time. Agents always mount named volumes read-only, as readers. Toolsets and
+    MCP servers hold their volumes as long as their connection is open. A call
+    that waits for a volume shows in `status().waiting`; a stop ends the wait.
+    The locks are `flock(2)` (util-linux's `flock` must be installed), so a
+    holder that died never keeps one. One volume may be mounted once per
+    sandbox.
+    So concurrent setups of one environment never interleave, and many
+    jobs that use it read-only run in parallel.
   - `environment` may not set `HOME` (it is `/w`); a `PATH` there is put
     before the sandbox's own PATH, never replacing it.
 

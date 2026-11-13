@@ -12,7 +12,7 @@ import type { CommandFailure, Json } from "./host/core.ts";
 import { removeWork } from "./host/layers.ts";
 import { head, LAYOUT, runSpawn, type SandboxPlan, sandboxed } from "./host/sandbox.ts";
 import type { Store } from "./host/store.ts";
-import { withVolumeLocks } from "./host/volumes.ts";
+import { lockVolumes } from "./host/volumes.ts";
 import type { CommandDef, CommandResult } from "./nodes.ts";
 import { declaredMedia, errorText, guessMedia, refsIn, schemaErrors, stripPaths, toJson, walkMarked, withPaths } from "./values.ts";
 
@@ -53,7 +53,7 @@ export type CommandOutcome = { type: "returned"; output: Json } | { type: "faile
 class Missing extends Error {}
 class Leaves extends Error {}
 
-export async function runCommand(call: { store: Store; work: string; def: CommandDef; input: Json; plan: () => SandboxPlan; signal: AbortSignal }): Promise<CommandOutcome> {
+export async function runCommand(call: { store: Store; work: string; def: CommandDef; input: Json; plan: () => SandboxPlan; signal: AbortSignal; onWait?: (volume: string | null) => void }): Promise<CommandOutcome> {
 	const { store, def } = call;
 	let plan: SandboxPlan;
 	let mounts: ReturnType<typeof mountsOf>;
@@ -71,7 +71,19 @@ export async function runCommand(call: { store: Store; work: string; def: Comman
 	removeWork(call.work);
 	mkdirSync(scratch, { recursive: true });
 	try {
-		const r = await withVolumeLocks(plan.volumes, () => runSpawn(sandboxed(plan, argv, { work: { kind: "dir", dir: scratch }, inputs: mounts.inputs, trees: mounts.trees }), JSON.stringify(mounted), { signal: call.signal }));
+		let locks: Awaited<ReturnType<typeof lockVolumes>>;
+		try {
+			locks = await lockVolumes(plan.volumes, { signal: call.signal, ...(call.onWait ? { onWait: call.onWait } : {}) });
+		} catch (error) {
+			if (call.signal.aborted) return { type: "failed", failure: { type: "killed", signal: "SIGKILL", stderr_head: "stopped by wallis while waiting for a volume" } };
+			return { type: "failed", failure: { type: "unrunnable", error: error instanceof Error ? error.message : String(error) } };
+		}
+		let r: Awaited<ReturnType<typeof runSpawn>>;
+		try {
+			r = await runSpawn(sandboxed(plan, argv, { work: { kind: "dir", dir: scratch }, inputs: mounts.inputs, trees: mounts.trees }), JSON.stringify(mounted), { signal: call.signal });
+		} finally {
+			await locks.release();
+		}
 		if (r.setup !== null) return { type: "failed", failure: { type: "unrunnable", error: `the sandbox could not start the command: ${r.setup}` } };
 		if (r.aborted) return { type: "failed", failure: { type: "killed", signal: "SIGKILL", stderr_head: "stopped by wallis" } };
 		if (r.signal !== null) return { type: "failed", failure: { type: "killed", signal: r.signal, stderr_head: head(r.stderr) } };

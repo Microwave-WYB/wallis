@@ -421,7 +421,7 @@ export class RunSession implements AgentHost {
 		const p = this.#pending.get(id);
 		if (!p?.command) return;
 		const abort = this.#signal();
-		void runCommand({ store: this.store, work: join(this.paths.work, callDir(p.slot, attempt)), def: p.command, input: p.input, plan: () => this.plans.plan(p.command!.sandbox), signal: abort.signal })
+		void runCommand({ store: this.store, work: join(this.paths.work, callDir(p.slot, attempt)), def: p.command, input: p.input, plan: () => this.plans.plan(p.command!.sandbox), signal: abort.signal, onWait: (volume) => this.#note(`volume_wait:${p.slot}`, volume) })
 			.then((r) => this.step(r.type === "returned" ? { type: "command_returned", id, output: r.output } : { type: "command_failed", id, failure: r.failure }))
 			.catch((error) => this.#crash(error))
 			.finally(() => this.#aborts.delete(abort));

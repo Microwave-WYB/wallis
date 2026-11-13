@@ -73,7 +73,9 @@ Rules that matter:
   the command wrote in `/w` into an Artifact or a Tree.
 - **Sandboxes** (`sandbox({...})`): `requires` (programs, called by their
   real path), `volumes` (`"./x:/x:ro"` read-only binds relative to the
-  workflow file, `"name:/target"` named volumes that persist), `environment`,
+  workflow file, `"name:/target"` named volumes that persist: writable and held by one
+  writer at a time; add `:ro` where a call only reads one, so readers run in
+  parallel), `environment`,
   `devices`, `network: "none" | "host"`. Nothing else is visible: not the
   workflow dir, not `$HOME`. A call sees `/in` (its inputs, read-only), `/w`
   (its scratch dir, also `$HOME`), its volumes and an empty `/tmp` (new for

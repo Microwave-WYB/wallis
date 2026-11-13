@@ -24,6 +24,7 @@ import { build } from "esbuild";
 import type { Json } from "./core.ts";
 import { removeWork } from "./layers.ts";
 import { LAYOUT, type SandboxPlan, sandboxed } from "./sandbox.ts";
+import { lockVolumes, type VolumeLocks } from "./volumes.ts";
 import type { Store } from "./store.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -155,18 +156,26 @@ export class ToolSources {
 		if (plan.programs.node === undefined) throw new Error("a toolset's sandbox must require node");
 		const dir = this.#scratch(`toolset-${bundle.slice(7, 19)}`);
 		const sp = sandboxed(plan, ["node", `${LAYOUT.inputs}/runner.mjs`], { work: { kind: "dir", dir }, inputs: [{ at: `${LAYOUT.inputs}/runner.mjs`, file: this.#store.blobPath(bundle) }], trees: [], env: secrets });
-		return this.#connect(sp, dir, `toolset ${bundle.slice(0, 19)}`);
+		return this.#connect(sp, dir, `toolset ${bundle.slice(0, 19)}`, plan);
 	}
 
 	/** An MCP server's command in its sandbox, with its env's secrets filled from `from`. */
 	async connectServer(config: McpServerConfig, plan: SandboxPlan, from: Readonly<Record<string, string | undefined>> = process.env): Promise<Opened> {
 		const dir = this.#scratch("mcp");
 		const sp = sandboxed(plan, [config.command, ...(config.args ?? [])], { work: { kind: "dir", dir }, inputs: [], trees: [], env: fillSecrets(config.env, from) });
-		return this.#connect(sp, dir, `MCP server ${config.command}`);
+		return this.#connect(sp, dir, `MCP server ${config.command}`, plan);
 	}
 
 	/** A failed start names the source and keeps the process's stderr: the cause is usually there. */
-	async #connect(sp: { command: string; args: readonly string[]; cwd: string }, dir: string, what: string): Promise<Opened> {
+	async #connect(sp: { command: string; args: readonly string[]; cwd: string }, dir: string, what: string, plan: SandboxPlan): Promise<Opened> {
+		// Its named volumes are held as long as the connection is open: shared for :ro, exclusive otherwise.
+		let locks: VolumeLocks;
+		try {
+			locks = await lockVolumes(plan.volumes);
+		} catch (e) {
+			removeWork(dir);
+			throw e;
+		}
 		const transport = new StdioTransport({ command: sp.command, args: [...sp.args], env: {}, inheritEnv: false, stderr: "pipe", cwd: sp.cwd });
 		const client = new McpClient({ name: "wallis", version: "2.0.0" });
 		try {
@@ -177,6 +186,7 @@ export class ToolSources {
 			const stderr = transport.stderr.trim().split("\n").slice(-20).join("\n");
 			await client.close().catch(() => {});
 			removeWork(dir);
+			await locks.release();
 			throw new Error(`${what} did not start: ${e instanceof Error ? e.message : String(e)}${stderr ? `\nits stderr:\n${stderr}` : " (it wrote nothing to stderr)"}`, { cause: e });
 		}
 		return {
@@ -186,6 +196,7 @@ export class ToolSources {
 					await client.close();
 				} finally {
 					removeWork(dir);
+					await locks.release();
 				}
 			},
 		};

@@ -40,6 +40,7 @@ import { putDialogue, readDialogue } from "./host/dialogues.ts";
 import { crashPoint } from "./host/faults.ts";
 import { splitImages } from "./host/images.ts";
 import type { Journal } from "./host/journal.ts";
+import { lockVolumes } from "./host/volumes.ts";
 import { commitLayer, layersAfter, prepareWork, removeWork, type Work, xattrToolsMissing } from "./host/layers.ts";
 import { callDir, type RunPaths } from "./host/runs.ts";
 import { head, LAYOUT, runSpawn, type SandboxPlan, sandboxed } from "./host/sandbox.ts";
@@ -667,7 +668,7 @@ class AgentCall {
 	}
 
 	/** One process in the call's sandbox, over its current view. */
-	#inSandbox(argv: string[], options: { stdin?: string; extra?: string; timeoutMs?: number } = {}) {
+	async #inSandbox(argv: string[], options: { stdin?: string; extra?: string; timeoutMs?: number } = {}) {
 		const plan = this.#s.host.planFor(this.#s.def);
 		const mounts = mountsOf(this.#store, this.#refs);
 		const work = this.#work;
@@ -682,7 +683,13 @@ class AgentCall {
 			...(options.extra ? { out: options.extra } : {}),
 		};
 		const sp = sandboxed(plan, argv, view, { root: this.#s.host.paths.dir });
-		return runSpawn(sp, options.stdin ?? "", { signal: this.#s.signal, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) });
+		// An agent only reads named volumes: a shared lock, so no writer changes them under it.
+		const locks = await lockVolumes(plan.volumes, { agent: true, signal: this.#s.signal });
+		try {
+			return await runSpawn(sp, options.stdin ?? "", { signal: this.#s.signal, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) });
+		} finally {
+			await locks.release();
+		}
 	}
 
 	#fileTools(access: "read" | "write" | "exec"): AgentTool[] {

@@ -19,6 +19,8 @@ export interface Status {
 	readonly elapsed: Duration;
 	readonly completed: number;
 	readonly running: readonly CallRef[];
+	/** Running calls waiting for a named volume another call holds (a writer, or readers while it writes). */
+	readonly waiting: readonly { readonly call: CallRef; readonly volume: string }[];
 	/** Calls whose newest attempt failed (the body may have caught some and gone on). */
 	readonly failed: readonly FailedCall[];
 }
@@ -195,6 +197,7 @@ export class RunView {
 			elapsed: duration((ended ?? Date.now()) - created),
 			completed: this.calls.filter((c) => c.attempts.at(-1)?.type === "answered").length,
 			running: state === "running" ? this.calls.filter((c) => c.attempts.at(-1)?.type === "running").map((c) => this.ref(c)) : [],
+			waiting: state === "running" ? this.calls.flatMap((c) => (c.attempts.at(-1)?.type === "running" && typeof this.facts[`volume_wait:${c.slot}`] === "string" ? [{ call: this.ref(c), volume: this.facts[`volume_wait:${c.slot}`] as string }] : [])) : [],
 			failed: this.failed(store),
 		};
 	}

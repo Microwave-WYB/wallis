@@ -9,7 +9,7 @@ import { Address, agent, sandbox, Tree, Type, workflow } from "wallis";
 
 const dev = sandbox({
 	requires: ["git", "node", "npm", "rg"],
-	volumes: ["npm-cache:/root/.npm"],
+	volumes: ["npm-cache:/root/.npm:ro"], // an agent only reads named volumes
 });
 
 const assistant = agent({
