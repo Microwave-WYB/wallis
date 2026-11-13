@@ -90,3 +90,13 @@ test("Tree.from of a read-only host dir is ingested by copy", opts, async () => 
 		chmodSync(join(src, "d"), 0o755);
 	}
 });
+
+test("r.file of a file in a dir and r.dir of that dir keep both, in either order", opts, async () => {
+	const { wf } = await fixture();
+	for (const fileFirst of [true, false]) {
+		const r = await run(wf.fileAndDir, { fileFirst });
+		assert.equal(readFileSync(r.output.report.path, "utf8"), "report\n", `the file (fileFirst: ${fileFirst})`);
+		assert.equal(readFileSync(join(r.output.all.path, "report.txt"), "utf8"), "report\n", `the file in the Tree (fileFirst: ${fileFirst})`);
+		assert.equal(readFileSync(join(r.output.all.path, "other.txt"), "utf8"), "other\n");
+	}
+});

@@ -117,6 +117,16 @@ export async function runCommand(call: { store: Store; work: string; def: Comman
  */
 function resolveDrafts(store: Store, scratch: string, schema: unknown, value: unknown): unknown {
 	const realScratch = realpathSync(scratch);
+	// Every draft's path: one that another draft's path holds, or is held by, or names too, is copied
+	// (moving it would take it from under the other: `r.file("out/a")` with `r.dir("out")`).
+	const paths: string[] = [];
+	const collect = (v: unknown): void => {
+		if (v instanceof Draft) paths.push(resolve(scratch, v.name));
+		else if (Array.isArray(v)) v.forEach(collect);
+		else if (v !== null && typeof v === "object") Object.values(v).forEach(collect);
+	};
+	collect(value);
+	const overlaps = (path: string) => paths.filter((p) => p === path || p.startsWith(`${path}${sep}`) || path.startsWith(`${p}${sep}`)).length > 1;
 	const ingest = (d: Draft, media: string | undefined) => {
 		const path = resolve(scratch, d.name);
 		const rel = relative(scratch, path);
@@ -128,7 +138,7 @@ function resolveDrafts(store: Store, scratch: string, schema: unknown, value: un
 			throw new Missing(d.name);
 		}
 		if (real !== realScratch && !real.startsWith(`${realScratch}${sep}`)) throw new Leaves(`${d.name} leads to ${real}, which leaves the command's scratch dir: a result must be a file the command wrote in /w`);
-		const direct = real === resolve(realScratch, rel);
+		const direct = real === resolve(realScratch, rel) && !overlaps(path);
 		const st = lstatSync(real);
 		if (d.kind === "file") {
 			if (!st.isFile()) throw new Missing(`${d.name} (not a regular file)`);
