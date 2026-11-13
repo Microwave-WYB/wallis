@@ -1,6 +1,7 @@
 # wallis SIDERIUS example: the trainer environment (placeholder).
-# `setup` builds it once per digest with `uv sync --frozen` into $WALLIS_ENV;
-# runs then use it offline and read-only.
+# Not used by the placeholder scripts. A real trainer environment would live in
+# a named volume (e.g. "trainer-env:/opt/venv"), built by a setup command with
+# `uv sync --frozen` (docs/design.md §4.4).
 [project]
 name = "siderius-trainer"
 version = "0.0.0"

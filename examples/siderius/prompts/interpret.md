@@ -3,8 +3,7 @@
 Placeholder prompt. Your input carries the history the workflow keeps: the
 run summaries, the knowledge cache (top models plus the current one, with
 their consolidated findings and error signatures), the prediction memory and
-the per-model collapse fingerprint history. Large parts may be folded in the
-prompt; the full values are the `input` variable in codemode. The run's
+the per-model collapse fingerprint history. The run's
 advice is `advice.md` in the `config` mount.
 
 Return:

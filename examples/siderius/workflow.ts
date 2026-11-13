@@ -2,14 +2,14 @@
 // workflow: the fixed iteration loop of src/workflows/model_exploration.py
 // with its carried history (research_history.py), run invariants and
 // accounting. The task package (models, training, Health gates) stays
-// domain code behind scripts/. See MAPPING.md for what maps where and what
-// is approximated.
+// domain code: placeholder scripts in trainer/ and checks/. See README.md for
+// a tour and MAPPING.md for what maps where and what is approximated.
 //
 // The body is a pure program over journaled calls. The carried history
 // (knowledge cache, findings archive, collapse history, prediction memory,
 // error signatures, incumbent) is the body's local variables, rebuilt by
 // replay on resume. Agents never read it: the body builds each agent's
-// input from it, and marks the parts that can grow `Foldable`.
+// input from it.
 
 import { readFileSync } from "node:fs";
 import { agent, Artifact, command, NodeFailed, sandbox, toolset, Type, workflow, type Ctx, type Static } from "wallis";
@@ -116,13 +116,14 @@ const { Score, Config, RunSummary, Finding, RawSignature, ErrorSignature, CacheE
 // workflow-relative; `prompts/` is never bound anywhere, so no agent or
 // command can read the judge's prompt or the Health code it is graded by.
 // /data (the dataset) and /config (data_scope.json, health_config.yaml,
-// advice.md: the locked files of run_invariants.py) are given by the caller
-// (`--volume /data=<dir>`) or the local profile. A bind's content digest is
-// part of the cache key of every call whose sandbox binds it.
+// advice.md: the locked files of run_invariants.py) are ./data and ./config
+// next to this file; point them elsewhere by editing the volume strings.
+// Bound files are not part of any node's digest (docs/design.md §5.5): after
+// changing one, start a new run rather than resuming.
 
 const ModelPlugin = Artifact("text/x-python");
 const Checkpoint = Artifact("application/x-checkpoint");
-/** ./data and ./config are not in the workflow dir: the caller gives them. */
+/** Read-only binds, relative to this file. */
 const trainer = "./trainer:/trainer:ro";
 const checks = "./checks:/checks:ro";
 const data = "./data:/data:ro";
@@ -243,9 +244,7 @@ const consolidator = agent(
 // --- Projections the body builds for agent inputs ---------------------------
 //
 // SIDERIUS's carried history lives in the body (see the loop). These are the
-// shapes agents receive; the large ones are Foldable, so the prompt shows a
-// skeleton when they outgrow maxChars and the full value is `input` in
-// codemode.
+// shapes agents receive, as part of their typed input.
 
 type Evidence = Static<typeof Evidence>;
 type Incumbent = Static<typeof Incumbent>;
@@ -268,7 +267,7 @@ function judgeProjection(evidence: readonly Evidence[]): { items: Static<typeof 
 	return { items, omitted: evidence.length - items.length };
 }
 
-/** What the interpreter and proposer read: the carried history, foldable. */
+/** What the interpreter and proposer read: the carried history. */
 const History = Type.Object({
 	runs: Type.Array(RunSummary),
 	knowledge_cache: Type.Array(CacheEntry),
@@ -397,7 +396,7 @@ const tunePlanner = agent({
 });
 
 /**
- * JudgeStop with `on_met: "request_input"`: the approval pattern (docs/v2.md §6). The body sends
+ * JudgeStop with `on_met: "request_input"`: the approval pattern (docs/design.md §6). The body sends
  * the judge's recommendation (self-contained: the criterion and the reason) to the `stop_check`
  * outbox and waits in its own mailbox (registered as `decision`) for `stop` or `continue`.
  */
