@@ -107,3 +107,18 @@ test("a command its sandbox could not start fails as unrunnable (127), with bwra
 	assert.equal(e.reason.code, 127);
 	assert.match(e.reason.stderr, /^the sandbox could not start the command: bwrap: execvp \/no\/such\/program/);
 });
+
+test("sessionOf types a turn-limited session by its agent, and refuses it as another agent's", opts, async () => {
+	const { wf } = await fixture();
+	faux.setResponses([() => fauxAssistantMessage([fauxToolCall("ls", {} as never)], { stopReason: "toolUse" }), () => fauxAssistantMessage([fauxToolCall("ls", {} as never)], { stopReason: "toolUse" }), () => fauxAssistantMessage([fauxToolCall("submit_result", { result: { ok: true } } as never)], { stopReason: "toolUse" })]);
+	const r = await run(wf.continued, {});
+	assert.equal(r.output.ok, true);
+	assert.match(r.output.refused, /this session is not a session of other \(wf\.ts:\d+\)/);
+});
+
+test("an envelope's from goes into an agent's Address(T) input; the runtime checks its schema at call start", opts, async () => {
+	const { wf } = await fixture();
+	faux.setResponses([() => fauxAssistantMessage([fauxToolCall("send", { to: "to", message: "hi back" } as never)], { stopReason: "toolUse" }), () => fauxAssistantMessage([fauxToolCall("submit_result", { result: { ok: true } } as never)], { stopReason: "toolUse" })]);
+	assert.deepEqual((await run(wf.relayed, { numbers: false })).output, { heard: "hi back" });
+	await assert.rejects(run(wf.relayed, { numbers: true }), (e: unknown) => e instanceof NodeFailed && /takes another message schema than this input declares/.test(e.message));
+});

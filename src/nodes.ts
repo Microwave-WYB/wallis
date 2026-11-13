@@ -323,6 +323,17 @@ export function sessionValue(agent: AgentDef, id: string | null, layers: readonl
 	return Object.freeze({ kind: "session" as const, agent: agent.digest, id, layers: [...layers], [DEF]: agent });
 }
 
+/**
+ * A session of an unknown agent (a `turn_limit_reached` failure's) as a session of `agent`, typed
+ * by it: checked at run time, it throws if the session belongs to another agent.
+ */
+export function sessionOf<I, O, M, IS extends TSchema, OS extends TSchema>(agent: Agent<I, O, M, IS, OS>, session: Session<unknown, unknown, unknown>): Session<I, O, M> {
+	const data = session as unknown as Partial<SessionData>;
+	const def = agentDef(agent as unknown as Agent<unknown, unknown, unknown>);
+	if (data.kind !== "session" || data.agent !== def.digest) throw new TypeError(`this session is not a session of ${def.label}`);
+	return session as Session<I, O, M>;
+}
+
 export function sessionAgent(s: Session<unknown, unknown, unknown>): AgentDef | undefined {
 	return (s as unknown as { [DEF]?: AgentDef })[DEF];
 }

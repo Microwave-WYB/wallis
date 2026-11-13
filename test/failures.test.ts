@@ -75,3 +75,9 @@ test("a failed run names first the failure that ended it, not one the body handl
 	assert.deepEqual(failed.map((f) => f.tail), ["broken 2", "broken 1"]);
 	await assert.rejects(h.done(), (x: unknown) => x instanceof NodeFailed && x.call.id === failed[0]!.id);
 });
+
+test("an actor's handler attached at spawn handles a failure that happens during a later await; one reached only after it is too late", opts, async () => {
+	const { wf } = await fixture();
+	assert.deepEqual((await run(wf.handledAtSpawn, {})).output, { caught: "boom" });
+	await assert.rejects(run(wf.handledTooLate, {}), (e: unknown) => e instanceof NodeFailed && /boom/.test(e.message));
+});

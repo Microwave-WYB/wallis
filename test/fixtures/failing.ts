@@ -106,3 +106,38 @@ export const twoFailures = workflow({
 		return {};
 	},
 });
+
+/** The documented pattern: the handler is attached at spawn, so a failure during a later await is handled. */
+export const handledAtSpawn = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ caught: Type.String() }),
+	run: async (ctx) => {
+		const a = ctx.spawn(Type.String(), async () => {
+			throw new Error("boom");
+		});
+		const done = a.result.then(
+			() => "no failure",
+			(e: unknown) => (e as Error).message,
+		);
+		await ctx.call(wait, { s: 1 });
+		return { caught: await done };
+	},
+});
+
+/** The pitfall: a catch reached only after a long await comes too late; the failure is unhandled by then. */
+export const handledTooLate = workflow({
+	input: Type.Object({}),
+	output: Type.Object({ caught: Type.String() }),
+	run: async (ctx) => {
+		const a = ctx.spawn(Type.String(), async () => {
+			throw new Error("boom");
+		});
+		await ctx.call(wait, { s: 1 });
+		try {
+			await a.result;
+			return { caught: "no failure" };
+		} catch (e) {
+			return { caught: (e as Error).message };
+		}
+	},
+});

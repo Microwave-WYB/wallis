@@ -32,7 +32,8 @@ export interface SessionValue {
 export type FailureReason =
 	| { readonly type: "command_exited"; readonly code: number; readonly stderr: string }
 	| { readonly type: "output_invalid"; readonly errors: readonly string[] }
-	| { readonly type: "turn_limit_reached"; readonly turns: number; readonly session: Session<any, any, any> }
+	/** `session`: the agent's session at the limit; `sessionOf(agent, session)` types it by its agent. */
+	| { readonly type: "turn_limit_reached"; readonly turns: number; readonly session: Session<unknown, unknown, unknown> }
 	| { readonly type: "model_failed"; readonly message: string }
 	| { readonly type: "tool_failed"; readonly message: string }
 	| { readonly type: "workflow_threw"; readonly message: string };

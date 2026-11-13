@@ -40,7 +40,13 @@ import { type Address, addressesIn, canonical, type MessageId, schemaDigest, sch
 /** What a mailbox yields. `from` is the sender's own address, so a server replies without wiring. */
 export interface Envelope<M> {
 	readonly id: MessageId;
-	readonly from: Address<unknown>;
+	/**
+	 * The sender's address. Its message type is not known to the receiver, so it is unchecked
+	 * (`Address<any>`): it goes where a typed address goes, and the runtime checks it there (an
+	 * agent's `Address(T)` input compares schema digests when the call starts; `ctx.send` validates
+	 * the message against the sender's mailbox schema).
+	 */
+	readonly from: Address<any>;
 	readonly replyTo?: MessageId;
 	readonly body: M;
 }

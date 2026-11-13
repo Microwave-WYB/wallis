@@ -205,6 +205,14 @@ await r.resume({ detach: true });
 
 ## Pitfalls
 
+- **Handle an actor's failure when you spawn it.** An actor's failure that
+  nobody handles fails its spawner, like an unhandled rejection, and whether
+  it is handled is decided when it fails. So
+  `const done = a.result.catch((e) => …)` right after `ctx.spawn`, and
+  `await done` later; or await `a.result` before any other long await. A
+  `try { await a.result }` reached only after awaiting something else may
+  come too late.
+
 - **Never write into a ref's `path` on the host** (a body, a caller, a
   script run outside wallis). It is the project store's own file, shared by
   every Tree and run that holds the same content; the store keeps files'

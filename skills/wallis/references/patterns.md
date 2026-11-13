@@ -55,7 +55,10 @@ The try/catch around each job is the restart policy: a render that fails
 becomes an `{ error }` reply and the actor goes on. Without it, the first
 failing render would end the actor; since nobody awaits `renderer.result`,
 its failure fails the `grade` body (and the run, naming `renderer`), which
-also cancels the grader waiting for the reply. wallis has no supervisors:
+also cancels the grader waiting for the reply. A body that wants to handle
+an actor's failure itself attaches the handler at spawn
+(`const done = renderer.result.catch((e) => …)`), because a catch reached
+only after another long await is too late. wallis has no supervisors:
 an actor that should survive bad messages catches per message, and a run
 that failed is recovered with `resume`.
 
