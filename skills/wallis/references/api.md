@@ -140,7 +140,7 @@ start or resume is one; a resume reopens what an earlier epoch closed).
 ```ts
 run(wf, input): Promise<Finished<O>>                                   // foreground, waits; throws NodeFailed
 run(wf, input, { detach: true, onExit?: "<shell>" }): Promise<Run<O>>  // its own process
-attach(id) / attach(wf, id): Run<O>                                    // attach(wf, id) throws for a run of another workflow
+attach(id) / attach(wf, id): Run<O>                                    // attach(wf, id) throws for a run of another workflow (and after wf's module moved: use attach(id))
 list(workflowFile): Promise<{ id, state, started }[]>
 prune(): Promise<{ freed }>
 ```

@@ -14,6 +14,7 @@ import { type CallId, type FailedCall, MessageRejected, NodeFailed } from "./err
 import type { Json } from "./host/core.ts";
 import { readDialogue } from "./host/dialogues.ts";
 import { acquireLock, listRuns, lockHolder, newRunId, oldestLiveLock, projectOf, RunLocked, type RunPaths, runPaths, runsDir } from "./host/runs.ts";
+import { squash } from "./host/layers.ts";
 import { Store } from "./host/store.ts";
 import { workflowDef } from "./nodes.ts";
 import { importWorkflow, launch, notInRunner, processLog, readStart, type StartRequest, workflowName, writeStart } from "./launch.ts";
@@ -32,7 +33,7 @@ export interface Run<O> {
 	readonly id: string;
 	status(): Promise<Status>;
 	tree(): Promise<unknown>;
-	/** An agent call's dialogue, every attempt. */
+	/** An agent call's dialogue: its last attempt's. */
 	transcript(call: CallId): Promise<unknown>;
 	/** The next outbox message, the end of the run, or `timeout` (harnesses cap background waits). */
 	next(options?: { readonly timeout?: Duration }): Promise<Next<O>>;
@@ -172,9 +173,12 @@ class RunHandle<O> implements Run<O> {
 		// A recipient that has ended reads nothing more: a finished run, a settled agent call, a closed actor.
 		const closed = [{ path: "/", message: `${registered.address} is closed: it has ended and reads no more messages` }];
 		// A finished run reads nothing more. A live one: as the run sees it (this epoch). A stopped or failed
-		// run keeps the message for its resume, which reopens what the earlier process closed.
+		// run keeps the message for its resume, which reopens the actors and bodies the earlier process closed.
 		if (v.ended?.type === "done") throw new MessageRejected(to, closed, "closed");
 		if (v.live && isClosed(v.core, registered.address)) throw new MessageRejected(to, closed, "closed");
+		// An agent call the journal shows ended (answered, or a decided failure) stays ended on resume:
+		// rejected now, not accepted and dropped later.
+		if (registered.address.startsWith("agent:") && isClosed(v.core, registered.address)) throw new MessageRejected(to, closed, "closed");
 		const key = `caller:${randomUUID()}`;
 		appendFileSync(join(this.paths.dir, "inbox.jsonl"), `${JSON.stringify({ key, name, body: stripPaths(json.value), ...(options.replyTo ? { replyTo: options.replyTo } : {}), ...(options.interrupt ? { interrupt: true } : {}) })}\n`);
 		// A live run journals it within moments (its id comes from the journal), or rejects it (the
@@ -262,7 +266,8 @@ class RunHandle<O> implements Run<O> {
 }
 
 /** Copies every artifact and Tree in a value to a host dir (Trees as subdirs named by digest). */
-function exportRefs(store: Store, value: Json, dir: string): void {
+/** Copies every Artifact and Tree in `value` into `dir` (exported for tests; callers use exportOutput). */
+export function exportRefs(store: Store, value: Json, dir: string): void {
 	mkdirSync(dir, { recursive: true });
 	const used = new Map<string, string>();
 	for (const r of refsIn(value)) {
@@ -277,10 +282,10 @@ function exportRefs(store: Store, value: Json, dir: string): void {
 			const target = join(dir, r.digest.slice(7, 19));
 			const layers = store.treeLayers(r.digest);
 			if (layers === null) throw new Error(`exportOutput: Tree ${r.digest} is not in the project's store`);
-			for (const l of layers) {
-				const c = spawnSync("cp", ["-a", "--reflink=auto", "-T", store.layerDir(l), target], { encoding: "utf8" });
-				if (c.status !== 0) throw new Error(`exportOutput: copying Tree ${r.digest} to ${target} failed: ${(c.stderr || String(c.error)).trim()}`);
-			}
+			// One dir: a Tree of several layers is squashed first (whiteouts and opaque dirs applied), never copied layer over layer.
+			const top = layers.length === 1 ? layers[0]! : squash(store.dir, layers);
+			const c = spawnSync("cp", ["-a", "--reflink=auto", "-T", store.layerDir(top), target], { encoding: "utf8" });
+			if (c.status !== 0) throw new Error(`exportOutput: copying Tree ${r.digest} to ${target} failed: ${(c.stderr || String(c.error)).trim()}`);
 			spawnSync("chmod", ["-R", "u+w", target]);
 		}
 	}

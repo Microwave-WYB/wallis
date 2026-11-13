@@ -85,8 +85,9 @@ export function resolvePrograms(requires: readonly string[], path = HOST_PATH): 
 	const out: Record<string, string> = {};
 	const missing: string[] = [];
 	for (const name of [...new Set(requires)].sort()) {
-		// `node` falls back to the one running wallis (toolsets run under it).
-		const found = name.includes("/") ? (isAbsolute(name) && existsSync(name) ? realpathSync(name) : null) : (onPath(name, path) ?? (name === "node" ? realpathSync(process.execPath) : null));
+		// `node` is the one running wallis (toolsets run under it, and it is the version wallis was
+		// tested with), never another found first on PATH.
+		const found = name.includes("/") ? (isAbsolute(name) && existsSync(name) ? realpathSync(name) : null) : name === "node" ? realpathSync(process.execPath) : onPath(name, path);
 		if (found === null) missing.push(name);
 		else out[name] = found;
 	}

@@ -171,3 +171,25 @@ test("prune removes the temp files and dirs a dead process left, never a live on
 	for (const p of leftovers) assert.ok(!existsSync(p), `${p} is gone`);
 	for (const p of live) assert.ok(existsSync(p), `${p} is kept`);
 });
+
+test("exportOutput copies a Tree of several layers as one dir: a file over an earlier layer's dir replaces it", async () => {
+	const { exportRefs } = await import("../src/caller.ts");
+	const root = tmp();
+	const store = new Store(root);
+	const a = join(root, "a");
+	mkdirSync(join(a, "d"), { recursive: true });
+	writeFileSync(join(a, "d", "old.txt"), "old");
+	writeFileSync(join(a, "keep.txt"), "keep");
+	const b = join(root, "b");
+	mkdirSync(b);
+	writeFileSync(join(b, "d"), "now a file");
+	const [l1] = store.ingestTree(a, { move: false });
+	const [l2] = store.ingestTree(b, { move: false });
+	const tree = store.putTree([l1!, l2!]);
+	const out = join(root, "out");
+	mkdirSync(out);
+	exportRefs(store, { t: { kind: "tree", digest: tree } }, out);
+	const dir = join(out, tree.slice(7, 19));
+	assert.equal(readFileSync(join(dir, "d"), "utf8"), "now a file");
+	assert.equal(readFileSync(join(dir, "keep.txt"), "utf8"), "keep");
+});

@@ -62,3 +62,39 @@ test("an author volume at /out does not break an agent's file result; a bash com
 	const r = await run(wf.outAndTimeout, { cmd: "sleep 5" });
 	assert.equal(readFileSync(r.output.report.path, "utf8"), "report\n");
 });
+
+test("a malformed retryDelaysMs is an error, not ignored", async () => {
+	const { readConfig } = await import("../src/config.ts");
+	const { mkdirSync, writeFileSync } = await import("node:fs");
+	const root = tmp();
+	mkdirSync(join(root, ".wallis"));
+	for (const bad of ['"5s"', '[5000, "30s"]', "[-1]"]) {
+		writeFileSync(join(root, ".wallis", "config.json"), `{ "models": {}, "retryDelaysMs": ${bad} }`);
+		assert.throws(() => readConfig(root), /"retryDelaysMs" is an array of waits in milliseconds/);
+	}
+	writeFileSync(join(root, ".wallis", "config.json"), '{ "models": {}, "retryDelaysMs": [10, 20] }');
+	assert.deepEqual(readConfig(root).retryDelaysMs, [10, 20]);
+});
+
+test("node is the Node running wallis even when another comes first on PATH", async () => {
+	const { chmodSync, mkdirSync, realpathSync, writeFileSync } = await import("node:fs");
+	const dir = join(tmp(), "bin");
+	mkdirSync(dir);
+	writeFileSync(join(dir, "node"), "#!/bin/sh\necho other node\n");
+	chmodSync(join(dir, "node"), 0o755);
+	assert.equal(resolvePrograms(["node"], `${dir}:/usr/bin`).node, realpathSync(process.execPath));
+});
+
+test("named volumes left in the old ~/.cache/wallis/volumes are named once in a warning", async () => {
+	const { mkdirSync } = await import("node:fs");
+	const { spawnSync } = await import("node:child_process");
+	const cache = tmp();
+	mkdirSync(join(cache, "wallis", "volumes", "uv-env"), { recursive: true });
+	// A fresh process: the notice is once per process.
+	const script = `import { resolveVolumes } from ${JSON.stringify(join(here, "../src/host/volumes.ts"))}; resolveVolumes(["a:/a"], ${JSON.stringify(tmp())}); resolveVolumes(["b:/b"], ${JSON.stringify(tmp())});`;
+	const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, XDG_CACHE_HOME: cache }, encoding: "utf8" });
+	assert.equal(r.status, 0, r.stderr);
+	const warned = r.stderr.split("\n").filter((l) => l.startsWith("wallis:"));
+	assert.equal(warned.length, 1);
+	assert.match(warned[0]!, /\(uv-env\) are no longer used/);
+});

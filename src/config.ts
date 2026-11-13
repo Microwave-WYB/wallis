@@ -35,7 +35,8 @@ export function readConfig(root: string): ProjectConfig {
 		}
 	}
 	if (executor !== undefined && typeof executor !== "string") throw new Error(`${file}: "executor" is a module path`);
-	const delays = Array.isArray(retryDelaysMs) && retryDelaysMs.every((d) => typeof d === "number") ? (retryDelaysMs as number[]) : undefined;
+	if (retryDelaysMs !== undefined && !(Array.isArray(retryDelaysMs) && retryDelaysMs.every((d: unknown) => typeof d === "number" && Number.isFinite(d) && d >= 0))) throw new Error(`${file}: "retryDelaysMs" is an array of waits in milliseconds (numbers >= 0), e.g. [5000, 30000, 120000]`);
+	const delays = retryDelaysMs as number[] | undefined;
 	return { models: table, executor: typeof executor === "string" ? resolve(root, executor) : null, ...(delays ? { retryDelaysMs: delays } : {}) };
 }
 

@@ -360,7 +360,9 @@ labels:
   wallis builds from the module is recorded in the run, so a resumed run
   serves the same bundle;
 - a node is its definition digest;
-- a workflow is its module digest.
+- a workflow is its definition digest (its schemas and the source text of
+  its body), like any node; a run records the workflow's file and export
+  name to find it again.
 
 **What a node's digest covers.** Its own definition: its schemas, its
 sandbox, its prompt, and the source text of its own functions (`run`,
@@ -410,7 +412,9 @@ value.
   run) is rejected with reason `closed`, never journaled: the `send` tool
   fails, `ctx.send` throws `MessageRejected` (`reason: "closed"`),
   `run.send` rejects. A run that is only stopped still takes messages: they
-  persist and are delivered on resume.
+  persist and are delivered on resume. Except for an agent call the journal
+  shows ended (answered, or a decided failure): that stays ended on resume,
+  so `run.send` rejects it as `closed` at once, stopped or not.
 - **An agent's send is delivered once.** Its key is (call, turn, the model's
   tool-call id), and the journal delivers each key once. A reply with tool
   calls is checkpointed before its tools run, so a turn cut off by a crash
@@ -432,7 +436,13 @@ value.
   - If its spawner awaits `result` (or attaches a handler to it), the
     spawner gets the `NodeFailed` or the thrown error and handles it in code.
   - If nobody handles `result`, the failure propagates to the spawning body,
-    like an unhandled rejection, and from there up the call chain. If nothing
+    like an unhandled rejection, and from there up the call chain.
+    - "Handles" is decided when the actor fails, as Node decides an
+      unhandled rejection: a `try { await a.result } catch {}` that the body
+      reaches only after another long await comes too late if the actor
+      failed meanwhile. Attach the handler when spawning
+      (`const done = a.result.catch((e) => …)`, awaited later), or await
+      `result` before any other long await. If nothing
     catches it, the run fails, and its first `FailedCall` names the actor (its
     const name and spawn site).
   - A failed actor's mailbox closes: later sends are rejected as `closed` on
@@ -551,7 +561,10 @@ attach(id);  await list("./negative/workflow.ts");  await prune();
   neither until it is done. `exportOutput` copies every Artifact and Tree of
   the output into the dir (`~` is the home dir) and fails if a copy fails.
 - **Who may attach.** `attach(wf, id)` checks that the run is a run of `wf`
-  (its file and export), and throws otherwise.
+  (its file and export), and throws otherwise. So a typed `attach` fails
+  after the workflow's module is moved or renamed, or its export renamed:
+  attach those runs untyped (`attach(id)`), or start new runs from the
+  moved module.
 
 - **Detaching.** `detach` starts the run as a detached Node process and
   returns at once. `onExit` runs when the run process exits normally.
@@ -730,7 +743,8 @@ examples left room. None changes the authoring API.
      it (a command's `/w`, or `exportOutput`) and change the copy.
 6. **`requires`** skips version-manager shim dirs on `PATH` (`…/shims`:
    mise, asdf, pyenv), because a shim needs its manager's config. `node`
-   falls back to the Node that runs wallis.
+   is always the Node that runs wallis (`process.execPath`), even when
+   another one comes first on `PATH`.
 7. **Detached runs** are `node runner.ts <run dir>`, reading
    `start.json` (with its `onExit`, also on a detached resume). The caller
    writes the child's pid and start time into the lock at once,

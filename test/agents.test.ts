@@ -269,3 +269,16 @@ test("a registered agent whose failed attempt will run again still accepts messa
 	await h.resume();
 	assert.deepEqual((await h.done()).output, { heard: "now report" });
 });
+
+test("a stopped run rejects at once a message to an agent call its journal shows ended (closed), and still takes one for the body", opts, async () => {
+	const root = project({ "wf.ts": readFileSync(join(here, "fixtures/agents.ts"), "utf8") }, { models: { default: "faux/m" }, executor: join(here, "fixtures/heard-executor.ts") });
+	const wf = (await import(pathToFileURL(join(root, "wf.ts")).href)) as typeof import("./fixtures/agents.ts");
+	const r = await run(wf.lingering, {}, { detach: true });
+	for (let i = 0; i < 400 && view(root, r.id).core.callState(view(root, r.id).calls[0]?.slot ?? "") !== "answered"; i++) await new Promise((d) => setTimeout(d, 25));
+	await r.stop();
+	assert.equal((await r.next({ timeout: "10s" })).type, "stopped");
+	await assert.rejects(r.send("steer", "too late"), (e: unknown) => e instanceof MessageRejected && e.reason === "closed");
+	await r.send("self", "done");
+	const resumed = await r.resume({ detach: true });
+	assert.deepEqual(await resumed.next({ timeout: "20s" }), { type: "finished", output: { heard: "nothing" } });
+});
