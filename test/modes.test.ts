@@ -45,3 +45,48 @@ test("a command copies an input Tree into /w and edits a copied file in place; t
 	assert.equal(statSync(join(r.output.out.path, "package.json")).mode & 0o777, 0o644);
 	assert.equal(statSync(join(r.output.out.path, "bin", "run")).mode & 0o777, 0o755);
 });
+
+test("r.dir of a dir the command made read-only all the way down enters the store, modes kept", opts, async () => {
+	const { root, wf } = await fixture();
+	const r = await run(wf.seal, {});
+	assert.equal(readFileSync(join(r.output.out.path, "sub", "a.txt"), "utf8"), "a\n");
+	assert.deepEqual(modes(root, r.output.out), { sub: 0o555, "sub/a.txt": 0o444 });
+	assert.equal(statSync(r.output.out.path).mode & 0o777, 0o555, "the layer's root keeps its mode too");
+});
+
+test("an agent that leaves its /w root read-only commits its workspace", opts, async () => {
+	const { wf } = await fixture();
+	faux.setResponses([() => call("bash", { command: "echo kept > note.txt && chmod 0555 /w" }), () => call("submit_result", { result: { ok: true } })]);
+	const r = await run(wf.lockedRoot, {});
+	assert.equal(readFileSync(join(r.output.files.path, "note.txt"), "utf8"), "kept\n");
+});
+
+test("a read-only result dir also enters the store when the run dies right after the move and is resumed", opts, async () => {
+	const { wf } = await fixture();
+	// The process dies once the layer is in the store, before the event that names it.
+	process.env.WALLIS_CRASH_AT = "layer:1";
+	const r = await run(wf.seal, {}, { detach: true });
+	delete process.env.WALLIS_CRASH_AT;
+	assert.equal((await r.next({ timeout: "20s" })).type, "stopped");
+	const resumed = await r.resume({ detach: true });
+	const n = await resumed.next({ timeout: "20s" });
+	assert.equal(n.type, "finished");
+	const done = await resumed.done();
+	assert.equal(readFileSync(join(done.output.out.path, "sub", "a.txt"), "utf8"), "a\n");
+});
+
+test("Tree.from of a read-only host dir is ingested by copy", opts, async () => {
+	const { root, wf } = await fixture();
+	const src = join(root, "ro");
+	mkdirSync(join(src, "d"), { recursive: true });
+	writeFileSync(join(src, "d", "package.json"), "{}\n");
+	chmodSync(join(src, "d"), 0o555);
+	chmodSync(src, 0o555);
+	try {
+		const r = await run(wf.patched, { t: Tree.from(join(src, "d")) });
+		assert.equal(readFileSync(join(r.output.out.path, "package.json"), "utf8"), "{}\npatched\n");
+	} finally {
+		chmodSync(src, 0o755);
+		chmodSync(join(src, "d"), 0o755);
+	}
+});

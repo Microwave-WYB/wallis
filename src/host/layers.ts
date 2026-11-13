@@ -206,11 +206,29 @@ export function commitLayer(store: string, work: Pick<Work, "upper">, root: stri
 	if (existsSync(dir)) removeWork(work.upper);
 	else {
 		syncTree(work.upper);
-		renameSync(work.upper, dir);
+		moveDir(work.upper, dir);
 		syncPath(layersDir(store));
 	}
 	crashPoint("layer");
 	return digest;
+}
+
+/**
+ * Renames a dir into another parent dir. That rewrites its `..`, which needs
+ * write permission on the dir itself: a read-only one (a command's
+ * `chmod -R a-w`, an agent's 0555 `/w`) is made writable for the rename and
+ * given its mode back after. Its contents are not touched.
+ */
+export function moveDir(from: string, to: string): void {
+	const mode = lstatSync(from).mode & 0o7777;
+	if ((mode & 0o200) === 0) chmodSync(from, mode | 0o700);
+	try {
+		renameSync(from, to);
+	} catch (e) {
+		if ((mode & 0o200) === 0) chmodSync(from, mode);
+		throw e;
+	}
+	if ((mode & 0o200) === 0) chmodSync(to, mode);
 }
 
 /** fsync of one file or dir. */
