@@ -42,7 +42,8 @@ verdicts, the stop question, a crash and resume) is planned.
 
 ## Run it with real models
 
-Agents name model aliases, one per SIDERIUS `llm.json` route. Map them in
+Agents name model aliases, one per SIDERIUS `llm.json` route family
+(the findings consolidator uses `interpret`, as in SIDERIUS). Map them in
 `.wallis/config.json` at the project root (the nearest directory with
 `.wallis/` or `package.json`):
 
@@ -56,8 +57,7 @@ Agents name model aliases, one per SIDERIUS `llm.json` route. Map them in
     "propose": "anthropic/claude-opus-5-5",
     "implement": "anthropic/claude-sonnet-5-5",
     "validate": "anthropic/claude-sonnet-5-5",
-    "tune": "anthropic/claude-sonnet-5-5",
-    "consolidate": "anthropic/claude-haiku-5-5"
+    "tune": "anthropic/claude-sonnet-5-5"
   }
 }
 ```
@@ -97,8 +97,8 @@ Read in this order:
    exactly what its node can see.
 3. **The nested workflows** `implementAndValidate` (implementor, then the
    deterministic checks, then the LLM review, bounded retries) and `tune`
-   (Trial rounds, then the forced Formal round; evaluation and Health per
-   trained checkpoint).
+   (Trial rounds, then the forced Formal round; attempts in sequence
+   until one is scored, then Health on that checkpoint).
 4. **The deterministic folds** (`rankPrune`, `mergeSignatures`,
    `pruneCollapse`, `capCache`, `evaluatePrediction`, `judgeProjection`):
    SIDERIUS's bookkeeping, as plain functions over the local state.

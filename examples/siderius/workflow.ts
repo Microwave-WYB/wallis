@@ -12,7 +12,7 @@
 // input from it.
 
 import { readFileSync } from "node:fs";
-import { agent, Artifact, command, NodeFailed, sandbox, toolset, Type, workflow, type Ctx, type Static } from "wallis";
+import { agent, Artifact, command, NodeFailed, sandbox, toolset, Type, workflow, type Static } from "wallis";
 
 const text = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
@@ -65,8 +65,9 @@ const S = Type.Script(
 	}
 
 	// One per model, holding its own consolidated findings and bottlenecks (at
-	// most 8 each) and its error signatures. rank_score is the best Health-valid
-	// formal score, sign-normalized by the metric order (higher is better).
+	// most 8 each) and its error signatures. rank_score is the model's best score,
+	// unfiltered (as cap_knowledge_cache ranks by best_denoising_score),
+	// sign-normalized by the metric order (higher is better).
 	type CacheEntry = {
 		model_type: string, description: string, iteration: Int, rank_score: Score,
 		stats: { best_score: Score, best_formal_score: Score, best_valid_formal_score: Score },
@@ -227,7 +228,8 @@ const validateScript = command({
 
 const consolidator = agent(
 	{
-		model: "consolidate",
+		// SIDERIUS's consolidator has no route of its own: it uses the interpret route.
+			model: "interpret",
 		prompt: text("./prompts/consolidate-findings.md"),
 		input: Type.Object({
 			model_type: Type.String(),
@@ -614,7 +616,10 @@ const TuneInput = Type.Object({
 });
 
 const TuneOutput = Type.Object({
+	/** The best score of any round, unfiltered (best_denoising_score). */
 	best_score: Score,
+	/** The best Health-valid score, Trial or Formal (best_valid_denoising_score). */
+	best_valid_score: Score,
 	best_formal_score: Score,
 	best_valid_formal_score: Score,
 	termination_reason: Type.String(),
@@ -627,18 +632,33 @@ const tune = workflow({
 	output: TuneOutput,
 	run: async (ctx, input) => {
 		let bestScore: number | null = null;
+		let bestValid: number | null = null;
 		let bestFormal: number | null = null;
 		let bestValidFormal: number | null = null;
 		let bestTrialConfig: Static<typeof Config> | null = null;
 		let bestTrialScore: number | null = null;
+		let completed = 0;
 		let failRounds = 0;
+		let planned = 0;
 		const notes: string[] = [];
 		const rejections = [...input.previous_rejections];
 		const failedChecks: Static<typeof HealthCheck>[] = [];
+		const end = (termination_reason: string) => ({
+			best_score: bestScore,
+			best_valid_score: bestValid,
+			best_formal_score: bestFormal,
+			best_valid_formal_score: bestValidFormal,
+			termination_reason,
+			physical_rejections: rejections,
+			failed_checks: failedChecks,
+		});
 
-		for (let round = 1; round <= input.max_rounds; round++) {
-			// force_formal_round: the last round is Formal (formal_round_strategy full_clone).
-			const isTrial = round < input.max_rounds;
+		// Only a successful round counts toward max_rounds; a failed one is planned again, until
+		// max_fail_rounds fail in a row. The last round is Formal (force_formal_round).
+		while (completed < input.max_rounds) {
+			const round = completed + 1;
+			const isTrial = completed < input.max_rounds - 1;
+			planned++;
 			const plan = await ctx.call(tunePlanner, {
 				round,
 				is_trial: isTrial,
@@ -648,84 +668,58 @@ const tune = workflow({
 				physical_rejections: rejections,
 				knowledge_cache: input.knowledge_cache,
 			});
+			// formal_round_strategy full_clone: the Formal round starts from the best valid Trial config.
 			const config: Static<typeof Config> = isTrial ? plan.config : { ...(bestTrialConfig ?? plan.config), ...plan.config };
 
-			// Gate refusals and OOM count as attempts, not rounds. Each attempt
-			// trains, then scores and runs Health on its checkpoint in parallel.
-			type Attempt = { status: string; scored: { score: number; checkpoint: Static<typeof Checkpoint>; health: Static<typeof HealthReport> } | null };
+			// Up to N attempts, one after another; the round ends at the first scored one.
+			// OOM and gate refusals use an attempt. Health runs only on a scored checkpoint.
 			const attempts = isTrial ? input.attempts_trial : input.attempts_formal;
 			const scope = isTrial ? "trial" : "formal";
-			const tryOnce = async (c: Ctx, attempt: number): Promise<Attempt> => {
-				const trained = await c.call(trainScript, {
+			let scored: { score: number; health: Static<typeof HealthReport> } | null = null;
+			for (let attempt = 1; attempt <= attempts && scored === null; attempt++) {
+				const trained = await ctx.call(trainScript, {
 					model: input.model,
 					config,
 					scope,
 					max_epochs: isTrial ? input.trial_max_epochs : input.formal_max_epochs,
 					time_budget_minutes: isTrial ? input.trial_minutes : input.formal_minutes,
-					seed: probeSeed(input.seed, input.iteration * 100 + round, attempt),
+					seed: probeSeed(input.seed, input.iteration * 100 + planned, attempt),
 					data_scope: files.dataScope,
 				});
-				if (trained.status !== "ok" || trained.checkpoint === null) return { status: trained.status, scored: null };
-				const checkpoint = trained.checkpoint;
-				const [evaluated, health] = await Promise.all([
-					c.call(evaluateScript, { checkpoint, scope }),
-					c.call(healthScript, { checkpoint, health_config: files.healthConfig, model_type: input.model_type }),
-				]);
-				return { status: "ok", scored: evaluated.scoreable && evaluated.score !== null ? { score: evaluated.score, checkpoint, health } : null };
-			};
-			// Trial attempts of one round run in parallel (one actor each, through ctx.map);
-			// Formal attempts stay sequential, stopping at the first scored one.
-			const tried: Attempt[] = [];
-			if (isTrial) tried.push(...(await ctx.map(Array.from({ length: attempts }, (_, i) => i + 1), (c, attempt) => tryOnce(c, attempt))));
-			else for (let attempt = 1; attempt <= attempts && !tried.some((t) => t.scored); attempt++) tried.push(await tryOnce(ctx, attempt));
-			if (tried.some((t) => t.status === "infrastructure_abort")) {
-				return {
-					best_score: bestScore,
-					best_formal_score: bestFormal,
-					best_valid_formal_score: bestValidFormal,
-					termination_reason: "infrastructure_abort",
-					physical_rejections: rejections,
-					failed_checks: failedChecks,
-				};
+				if (trained.status === "infrastructure_abort") return end("infrastructure_abort");
+				if (trained.status !== "ok" || trained.checkpoint === null) continue;
+				const evaluated = await ctx.call(evaluateScript, { checkpoint: trained.checkpoint, scope });
+				if (!evaluated.scoreable || evaluated.score === null) continue;
+				const health = await ctx.call(healthScript, { checkpoint: trained.checkpoint, health_config: files.healthConfig, model_type: input.model_type });
+				scored = { score: evaluated.score, health };
 			}
-			// The best scored attempt of the round, in attempt order on ties.
-			const scored = tried
-				.flatMap((t) => (t.scored ? [t.scored] : []))
-				.reduce<Attempt["scored"]>((best, t) => (best === null || better(input.direction, t.score, best.score) ? t : best), null);
 
 			if (scored === null) {
 				failRounds++;
-				if (failRounds >= input.max_fail_rounds) break;
+				if (failRounds >= input.max_fail_rounds) return end("aborted_fail_rounds");
 				continue;
 			}
 			failRounds = 0;
+			completed++;
 
-			// Health: scientific gates on every scored round.
-			const health = scored.health;
+			const { score, health } = scored;
 			failedChecks.push(...health.failed_checks);
-			if (better(input.direction, scored.score, bestScore)) bestScore = scored.score;
-			if (isTrial && better(input.direction, scored.score, bestTrialScore)) {
-				bestTrialScore = scored.score;
+			if (better(input.direction, score, bestScore)) bestScore = score;
+			if (health.valid && better(input.direction, score, bestValid)) bestValid = score;
+			if (isTrial && health.valid && better(input.direction, score, bestTrialScore)) {
+				bestTrialScore = score;
 				bestTrialConfig = config;
 			}
 			if (!isTrial) {
-				if (better(input.direction, scored.score, bestFormal)) bestFormal = scored.score;
-				if (health.valid && better(input.direction, scored.score, bestValidFormal)) bestValidFormal = scored.score;
+				if (better(input.direction, score, bestFormal)) bestFormal = score;
+				if (health.valid && better(input.direction, score, bestValidFormal)) bestValidFormal = score;
 			}
 
-			const reflection = await ctx.call(tuneReflector, { round, is_trial: isTrial, result: { score: scored.score, health } });
+			const reflection = await ctx.call(tuneReflector, { round, is_trial: isTrial, result: { score, health } });
 			notes.push(reflection.notes);
 			rejections.push(...reflection.physical_rejections);
 		}
-
-		return {
-			best_score: bestScore,
-			best_formal_score: bestFormal,
-			best_valid_formal_score: bestValidFormal,
-			termination_reason: failRounds >= input.max_fail_rounds ? "aborted_fail_rounds" : "completed",
-			physical_rejections: rejections,
-			failed_checks: failedChecks,
-		};
+		return end("completed");
 	},
 });
 
@@ -778,8 +772,10 @@ export default workflow({
 		let infoGainV2 = 0;
 		// Evidence for the judge projection, oldest first.
 		const evidence: Evidence[] = [];
-		// chain_formal_incumbent_reference.
+		// chain_formal_incumbent_reference: the best Health-valid Formal score; it alone drives the target and the stops.
 		let incumbent: Incumbent | null = null;
+		// interpretation_evidence.best_valid_denoising_score: the prediction reference.
+		let bestValidSoFar: number | null = null;
 
 		let stop: StopReason = "iterations_exhausted";
 		let iterations = 0;
@@ -964,16 +960,18 @@ export default workflow({
 				model_type: modelType,
 				description: candidate.proposal.model_description,
 				iteration,
-				rank_score: valid === null ? null : sign * valid,
+				rank_score: tuned.best_score === null ? null : sign * tuned.best_score,
 				stats: { best_score: tuned.best_score, best_formal_score: tuned.best_formal_score, best_valid_formal_score: valid },
 				key_findings: prior?.key_findings ?? [],
 				bottlenecks: prior?.bottlenecks ?? [],
 				error_signatures: mergeSignatures(prior?.error_signatures ?? [], signatures),
 			});
 
-			// PredictionMemory v2: the deterministic rule, against the incumbent before this iteration.
+			// PredictionMemory v2: the deterministic rule. The model's best score against the
+			// reference the proposer saw: the best Health-valid score so far, any model, Trial or Formal.
+			const prediction = evaluatePrediction(direction, tuned.best_score, bestValidSoFar);
+			if (tuned.best_valid_score !== null && better(direction, tuned.best_valid_score, bestValidSoFar)) bestValidSoFar = tuned.best_valid_score;
 			const before = incumbent === null ? null : incumbent.score;
-			const prediction = evaluatePrediction(direction, valid, before);
 			if (prediction.outcome !== "unevaluated") {
 				predictionV2[prediction.outcome] = (predictionV2[prediction.outcome] ?? 0) + 1;
 				infoGainV2 += prediction.gain;
